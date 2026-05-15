@@ -8,6 +8,14 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+### Breaking
+
+### Fixes
+
+## 2026.5.15 (v0.8.0)
+
+### Changes
+
 - Runtime/embedding: add an optional `onPermissionRequest` callback to `AcpRuntimeOptions` and `AcpClientOptions` so embedders can intercept ACP per-call permission requests with their own UI. Returning a decision short-circuits the mode-based resolver; returning `undefined` falls through to it, leaving CLI behavior unchanged. Thanks @DaniAkash.
 - Runtime/embedding: `AcpRuntime.ensureSession` now accepts `sessionOptions` (`systemPrompt`, `model`, `allowedTools`, `maxTurns`) for fresh sessions, threading the values into `_meta.systemPrompt` (and `_meta.claudeCode.options.*`) on the underlying `session/new` request and persisting them onto the new record. Reusing an existing persistent record continues to ignore `sessionOptions` since system prompts are fixed at `newSession` time. `SessionAgentOptions` and `SystemPromptOption` are now re-exported from `acpx/runtime`. Thanks @DaniAkash.
 - Runtime/embedding: surface advertised models on `AcpRuntimeStatus.models` so embedders can build model pickers without reaching into private session records. Thanks @DaniAkash.
