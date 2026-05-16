@@ -466,6 +466,47 @@ function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
+function parseImportedFrom(raw: unknown): SessionRecord["importedFrom"] | null | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+
+  const record = asRecord(raw);
+  if (
+    !record ||
+    typeof record.record_id !== "string" ||
+    typeof record.cwd_original !== "string" ||
+    typeof record.exported_by !== "string" ||
+    typeof record.exported_at !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    recordId: record.record_id,
+    cwdOriginal: record.cwd_original,
+    exportedBy: record.exported_by,
+    exportedAt: record.exported_at,
+  };
+}
+
+function parseSessionRecordMetadata(record: Record<string, unknown>): {
+  lastRequestId: string | undefined;
+  importedFrom: SessionRecord["importedFrom"];
+} | null {
+  const lastRequestId = normalizeOptionalString(record.last_request_id);
+  if (lastRequestId === null) {
+    return null;
+  }
+
+  const importedFrom = parseImportedFrom(record.imported_from);
+  if (importedFrom === null) {
+    return null;
+  }
+
+  return { lastRequestId, importedFrom };
+}
+
 function normalizeOptionalName(value: unknown): string | undefined | null {
   if (value == null) {
     return undefined;
@@ -574,8 +615,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   }
 
   const eventLog = parseEventLog(record.event_log, record.acpx_record_id);
-  const lastRequestId = normalizeOptionalString(record.last_request_id);
-  if (lastRequestId === null) {
+  const metadata = parseSessionRecordMetadata(record);
+  if (!metadata) {
     return null;
   }
 
@@ -590,7 +631,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     createdAt: record.created_at,
     lastUsedAt: record.last_used_at,
     lastSeq: record.last_seq,
-    lastRequestId,
+    lastRequestId: metadata.lastRequestId,
     eventLog,
     closed: optionals.closed,
     closedAt: optionals.closedAt,
@@ -610,6 +651,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     cumulative_token_usage: conversation.cumulative_token_usage,
     request_token_usage: conversation.request_token_usage,
     acpx: parseAcpxState(record.acpx),
+    importedFrom: metadata.importedFrom,
   };
 }
 

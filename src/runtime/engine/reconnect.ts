@@ -240,7 +240,7 @@ export async function connectAndLoadSession(
 ): Promise<ConnectAndLoadSessionResult> {
   const record = options.record;
   const client = options.client;
-  const sameSessionOnly = requiresSameSession(options.resumePolicy);
+  const sameSessionOnly = requiresSameSession(options.resumePolicy) || Boolean(record.importedFrom);
   const originalSessionId = record.acpSessionId;
   const originalAgentSessionId = record.agentSessionId;
   const desiredModeId = getDesiredModeId(record.acpx);

@@ -1,4 +1,4 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { DEFAULT_HISTORY_LIMIT } from "../session/persistence.js";
 import {
   handleCancel,
@@ -6,7 +6,9 @@ import {
   handlePrompt,
   handleSessionsClose,
   handleSessionsEnsure,
+  handleSessionsExport,
   handleSessionsHistory,
+  handleSessionsImport,
   handleSessionsList,
   handleSessionsNew,
   handleSessionsPrune,
@@ -26,7 +28,9 @@ import {
   parsePruneBeforeDate,
   parseSessionName,
   type PromptFlags,
+  type SessionsExportFlags,
   type SessionsHistoryFlags,
+  type SessionsImportFlags,
   type SessionsListFlags,
   type SessionsNewFlags,
   type SessionsPruneFlags,
@@ -48,6 +52,20 @@ type SharedSubcommandDescriptions = {
   setConfig: string;
   status: string;
 };
+
+class LocalAttributeOption extends Option {
+  constructor(
+    flags: string,
+    description: string,
+    private readonly localAttributeName: string,
+  ) {
+    super(flags, description);
+  }
+
+  override attributeName(): string {
+    return this.localAttributeName;
+  }
+}
 
 function addSessionsListOptions(command: Command): Command {
   return command
@@ -149,6 +167,38 @@ export function registerSessionsCommand(
         this,
         config,
       );
+    });
+
+  sessionsCommand
+    .command("export")
+    .description("Export a portable session archive")
+    .argument("[name]", "Session name", parseSessionName)
+    .requiredOption("--output <path>", "Output archive path", (value: string) =>
+      parseNonEmptyValue("Output path", value),
+    )
+    .addOption(
+      new LocalAttributeOption("--cwd <cwd>", "Session cwd to export", "sourceCwd").argParser(
+        (value: string) => parseNonEmptyValue("Session cwd", value),
+      ),
+    )
+    .action(async function (this: Command, name: string | undefined, flags: SessionsExportFlags) {
+      await handleSessionsExport(explicitAgentName, name, flags, this, config);
+    });
+
+  sessionsCommand
+    .command("import")
+    .description("Import a portable session archive")
+    .argument("<archive-path>", "Archive path", (value: string) =>
+      parseNonEmptyValue("Archive path", value),
+    )
+    .option("--name <name>", "Imported session name", parseSessionName)
+    .addOption(
+      new LocalAttributeOption("--cwd <cwd>", "Imported session cwd", "destinationCwd").argParser(
+        (value: string) => parseNonEmptyValue("Imported session cwd", value),
+      ),
+    )
+    .action(async function (this: Command, archivePath: string, flags: SessionsImportFlags) {
+      await handleSessionsImport(explicitAgentName, archivePath, flags, this, config);
     });
 
   sessionsCommand

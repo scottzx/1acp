@@ -28,7 +28,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>]]
+acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -38,7 +38,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
 `<agent>` can be:
@@ -310,6 +310,8 @@ acpx [global_options] <agent> sessions show
 acpx [global_options] <agent> sessions show <name>
 acpx [global_options] <agent> sessions history
 acpx [global_options] <agent> sessions history <name> [--limit <count>]
+acpx [global_options] <agent> sessions export [name] --output <path> [--cwd <dir>]
+acpx [global_options] <agent> sessions import <archive> [--name <name>] [--cwd <dir>]
 acpx [global_options] <agent> sessions prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]
 
 acpx [global_options] sessions ...   # defaults to codex
@@ -340,6 +342,10 @@ Behavior:
 - `sessions close <name>` soft-closes current cwd named session
 - `sessions show [name]` displays stored session metadata
 - `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`)
+- `sessions export [name] --output <path>` writes a portable JSON archive with session state and event history; `--cwd <dir>` selects a different source cwd relative to global `--cwd`
+- `sessions import <archive>` writes a fresh local record from a portable archive, reopens it as idle, keeps the provider session id, and clears source-machine process metadata
+- Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
+- `sessions import --name <name>` and `--cwd <dir>` override the imported destination scope; import fails instead of creating a duplicate when an active session already exists for that `(agent, cwd, name)` scope or when another local record already uses the same provider session id
 - `sessions prune --dry-run` previews closed sessions that can be deleted
 - `sessions prune` deletes closed session records for the selected agent; add `--include-history` to delete event stream files too
 - `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records
@@ -518,7 +524,7 @@ Hard rule for the ACP stream:
 When `--format json` is used:
 
 - commands that talk to an ACP adapter emit raw ACP JSON-RPC messages.
-- local query commands (`sessions list/show/history/prune`) emit local JSON documents (not ACP stream traffic).
+- local query commands (`sessions list/show/history/export/import/prune`) emit local JSON documents (not ACP stream traffic).
 
 ### Sessions/query command output behavior
 
@@ -529,6 +535,12 @@ When `--format json` is used:
 - `sessions show` with `json`: full session record object
 - `sessions history` with `text`: tab-separated `timestamp role textPreview` entries
 - `sessions history` with `json`: object containing `entries` array
+- `sessions export` with `text`: output path summary
+- `sessions export` with `json`: object containing `action` and `output`
+- `sessions export` with `quiet`: output path
+- `sessions import` with `text`: imported record id and cwd summary
+- `sessions import` with `json`: object containing `action`, `record_id`, and `cwd`
+- `sessions import` with `quiet`: imported record id
 - `sessions prune` with `text`: summary plus pruned ids and close/last-used time
 - `sessions prune` with `json`: object containing `action`, `dryRun`, `count`, `bytesFreed`, and `pruned`
 - `sessions prune` with `quiet`: one pruned session id per line

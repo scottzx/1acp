@@ -74,6 +74,16 @@ export type SessionsListFlags = {
   local?: boolean;
 };
 
+export type SessionsExportFlags = {
+  output: string;
+  sourceCwd?: string;
+};
+
+export type SessionsImportFlags = {
+  name?: string;
+  destinationCwd?: string;
+};
+
 export type StatusFlags = {
   session?: string;
 };

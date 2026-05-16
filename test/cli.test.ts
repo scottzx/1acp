@@ -325,6 +325,26 @@ test("global passthrough flags are present in help output", async () => {
   });
 });
 
+test("CLI ignores npm-run delimiter before forwarded arguments", async () => {
+  await withTempHome(async (homeDir) => {
+    const env = {
+      npm_lifecycle_event: "dev",
+      npm_lifecycle_script: "tsx src/cli.ts",
+    };
+
+    const rootHelp = await runCli(["--", "--help"], homeDir, { env });
+    assert.equal(rootHelp.code, 0, rootHelp.stderr);
+    assert.match(rootHelp.stdout, /Usage: acpx/);
+
+    const importHelp = await runCli(["--", "codex", "sessions", "import", "--help"], homeDir, {
+      env,
+    });
+    assert.equal(importHelp.code, 0, importHelp.stderr);
+    assert.match(importHelp.stdout, /Import a portable session archive/);
+    assert.match(importHelp.stdout, /archive-path/);
+  });
+});
+
 test("sessions new command is present in help output", async () => {
   await withTempHome(async (homeDir) => {
     const result = await runCli(["sessions", "--help"], homeDir);
@@ -2041,6 +2061,158 @@ test("sessions history prints stored history entries", async () => {
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /second message/);
     assert.doesNotMatch(result.stdout, /first message/);
+  });
+});
+
+test("sessions import --cwd overrides the destination cwd without replacing global cwd", async () => {
+  await withTempHome(async (homeDir) => {
+    const sourceCwd = path.join(homeDir, "source");
+    const destinationCwd = path.join(homeDir, "restored");
+    const archivePath = path.join(homeDir, "archive.json");
+    await fs.mkdir(sourceCwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "export-source",
+      acpSessionId: "provider-session",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: sourceCwd,
+      name: "debug",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: false,
+    });
+
+    const exported = await runCli(
+      [
+        "--cwd",
+        sourceCwd,
+        "--format",
+        "quiet",
+        "codex",
+        "sessions",
+        "export",
+        "debug",
+        "--output",
+        archivePath,
+      ],
+      homeDir,
+    );
+    assert.equal(exported.code, 0, exported.stderr);
+    assert.equal(exported.stdout.trim(), archivePath);
+    await fs.rm(sessionFilePath(homeDir, "export-source"));
+
+    const imported = await runCli(
+      [
+        "--cwd",
+        sourceCwd,
+        "--format",
+        "json",
+        "codex",
+        "sessions",
+        "import",
+        archivePath,
+        "--name",
+        "debug-copy",
+        "--cwd",
+        destinationCwd,
+      ],
+      homeDir,
+    );
+    assert.equal(imported.code, 0, imported.stderr);
+    const payload = JSON.parse(imported.stdout) as { record_id?: string; cwd?: string };
+    assert.equal(payload.cwd, destinationCwd);
+    assert.equal(typeof payload.record_id, "string");
+
+    const record = JSON.parse(
+      await fs.readFile(sessionFilePath(homeDir, payload.record_id ?? ""), "utf8"),
+    ) as { cwd?: string; name?: string };
+    assert.equal(record.cwd, destinationCwd);
+    assert.equal(record.name, "debug-copy");
+  });
+});
+
+test("sessions export omits agent_name for raw --agent overrides", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const archivePath = path.join(homeDir, "archive.json");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "raw-agent-source",
+      acpSessionId: "provider-session",
+      agentCommand: MOCK_AGENT_COMMAND,
+      cwd,
+      name: "debug",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: false,
+    });
+
+    const exported = await runCli(
+      [
+        "--agent",
+        MOCK_AGENT_COMMAND,
+        "--cwd",
+        cwd,
+        "--format",
+        "quiet",
+        "sessions",
+        "export",
+        "debug",
+        "--output",
+        archivePath,
+      ],
+      homeDir,
+    );
+    assert.equal(exported.code, 0, exported.stderr);
+
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      session?: { agent_name?: unknown };
+    };
+    assert.equal(archive.session?.agent_name, undefined);
+  });
+});
+
+test("sessions import rejects archives for a different invoked agent", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const archivePath = path.join(homeDir, "archive.json");
+    await fs.mkdir(cwd, { recursive: true });
+
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "codex-export-source",
+      acpSessionId: "provider-session",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      name: "debug",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: false,
+    });
+
+    const exported = await runCli(
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "quiet",
+        "codex",
+        "sessions",
+        "export",
+        "debug",
+        "--output",
+        archivePath,
+      ],
+      homeDir,
+    );
+    assert.equal(exported.code, 0, exported.stderr);
+
+    const imported = await runCli(
+      ["--cwd", cwd, "claude", "sessions", "import", archivePath, "--name", "wrong-agent"],
+      homeDir,
+    );
+    assert.equal(imported.code, 2);
+    assert.match(imported.stderr, /does not match the requested agent/);
   });
 });
 

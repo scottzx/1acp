@@ -10,6 +10,8 @@ import {
   PromptInputValidationError,
   textPrompt,
 } from "../prompt-content.js";
+import { exportSession } from "../session/export.js";
+import { importSession } from "../session/import.js";
 import {
   findGitRepositoryRoot,
   findSession,
@@ -34,7 +36,9 @@ import {
   resolveSessionNameFromFlags,
   type ExecFlags,
   type GlobalFlags,
+  type SessionsExportFlags,
   type PromptFlags,
+  type SessionsImportFlags,
   type SessionsHistoryFlags,
   type SessionsListFlags,
   type SessionsNewFlags,
@@ -1031,6 +1035,78 @@ export async function handleSessionsHistory(
   const record = await findScopedSessionOrThrow(agent, sessionName);
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
+}
+
+export async function handleSessionsExport(
+  explicitAgentName: string | undefined,
+  sessionName: string | undefined,
+  flags: SessionsExportFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const cwd = flags.sourceCwd ? path.resolve(agent.cwd, flags.sourceCwd) : agent.cwd;
+
+  await exportSession(
+    {
+      agentName: globalFlags.agent ? undefined : agent.agentName,
+      agentCommand: agent.agentCommand,
+      cwd,
+      name: sessionName,
+    },
+    flags.output,
+  );
+
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "session_exported",
+      output: flags.output,
+    })
+  ) {
+    return;
+  }
+
+  if (globalFlags.format === "quiet") {
+    process.stdout.write(`${flags.output}\n`);
+    return;
+  }
+
+  process.stdout.write(`exported session to ${flags.output}\n`);
+}
+
+export async function handleSessionsImport(
+  explicitAgentName: string | undefined,
+  archivePath: string,
+  flags: SessionsImportFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const result = await importSession(archivePath, {
+    name: flags.name,
+    newCwd: flags.destinationCwd ? path.resolve(globalFlags.cwd, flags.destinationCwd) : undefined,
+    expectedAgentName: globalFlags.agent ? undefined : agent.agentName,
+    expectedAgentCommand: agent.agentCommand,
+  });
+
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "session_imported",
+      record_id: result.record_id,
+      cwd: result.cwd,
+    })
+  ) {
+    return;
+  }
+
+  if (globalFlags.format === "quiet") {
+    process.stdout.write(`${result.record_id}\n`);
+    return;
+  }
+
+  process.stdout.write(`imported session ${result.record_id} at ${result.cwd}\n`);
 }
 
 export async function handleSessionsPrune(

@@ -439,7 +439,8 @@ async function handleProgramParseError(
 }
 
 export async function main(argv: string[] = process.argv): Promise<void> {
-  const rawArgs = argv.slice(2);
+  const rawArgs = normalizeLifecycleScriptArgs(argv.slice(2));
+  const normalizedArgv = [argv[0] ?? "node", argv[1] ?? "acpx", ...rawArgs];
 
   if (await handleQueueOwnerCommand(argv)) {
     return;
@@ -450,7 +451,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
     return;
   }
 
-  await maybeHandleSkillflag(argv);
+  await maybeHandleSkillflag(normalizedArgv);
 
   const config = await loadResolvedConfig(detectInitialCwd(rawArgs));
   const requestedJsonStrict = detectJsonStrict(rawArgs);
@@ -486,7 +487,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   try {
     await runWithOutputPolicy(requestedOutputPolicy, async () => {
       try {
-        await program.parseAsync(argv);
+        await program.parseAsync(normalizedArgv);
       } catch (error) {
         await handleProgramParseError(error, requestedOutputPolicy);
       }
@@ -494,4 +495,14 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   } finally {
     flushPerfMetricsCapture();
   }
+}
+
+function normalizeLifecycleScriptArgs(rawArgs: string[]): string[] {
+  if (
+    rawArgs[0] === "--" &&
+    (process.env.npm_lifecycle_event || process.env.npm_lifecycle_script)
+  ) {
+    return rawArgs.slice(1);
+  }
+  return rawArgs;
 }

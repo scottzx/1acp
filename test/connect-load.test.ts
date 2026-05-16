@@ -306,6 +306,62 @@ test("connectAndLoadSession fails instead of creating a fresh session when resum
   });
 });
 
+test("connectAndLoadSession requires the same provider session for imported records", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "imported-record",
+      acpSessionId: "imported-provider-session",
+      agentCommand: "agent",
+      cwd,
+      importedFrom: {
+        recordId: "source-record",
+        cwdOriginal: "/source/workspace",
+        exportedBy: "source-user",
+        exportedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "session not found",
+          },
+        };
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          timeoutMs: 1_000,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      /Persistent ACP session imported-provider-session could not be resumed: .*session not found/i,
+    );
+
+    assert.equal(record.acpSessionId, "imported-provider-session");
+  });
+});
+
 test("connectAndLoadSession falls back to createSession for empty sessions on adapter internal errors", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
