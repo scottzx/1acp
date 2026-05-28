@@ -1,5 +1,3 @@
-![acpx banner](docs/assets/readme-banner.jpg)
-
 <p align="center">
   <img src="acpx_banner.svg" alt="acpx banner" width="100%" />
 </p>
