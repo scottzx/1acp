@@ -13,10 +13,12 @@ import type {
   PromptInput,
   SessionAcpxState,
   SessionConversation,
+  SessionAvailableCommand,
   SessionAgentContent,
   SessionAgentMessage,
   SessionMessage,
   SessionTokenUsage,
+  SessionUsageCost,
   SessionToolResult,
   SessionToolResultContent,
   SessionToolUse,
@@ -52,11 +54,32 @@ function hasOwn(source: object, key: string): boolean {
 }
 
 function normalizeAgentName(value: unknown): string | undefined {
+  return trimmedString(value);
+}
+
+function trimmedString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeAvailableCommand(value: unknown): SessionAvailableCommand | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  const name = trimmedString(record.name);
+  if (!name) {
+    return undefined;
+  }
+  const description = trimmedString(record.description);
+  return {
+    name,
+    ...(description ? { description } : {}),
+    has_input: record.input != null,
+  };
 }
 
 function extractText(content: ContentBlock): string | undefined {
@@ -439,6 +462,8 @@ function usageToTokenUsage(update: UsageUpdate): SessionTokenUsage | undefined {
       "cacheReadInputTokens",
       "cachedReadTokens",
     ]),
+    thought_tokens: numberField(source, ["thought_tokens", "thoughtTokens"]),
+    total_tokens: numberField(source, ["total_tokens", "totalTokens"]),
   };
 
   if (!hasTokenUsageValue(normalized)) {
@@ -450,6 +475,29 @@ function usageToTokenUsage(update: UsageUpdate): SessionTokenUsage | undefined {
 
 function hasTokenUsageValue(usage: SessionTokenUsage): boolean {
   return Object.values(usage).some((value) => value !== undefined);
+}
+
+function usageCost(update: UsageUpdate): SessionUsageCost | undefined {
+  const cost = asRecord(asRecord(update)?.cost);
+  if (!cost) {
+    return undefined;
+  }
+  return buildUsageCost(numberField(cost, ["amount"]), stringField(cost.currency));
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function buildUsageCost(
+  amount: number | undefined,
+  currency: string | undefined,
+): SessionUsageCost | undefined {
+  const cost: SessionUsageCost = {
+    ...(amount !== undefined ? { amount } : {}),
+    ...(currency !== undefined ? { currency } : {}),
+  };
+  return Object.keys(cost).length > 0 ? cost : undefined;
 }
 
 function ensureAcpxState(state: SessionAcpxState | undefined): SessionAcpxState {
@@ -472,6 +520,7 @@ export function createSessionConversation(timestamp = isoNow()): SessionConversa
     messages: [],
     updated_at: timestamp,
     cumulative_token_usage: {},
+    cumulative_cost: undefined,
     request_token_usage: {},
   };
 }
@@ -488,8 +537,13 @@ export function cloneSessionConversation(
     messages: deepClone(conversation.messages ?? []),
     updated_at: conversation.updated_at,
     cumulative_token_usage: deepClone(conversation.cumulative_token_usage ?? {}),
+    cumulative_cost: cloneUsageCost(conversation.cumulative_cost),
     request_token_usage: deepClone(conversation.request_token_usage ?? {}),
   };
+}
+
+function cloneUsageCost(cost: SessionUsageCost | undefined): SessionUsageCost | undefined {
+  return cost ? { ...cost } : undefined;
 }
 
 export function cloneSessionAcpxState(
@@ -507,7 +561,9 @@ export function cloneSessionAcpxState(
       : undefined,
     current_model_id: state.current_model_id,
     available_models: state.available_models ? [...state.available_models] : undefined,
-    available_commands: state.available_commands ? [...state.available_commands] : undefined,
+    available_commands: state.available_commands
+      ? state.available_commands.map((command) => ({ ...command }))
+      : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     session_options: cloneSessionOptions(state.session_options),
   };
@@ -693,8 +749,8 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
   available_commands_update: (_conversation, acpx, update) => {
     if (update.sessionUpdate === "available_commands_update") {
       acpx.available_commands = update.availableCommands
-        .map((entry) => entry.name)
-        .filter((entry) => typeof entry === "string" && entry.trim().length > 0);
+        .map((entry) => normalizeAvailableCommand(entry))
+        .filter((entry): entry is SessionAvailableCommand => entry !== undefined);
     }
   },
   current_mode_update: (_conversation, acpx, update) => {
@@ -735,13 +791,19 @@ function appendAgentMessageChunk(
 
 function applyUsageUpdate(conversation: SessionConversation, update: UsageUpdate): void {
   const usage = usageToTokenUsage(update);
-  if (!usage) {
+  const cost = usageCost(update);
+  if (!usage && !cost) {
     return;
   }
-  conversation.cumulative_token_usage = usage;
-  const userId = lastUserMessageId(conversation);
-  if (userId) {
-    conversation.request_token_usage[userId] = usage;
+  if (usage) {
+    conversation.cumulative_token_usage = usage;
+    const userId = lastUserMessageId(conversation);
+    if (userId) {
+      conversation.request_token_usage[userId] = usage;
+    }
+  }
+  if (cost) {
+    conversation.cumulative_cost = cost;
   }
 }
 

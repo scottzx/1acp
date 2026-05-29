@@ -226,13 +226,20 @@ test("parsePromptEventLine handles runtime status-style updates", () => {
     parsePromptEventLine(
       JSON.stringify({
         sessionUpdate: "available_commands_update",
-        availableCommands: ["a", "b"],
+        availableCommands: [
+          { name: "/compact", description: "Compact context" },
+          { name: "/clear" },
+        ],
       }),
     ),
     {
       type: "status",
       text: "available commands updated (2)",
       tag: "available_commands_update",
+      availableCommands: [
+        { name: "/compact", description: "Compact context", hasInput: false },
+        { name: "/clear", hasInput: false },
+      ],
     },
   );
 
@@ -439,6 +446,7 @@ test("parsePromptEventLine covers status and tool summary fallbacks", () => {
       type: "status",
       text: "available commands updated",
       tag: "available_commands_update",
+      availableCommands: [],
     },
   );
   assert.deepEqual(
@@ -550,6 +558,165 @@ test("parsePromptEventLine covers status and tool summary fallbacks", () => {
         { type: "resource", resource: { uri: "file:///resource" } },
         { type: "audio", mimeType: "audio/wav", data: "UklGRg==" },
         { type: "terminal" },
+      ],
+    },
+  );
+});
+
+test("parsePromptEventLine surfaces cost and _meta.usage breakdown on usage_update", () => {
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "usage_update",
+        used: 1200,
+        size: 200_000,
+        cost: { amount: 0.0123, currency: "USD" },
+        _meta: {
+          usage: {
+            inputTokens: 800,
+            outputTokens: 400,
+            cachedReadTokens: 600,
+            cachedWriteTokens: 50,
+            thoughtTokens: 75,
+            totalTokens: 1925,
+          },
+        },
+      }),
+    ),
+    {
+      type: "status",
+      text: "usage updated: 1200/200000",
+      tag: "usage_update",
+      used: 1200,
+      size: 200_000,
+      cost: { amount: 0.0123, currency: "USD" },
+      breakdown: {
+        inputTokens: 800,
+        outputTokens: 400,
+        cachedReadTokens: 600,
+        cachedWriteTokens: 50,
+        thoughtTokens: 75,
+        totalTokens: 1925,
+      },
+    },
+  );
+
+  // Cost is forwarded even when only one field is populated.
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "usage_update",
+        used: 10,
+        size: 100,
+        cost: { amount: 0.05 },
+      }),
+    ),
+    {
+      type: "status",
+      text: "usage updated: 10/100",
+      tag: "usage_update",
+      used: 10,
+      size: 100,
+      cost: { amount: 0.05 },
+    },
+  );
+
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "usage_update",
+        used: 25,
+        size: 100,
+        _meta: {
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 2,
+            thought_tokens: 1,
+            total_tokens: 21,
+          },
+        },
+      }),
+    ),
+    {
+      type: "status",
+      text: "usage updated: 25/100",
+      tag: "usage_update",
+      used: 25,
+      size: 100,
+      breakdown: {
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 3,
+        cachedWriteTokens: 2,
+        thoughtTokens: 1,
+        totalTokens: 21,
+      },
+    },
+  );
+
+  // _meta without a usage record is ignored — no synthetic breakdown.
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "usage_update",
+        used: 5,
+        size: 100,
+        _meta: { somethingElse: "ignored" },
+      }),
+    ),
+    {
+      type: "status",
+      text: "usage updated: 5/100",
+      tag: "usage_update",
+      used: 5,
+      size: 100,
+    },
+  );
+});
+
+test("parsePromptEventLine surfaces full availableCommands list with hasInput flag", () => {
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "available_commands_update",
+        availableCommands: [
+          {
+            name: "/compact",
+            description: "Compact the conversation",
+            // No input → hasInput should be false.
+          },
+          {
+            name: "/search",
+            description: "Search the workspace",
+            input: { hint: "query" },
+          },
+          {
+            // Missing name → dropped.
+            description: "no name",
+          },
+          // Bare string entry — non-spec but should not crash.
+          "/clear",
+          {
+            name: "  ", // whitespace-only name → dropped.
+            description: "blank",
+          },
+          {
+            name: "/cost",
+            // No description, no input.
+          },
+        ],
+      }),
+    ),
+    {
+      type: "status",
+      text: "available commands updated (3)",
+      tag: "available_commands_update",
+      availableCommands: [
+        { name: "/compact", description: "Compact the conversation", hasInput: false },
+        { name: "/search", description: "Search the workspace", hasInput: true },
+        { name: "/cost", hasInput: false },
       ],
     },
   );

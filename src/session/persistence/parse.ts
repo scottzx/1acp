@@ -23,6 +23,50 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
+function parseAvailableCommand(
+  raw: unknown,
+): NonNullable<SessionAcpxState["available_commands"]>[number] | undefined {
+  if (typeof raw === "string") {
+    const name = raw.trim();
+    return name ? { name } : undefined;
+  }
+  const record = asRecord(raw);
+  if (!record) {
+    return undefined;
+  }
+  const name = parseNonEmptyString(record.name);
+  if (!name) {
+    return undefined;
+  }
+  const description = parseNonEmptyString(record.description);
+  return {
+    name,
+    ...(description ? { description } : {}),
+    ...(typeof record.has_input === "boolean" ? { has_input: record.has_input } : {}),
+  };
+}
+
+function parseAvailableCommands(raw: unknown): SessionAcpxState["available_commands"] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const commands = raw
+    .map((entry) => parseAvailableCommand(entry))
+    .filter(
+      (entry): entry is NonNullable<SessionAcpxState["available_commands"]>[number] =>
+        entry !== undefined,
+    );
+  return commands.length > 0 ? commands : undefined;
+}
+
+function parseNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function parseTokenUsage(
   raw: unknown,
 ): SessionConversation["cumulative_token_usage"] | null | undefined {
@@ -41,6 +85,8 @@ function parseTokenUsage(
     "output_tokens",
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
+    "thought_tokens",
+    "total_tokens",
   ];
 
   for (const field of fields) {
@@ -59,6 +105,50 @@ function parseTokenUsage(
 
 function isNonNegativeFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function parseUsageCost(raw: unknown): SessionConversation["cumulative_cost"] | null | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  const record = asRecord(raw);
+  if (!record) {
+    return null;
+  }
+  return parseUsageCostRecord(record);
+}
+
+function parseUsageCostRecord(
+  record: Record<string, unknown>,
+): SessionConversation["cumulative_cost"] | null | undefined {
+  const amount = parseCostAmount(record.amount);
+  const currency = parseCostCurrency(record.currency);
+  if (amount === null || currency === null) {
+    return null;
+  }
+  const cost: NonNullable<SessionConversation["cumulative_cost"]> = {
+    ...(amount !== undefined ? { amount } : {}),
+    ...(currency !== undefined ? { currency } : {}),
+  };
+  return Object.keys(cost).length > 0 ? cost : undefined;
+}
+
+function parseCostAmount(value: unknown): number | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return isNonNegativeFiniteNumber(value) ? value : null;
+}
+
+function parseCostCurrency(value: unknown): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const currency = value.trim();
+  return currency.length > 0 ? currency : undefined;
 }
 
 function parseRequestTokenUsage(
@@ -260,8 +350,9 @@ function parseConversationRecord(record: Record<string, unknown>): SessionConver
   }
 
   const cumulativeTokenUsage = parseTokenUsage(record.cumulative_token_usage);
+  const cumulativeCost = parseUsageCost(record.cumulative_cost);
   const requestTokenUsage = parseRequestTokenUsage(record.request_token_usage);
-  if (cumulativeTokenUsage === null || requestTokenUsage === null) {
+  if (cumulativeTokenUsage === null || cumulativeCost === null || requestTokenUsage === null) {
     return undefined;
   }
 
@@ -270,6 +361,7 @@ function parseConversationRecord(record: Record<string, unknown>): SessionConver
     messages: record.messages,
     updated_at: record.updated_at,
     cumulative_token_usage: cumulativeTokenUsage ?? {},
+    cumulative_cost: cumulativeCost,
     request_token_usage: requestTokenUsage ?? {},
   };
 }
@@ -317,8 +409,9 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
     state.available_models = [...record.available_models];
   }
 
-  if (isStringArray(record.available_commands)) {
-    state.available_commands = [...record.available_commands];
+  const availableCommands = parseAvailableCommands(record.available_commands);
+  if (availableCommands) {
+    state.available_commands = availableCommands;
   }
 
   if (Array.isArray(record.config_options)) {
@@ -649,6 +742,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     messages: conversation.messages,
     updated_at: conversation.updated_at,
     cumulative_token_usage: conversation.cumulative_token_usage,
+    cumulative_cost: conversation.cumulative_cost,
     request_token_usage: conversation.request_token_usage,
     acpx: parseAcpxState(record.acpx),
     importedFrom: metadata.importedFrom,

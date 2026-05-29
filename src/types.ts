@@ -327,6 +327,19 @@ export type SessionTokenUsage = {
   output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  thought_tokens?: number;
+  total_tokens?: number;
+};
+
+export type SessionUsageCost = {
+  amount?: number;
+  currency?: string;
+};
+
+export type SessionAvailableCommand = {
+  name: string;
+  description?: string;
+  has_input?: boolean;
 };
 
 export type SessionConversation = {
@@ -334,6 +347,7 @@ export type SessionConversation = {
   messages: SessionMessage[];
   updated_at: string;
   cumulative_token_usage: SessionTokenUsage;
+  cumulative_cost?: SessionUsageCost;
   request_token_usage: Record<string, SessionTokenUsage>;
 };
 
@@ -344,7 +358,7 @@ export type SessionAcpxState = {
   desired_config_options?: Record<string, string>;
   current_model_id?: string;
   available_models?: string[];
-  available_commands?: string[];
+  available_commands?: SessionAvailableCommand[];
   config_options?: SessionConfigOption[];
   session_options?: {
     model?: string;
@@ -389,6 +403,7 @@ export type SessionRecord = {
   messages: SessionMessage[];
   updated_at: string;
   cumulative_token_usage: SessionTokenUsage;
+  cumulative_cost?: SessionUsageCost;
   request_token_usage: Record<string, SessionTokenUsage>;
   acpx?: SessionAcpxState;
   importedFrom?: SessionImportedFrom;

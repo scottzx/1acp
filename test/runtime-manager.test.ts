@@ -2845,3 +2845,119 @@ test("AcpRuntimeManager ignores sessionOptions when reusing an existing persiste
   assert.equal(record.acpSessionId, "sid-existing");
   assert.equal(record.acpx?.session_options, undefined);
 });
+
+test("AcpRuntimeManager getStatus surfaces token usage breakdowns and available commands", async () => {
+  const record = makeSessionRecord(
+    {
+      acpxRecordId: "usage-status:1",
+      acpSessionId: "usage-sid",
+      agentCommand: "claude --acp",
+      cwd: "/workspace",
+      cumulative_token_usage: {
+        input_tokens: 1000,
+        output_tokens: 250,
+        cache_read_input_tokens: 800,
+        cache_creation_input_tokens: 100,
+        thought_tokens: 75,
+        total_tokens: 1325,
+      },
+      cumulative_cost: {
+        amount: 0.0123,
+        currency: "USD",
+      },
+      request_token_usage: {
+        "msg-1": {
+          input_tokens: 500,
+          output_tokens: 125,
+          thought_tokens: 25,
+          total_tokens: 650,
+        },
+        "msg-2": {
+          input_tokens: 500,
+          output_tokens: 125,
+          thought_tokens: 50,
+          total_tokens: 675,
+        },
+      },
+    },
+    { defaultAcpx: false },
+  );
+  record.acpx = {
+    available_commands: [
+      { name: "/compact", description: "Compact context", has_input: false },
+      { name: "/clear", has_input: false },
+      { name: "/cost", description: "Show cost", has_input: true },
+    ],
+  };
+
+  const store = new InMemorySessionStore([record]);
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+  );
+
+  const status = await manager.getStatus(createHandle("usage-status:1"));
+
+  assert.deepEqual(status.usage, {
+    cumulative: {
+      inputTokens: 1000,
+      outputTokens: 250,
+      cachedReadTokens: 800,
+      cachedWriteTokens: 100,
+      thoughtTokens: 75,
+      totalTokens: 1325,
+    },
+    cost: {
+      amount: 0.0123,
+      currency: "USD",
+    },
+    perRequest: {
+      "msg-1": { inputTokens: 500, outputTokens: 125, thoughtTokens: 25, totalTokens: 650 },
+      "msg-2": { inputTokens: 500, outputTokens: 125, thoughtTokens: 50, totalTokens: 675 },
+    },
+  });
+
+  assert.deepEqual(status.availableCommands, [
+    { name: "/compact", description: "Compact context", hasInput: false },
+    { name: "/clear", hasInput: false },
+    { name: "/cost", description: "Show cost", hasInput: true },
+  ]);
+});
+
+test("AcpRuntimeManager getStatus omits usage and availableCommands when the record carries neither", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "empty-status:1",
+    acpSessionId: "empty-sid",
+    agentCommand: "gemini --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([record]);
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+  );
+
+  const status = await manager.getStatus(createHandle("empty-status:1"));
+
+  assert.equal(status.usage, undefined);
+  assert.equal(status.availableCommands, undefined);
+});
+
+test("AcpRuntimeManager getStatus accepts legacy available command names", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "legacy-commands:1",
+    acpSessionId: "legacy-commands-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+  });
+  record.acpx = {
+    available_commands: ["/compact", "/clear"] as never,
+  };
+
+  const store = new InMemorySessionStore([record]);
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+  );
+
+  const status = await manager.getStatus(createHandle("legacy-commands:1"));
+
+  assert.deepEqual(status.availableCommands, [{ name: "/compact" }, { name: "/clear" }]);
+});
