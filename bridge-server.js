@@ -28,6 +28,9 @@ const runtime = createAcpRuntime({
 // sessionId -> { handle, activeTurn }
 const activeSessions = new Map();
 
+// Map of currently initializing sessions: sessionId -> Promise<handle>
+const initializingSessions = new Map();
+
 // Map of pending permission requests
 // requestId -> { resolve, reject, timer }
 const pendingPermissions = new Map();
@@ -325,7 +328,7 @@ wss.on("connection", (ws) => {
             `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
 
-          const handle = await runtime.ensureSession({
+          const sessionPromise = runtime.ensureSession({
             sessionKey: sessionId,
             agent: agentType,
             mode: "persistent",
@@ -333,16 +336,22 @@ wss.on("connection", (ws) => {
             resumeSessionId: resumeId || undefined,
             sessionOptions,
           });
+          initializingSessions.set(sessionId, sessionPromise);
 
-          activeSessions.set(sessionId, { handle, activeTurn: null, ws });
+          try {
+            const handle = await sessionPromise;
+            activeSessions.set(sessionId, { handle, activeTurn: null, ws });
 
-          ws.send(
-            JSON.stringify({
-              event: "session_ready",
-              sessionId,
-              agentSessionId: handle.agentSessionId,
-            }),
-          );
+            ws.send(
+              JSON.stringify({
+                event: "session_ready",
+                sessionId,
+                agentSessionId: handle.agentSessionId || handle.backendSessionId,
+              }),
+            );
+          } finally {
+            initializingSessions.delete(sessionId);
+          }
           break;
         }
 
@@ -523,6 +532,18 @@ wss.on("connection", (ws) => {
             return;
           }
 
+          // If the session is currently initializing, wait for it to be ready
+          if (initializingSessions.has(sessionId)) {
+            try {
+              await initializingSessions.get(sessionId);
+            } catch (err) {
+              console.warn(
+                `[acpx-server] Awaiting initializing session ${sessionId} failed:`,
+                err.message,
+              );
+            }
+          }
+
           const session = activeSessions.get(sessionId);
           const agentType = payload.agentType || session?.handle?.agent;
           // The agent-side session id is the runtime's own field — it's the
@@ -530,7 +551,10 @@ wss.on("connection", (ws) => {
           // on disk. We prefer it over anything in the payload so the
           // history is bound to the actual agent process, not whatever the
           // cc-connect / IM side happens to be tracking.
-          const acpSessionId = session?.handle?.agentSessionId || payload.acpSessionId;
+          const acpSessionId =
+            session?.handle?.agentSessionId ||
+            session?.handle?.backendSessionId ||
+            payload.acpSessionId;
           const workspacePath = session?.handle?.cwd;
 
           // Fast path: in-process runtime session store.
