@@ -77,6 +77,7 @@ export const BUILT_IN_AGENT_PACKAGES = {
 const AGENT_ALIASES: Record<string, string> = {
   "factory-droid": "droid",
   factorydroid: "droid",
+  claudecode: "claude",
 };
 
 export const DEFAULT_AGENT_NAME = "codex";

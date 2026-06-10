@@ -34,6 +34,207 @@ const pendingPermissions = new Map();
 let nextRequestId = 1;
 
 // ----------------------------------------------------
+// History Adapters — per-agent native storage readers
+// ----------------------------------------------------
+// Each adapter returns an array of structured items that the frontend
+// maps 1:1 onto ChatItem kinds. An empty array means "no history found"
+// (e.g. brand-new session, file missing, or agent type not yet supported)
+// — the UI treats that as the empty state, not an error.
+//
+// Item shape (one of):
+//   { kind: "user",           text: string,             createdAt?: string }
+//   { kind: "assistant_text", text: string,             createdAt?: string }
+//   { kind: "thinking",       text: string,             createdAt?: string }
+//   { kind: "tool_use",       toolName, input, toolCallId?, createdAt? }
+//   { kind: "tool_result",    toolCallId, content, isError, createdAt? }
+
+const historyAdapters = {};
+
+/**
+ * Default stub for agent types that don't have a native storage reader yet.
+ * Returning [] lets the UI show the empty hint without an error bubble.
+ */
+async function defaultHistoryAdapter() {
+  return [];
+}
+
+/**
+ * Push a text-bearing item, merging into the previous one of the same kind
+ * so a multi-block assistant turn (e.g. several consecutive text deltas) shows
+ * up as a single bubble rather than a wall of small ones.
+ */
+function pushMerged(items, next) {
+  const last = items[items.length - 1];
+  const mergeable = new Set(["user", "assistant_text", "thinking"]);
+  if (last && mergeable.has(last.kind) && last.kind === next.kind) {
+    last.text = last.text ? `${last.text}\n${next.text}` : next.text;
+    return;
+  }
+  items.push(next);
+}
+
+function flattenToolResultContent(content) {
+  if (content == null) {return "";}
+  if (typeof content === "string") {return content;}
+  if (Array.isArray(content)) {
+    return content
+      .filter((b) => b && b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text)
+      .join("\n");
+  }
+  return String(content);
+}
+
+/**
+ * Claude Code stores session history as JSONL under
+ *   ~/.claude/projects/<slugified-cwd>/<ccSessionId>.jsonl
+ * The slug is the absolute path with every char outside [A-Za-z0-9._-]
+ * replaced by '-'. See docs/ai_collaborative_workbench_design.md §3.1.
+ */
+async function loadClaudeCodeHistory(ctx) {
+  const { ccSessionId, workspacePath } = ctx;
+  if (!ccSessionId || !workspacePath) {
+    return [];
+  }
+  const slug = workspacePath.replace(/[^A-Za-z0-9._-]/g, "-");
+  const jsonlPath = path.join(os.homedir(), ".claude", "projects", slug, `${ccSessionId}.jsonl`);
+
+  let raw;
+  try {
+    raw = await fs.promises.readFile(jsonlPath, "utf8");
+  } catch {
+    // File missing or unreadable — treat as "no history yet".
+    return [];
+  }
+
+  const items = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {continue;}
+    let ev;
+    try {
+      ev = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!ev || typeof ev !== "object") {continue;}
+
+    const createdAt = typeof ev.timestamp === "string" ? ev.timestamp : undefined;
+    const msg = ev.message;
+    if (!msg) {continue;}
+
+    if (ev.type === "user") {
+      const content = msg.content;
+      if (typeof content === "string") {
+        if (content) {pushMerged(items, { kind: "user", text: content, createdAt });}
+        continue;
+      }
+      if (!Array.isArray(content)) {continue;}
+
+      const textParts = [];
+      for (const b of content) {
+        if (!b || typeof b !== "object") {continue;}
+        if (b.type === "text" && typeof b.text === "string") {
+          textParts.push(b.text);
+        } else if (b.type === "tool_result") {
+          if (textParts.length) {
+            pushMerged(items, { kind: "user", text: textParts.join("\n"), createdAt });
+            textParts.length = 0;
+          }
+          items.push({
+            kind: "tool_result",
+            toolCallId: b.tool_use_id,
+            content: flattenToolResultContent(b.content),
+            isError: !!b.is_error,
+            createdAt,
+          });
+        }
+      }
+      if (textParts.length) {
+        pushMerged(items, { kind: "user", text: textParts.join("\n"), createdAt });
+      }
+    } else if (ev.type === "assistant" && Array.isArray(msg.content)) {
+      for (const b of msg.content) {
+        if (!b || typeof b !== "object") {continue;}
+        if (b.type === "text" && typeof b.text === "string") {
+          pushMerged(items, { kind: "assistant_text", text: b.text, createdAt });
+        } else if (b.type === "thinking" && typeof b.thinking === "string") {
+          pushMerged(items, { kind: "thinking", text: b.thinking, createdAt });
+        } else if (b.type === "tool_use") {
+          items.push({
+            kind: "tool_use",
+            toolName: b.name || "tool",
+            input: b.input ?? {},
+            toolCallId: b.id,
+            createdAt,
+          });
+        }
+      }
+    }
+    // Skip queue-operation, attachment, last-prompt, system, etc. for v1.
+  }
+  return items;
+}
+
+/**
+ * Convert an acpx runtime SessionRecord (its `messages` field) into the
+ * same item shape produced by the agent-native adapters. The acpx schema
+ * differs from Claude Code's: User/Agent content blocks use {Text, Thinking,
+ * ToolUse} rather than {type, text, thinking, tool_use}, and tool_result
+ * blocks are runtime-only (never persisted).
+ */
+function extractFromRuntimeRecord(record) {
+  const items = [];
+  if (!record || !Array.isArray(record.messages)) {return items;}
+  for (const msg of record.messages) {
+    if (msg.User && Array.isArray(msg.User.content)) {
+      const parts = [];
+      for (const c of msg.User.content) {
+        if (c && c.Text !== undefined) {parts.push(c.Text);}
+      }
+      if (parts.length) {
+        pushMerged(items, { kind: "user", text: parts.join("\n") });
+      }
+    } else if (msg.Agent && Array.isArray(msg.Agent.content)) {
+      for (const c of msg.Agent.content) {
+        if (!c || typeof c !== "object") {continue;}
+        if (c.Text !== undefined) {
+          pushMerged(items, { kind: "assistant_text", text: c.Text });
+        } else if (c.Thinking) {
+          const text = c.Thinking.text || "";
+          if (text) {pushMerged(items, { kind: "thinking", text });}
+        } else if (c.ToolUse) {
+          items.push({
+            kind: "tool_use",
+            toolName: c.ToolUse.name || "tool",
+            input: c.ToolUse.input ?? c.ToolUse.raw_input ?? {},
+            toolCallId: c.ToolUse.id,
+          });
+        }
+      }
+    }
+  }
+  return items;
+}
+
+historyAdapters.claudecode = loadClaudeCodeHistory;
+for (const t of [
+  "codex",
+  "acp",
+  "gemini",
+  "cursor",
+  "devin",
+  "iflow",
+  "kimi",
+  "opencode",
+  "pi",
+  "qoder",
+  "tmux",
+]) {
+  historyAdapters[t] = defaultHistoryAdapter;
+}
+
+// ----------------------------------------------------
 // WebSocket Server Setup
 // ----------------------------------------------------
 const wss = new WebSocketServer({ port: PORT });
@@ -289,45 +490,52 @@ wss.on("connection", (ws) => {
           }
 
           const session = activeSessions.get(sessionId);
-          if (!session) {
-            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
-            return;
-          }
+          const agentType = payload.agentType || session?.handle?.agent;
+          const ccSessionId = payload.ccSessionId;
+          const workspacePath = session?.handle?.cwd;
 
-          // Try to load historical messages
-          try {
-            const record = await runtime.options.sessionStore.load(
-              session.handle.acpxRecordId || sessionId,
-            );
-            const messages = [];
-
-            if (record && record.messages) {
-              for (const msg of record.messages) {
-                if (msg.User) {
-                  const texts = msg.User.content
-                    .filter((c) => c.Text !== undefined)
-                    .map((c) => c.Text);
-                  messages.push({ role: "user", text: texts.join("\n") });
-                } else if (msg.Agent) {
-                  const texts = msg.Agent.content
-                    .filter((c) => c.Text !== undefined)
-                    .map((c) => c.Text);
-                  messages.push({ role: "agent", text: texts.join("\n") });
-                }
-              }
+          // Fast path: in-process runtime session store.
+          let items = [];
+          if (session) {
+            try {
+              const record = await runtime.options.sessionStore.load(
+                session.handle.acpxRecordId || sessionId,
+              );
+              items = extractFromRuntimeRecord(record);
+            } catch (err) {
+              console.warn(
+                `[acpx-server] Runtime store load failed for ${sessionId}; falling back to native adapter:`,
+                err.message,
+              );
             }
-
-            ws.send(
-              JSON.stringify({
-                event: "history_response",
-                sessionId,
-                messages,
-              }),
-            );
-          } catch (err) {
-            console.error(`[acpx-server] Failed to load history for ${sessionId}:`, err);
-            sendError(ws, sessionId, "HISTORY_FAILED", err.message);
           }
+
+          // Fallback: agent-type native storage (e.g. Claude Code's JSONL).
+          // An empty result is a normal "no history yet" outcome — the UI
+          // shows the empty hint, not an error.
+          if (items.length === 0) {
+            const adapter = historyAdapters[agentType] || defaultHistoryAdapter;
+            try {
+              items = await adapter({ agentType, ccSessionId, workspacePath });
+              console.log(
+                `[acpx-server] History adapter for ${agentType} returned ${items.length} item(s) for ${sessionId}`,
+              );
+            } catch (err) {
+              console.warn(
+                `[acpx-server] History adapter for ${agentType} failed for ${sessionId}:`,
+                err.message,
+              );
+              items = [];
+            }
+          }
+
+          ws.send(
+            JSON.stringify({
+              event: "history_response",
+              sessionId,
+              items,
+            }),
+          );
           break;
         }
 
