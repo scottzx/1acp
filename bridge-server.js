@@ -74,8 +74,12 @@ function pushMerged(items, next) {
 }
 
 function flattenToolResultContent(content) {
-  if (content == null) {return "";}
-  if (typeof content === "string") {return content;}
+  if (content == null) {
+    return "";
+  }
+  if (typeof content === "string") {
+    return content;
+  }
   if (Array.isArray(content)) {
     return content
       .filter((b) => b && b.type === "text" && typeof b.text === "string")
@@ -92,12 +96,12 @@ function flattenToolResultContent(content) {
  * replaced by '-'. See docs/ai_collaborative_workbench_design.md §3.1.
  */
 async function loadClaudeCodeHistory(ctx) {
-  const { ccSessionId, workspacePath } = ctx;
-  if (!ccSessionId || !workspacePath) {
+  const { acpSessionId, workspacePath } = ctx;
+  if (!acpSessionId || !workspacePath) {
     return [];
   }
   const slug = workspacePath.replace(/[^A-Za-z0-9._-]/g, "-");
-  const jsonlPath = path.join(os.homedir(), ".claude", "projects", slug, `${ccSessionId}.jsonl`);
+  const jsonlPath = path.join(os.homedir(), ".claude", "projects", slug, `${acpSessionId}.jsonl`);
 
   let raw;
   try {
@@ -110,30 +114,42 @@ async function loadClaudeCodeHistory(ctx) {
   const items = [];
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
-    if (!trimmed) {continue;}
+    if (!trimmed) {
+      continue;
+    }
     let ev;
     try {
       ev = JSON.parse(trimmed);
     } catch {
       continue;
     }
-    if (!ev || typeof ev !== "object") {continue;}
+    if (!ev || typeof ev !== "object") {
+      continue;
+    }
 
     const createdAt = typeof ev.timestamp === "string" ? ev.timestamp : undefined;
     const msg = ev.message;
-    if (!msg) {continue;}
+    if (!msg) {
+      continue;
+    }
 
     if (ev.type === "user") {
       const content = msg.content;
       if (typeof content === "string") {
-        if (content) {pushMerged(items, { kind: "user", text: content, createdAt });}
+        if (content) {
+          pushMerged(items, { kind: "user", text: content, createdAt });
+        }
         continue;
       }
-      if (!Array.isArray(content)) {continue;}
+      if (!Array.isArray(content)) {
+        continue;
+      }
 
       const textParts = [];
       for (const b of content) {
-        if (!b || typeof b !== "object") {continue;}
+        if (!b || typeof b !== "object") {
+          continue;
+        }
         if (b.type === "text" && typeof b.text === "string") {
           textParts.push(b.text);
         } else if (b.type === "tool_result") {
@@ -155,7 +171,9 @@ async function loadClaudeCodeHistory(ctx) {
       }
     } else if (ev.type === "assistant" && Array.isArray(msg.content)) {
       for (const b of msg.content) {
-        if (!b || typeof b !== "object") {continue;}
+        if (!b || typeof b !== "object") {
+          continue;
+        }
         if (b.type === "text" && typeof b.text === "string") {
           pushMerged(items, { kind: "assistant_text", text: b.text, createdAt });
         } else if (b.type === "thinking" && typeof b.thinking === "string") {
@@ -185,24 +203,32 @@ async function loadClaudeCodeHistory(ctx) {
  */
 function extractFromRuntimeRecord(record) {
   const items = [];
-  if (!record || !Array.isArray(record.messages)) {return items;}
+  if (!record || !Array.isArray(record.messages)) {
+    return items;
+  }
   for (const msg of record.messages) {
     if (msg.User && Array.isArray(msg.User.content)) {
       const parts = [];
       for (const c of msg.User.content) {
-        if (c && c.Text !== undefined) {parts.push(c.Text);}
+        if (c && c.Text !== undefined) {
+          parts.push(c.Text);
+        }
       }
       if (parts.length) {
         pushMerged(items, { kind: "user", text: parts.join("\n") });
       }
     } else if (msg.Agent && Array.isArray(msg.Agent.content)) {
       for (const c of msg.Agent.content) {
-        if (!c || typeof c !== "object") {continue;}
+        if (!c || typeof c !== "object") {
+          continue;
+        }
         if (c.Text !== undefined) {
           pushMerged(items, { kind: "assistant_text", text: c.Text });
         } else if (c.Thinking) {
           const text = c.Thinking.text || "";
-          if (text) {pushMerged(items, { kind: "thinking", text });}
+          if (text) {
+            pushMerged(items, { kind: "thinking", text });
+          }
         } else if (c.ToolUse) {
           items.push({
             kind: "tool_use",
@@ -262,7 +288,8 @@ wss.on("connection", (ws) => {
     try {
       switch (action) {
         case "ensure_session": {
-          const { workspacePath, agentType, systemContext } = payload;
+          const { workspacePath, agentType, systemContext, resumeSessionId, acpSessionId } =
+            payload;
           if (!sessionId || !workspacePath || !agentType) {
             sendError(
               ws,
@@ -289,8 +316,13 @@ wss.on("connection", (ws) => {
             sessionOptions.systemPrompt = systemContext;
           }
 
+          // Prefer the explicit resumeSessionId (the agent-side UUID
+          // recorded in the 1agents index); fall back to acpSessionId
+          // for older clients. Empty string means "start a fresh session".
+          const resumeId = (resumeSessionId || acpSessionId || "").trim();
+
           console.log(
-            `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}`,
+            `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
 
           const handle = await runtime.ensureSession({
@@ -298,6 +330,7 @@ wss.on("connection", (ws) => {
             agent: agentType,
             mode: "persistent",
             cwd: normalizedPath,
+            resumeSessionId: resumeId || undefined,
             sessionOptions,
           });
 
@@ -307,6 +340,7 @@ wss.on("connection", (ws) => {
             JSON.stringify({
               event: "session_ready",
               sessionId,
+              agentSessionId: handle.agentSessionId,
             }),
           );
           break;
@@ -491,7 +525,12 @@ wss.on("connection", (ws) => {
 
           const session = activeSessions.get(sessionId);
           const agentType = payload.agentType || session?.handle?.agent;
-          const ccSessionId = payload.ccSessionId;
+          // The agent-side session id is the runtime's own field — it's the
+          // canonical ACP id (e.g. Claude Code's UUID) that names the JSONL
+          // on disk. We prefer it over anything in the payload so the
+          // history is bound to the actual agent process, not whatever the
+          // cc-connect / IM side happens to be tracking.
+          const acpSessionId = session?.handle?.agentSessionId || payload.acpSessionId;
           const workspacePath = session?.handle?.cwd;
 
           // Fast path: in-process runtime session store.
@@ -516,9 +555,9 @@ wss.on("connection", (ws) => {
           if (items.length === 0) {
             const adapter = historyAdapters[agentType] || defaultHistoryAdapter;
             try {
-              items = await adapter({ agentType, ccSessionId, workspacePath });
+              items = await adapter({ agentType, acpSessionId, workspacePath });
               console.log(
-                `[acpx-server] History adapter for ${agentType} returned ${items.length} item(s) for ${sessionId}`,
+                `[acpx-server] History adapter for ${agentType} returned ${items.length} item(s) for ${sessionId} (acp=${acpSessionId || "<none>"})`,
               );
             } catch (err) {
               console.warn(
