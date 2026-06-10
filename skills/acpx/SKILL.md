@@ -308,6 +308,27 @@ For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
 child agents, but they do not trigger ACP auth-method selection on their own.
 
+## Devin ACP compatibility
+
+Devin is not a built-in agent shortcut. Use the raw command escape hatch:
+
+```bash
+acpx --agent 'devin acp' exec 'summarize this repo'
+```
+
+Pass Devin global flags such as `--model <model>` before `acp` when needed.
+
+When `acpx` detects a Devin ACP launch (`devin ... acp`, `devin ... --acp`, or `devin ... --experimental-acp`), it advertises the minimum Windsurf-compatible metadata needed for Devin's ACP gate:
+
+- `clientInfo.name`: `windsurf` instead of `acpx`
+- `clientInfo.version`: `ACPX_DEVIN_WINDSURF_VERSION` env var, default `1.110.1`
+- `clientCapabilities`: standard `fs` and `terminal` support, plus `_meta["cognition.ai/requestDiagnostics"] = true`
+- Extension handling: returns `{}` for Devin `_cognition.ai/request_diagnostics` requests and accepts extension notifications without method-not-found noise
+
+This compatibility shim is scoped to Devin ACP launches only. Other agents continue to receive standard `acpx` identity and capabilities.
+
+See the repository [`agents/Devin.md`](https://github.com/openclaw/acpx/blob/main/agents/Devin.md) for the full Devin compatibility contract.
+
 ## Session behavior
 
 Persistent prompt sessions are scoped by:

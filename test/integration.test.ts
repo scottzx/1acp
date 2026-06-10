@@ -1057,6 +1057,207 @@ test("integration: exec --no-terminal disables advertised terminal capability", 
   });
 });
 
+test("integration: non-Devin ACP launch advertises standard acpx client capabilities", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "exec", "echo hello"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const initializeRequest = payloads.find((payload) => payload.method === "initialize") as
+        | {
+            params?: {
+              clientCapabilities?: {
+                _meta?: unknown;
+                elicitation?: unknown;
+                fs?: { readTextFile?: unknown; writeTextFile?: unknown };
+                terminal?: unknown;
+              };
+              clientInfo?: { name?: unknown; version?: unknown };
+            };
+          }
+        | undefined;
+      assert(initializeRequest, result.stdout);
+      assert.equal(initializeRequest.params?.clientInfo?.name, "acpx");
+      assert.equal(initializeRequest.params?.clientCapabilities?.terminal, true);
+      assert.deepEqual(initializeRequest.params?.clientCapabilities?.fs, {
+        readTextFile: true,
+        writeTextFile: true,
+      });
+      assert.equal(initializeRequest.params?.clientCapabilities?._meta, undefined);
+      assert.equal(initializeRequest.params?.clientCapabilities?.elicitation, undefined);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec accepts agent extension notifications", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "exec",
+          "extension-notification _cognition.ai/output hello",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /extension notification accepted: _cognition\.ai\/output/);
+      assert.doesNotMatch(result.stderr, /Method not found/);
+      assert.doesNotMatch(result.stderr, /Error handling notification/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: non-Devin ACP launch rejects Devin diagnostics extension requests", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "exec",
+          "extension-request _cognition.ai/request_diagnostics hello",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.doesNotMatch(
+        result.stdout,
+        /extension request accepted: _cognition\.ai\/request_diagnostics/,
+      );
+      assert.match(result.stderr, /"Method not found": _cognition\.ai\/request_diagnostics/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec answers Devin diagnostics extension requests", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
+
+    try {
+      await writeFakeDevinAgent(fakeBinDir);
+
+      const result = await runCli(
+        [
+          "--agent",
+          "devin --model swe-1-6 acp",
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "quiet",
+          "exec",
+          "extension-request _cognition.ai/request_diagnostics hello",
+        ],
+        homeDir,
+        {
+          env: {
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(
+        result.stdout,
+        /extension request accepted: _cognition\.ai\/request_diagnostics \{\}/,
+      );
+      assert.doesNotMatch(result.stderr, /Method not found/);
+      assert.doesNotMatch(result.stderr, /Error handling request/);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: Devin ACP launch advertises scoped Windsurf client info", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
+
+    try {
+      await writeFakeDevinAgent(fakeBinDir);
+
+      const result = await runCli(
+        [
+          "--agent",
+          "devin --model swe-1-6 --acp",
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+        {
+          env: {
+            ACPX_DEVIN_WINDSURF_VERSION: "9.9.9-test",
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const initializeRequest = payloads.find((payload) => payload.method === "initialize") as
+        | {
+            params?: {
+              clientCapabilities?: {
+                _meta?: Record<string, unknown> | null;
+                elicitation?: unknown;
+                fs?: { readTextFile?: unknown; writeTextFile?: unknown };
+                terminal?: unknown;
+              };
+              clientInfo?: {
+                name?: unknown;
+                version?: unknown;
+              };
+            };
+          }
+        | undefined;
+      assert(initializeRequest, result.stdout);
+      assert.deepEqual(initializeRequest.params?.clientInfo, {
+        name: "windsurf",
+        version: "9.9.9-test",
+      });
+      assert.equal(initializeRequest.params?.clientCapabilities?.terminal, true);
+      assert.deepEqual(initializeRequest.params?.clientCapabilities?.fs, {
+        readTextFile: true,
+        writeTextFile: true,
+      });
+      assert.deepEqual(initializeRequest.params?.clientCapabilities?._meta, {
+        "cognition.ai/requestDiagnostics": true,
+      });
+      assert.equal(initializeRequest.params?.clientCapabilities?.elicitation, undefined);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: exec --model sets the advertised model config option", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -3976,6 +4177,51 @@ async function writeFakeDroidAgent(binDir: string): Promise<void> {
       'if [ "$1" = "acp" ]; then',
       "  shift",
       "fi",
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
+async function writeFakeDevinAgent(binDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "devin.cmd"),
+      [
+        "@echo off",
+        "setlocal",
+        ":shift_known",
+        'if "%~1"=="--model" shift & shift & goto shift_known',
+        'if "%~1"=="acp" shift & goto shift_known',
+        'if "%~1"=="--acp" shift & goto shift_known',
+        'if "%~1"=="--experimental-acp" shift & goto shift_known',
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
+        "",
+      ].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "devin"),
+    [
+      "#!/bin/sh",
+      'while [ "$#" -gt 0 ]; do',
+      '  case "$1" in',
+      "    --model)",
+      "      shift",
+      '      [ "$#" -gt 0 ] && shift',
+      "      ;;",
+      "    acp|--acp|--experimental-acp)",
+      "      shift",
+      "      ;;",
+      "    *)",
+      "      break",
+      "      ;;",
+      "  esac",
+      "done",
       `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
       "",
     ].join("\n"),
