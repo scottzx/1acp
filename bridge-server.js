@@ -35,7 +35,9 @@ const initializingSessions = new Map();
 const agentSessionToClientSession = new Map();
 
 function registerAgentSessionMapping(sessionId, handle) {
-  if (!handle) {return;}
+  if (!handle) {
+    return;
+  }
   if (handle.backendSessionId) {
     agentSessionToClientSession.set(handle.backendSessionId, sessionId);
   }
@@ -45,7 +47,9 @@ function registerAgentSessionMapping(sessionId, handle) {
 }
 
 function unregisterAgentSessionMapping(handle) {
-  if (!handle) {return;}
+  if (!handle) {
+    return;
+  }
   if (handle.backendSessionId) {
     agentSessionToClientSession.delete(handle.backendSessionId);
   }
@@ -503,13 +507,17 @@ wss.on("connection", (ws) => {
                     "[acpx-server] Real-time tool_call event received:",
                     JSON.stringify(event, null, 2),
                   );
+                  // Forward rawInput as-is. During streaming the runtime may
+                  // emit a tool_call event before rawInput is populated; in
+                  // that case `arguments` is omitted on the wire and the
+                  // client skips rendering the placeholder card.
                   targetWs.send(
                     JSON.stringify({
                       event: "tool_call",
                       sessionId,
                       toolName: event.toolName || event.title || event.text || "tool",
                       toolCallId: event.toolCallId,
-                      arguments: event.rawInput || {},
+                      ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
                     }),
                   );
                   if (
