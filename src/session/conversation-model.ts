@@ -54,6 +54,26 @@ function hasOwn(source: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(source, key);
 }
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readClaudeCodeToolName(meta: unknown): string | undefined {
+  if (!isObjectRecord(meta)) {
+    return undefined;
+  }
+  const claudeCode = meta.claudeCode;
+  if (!isObjectRecord(claudeCode)) {
+    return undefined;
+  }
+  const nameVal = claudeCode.toolName;
+  if (typeof nameVal !== "string") {
+    return undefined;
+  }
+  const trimmed = nameVal.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function normalizeAgentName(value: unknown): string | undefined {
   return trimmedString(value);
 }
@@ -372,17 +392,27 @@ function applyToolCallUpdate(agent: SessionAgentMessage, update: ToolCall | Tool
 }
 
 function applyToolIdentityUpdate(tool: SessionToolUse, update: ToolCall | ToolCallUpdate): void {
-  if (hasOwn(update, "title")) {
+  const metaToolName = readClaudeCodeToolName((update as { _meta?: unknown })._meta);
+
+  if (metaToolName) {
+    tool.name = metaToolName;
+  } else if (hasOwn(update, "title")) {
     tool.name =
       normalizeAgentName((update as { title?: unknown }).title) ?? tool.name ?? "tool_call";
   }
 
-  if (hasOwn(update, "kind")) {
-    const kindName = normalizeAgentName((update as { kind?: unknown }).kind);
-    if (!tool.name || tool.name === "tool_call") {
-      tool.name = kindName ?? tool.name;
-    }
+  applyKindFallbackName(tool, update);
+}
+
+function applyKindFallbackName(tool: SessionToolUse, update: ToolCall | ToolCallUpdate): void {
+  if (!hasOwn(update, "kind")) {
+    return;
   }
+  if (tool.name && tool.name !== "tool_call") {
+    return;
+  }
+  const kindName = normalizeAgentName((update as { kind?: unknown }).kind);
+  tool.name = kindName ?? tool.name;
 }
 
 function applyToolInputUpdate(tool: SessionToolUse, update: ToolCall | ToolCallUpdate): void {

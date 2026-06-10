@@ -332,6 +332,22 @@ const TOOL_KINDS = new Set([
   "other",
 ]);
 
+function readClaudeCodeToolName(meta: unknown): string | undefined {
+  if (!isRecord(meta)) {
+    return undefined;
+  }
+  const claudeCode = meta.claudeCode;
+  if (!isRecord(claudeCode)) {
+    return undefined;
+  }
+  const nameVal = claudeCode.toolName;
+  if (typeof nameVal !== "string") {
+    return undefined;
+  }
+  const trimmed = nameVal.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function createToolCallEvent(params: {
   payload: Record<string, unknown>;
   tag: AcpSessionUpdateTag;
@@ -348,20 +364,22 @@ function createToolCallEvent(params: {
     params.tag === "tool_call_update"
       ? (outputSummary ?? inputSummary)
       : (inputSummary ?? outputSummary);
+  const toolName = readClaudeCodeToolName(params.payload._meta);
+
   const event: AcpRuntimeEvent = {
     type: "tool_call",
     text: detailSummary ? `${summaryText}: ${detailSummary}` : summaryText,
     tag: params.tag,
     title,
   };
-  assignToolCallEventMetadata(event, params.payload, { toolCallId, status, kind });
+  assignToolCallEventMetadata(event, params.payload, { toolCallId, status, kind, toolName });
   return event;
 }
 
 function assignToolCallEventMetadata(
   event: AcpRuntimeEvent,
   payload: Record<string, unknown>,
-  values: { toolCallId?: string; status?: string; kind?: ToolKind },
+  values: { toolCallId?: string; status?: string; kind?: ToolKind; toolName?: string },
 ): void {
   if (event.type !== "tool_call") {
     return;
@@ -374,6 +392,9 @@ function assignToolCallEventMetadata(
   }
   if (values.kind) {
     event.kind = values.kind;
+  }
+  if (values.toolName) {
+    event.toolName = values.toolName;
   }
   assignForwardedToolPayload(event, payload);
 }

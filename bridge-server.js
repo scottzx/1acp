@@ -31,6 +31,29 @@ const activeSessions = new Map();
 // Map of currently initializing sessions: sessionId -> Promise<handle>
 const initializingSessions = new Map();
 
+// Map of Agent UUID -> Client Session ID (for permission callbacks)
+const agentSessionToClientSession = new Map();
+
+function registerAgentSessionMapping(sessionId, handle) {
+  if (!handle) {return;}
+  if (handle.backendSessionId) {
+    agentSessionToClientSession.set(handle.backendSessionId, sessionId);
+  }
+  if (handle.agentSessionId) {
+    agentSessionToClientSession.set(handle.agentSessionId, sessionId);
+  }
+}
+
+function unregisterAgentSessionMapping(handle) {
+  if (!handle) {return;}
+  if (handle.backendSessionId) {
+    agentSessionToClientSession.delete(handle.backendSessionId);
+  }
+  if (handle.agentSessionId) {
+    agentSessionToClientSession.delete(handle.agentSessionId);
+  }
+}
+
 // Map of pending permission requests
 // requestId -> { resolve, reject, timer }
 const pendingPermissions = new Map();
@@ -184,7 +207,7 @@ async function loadClaudeCodeHistory(ctx) {
         } else if (b.type === "tool_use") {
           items.push({
             kind: "tool_use",
-            toolName: b.name || "tool",
+            toolName: b.name || b.tool_name || b.toolName || "tool",
             input: b.input ?? {},
             toolCallId: b.id,
             createdAt,
@@ -235,9 +258,34 @@ function extractFromRuntimeRecord(record) {
         } else if (c.ToolUse) {
           items.push({
             kind: "tool_use",
-            toolName: c.ToolUse.name || "tool",
+            toolName: c.ToolUse.name || c.ToolUse.tool_name || c.ToolUse.toolName || "tool",
             input: c.ToolUse.input ?? c.ToolUse.raw_input ?? {},
             toolCallId: c.ToolUse.id,
+          });
+        }
+      }
+
+      if (msg.Agent.tool_results && typeof msg.Agent.tool_results === "object") {
+        for (const res of Object.values(msg.Agent.tool_results)) {
+          if (!res || typeof res !== "object") {
+            continue;
+          }
+          let textContent = "";
+          if (res.output !== undefined && res.output !== null) {
+            textContent = typeof res.output === "string" ? res.output : JSON.stringify(res.output);
+          } else if (res.content) {
+            if (typeof res.content.Text === "string") {
+              textContent = res.content.Text;
+            } else if (res.content.Image) {
+              textContent = `[Image: ${res.content.Image.source}]`;
+            }
+          }
+          items.push({
+            kind: "tool_result",
+            toolCallId: res.tool_use_id,
+            toolName: res.tool_name || res.toolName || res.name || "tool",
+            content: textContent,
+            isError: !!res.is_error,
           });
         }
       }
@@ -324,6 +372,46 @@ wss.on("connection", (ws) => {
           // for older clients. Empty string means "start a fresh session".
           const resumeId = (resumeSessionId || acpSessionId || "").trim();
 
+          const existingSession = activeSessions.get(sessionId);
+          if (existingSession) {
+            console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
+            existingSession.ws = ws;
+            registerAgentSessionMapping(sessionId, existingSession.handle);
+            ws.send(
+              JSON.stringify({
+                event: "session_ready",
+                sessionId,
+                agentSessionId:
+                  existingSession.handle.agentSessionId || existingSession.handle.backendSessionId,
+              }),
+            );
+            break;
+          }
+
+          if (initializingSessions.has(sessionId)) {
+            console.log(
+              `[acpx-server] Session ${sessionId} is currently initializing, awaiting...`,
+            );
+            try {
+              const handle = await initializingSessions.get(sessionId);
+              const sess = activeSessions.get(sessionId);
+              if (sess) {
+                sess.ws = ws;
+              }
+              registerAgentSessionMapping(sessionId, handle);
+              ws.send(
+                JSON.stringify({
+                  event: "session_ready",
+                  sessionId,
+                  agentSessionId: handle.agentSessionId || handle.backendSessionId,
+                }),
+              );
+            } catch (err) {
+              sendError(ws, sessionId, "INITIALIZATION_FAILED", err.message);
+            }
+            break;
+          }
+
           console.log(
             `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
@@ -341,6 +429,7 @@ wss.on("connection", (ws) => {
           try {
             const handle = await sessionPromise;
             activeSessions.set(sessionId, { handle, activeTurn: null, ws });
+            registerAgentSessionMapping(sessionId, handle);
 
             ws.send(
               JSON.stringify({
@@ -392,9 +481,16 @@ wss.on("connection", (ws) => {
           (async () => {
             try {
               for await (const event of turn.events) {
+                const currentSession = activeSessions.get(sessionId);
+                const targetWs = currentSession ? currentSession.ws : ws;
+                if (!targetWs || targetWs.readyState !== 1 /* OPEN */) {
+                  console.warn(`[acpx-server] ws is not open, skipping event: ${event.type}`);
+                  continue;
+                }
+
                 // event types: text_delta, status, tool_call, error
                 if (event.type === "text_delta") {
-                  ws.send(
+                  targetWs.send(
                     JSON.stringify({
                       event: "text_delta",
                       sessionId,
@@ -403,16 +499,44 @@ wss.on("connection", (ws) => {
                     }),
                   );
                 } else if (event.type === "tool_call") {
-                  ws.send(
+                  console.log(
+                    "[acpx-server] Real-time tool_call event received:",
+                    JSON.stringify(event, null, 2),
+                  );
+                  targetWs.send(
                     JSON.stringify({
                       event: "tool_call",
                       sessionId,
-                      toolName: event.title || event.text || "tool",
+                      toolName: event.toolName || event.title || event.text || "tool",
+                      toolCallId: event.toolCallId,
                       arguments: event.rawInput || {},
                     }),
                   );
+                  if (
+                    event.rawOutput !== undefined ||
+                    event.status === "success" ||
+                    event.status === "failed"
+                  ) {
+                    let textContent = "";
+                    if (event.rawOutput !== undefined && event.rawOutput !== null) {
+                      textContent =
+                        typeof event.rawOutput === "string"
+                          ? event.rawOutput
+                          : JSON.stringify(event.rawOutput);
+                    }
+                    targetWs.send(
+                      JSON.stringify({
+                        event: "tool_result",
+                        sessionId,
+                        toolCallId: event.toolCallId,
+                        toolName: event.toolName || event.title || event.text || "tool",
+                        text: textContent,
+                        isError: event.status === "failed",
+                      }),
+                    );
+                  }
                 } else if (event.type === "error") {
-                  ws.send(
+                  targetWs.send(
                     JSON.stringify({
                       event: "error",
                       sessionId,
@@ -428,43 +552,54 @@ wss.on("connection", (ws) => {
                 `[acpx-server] Turn finished for session: ${sessionId}. Status: ${result.status}`,
               );
 
-              if (result.status === "failed") {
-                ws.send(
-                  JSON.stringify({
-                    event: "error",
-                    sessionId,
-                    message: result.error?.message || "Turn execution failed",
-                  }),
-                );
-              } else {
-                // Retrieve status summary for ending message
-                let summary = "Execution completed successfully.";
-                try {
-                  const status = await runtime.getStatus({ handle: session.handle });
-                  summary = status.summary || summary;
-                } catch {
-                  // Fallback
-                }
+              const currentSession = activeSessions.get(sessionId);
+              const targetWs = currentSession ? currentSession.ws : ws;
+              if (targetWs && targetWs.readyState === 1 /* OPEN */) {
+                if (result.status === "failed") {
+                  targetWs.send(
+                    JSON.stringify({
+                      event: "error",
+                      sessionId,
+                      message: result.error?.message || "Turn execution failed",
+                    }),
+                  );
+                } else {
+                  // Retrieve status summary for ending message
+                  let summary = "Execution completed successfully.";
+                  try {
+                    const status = await runtime.getStatus({ handle: currentSession.handle });
+                    summary = status.summary || summary;
+                  } catch {
+                    // Fallback
+                  }
 
-                ws.send(
-                  JSON.stringify({
-                    event: "done",
-                    sessionId,
-                    summary,
-                  }),
-                );
+                  targetWs.send(
+                    JSON.stringify({
+                      event: "done",
+                      sessionId,
+                      summary,
+                    }),
+                  );
+                }
               }
             } catch (err) {
               console.error(`[acpx-server] Error executing turn:`, err);
-              ws.send(
-                JSON.stringify({
-                  event: "error",
-                  sessionId,
-                  message: err.message,
-                }),
-              );
+              const currentSession = activeSessions.get(sessionId);
+              const targetWs = currentSession ? currentSession.ws : ws;
+              if (targetWs && targetWs.readyState === 1 /* OPEN */) {
+                targetWs.send(
+                  JSON.stringify({
+                    event: "error",
+                    sessionId,
+                    message: err.message,
+                  }),
+                );
+              }
             } finally {
-              session.activeTurn = null;
+              const currentSession = activeSessions.get(sessionId);
+              if (currentSession) {
+                currentSession.activeTurn = null;
+              }
             }
           })();
           break;
@@ -611,6 +746,7 @@ wss.on("connection", (ws) => {
           const session = activeSessions.get(sessionId);
           if (session) {
             console.log(`[acpx-server] Closing session: ${sessionId}`);
+            unregisterAgentSessionMapping(session.handle);
             try {
               if (session.activeTurn) {
                 await session.activeTurn.cancel({ reason: "Session closed" });
@@ -662,15 +798,18 @@ function sendError(ws, sessionId, errorCode, message) {
 // ----------------------------------------------------
 async function handlePermissionRequestCallback(req, ctx) {
   const { sessionId } = req;
-  const session = activeSessions.get(sessionId);
+  const clientSessionId = agentSessionToClientSession.get(sessionId) || sessionId;
+  const session = activeSessions.get(clientSessionId);
   if (!session) {
-    console.warn(`[acpx-server] Permission requested for unknown session: ${sessionId}`);
+    console.warn(
+      `[acpx-server] Permission requested for unknown session: ${sessionId} (mapped clientSessionId: ${clientSessionId})`,
+    );
     return { outcome: "reject_once" };
   }
 
   const requestId = `perm_${nextRequestId++}`;
   console.log(
-    `[acpx-server] Intercepted permission request: ${req.raw.toolCall.title}. RequestId: ${requestId}`,
+    `[acpx-server] Intercepted permission request: ${req.raw.toolCall.title}. RequestId: ${requestId} for client session: ${clientSessionId}`,
   );
 
   return new Promise((resolve, reject) => {
@@ -685,7 +824,7 @@ async function handlePermissionRequestCallback(req, ctx) {
         session.ws.send(
           JSON.stringify({
             event: "permission_timeout",
-            sessionId,
+            sessionId: clientSessionId,
             requestId,
             message: `Permission request for "${req.raw.toolCall.title}" auto-denied after 5min timeout.`,
           }),
@@ -713,7 +852,7 @@ async function handlePermissionRequestCallback(req, ctx) {
     session.ws.send(
       JSON.stringify({
         event: "permission_request",
-        sessionId,
+        sessionId: clientSessionId,
         requestId,
         toolName: req.raw.toolCall.title || "Unknown Tool",
         arguments: req.raw.toolCall.rawInput || {},
@@ -730,6 +869,7 @@ async function killAllManagedAgents() {
   const promises = [];
   for (const [sessionId, session] of activeSessions.entries()) {
     try {
+      unregisterAgentSessionMapping(session.handle);
       if (session.activeTurn) {
         promises.push(session.activeTurn.cancel({ reason: "Clean shutdown" }));
       }
@@ -740,6 +880,7 @@ async function killAllManagedAgents() {
   }
   await Promise.all(promises);
   activeSessions.clear();
+  agentSessionToClientSession.clear();
 }
 
 // 1. Parent process stdin close check (Double protection)
