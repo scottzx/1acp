@@ -714,9 +714,14 @@ wss.on("connection", (ws) => {
           // bypasses the user prompt without a turn boundary. The Go
           // side already persisted the choice via PATCH; this WS action
           // is only about the in-memory gate.
-          const { mode } = payload;
+          //
+          // Field is `permissionMode` (not `mode`) to match the JSON
+          // tag on Go's WsMessage.PermissionMode — Go strips unknown
+          // fields during the bridge's ReadJSON → WriteJSON forward,
+          // so any other name silently arrives empty here.
+          const { permissionMode: mode } = payload;
           if (!sessionId || !mode) {
-            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and mode are required");
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and permissionMode are required");
             return;
           }
           if (!isValidPermissionMode(mode)) {
@@ -724,7 +729,7 @@ wss.on("connection", (ws) => {
               ws,
               sessionId,
               "INVALID_PARAMS",
-              "mode must be approve-reads, approve-all, or deny-all",
+              "permissionMode must be approve-reads, approve-all, or deny-all",
             );
             return;
           }
@@ -739,7 +744,7 @@ wss.on("connection", (ws) => {
             JSON.stringify({
               event: "permission_mode_changed",
               sessionId,
-              mode,
+              permissionMode: mode,
             }),
           );
           break;
@@ -977,6 +982,7 @@ async function handlePermissionRequestCallback(req, ctx) {
         event: "permission_request",
         sessionId: clientSessionId,
         requestId,
+        toolCallId: req.raw.toolCall.toolCallId,
         toolName: req.raw.toolCall.title || "Unknown Tool",
         arguments: req.raw.toolCall.rawInput || {},
       }),
