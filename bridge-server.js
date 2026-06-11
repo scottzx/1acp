@@ -426,7 +426,11 @@ wss.on("connection", (ws) => {
           if (existingSession) {
             console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
             existingSession.ws = ws;
-            if (seededMode) {
+            // Only seed the in-memory mode from the store when nothing is
+            // set yet. Never overwrite a live mode with a (possibly stale)
+            // store value — that would let a PATCH that hasn't completed
+            // yet downgrade the user's just-toggled choice.
+            if (seededMode && !existingSession.permissionMode) {
               existingSession.permissionMode = seededMode;
             }
             registerAgentSessionMapping(sessionId, existingSession.handle);
@@ -491,7 +495,10 @@ wss.on("connection", (ws) => {
               // permissionMode is per-session and overrides the runtime
               // default in handlePermissionRequestCallback. The Composer's
               // mode toggle later updates this via set_permission_mode.
-              permissionMode: seededMode,
+              // Default to approve-reads when the store has nothing (e.g.
+              // brand-new session) so the mode check at line ~925 never
+              // has to special-case null/undefined.
+              permissionMode: seededMode ?? "approve-reads",
             });
             registerAgentSessionMapping(sessionId, handle);
 
@@ -916,6 +923,15 @@ async function handlePermissionRequestCallback(req, ctx) {
     );
     return { outcome: "reject_once" };
   }
+
+  // Debug breadcrumb so the mode-vs-actual check is observable from the
+  // bridge-server log without needing to attach a debugger. Logged on
+  // every callback, not just the prompt-emitting branches, so you can
+  // see auto-allow/reject decisions alongside the manual-prompt ones.
+  console.log(
+    `[acpx-server] permission check for ${req.raw.toolCall.title}:`,
+    `mode=${session.permissionMode}, requestId=${req.raw.toolCall.toolCallId}`,
+  );
 
   // Per-session mode shortcut — gates the prompt without round-tripping
   // through the UI. approve-reads falls through to the normal flow
