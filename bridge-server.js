@@ -747,6 +747,24 @@ wss.on("connection", (ws) => {
           }
           session.permissionMode = mode;
           console.log(`[acpx-server] permission mode for ${sessionId} set to ${mode}`);
+          // Push the mode down to the live ACP session so the runtime's
+          // own fast-path (filesystem.ts permissionGate, permissions.ts)
+          // honors it on the very next tool call. Without this, the
+          // runtime continues to use whatever permissionMode it was
+          // created with — a stale "approve-reads" lets writes through
+          // regardless of the user's toggle, and an "approve-all"
+          // makes deny-all a no-op.
+          try {
+            await runtime.setMode({ handle: session.handle, mode });
+            console.log(
+              `[acpx-server] runtime.setMode pushed ${mode} to ACP session for ${sessionId}`,
+            );
+          } catch (err) {
+            console.warn(
+              `[acpx-server] runtime.setMode failed for ${sessionId} (in-memory mode still ${mode}):`,
+              err.message,
+            );
+          }
           ws.send(
             JSON.stringify({
               event: "permission_mode_changed",
