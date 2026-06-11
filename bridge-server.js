@@ -491,6 +491,7 @@ wss.on("connection", (ws) => {
             activeSessions.set(sessionId, {
               handle,
               activeTurn: null,
+              promptQueue: [],
               ws,
               // permissionMode is per-session and overrides the runtime
               // default in handlePermissionRequestCallback. The Composer's
@@ -528,155 +529,32 @@ wss.on("connection", (ws) => {
             return;
           }
 
-          if (session.activeTurn) {
-            sendError(
+          if (session.activeTurn || session.promptQueue.length > 0) {
+            // Another prompt is already executing or waiting. Append to the
+            // per-session queue and ack the sender — the active turn's
+            // finally block will drain this when it finishes.
+            const queuedRequestId = `queued_${Date.now()}_${session.promptQueue.length}`;
+            session.promptQueue.push({
+              text,
+              queuedRequestId,
               ws,
-              sessionId,
-              "TURN_IN_PROGRESS",
-              "Another prompt is already executing in this session",
+            });
+            ws.send(
+              JSON.stringify({
+                event: "prompt_queued",
+                sessionId,
+                requestId: queuedRequestId,
+                queuePosition: session.promptQueue.length,
+                text,
+              }),
+            );
+            console.log(
+              `[acpx-server] Prompt queued for session ${sessionId} (queue depth=${session.promptQueue.length})`,
             );
             return;
           }
 
-          const requestId = `turn_${Date.now()}`;
-          const turn = runtime.startTurn({
-            handle: session.handle,
-            text,
-            mode: "prompt",
-            requestId,
-          });
-
-          session.activeTurn = turn;
-
-          // Consume the turn events stream asynchronously
-          (async () => {
-            try {
-              for await (const event of turn.events) {
-                const currentSession = activeSessions.get(sessionId);
-                const targetWs = currentSession ? currentSession.ws : ws;
-                if (!targetWs || targetWs.readyState !== 1 /* OPEN */) {
-                  console.warn(`[acpx-server] ws is not open, skipping event: ${event.type}`);
-                  continue;
-                }
-
-                // event types: text_delta, status, tool_call, error
-                if (event.type === "text_delta") {
-                  targetWs.send(
-                    JSON.stringify({
-                      event: "text_delta",
-                      sessionId,
-                      text: event.text,
-                      type: event.stream || "output", // 'thought' or 'output'
-                    }),
-                  );
-                } else if (event.type === "tool_call") {
-                  console.log(
-                    "[acpx-server] Real-time tool_call event received:",
-                    JSON.stringify(event, null, 2),
-                  );
-                  // Forward rawInput as-is. During streaming the runtime may
-                  // emit a tool_call event before rawInput is populated; in
-                  // that case `arguments` is omitted on the wire and the
-                  // client skips rendering the placeholder card.
-                  targetWs.send(
-                    JSON.stringify({
-                      event: "tool_call",
-                      sessionId,
-                      toolName: event.toolName || event.title || event.text || "tool",
-                      toolCallId: event.toolCallId,
-                      ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
-                    }),
-                  );
-                  if (
-                    event.rawOutput !== undefined ||
-                    event.status === "success" ||
-                    event.status === "failed"
-                  ) {
-                    let textContent = "";
-                    if (event.rawOutput !== undefined && event.rawOutput !== null) {
-                      textContent =
-                        typeof event.rawOutput === "string"
-                          ? event.rawOutput
-                          : JSON.stringify(event.rawOutput);
-                    }
-                    targetWs.send(
-                      JSON.stringify({
-                        event: "tool_result",
-                        sessionId,
-                        toolCallId: event.toolCallId,
-                        toolName: event.toolName || event.title || event.text || "tool",
-                        text: textContent,
-                        isError: event.status === "failed",
-                      }),
-                    );
-                  }
-                } else if (event.type === "error") {
-                  targetWs.send(
-                    JSON.stringify({
-                      event: "error",
-                      sessionId,
-                      message: event.message,
-                    }),
-                  );
-                }
-              }
-
-              // Await the final turn result
-              const result = await turn.result;
-              console.log(
-                `[acpx-server] Turn finished for session: ${sessionId}. Status: ${result.status}`,
-              );
-
-              const currentSession = activeSessions.get(sessionId);
-              const targetWs = currentSession ? currentSession.ws : ws;
-              if (targetWs && targetWs.readyState === 1 /* OPEN */) {
-                if (result.status === "failed") {
-                  targetWs.send(
-                    JSON.stringify({
-                      event: "error",
-                      sessionId,
-                      message: result.error?.message || "Turn execution failed",
-                    }),
-                  );
-                } else {
-                  // Retrieve status summary for ending message
-                  let summary = "Execution completed successfully.";
-                  try {
-                    const status = await runtime.getStatus({ handle: currentSession.handle });
-                    summary = status.summary || summary;
-                  } catch {
-                    // Fallback
-                  }
-
-                  targetWs.send(
-                    JSON.stringify({
-                      event: "done",
-                      sessionId,
-                      summary,
-                    }),
-                  );
-                }
-              }
-            } catch (err) {
-              console.error(`[acpx-server] Error executing turn:`, err);
-              const currentSession = activeSessions.get(sessionId);
-              const targetWs = currentSession ? currentSession.ws : ws;
-              if (targetWs && targetWs.readyState === 1 /* OPEN */) {
-                targetWs.send(
-                  JSON.stringify({
-                    event: "error",
-                    sessionId,
-                    message: err.message,
-                  }),
-                );
-              }
-            } finally {
-              const currentSession = activeSessions.get(sessionId);
-              if (currentSession) {
-                currentSession.activeTurn = null;
-              }
-            }
-          })();
+          runPromptTurn(session, sessionId, { text });
           break;
         }
 
@@ -775,9 +653,9 @@ wss.on("connection", (ws) => {
           break;
         }
 
-        case "cancel": {
-          if (!sessionId) {
-            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId is required");
+        case "cancel_queued": {
+          if (!sessionId || !payload.requestId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and requestId are required");
             return;
           }
 
@@ -787,12 +665,23 @@ wss.on("connection", (ws) => {
             return;
           }
 
-          if (session.activeTurn) {
-            console.log(`[acpx-server] Cancelling active turn for session: ${sessionId}`);
-            await session.activeTurn.cancel({ reason: "User cancelled via UI" });
-          } else {
-            console.log(`[acpx-server] No active turn to cancel for session: ${sessionId}`);
+          const idx = session.promptQueue.findIndex(
+            (item) => item.queuedRequestId === payload.requestId,
+          );
+          if (idx === -1) {
+            sendError(
+              ws,
+              sessionId,
+              "QUEUED_PROMPT_NOT_FOUND",
+              "No queued prompt matches that requestId",
+            );
+            return;
           }
+          const [removed] = session.promptQueue.splice(idx, 1);
+          sendPromptCancelled(removed.ws, sessionId, removed.queuedRequestId);
+          console.log(
+            `[acpx-server] Cancelled queued prompt ${removed.queuedRequestId} for session ${sessionId} (queue depth=${session.promptQueue.length})`,
+          );
           break;
         }
 
@@ -886,6 +775,7 @@ wss.on("connection", (ws) => {
               if (session.activeTurn) {
                 await session.activeTurn.cancel({ reason: "Session closed" });
               }
+              cancelSessionQueue(session, sessionId);
               await runtime.close({ handle: session.handle, reason: "Session closed by request" });
             } catch (err) {
               console.error(`[acpx-server] Error closing runtime handle:`, err);
@@ -926,6 +816,185 @@ function sendError(ws, sessionId, errorCode, message) {
       message,
     }),
   );
+}
+
+// Send a prompt_cancelled event to the ws that originally submitted the
+// queued prompt. ws may be stale (e.g. client reconnected) — the send is
+// allowed to fail silently in that case.
+function sendPromptCancelled(ws, sessionId, requestId) {
+  if (!ws || ws.readyState !== 1 /* OPEN */) {
+    return;
+  }
+  ws.send(
+    JSON.stringify({
+      event: "prompt_cancelled",
+      sessionId,
+      requestId,
+    }),
+  );
+}
+
+// Cancel every prompt still sitting in the session's queue, notifying the
+// originating ws for each one. The active turn is left untouched — callers
+// handle the active-turn cancel separately so they can attach their own
+// reason ("User cancelled via UI" vs "Session closed" vs "Clean shutdown").
+function cancelSessionQueue(session, sessionId) {
+  if (!session?.promptQueue) {
+    return;
+  }
+  for (const item of session.promptQueue) {
+    sendPromptCancelled(item.ws, sessionId, item.queuedRequestId);
+  }
+  session.promptQueue.length = 0;
+}
+
+// Start (or continue) running a prompt on the given session and chain into
+// the next queued prompt when this turn completes. Extracted from
+// case "prompt" so the queue-drain in the finally block can re-enter it
+// without duplicating the event-consumption logic.
+function runPromptTurn(session, sessionId, promptItem) {
+  const requestId = `turn_${Date.now()}`;
+  const turn = runtime.startTurn({
+    handle: session.handle,
+    text: promptItem.text,
+    mode: "prompt",
+    requestId,
+  });
+
+  session.activeTurn = turn;
+
+  (async () => {
+    try {
+      for await (const event of turn.events) {
+        const currentSession = activeSessions.get(sessionId);
+        const targetWs = currentSession ? currentSession.ws : null;
+        if (!targetWs || targetWs.readyState !== 1 /* OPEN */) {
+          console.warn(`[acpx-server] ws is not open, skipping event: ${event.type}`);
+          continue;
+        }
+
+        // event types: text_delta, status, tool_call, error
+        if (event.type === "text_delta") {
+          targetWs.send(
+            JSON.stringify({
+              event: "text_delta",
+              sessionId,
+              text: event.text,
+              type: event.stream || "output", // 'thought' or 'output'
+            }),
+          );
+        } else if (event.type === "tool_call") {
+          console.log(
+            "[acpx-server] Real-time tool_call event received:",
+            JSON.stringify(event, null, 2),
+          );
+          // Forward rawInput as-is. During streaming the runtime may
+          // emit a tool_call event before rawInput is populated; in
+          // that case `arguments` is omitted on the wire and the
+          // client skips rendering the placeholder card.
+          targetWs.send(
+            JSON.stringify({
+              event: "tool_call",
+              sessionId,
+              toolName: event.toolName || event.title || event.text || "tool",
+              toolCallId: event.toolCallId,
+              ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
+            }),
+          );
+          if (
+            event.rawOutput !== undefined ||
+            event.status === "success" ||
+            event.status === "failed"
+          ) {
+            let textContent = "";
+            if (event.rawOutput !== undefined && event.rawOutput !== null) {
+              textContent =
+                typeof event.rawOutput === "string"
+                  ? event.rawOutput
+                  : JSON.stringify(event.rawOutput);
+            }
+            targetWs.send(
+              JSON.stringify({
+                event: "tool_result",
+                sessionId,
+                toolCallId: event.toolCallId,
+                toolName: event.toolName || event.title || event.text || "tool",
+                text: textContent,
+                isError: event.status === "failed",
+              }),
+            );
+          }
+        } else if (event.type === "error") {
+          targetWs.send(
+            JSON.stringify({
+              event: "error",
+              sessionId,
+              message: event.message,
+            }),
+          );
+        }
+      }
+
+      // Await the final turn result
+      const result = await turn.result;
+      console.log(
+        `[acpx-server] Turn finished for session: ${sessionId}. Status: ${result.status}`,
+      );
+
+      const currentSession = activeSessions.get(sessionId);
+      const targetWs = currentSession ? currentSession.ws : null;
+      if (targetWs && targetWs.readyState === 1 /* OPEN */) {
+        if (result.status === "failed") {
+          targetWs.send(
+            JSON.stringify({
+              event: "error",
+              sessionId,
+              message: result.error?.message || "Turn execution failed",
+            }),
+          );
+        } else {
+          // Retrieve status summary for ending message
+          let summary = "Execution completed successfully.";
+          try {
+            const status = await runtime.getStatus({ handle: currentSession.handle });
+            summary = status.summary || summary;
+          } catch {
+            // Fallback
+          }
+
+          targetWs.send(
+            JSON.stringify({
+              event: "done",
+              sessionId,
+              summary,
+            }),
+          );
+        }
+      }
+    } catch (err) {
+      console.error(`[acpx-server] Error executing turn:`, err);
+      const currentSession = activeSessions.get(sessionId);
+      const targetWs = currentSession ? currentSession.ws : null;
+      if (targetWs && targetWs.readyState === 1 /* OPEN */) {
+        targetWs.send(
+          JSON.stringify({
+            event: "error",
+            sessionId,
+            message: err.message,
+          }),
+        );
+      }
+    } finally {
+      const currentSession = activeSessions.get(sessionId);
+      if (currentSession) {
+        currentSession.activeTurn = null;
+        if (currentSession.promptQueue.length > 0) {
+          const next = currentSession.promptQueue.shift();
+          runPromptTurn(currentSession, sessionId, next);
+        }
+      }
+    }
+  })();
 }
 
 // ----------------------------------------------------
@@ -1036,6 +1105,7 @@ async function killAllManagedAgents() {
       if (session.activeTurn) {
         promises.push(session.activeTurn.cancel({ reason: "Clean shutdown" }));
       }
+      cancelSessionQueue(session, sessionId);
       promises.push(runtime.close({ handle: session.handle, reason: "Clean shutdown" }));
     } catch (e) {
       console.error(`[acpx-server] Cleanup error for session ${sessionId}:`, e);
