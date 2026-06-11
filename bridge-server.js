@@ -58,6 +58,41 @@ function unregisterAgentSessionMapping(handle) {
   }
 }
 
+// ----------------------------------------------------
+// Permission helpers
+// ----------------------------------------------------
+
+// Mirror of backend/internal/agent/handler.go isValidPermissionMode — keep
+// in sync so the wire shape on both sides agrees.
+function isValidPermissionMode(mode) {
+  return mode === "approve-reads" || mode === "approve-all" || mode === "deny-all";
+}
+
+// Map the client-supplied `behavior` string to an ACP decision outcome.
+// Accepts the full ACP set (the 4 kinds + cancel) and the legacy
+// allow/deny shorthand from pre-multi-button frontends. Unknown values
+// fall back to reject_once: an unfamiliar behavior must not widen
+// permissions.
+function normalizePermissionOutcome(behavior) {
+  switch (behavior) {
+    case "allow_once":
+    case "allow_always":
+    case "reject_once":
+    case "reject_always":
+    case "cancel":
+      return behavior;
+    case "allow":
+      return "allow_once";
+    case "deny":
+      return "reject_once";
+    default:
+      console.warn(
+        `[acpx-server] Unknown permission behavior "${behavior}" — defaulting to reject_once`,
+      );
+      return "reject_once";
+  }
+}
+
 // Map of pending permission requests
 // requestId -> { resolve, reject, timer }
 const pendingPermissions = new Map();
@@ -343,8 +378,14 @@ wss.on("connection", (ws) => {
     try {
       switch (action) {
         case "ensure_session": {
-          const { workspacePath, agentType, systemContext, resumeSessionId, acpSessionId } =
-            payload;
+          const {
+            workspacePath,
+            agentType,
+            systemContext,
+            resumeSessionId,
+            acpSessionId,
+            permissionMode,
+          } = payload;
           if (!sessionId || !workspacePath || !agentType) {
             sendError(
               ws,
@@ -376,10 +417,18 @@ wss.on("connection", (ws) => {
           // for older clients. Empty string means "start a fresh session".
           const resumeId = (resumeSessionId || acpSessionId || "").trim();
 
+          // Normalize the per-session permission policy. Empty / invalid
+          // payload values fall back to the runtime-level default so this
+          // never accidentally widens permissions.
+          const seededMode = isValidPermissionMode(permissionMode) ? permissionMode : null;
+
           const existingSession = activeSessions.get(sessionId);
           if (existingSession) {
             console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
             existingSession.ws = ws;
+            if (seededMode) {
+              existingSession.permissionMode = seededMode;
+            }
             registerAgentSessionMapping(sessionId, existingSession.handle);
             ws.send(
               JSON.stringify({
@@ -401,6 +450,9 @@ wss.on("connection", (ws) => {
               const sess = activeSessions.get(sessionId);
               if (sess) {
                 sess.ws = ws;
+                if (seededMode) {
+                  sess.permissionMode = seededMode;
+                }
               }
               registerAgentSessionMapping(sessionId, handle);
               ws.send(
@@ -432,7 +484,15 @@ wss.on("connection", (ws) => {
 
           try {
             const handle = await sessionPromise;
-            activeSessions.set(sessionId, { handle, activeTurn: null, ws });
+            activeSessions.set(sessionId, {
+              handle,
+              activeTurn: null,
+              ws,
+              // permissionMode is per-session and overrides the runtime
+              // default in handlePermissionRequestCallback. The Composer's
+              // mode toggle later updates this via set_permission_mode.
+              permissionMode: seededMode,
+            });
             registerAgentSessionMapping(sessionId, handle);
 
             ws.send(
@@ -640,11 +700,48 @@ wss.on("connection", (ws) => {
           clearTimeout(pending.timer);
           pendingPermissions.delete(requestId);
 
-          if (behavior === "allow") {
-            pending.resolve({ outcome: "allow_once" });
-          } else {
-            pending.resolve({ outcome: "reject_once" });
+          // Accept the full ACP decision set plus the legacy two-button
+          // shorthand from older clients. Anything unrecognized falls back
+          // to reject_once — better to deny than to misforward intent.
+          const outcome = normalizePermissionOutcome(behavior);
+          pending.resolve({ outcome });
+          break;
+        }
+
+        case "set_permission_mode": {
+          // Per-session override for the bridge-server's permission
+          // gate. Applied immediately so the next permission request
+          // bypasses the user prompt without a turn boundary. The Go
+          // side already persisted the choice via PATCH; this WS action
+          // is only about the in-memory gate.
+          const { mode } = payload;
+          if (!sessionId || !mode) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and mode are required");
+            return;
           }
+          if (!isValidPermissionMode(mode)) {
+            sendError(
+              ws,
+              sessionId,
+              "INVALID_PARAMS",
+              "mode must be approve-reads, approve-all, or deny-all",
+            );
+            return;
+          }
+          const session = activeSessions.get(sessionId);
+          if (!session) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+          session.permissionMode = mode;
+          console.log(`[acpx-server] permission mode for ${sessionId} set to ${mode}`);
+          ws.send(
+            JSON.stringify({
+              event: "permission_mode_changed",
+              sessionId,
+              mode,
+            }),
+          );
           break;
         }
 
@@ -811,6 +908,24 @@ async function handlePermissionRequestCallback(req, ctx) {
   if (!session) {
     console.warn(
       `[acpx-server] Permission requested for unknown session: ${sessionId} (mapped clientSessionId: ${clientSessionId})`,
+    );
+    return { outcome: "reject_once" };
+  }
+
+  // Per-session mode shortcut — gates the prompt without round-tripping
+  // through the UI. approve-reads falls through to the normal flow
+  // (1acp internally auto-allows read/search; everything else prompts).
+  // approve-all and deny-all are blanket decisions for the entire
+  // session until the user toggles the mode again.
+  if (session.permissionMode === "approve-all") {
+    console.log(
+      `[acpx-server] permission mode=approve-all → auto allow_once for ${req.raw.toolCall.title}`,
+    );
+    return { outcome: "allow_once" };
+  }
+  if (session.permissionMode === "deny-all") {
+    console.log(
+      `[acpx-server] permission mode=deny-all → auto reject_once for ${req.raw.toolCall.title}`,
     );
     return { outcome: "reject_once" };
   }
