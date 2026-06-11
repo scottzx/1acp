@@ -348,6 +348,36 @@ function readClaudeCodeToolName(meta: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+// Some claude-code finalization paths (e.g. a permission-denied tool_call
+// update) carry the id under `_meta.claudeCode.toolCallId` instead of (or
+// in addition to) the top-level field. Mirror `readClaudeCodeToolName` so
+// the wire event surfaces the same id the conversation model persisted.
+function readClaudeCodeToolCallId(meta: unknown): string | undefined {
+  if (!isRecord(meta)) {
+    return undefined;
+  }
+  const claudeCode = meta.claudeCode;
+  if (!isRecord(claudeCode)) {
+    return undefined;
+  }
+  const idVal = claudeCode.toolCallId;
+  if (typeof idVal !== "string") {
+    return undefined;
+  }
+  const trimmed = idVal.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function selectToolCallDetailSummary(params: {
+  tag: AcpSessionUpdateTag;
+  inputSummary: string | undefined;
+  outputSummary: string | undefined;
+}): string | undefined {
+  return params.tag === "tool_call_update"
+    ? (params.outputSummary ?? params.inputSummary)
+    : (params.inputSummary ?? params.outputSummary);
+}
+
 function createToolCallEvent(params: {
   payload: Record<string, unknown>;
   tag: AcpSessionUpdateTag;
@@ -357,13 +387,15 @@ function createToolCallEvent(params: {
   const inputSummary = summarizeToolInput(params.payload.rawInput);
   const outputSummary =
     summarizeToolContent(params.payload.content) ?? summarizeToolOutput(params.payload.rawOutput);
-  const toolCallId = asOptionalString(params.payload.toolCallId);
+  const toolCallId =
+    asOptionalString(params.payload.toolCallId) ?? readClaudeCodeToolCallId(params.payload._meta);
   const kind = readToolKind(params.payload.kind);
   const summaryText = status ? `${title} (${status})` : title;
-  const detailSummary =
-    params.tag === "tool_call_update"
-      ? (outputSummary ?? inputSummary)
-      : (inputSummary ?? outputSummary);
+  const detailSummary = selectToolCallDetailSummary({
+    tag: params.tag,
+    inputSummary,
+    outputSummary,
+  });
   const toolName = readClaudeCodeToolName(params.payload._meta);
 
   const event: AcpRuntimeEvent = {
@@ -384,7 +416,12 @@ function assignToolCallEventMetadata(
   if (event.type !== "tool_call") {
     return;
   }
-  if (values.toolCallId) {
+  // Always carry the id through when the agent sent one, even an empty
+  // string — the conversation model keys off `update.toolCallId` without
+  // any truthiness gate, so dropping it here would desync the wire event
+  // from the persisted record. An empty string still indicates a known
+  // (if degenerate) id; only `undefined` (no id at all) is left unset.
+  if (typeof values.toolCallId === "string") {
     event.toolCallId = values.toolCallId;
   }
   if (values.status) {
