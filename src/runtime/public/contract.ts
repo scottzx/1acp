@@ -206,6 +206,7 @@ export type AcpRuntimeEvent =
       rawInput?: unknown;
       rawOutput?: unknown;
       content?: ToolCallContent[];
+      toolName?: string;
     }
   /**
    * Compatibility terminal event emitted by runTurn(...). startTurn(...).events
