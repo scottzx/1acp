@@ -409,7 +409,11 @@ wss.on("connection", (ws) => {
 
           const sessionOptions = {};
           if (systemContext) {
-            sessionOptions.systemPrompt = systemContext;
+            // {append} keeps the agent's own system prompt intact; a plain
+            // string would REPLACE it entirely (see 1acp agent-command.ts
+            // assignClaudeCodeSystemPrompt), which is never what a bridge
+            // client supplying extra context wants.
+            sessionOptions.systemPrompt = { append: systemContext };
           }
 
           // Prefer the explicit resumeSessionId (the agent-side UUID
@@ -432,6 +436,15 @@ wss.on("connection", (ws) => {
             // yet downgrade the user's just-toggled choice.
             if (seededMode && !existingSession.permissionMode) {
               existingSession.permissionMode = seededMode;
+            }
+            // Re-deliver any permission requests that were in-flight when the
+            // previous WebSocket dropped. The ACP runtime is still blocked
+            // waiting for the response; re-sending the event lets the newly
+            // connected client surface the prompt without a page reload.
+            for (const pending of pendingPermissions.values()) {
+              if (pending.sessionId === sessionId) {
+                ws.send(JSON.stringify(pending.payload));
+              }
             }
             registerAgentSessionMapping(sessionId, existingSession.handle);
             ws.send(
@@ -517,7 +530,10 @@ wss.on("connection", (ws) => {
         }
 
         case "prompt": {
-          const { text } = payload;
+          // attachments: optional [{ mediaType, data }] (base64) — forwarded
+          // to runtime.startTurn, which maps image/* and audio/* onto ACP
+          // content blocks. Other media types are rejected by the runtime.
+          const { text, attachments } = payload;
           if (!sessionId || text === undefined) {
             sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and text are required");
             return;
@@ -536,6 +552,7 @@ wss.on("connection", (ws) => {
             const queuedRequestId = `queued_${Date.now()}_${session.promptQueue.length}`;
             session.promptQueue.push({
               text,
+              attachments,
               queuedRequestId,
               ws,
             });
@@ -554,7 +571,7 @@ wss.on("connection", (ws) => {
             return;
           }
 
-          runPromptTurn(session, sessionId, { text });
+          runPromptTurn(session, sessionId, { text, attachments });
           break;
         }
 
@@ -854,9 +871,15 @@ function cancelSessionQueue(session, sessionId) {
 // without duplicating the event-consumption logic.
 function runPromptTurn(session, sessionId, promptItem) {
   const requestId = `turn_${Date.now()}`;
+  const attachments = Array.isArray(promptItem.attachments)
+    ? promptItem.attachments.filter(
+        (a) => a && typeof a.mediaType === "string" && typeof a.data === "string",
+      )
+    : [];
   const turn = runtime.startTurn({
     handle: session.handle,
     text: promptItem.text,
+    ...(attachments.length > 0 ? { attachments } : {}),
     mode: "prompt",
     requestId,
   });
@@ -1064,8 +1087,23 @@ async function handlePermissionRequestCallback(req, ctx) {
       5 * 60 * 1000,
     );
 
-    // Save pending info
-    pendingPermissions.set(requestId, { resolve, reject, timer });
+    // Save pending info — include session and full payload so the reconnect
+    // path can re-deliver the event to a new WebSocket without re-running
+    // the permission logic.
+    pendingPermissions.set(requestId, {
+      resolve,
+      reject,
+      timer,
+      sessionId: clientSessionId,
+      payload: {
+        event: "permission_request",
+        sessionId: clientSessionId,
+        requestId,
+        toolCallId: req.raw.toolCall.toolCallId,
+        toolName: req.raw.toolCall.title || "Unknown Tool",
+        arguments: req.raw.toolCall.rawInput || {},
+      },
+    });
 
     // Handle AbortSignal from runtime (e.g. if the turn is cancelled)
     ctx.signal.addEventListener(
