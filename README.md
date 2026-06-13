@@ -4,6 +4,8 @@
 
 # acpx
 
+> test hook-check: README update
+
 [![npm version](https://img.shields.io/npm/v/acpx.svg)](https://www.npmjs.com/package/acpx)
 [![npm downloads](https://img.shields.io/npm/dm/acpx.svg)](https://www.npmjs.com/package/acpx)
 [![CI](https://github.com/openclaw/acpx/actions/workflows/ci.yml/badge.svg)](https://github.com/openclaw/acpx/actions/workflows/ci.yml)
