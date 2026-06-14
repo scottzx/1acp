@@ -1,4 +1,4 @@
-import type { SessionRecord } from "../../types.js";
+import type { McpServer, SessionRecord } from "../../types.js";
 
 export type SystemPromptOption = string | { append: string };
 
@@ -7,6 +7,11 @@ export type SessionAgentOptions = {
   allowedTools?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
+  // mcpServers is a per-session MCP server list merged with the runtime-level
+  // servers at client creation. It is intentionally NOT persisted (see
+  // persistSessionOptions): the backend re-sends it on every connect and it
+  // may carry short-lived credentials in env, which must not hit disk.
+  mcpServers?: McpServer[];
 };
 
 export function mergeSessionOptions(
@@ -18,6 +23,7 @@ export function mergeSessionOptions(
   assignDefinedOption(merged, "allowedTools", preferred?.allowedTools);
   assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
   assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
+  assignDefinedOption(merged, "mcpServers", preferred?.mcpServers);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 

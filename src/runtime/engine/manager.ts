@@ -701,7 +701,13 @@ export class AcpRuntimeManager {
     const client = this.createClient({
       agentCommand,
       cwd,
-      mcpServers: [...(this.options.mcpServers ?? [])],
+      // Per-session mcpServers (e.g. the AI Project Manager's project-locked
+      // task tools) are appended to the runtime-level servers for this new
+      // session's client.
+      mcpServers: [
+        ...(this.options.mcpServers ?? []),
+        ...(input.sessionOptions?.mcpServers ?? []),
+      ],
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
