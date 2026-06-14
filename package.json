@@ -130,6 +130,9 @@
   "pnpm": {
     "overrides": {
       "qs": "6.15.2"
+    },
+    "patchedDependencies": {
+      "@agentclientprotocol/codex-acp@0.0.44": "patches/@agentclientprotocol__codex-acp@0.0.44.patch"
     }
   }
 }
