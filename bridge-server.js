@@ -382,6 +382,7 @@ wss.on("connection", (ws) => {
             workspacePath,
             agentType,
             systemContext,
+            mcpServers,
             resumeSessionId,
             acpSessionId,
             permissionMode,
@@ -414,6 +415,12 @@ wss.on("connection", (ws) => {
             // assignClaudeCodeSystemPrompt), which is never what a bridge
             // client supplying extra context wants.
             sessionOptions.systemPrompt = { append: systemContext };
+          }
+          // Per-session MCP servers (e.g. the AI Project Manager's
+          // project-locked task tools). Merged with runtime-level servers in
+          // the engine; only applies when this session's client is created.
+          if (Array.isArray(mcpServers) && mcpServers.length > 0) {
+            sessionOptions.mcpServers = mcpServers;
           }
 
           // Prefer the explicit resumeSessionId (the agent-side UUID
