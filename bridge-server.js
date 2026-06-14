@@ -814,7 +814,28 @@ wss.on("connection", (ws) => {
       }
     } catch (err) {
       console.error(`[acpx-server] Action execution failed:`, err);
-      sendError(ws, sessionId, "ACTION_FAILED", err.message);
+      // An AgentStartupError with exit 127 / "command not found" means the
+      // agent's ACP adapter binary could not be launched — almost always
+      // because the adapter package isn't installed for 1acp (the bare
+      // `npx … codex-acp` fallback fell through to PATH). Surface an
+      // actionable message instead of the opaque raw shell error.
+      if (
+        err?.detailCode === "AGENT_STARTUP_FAILED" &&
+        (err.exitCode === 127 ||
+          /command not found|ENOENT|not found/i.test(err.stderrSummary || err.message || ""))
+      ) {
+        const cmd = err.agentCommand || "the ACP adapter";
+        sendError(
+          ws,
+          sessionId,
+          "AGENT_ADAPTER_MISSING",
+          `ACP adapter failed to launch (${cmd}). The adapter is not installed for 1acp. ` +
+            `Run: cd modules/1acp && pnpm install, then restart 1agents. ` +
+            `Underlying: ${err.stderrSummary || err.message}`,
+        );
+      } else {
+        sendError(ws, sessionId, "ACTION_FAILED", err.message);
+      }
     }
   });
 
