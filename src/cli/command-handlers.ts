@@ -218,6 +218,9 @@ function buildSessionStartOptions(params: {
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
     sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
+    onModelWarning: params.globalFlags.jsonStrict
+      ? undefined
+      : (message) => process.stderr.write(`[acpx] warning: ${message}\n`),
   };
 }
 
@@ -319,7 +322,7 @@ export async function handlePrompt(
     agent.agentCommand,
     agent.agentName,
     agent.cwd,
-    flags.session,
+    resolveSessionNameFromFlags(flags, command),
   );
   const outputFormatter = createOutputFormatter(outputPolicy.format, {
     jsonContext: {

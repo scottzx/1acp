@@ -55,6 +55,8 @@ For normal session reuse, prefer a global install over `npx`.
 acpx [global_options] [prompt_text...]
 acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
+acpx [global_options] compare <agent>... '<prompt_text>'
+acpx [global_options] compare <agent>... --file <path>
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
@@ -92,6 +94,7 @@ Friendly agent names resolve to commands:
 - `kilocode` -> `npx -y @kilocode/cli acp`
 - `kimi` -> `kimi acp`
 - `kiro` -> `kiro-cli-chat acp`
+- `mux` -> `npx -y mux@^0.27.0 acp`
 - `opencode` -> `npx -y opencode-ai acp`
 - `qoder` -> `qodercli --acp`
   Forwards Qoder-native `--allowed-tools` and `--max-turns` startup flags from `acpx` session options.
@@ -147,6 +150,23 @@ Behavior:
 
 - Runs a single prompt in a temporary ACP session
 - Does not reuse or save persistent session state
+
+### Compare (multi-agent one-shot)
+
+```bash
+acpx compare pi openclaw codex 'summarize this checkout'
+acpx --format json compare codex claude --file prompt.md
+```
+
+Behavior:
+
+- Runs the same temporary-session prompt against each listed agent
+- Runs agents serially in the requested workspace
+- Reuses the global `exec` controls: cwd, timeout, permissions, `--policy`, auth, terminal, retries, model/system options, and output format
+- `--format text` prints one summary table row per agent
+- `--format json` or `--json` prints `CompareRow[]`
+- `--format quiet` prints `<agent>\t<status>` per row
+- Does not create saved sessions or separate compare transcript directories
 
 ### Cancel / Mode / Config / Model
 
@@ -307,6 +327,27 @@ For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 `ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
 Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
 child agents, but they do not trigger ACP auth-method selection on their own.
+
+## Devin ACP compatibility
+
+Devin is not a built-in agent shortcut. Use the raw command escape hatch:
+
+```bash
+acpx --agent 'devin acp' exec 'summarize this repo'
+```
+
+Pass Devin global flags such as `--model <model>` before `acp` when needed.
+
+When `acpx` detects a Devin ACP launch (`devin ... acp`, `devin ... --acp`, or `devin ... --experimental-acp`), it advertises the minimum Windsurf-compatible metadata needed for Devin's ACP gate:
+
+- `clientInfo.name`: `windsurf` instead of `acpx`
+- `clientInfo.version`: `ACPX_DEVIN_WINDSURF_VERSION` env var, default `1.110.1`
+- `clientCapabilities`: standard `fs` and `terminal` support, plus `_meta["cognition.ai/requestDiagnostics"] = true`
+- Extension handling: returns `{}` for Devin `_cognition.ai/request_diagnostics` requests and accepts extension notifications without method-not-found noise
+
+This compatibility shim is scoped to Devin ACP launches only. Other agents continue to receive standard `acpx` identity and capabilities.
+
+See the repository [`agents/Devin.md`](https://github.com/openclaw/acpx/blob/main/agents/Devin.md) for the full Devin compatibility contract.
 
 ## Session behavior
 

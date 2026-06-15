@@ -26,15 +26,22 @@ class FileSessionStore implements AcpSessionStore {
 
   async load(sessionId: string): Promise<AcpSessionRecord | undefined> {
     await this.ensureDir();
+    let payload: string;
     try {
-      const payload = await fs.readFile(this.filePath(sessionId), "utf8");
-      return parseSessionRecord(JSON.parse(payload)) ?? undefined;
+      payload = await fs.readFile(this.filePath(sessionId), "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return undefined;
       }
       throw error;
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return undefined;
+    }
+    return parseSessionRecord(parsed) ?? undefined;
   }
 
   async save(record: AcpSessionRecord): Promise<void> {

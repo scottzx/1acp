@@ -3,8 +3,10 @@ import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
+  RequestError,
   type AnyMessage,
   type AuthMethod,
+  type ClientCapabilities,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type InitializeResponse,
@@ -61,6 +63,7 @@ import type {
   PermissionStats,
   PromptInput,
 } from "../types.js";
+import { getAcpxVersion } from "../version.js";
 import {
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
@@ -69,6 +72,7 @@ import {
   ensureCopilotAcpSupport,
   isClaudeAcpCommand,
   isCopilotAcpCommand,
+  isDevinAcpCommand,
   isGeminiAcpCommand,
   isQoderAcpCommand,
   resolveAgentCloseAfterStdinEndMs,
@@ -121,6 +125,52 @@ const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
+const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
+  "cognition.ai/requestDiagnostics": true,
+});
+const DEVIN_COMPATIBILITY_CLIENT_NAME = "windsurf";
+// This is the embedded Windsurf IDE version bundled with Devin Desktop 3.1.7, the first locally verified version that passes Devin's server-side ACP precondition.
+const DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION = "1.110.1";
+
+function resolveClientInfo(devinAcp: boolean): { name: string; version: string } {
+  if (!devinAcp) {
+    return {
+      name: "acpx",
+      version: getAcpxVersion(),
+    };
+  }
+
+  return {
+    name: DEVIN_COMPATIBILITY_CLIENT_NAME,
+    version: process.env.ACPX_DEVIN_WINDSURF_VERSION ?? DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION,
+  };
+}
+
+function resolveClientCapabilities(params: {
+  devinAcp: boolean;
+  terminal: boolean;
+}): ClientCapabilities {
+  const baseCapabilities: ClientCapabilities = {
+    fs: {
+      readTextFile: true,
+      writeTextFile: true,
+    },
+    terminal: params.terminal,
+  };
+
+  if (!params.devinAcp) {
+    return baseCapabilities;
+  }
+
+  return {
+    ...baseCapabilities,
+    _meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META,
+  };
+}
+
+function isDevinRequestDiagnosticsMethod(method: string): boolean {
+  return method === "_cognition.ai/request_diagnostics";
+}
 
 type LoadSessionOptions = {
   suppressReplayUpdates?: boolean;
@@ -192,6 +242,7 @@ type AgentLaunchPlan = {
   spawnCommand: string;
   args: string[];
   resolvedBuiltInLaunch: ReturnType<typeof resolveBuiltInAgentLaunch>;
+  devinAcp: boolean;
   geminiAcp: boolean;
   copilotAcp: boolean;
   claudeAcp: boolean;
@@ -570,7 +621,7 @@ export class AcpClient {
       createNdJsonMessageStream(this.options.agentCommand, input, output),
     );
 
-    const connection = this.createConnection(stream);
+    const connection = this.createConnection(stream, launch);
     connection.signal.addEventListener(
       "abort",
       () => {
@@ -602,6 +653,7 @@ export class AcpClient {
       spawnCommand,
       args,
       resolvedBuiltInLaunch,
+      devinAcp: isDevinAcpCommand(spawnCommand, args),
       geminiAcp: isGeminiAcpCommand(spawnCommand, args),
       copilotAcp: isCopilotAcpCommand(spawnCommand, args),
       claudeAcp: isClaudeAcpCommand(spawnCommand, args),
@@ -656,10 +708,13 @@ export class AcpClient {
     return requireAgentStdio(spawnedChild);
   }
 
-  private createConnection(stream: {
-    readable: ReadableStream<AnyMessage>;
-    writable: WritableStream<AnyMessage>;
-  }): ClientSideConnection {
+  private createConnection(
+    stream: {
+      readable: ReadableStream<AnyMessage>;
+      writable: WritableStream<AnyMessage>;
+    },
+    launch: Pick<AgentLaunchPlan, "devinAcp">,
+  ): ClientSideConnection {
     return new ClientSideConnection(
       () => ({
         sessionUpdate: async (params: SessionNotification) => {
@@ -669,6 +724,12 @@ export class AcpClient {
           params: RequestPermissionRequest,
         ): Promise<RequestPermissionResponse> => {
           return this.handlePermissionRequest(params);
+        },
+        extMethod: async (method: string): Promise<Record<string, unknown>> => {
+          if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
+            return {};
+          }
+          throw RequestError.methodNotFound(method);
         },
         readTextFile: async (params: ReadTextFileRequest): Promise<ReadTextFileResponse> => {
           return this.handleReadTextFile(params);
@@ -695,6 +756,7 @@ export class AcpClient {
         ): Promise<ReleaseTerminalResponse> => {
           return this.handleReleaseTerminal(params);
         },
+        extNotification: async (): Promise<void> => {},
       }),
       stream,
     );
@@ -709,7 +771,7 @@ export class AcpClient {
   }): Promise<void> {
     try {
       const initResult = await Promise.race([
-        this.initializeProtocolConnection(params.connection, params.launch.geminiAcp),
+        this.initializeProtocolConnection(params.connection, params.launch),
         params.startupFailure.promise,
       ]);
       params.startupFailure.dispose();
@@ -724,23 +786,17 @@ export class AcpClient {
 
   private async initializeProtocolConnection(
     connection: ClientSideConnection,
-    geminiAcp: boolean,
+    launch: Pick<AgentLaunchPlan, "devinAcp" | "geminiAcp">,
   ): Promise<InitializeResponse> {
     const initializePromise = connection.initialize({
       protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
+      clientCapabilities: resolveClientCapabilities({
+        devinAcp: launch.devinAcp,
         terminal: this.options.terminal !== false,
-      },
-      clientInfo: {
-        name: "acpx",
-        version: "0.1.0",
-      },
+      }),
+      clientInfo: resolveClientInfo(launch.devinAcp),
     });
-    const initialized = geminiAcp
+    const initialized = launch.geminiAcp
       ? await withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
       : await initializePromise;
     await this.authenticateIfRequired(connection, initialized.authMethods ?? []);

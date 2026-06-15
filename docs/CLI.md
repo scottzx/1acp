@@ -23,6 +23,8 @@ Global options apply to all commands.
 acpx [global_options] [prompt_text...]
 acpx [global_options] prompt [prompt_options] [prompt_text...]
 acpx [global_options] exec [prompt_options] [prompt_text...]
+acpx [global_options] compare <agent>... '<prompt_text>'
+acpx [global_options] compare <agent>... --file <path>
 acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>] [--default-agent <name>]
 acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
@@ -252,6 +254,27 @@ Behavior:
 - Sends prompt once
 - Does not write/use a saved session record
 - Supports prompt text from args, stdin, `--file <path>`, and `--file -`
+
+## `compare` subcommand
+
+One-shot prompt against multiple agents:
+
+```bash
+acpx [global_options] compare <agent>... '<prompt_text>'
+acpx [global_options] compare <agent>... --file <path>
+acpx [global_options] compare <agent>... -- prompt words after the delimiter
+```
+
+Behavior:
+
+- Runs each agent with the same temporary `exec`-style ACP session.
+- Uses the same global execution controls as `exec`, including `--cwd`, `--timeout`, permission flags, `--policy`, auth, terminal advertising, retries, model/system options, and `--format`.
+- `--format text` prints one summary table row per agent.
+- `--format json` or command-local `--json` prints a `CompareRow[]` summary payload.
+- `--format quiet` prints `<agent>\t<status>` per row.
+- Agents run serially in the requested workspace. The command does not create saved sessions or separate compare transcript directories. Use `--format json` when you need a machine-readable artifact.
+
+`CompareRow.status` is `ok`, `cancelled`, `permission_denied`, or `error`.
 
 ## `cancel` command
 

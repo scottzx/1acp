@@ -17,6 +17,7 @@ import {
   handleSetMode,
   parseHistoryLimit,
 } from "./command-handlers.js";
+import { registerCompareCommand } from "./compare-command.js";
 import { registerConfigCommand } from "./config-command.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
@@ -342,5 +343,6 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
 
   registerSessionsCommand(program, undefined, config);
   registerConfigCommand(program, config);
+  registerCompareCommand(program, config);
   registerFlowCommand(program, config);
 }

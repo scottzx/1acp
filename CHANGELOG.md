@@ -11,12 +11,17 @@ Repo: https://github.com/openclaw/acpx
 - Agents/built-ins: bump the default Claude ACP adapter range to `@agentclientprotocol/claude-agent-acp@^0.37.0`. Thanks @trumpyla.
 - Runtime/embedding: surface cost, token usage breakdowns, and advertised command metadata on runtime status/events. Thanks @DaniAkash.
 - Agents/built-ins: add `fast-agent` as a built-in fast-agent ACP adapter via `uvx fast-agent-mcp acp`.
+- Agents/built-ins: add `mux` as a built-in coder/mux ACP adapter via `npx -y mux@^0.27.0 acp`. Thanks @ThomasK33.
+- CLI: add `acpx compare` to run one prompt across multiple agents and summarize timing, token usage, stop reason, permissions, and final output side by side. Thanks @mvanhorn.
 
 ### Breaking
 
 ### Fixes
 
 - ACP/models: support SDK 0.25 model config options while preserving `session/set_model` compatibility for adapters that explicitly advertise legacy model metadata.
+- CLI/Claude: let Claude Code adjudicate model selectors missing from a stale advertised model list on later persistent turns, and preserve the adapter-reported current model after model switches. Thanks @oakif.
+- Client/ACP: advertise scoped Devin/Windsurf-compatible client metadata and handle Devin extension requests/notifications without noisy method-not-found logs. Thanks @LivioGama.
+- Runtime/sessions: treat corrupt public file-session records as missing while preserving genuine filesystem errors. Thanks @KrasimirKralev.
 
 ## 2026.5.23 (v0.10.0)
 

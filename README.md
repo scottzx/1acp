@@ -40,6 +40,7 @@ One command surface for Pi, OpenClaw ACP, Codex, Claude, and other ACP-compatibl
 - **Structured output**: typed ACP messages (thinking, tool calls, diffs) instead of ANSI scraping
 - **Any ACP agent**: built-in registry + `--agent` escape hatch for custom servers
 - **One-shot mode**: `exec` for stateless fire-and-forget tasks
+- **Compare across agents**: `acpx compare pi openclaw codex 'fix the bug'` runs the same one-shot prompt against multiple ACP-compatible agents and summarizes timing, token usage, permissions, and final output side by side
 - **Experimental flows**: `flow run <file>` for TypeScript workflow modules over multiple prompts
 - **Runtime-owned flow actions**: shell-backed action steps can prepare workspaces and other deterministic mechanics outside the agent turn
 - **Flow workspace isolation**: `acp` nodes can target an explicit per-step cwd, so flows can keep agent work inside disposable worktrees
@@ -356,6 +357,7 @@ Built-ins:
 | `kilocode`   | `npx -y @kilocode/cli acp`                                                  | [Kilocode](https://kilocode.ai)                                                                                 |
 | `kimi`       | native (`kimi acp`)                                                         | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli)                                                              |
 | `kiro`       | native (`kiro-cli-chat acp`)                                                | [Kiro CLI](https://kiro.dev)                                                                                    |
+| `mux`        | `npx -y mux@^0.27.0 acp`                                                    | [Mux](https://mux.coder.com)                                                                                    |
 | `opencode`   | `npx -y opencode-ai acp`                                                    | [OpenCode](https://opencode.ai)                                                                                 |
 | `qoder`      | native (`qodercli --acp`)                                                   | [Qoder CLI](https://docs.qoder.com/cli/acp)                                                                     |
 | `qwen`       | native (`qwen --acp`)                                                       | [Qwen Code](https://github.com/QwenLM/qwen-code)                                                                |
