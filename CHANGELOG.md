@@ -4,7 +4,7 @@
 
 Repo: https://github.com/openclaw/acpx
 
-## Unreleased
+## 2026.6.17 (v0.11.0)
 
 ### Changes
 
