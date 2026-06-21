@@ -11,9 +11,11 @@ typescript:
       - "**/*.test.ts"
       - "**/*.spec.ts"
       - "dist/**"
-      - "dist-test/**"
+      - pattern: "dist-test/**"
+        reason: generated test compilation output
       - "node_modules/**"
-      - "examples/flows/replay-viewer/dist/**"
+      - pattern: "examples/flows/replay-viewer/dist/**"
+        reason: generated replay-viewer build output
     copied_blocks:
       enabled: true
       min_tokens: 100
