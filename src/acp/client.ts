@@ -1158,7 +1158,7 @@ export class AcpClient {
     const connection = this.getConnection();
     try {
       await this.runConnectionRequest(() =>
-        connection.unstable_setSessionModel({ sessionId, modelId }),
+        connection.extMethod("session/set_model", { sessionId, modelId }),
       );
       return undefined;
     } catch (error) {
