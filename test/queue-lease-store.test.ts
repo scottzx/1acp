@@ -61,6 +61,43 @@ test("tryAcquireQueueOwnerLease creates a lease that can be refreshed and releas
   });
 });
 
+test("tryAcquireQueueOwnerLease persists MCP config path metadata", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("lease-mcp-config", {
+      path: "/tmp/job-mcp.json",
+      fingerprint: "fingerprint-v1",
+    });
+    assert(lease);
+    assert.equal(lease.mcpConfigPath, "/tmp/job-mcp.json");
+    assert.equal(lease.mcpConfigFingerprint, "fingerprint-v1");
+
+    const record = await readQueueOwnerRecord("lease-mcp-config");
+    assert(record);
+    assert.equal(record.mcpConfigPath, "/tmp/job-mcp.json");
+    assert.equal(record.mcpConfigFingerprint, "fingerprint-v1");
+
+    await refreshQueueOwnerLease(lease, { queueDepth: 2 });
+    const refreshed = await readQueueOwnerRecord("lease-mcp-config");
+    assert(refreshed);
+    assert.equal(refreshed.mcpConfigPath, "/tmp/job-mcp.json");
+    assert.equal(refreshed.mcpConfigFingerprint, "fingerprint-v1");
+
+    await releaseQueueOwnerLease(lease);
+  });
+});
+
+test("tryAcquireQueueOwnerLease preserves the legacy clock callback argument", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease(
+      "lease-clock-callback",
+      () => "2026-03-26T00:00:00.000Z",
+    );
+    assert(lease);
+    assert.equal(lease.createdAt, "2026-03-26T00:00:00.000Z");
+    await releaseQueueOwnerLease(lease);
+  });
+});
+
 test("tryAcquireQueueOwnerLease assigns collision-resistant owner generations", async () => {
   await withTempHome(async () => {
     const originalDateNow = Date.now;
@@ -189,6 +226,35 @@ test("ensureOwnerIsUsable cleans up stale live owners", async () => {
       assert(owner);
       assert.equal(await ensureOwnerIsUsable(sessionId, owner), false);
       assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      assert.equal(isProcessAlive(keeper.pid), false);
+    } finally {
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("tryAcquireQueueOwnerLease terminates stale live owners before retry acquisition", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "stale-live-owner-acquire";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+
+    try {
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+        heartbeatAt: "2000-01-01T00:00:00.000Z",
+      });
+
+      assert.equal(await tryAcquireQueueOwnerLease(sessionId), undefined);
+      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      assert.equal(isProcessAlive(keeper.pid), false);
+
+      const lease = await tryAcquireQueueOwnerLease(sessionId);
+      assert(lease);
+      await releaseQueueOwnerLease(lease);
     } finally {
       stopProcess(keeper);
     }

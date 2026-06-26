@@ -25,7 +25,7 @@ jobs:
       docs_changed: ${{ steps.scope.outputs.docs_changed }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           fetch-tags: false
@@ -72,6 +72,7 @@ jobs:
                 ;;
               .github/workflows/ci.yml)
                 docs_only=false
+                changelog_scope_only=false
                 ;;
               *)
                 docs_only=false
@@ -122,14 +123,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 1
           fetch-tags: false
           submodules: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.0.8
+        uses: pnpm/action-setup@v6.0.9
         with:
           version: ${{ env.PNPM_VERSION }}
 
@@ -155,14 +156,14 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 1
           fetch-tags: false
           submodules: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.0.8
+        uses: pnpm/action-setup@v6.0.9
         with:
           version: ${{ env.PNPM_VERSION }}
 

@@ -61,6 +61,7 @@ const TOP_LEVEL_VERSION_VALUE_FLAG_VALUES = [
   "--prompt-retries",
   "--timeout",
   "--ttl",
+  "--mcp-config",
 ] as const;
 
 const TOP_LEVEL_VERSION_VALUE_FLAGS = new Set<string>(TOP_LEVEL_VERSION_VALUE_FLAG_VALUES);
@@ -82,6 +83,11 @@ const AGENT_SCAN_VALUE_FLAGS = new Set<string>(AGENT_SCAN_VALUE_FLAG_VALUES);
 const AGENT_SCAN_BOOLEAN_FLAGS = new Set<string>(TOP_LEVEL_VERSION_BOOLEAN_FLAGS);
 
 let skillflagModulePromise: Promise<SkillflagModule> | undefined;
+
+type TopLevelFlagStep = {
+  stop: boolean;
+  skipNext: boolean;
+};
 
 function loadSkillflagModule(): Promise<SkillflagModule> {
   skillflagModulePromise ??= import("skillflag");
@@ -174,28 +180,73 @@ function detectInitialCwd(argv: string[]): string {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
 
-    if (token === "--cwd") {
-      const next = argv[index + 1];
-      if (next && next !== "--") {
-        return path.resolve(next);
-      }
+    const scan = classifyTopLevelFlagScan(token);
+    if (scan.stop) {
       break;
     }
 
-    if (token.startsWith("--cwd=")) {
-      const value = token.slice("--cwd=".length).trim();
-      if (value.length > 0) {
-        return path.resolve(value);
-      }
+    const cwd = readCwdFlagValue(token, argv[index + 1]);
+    if (cwd) {
+      return path.resolve(cwd);
+    }
+    if (isCwdFlagToken(token)) {
       break;
     }
 
-    if (token === "--") {
-      break;
+    if (scan.skipNext) {
+      index += 1;
     }
   }
 
   return process.cwd();
+}
+
+function detectMcpConfigPath(argv: string[], cwd: string): string | undefined {
+  for (let index = 0; index < argv.length; index += 1) {
+    const scan = scanMcpConfigToken(argv[index], argv[index + 1], cwd);
+    if (scan.stop) {
+      return scan.path;
+    }
+    if (scan.skipNext) {
+      index += 1;
+    }
+  }
+  return undefined;
+}
+
+function scanMcpConfigToken(
+  token: string,
+  nextToken: string | undefined,
+  cwd: string,
+): { path?: string; skipNext?: boolean; stop?: boolean } {
+  if (token === "--" || !token.startsWith("-") || token === "-") {
+    return { stop: true };
+  }
+  if (token === "--mcp-config") {
+    return { path: resolveMcpConfigPath(nextToken, cwd), stop: true };
+  }
+  if (token.startsWith("--mcp-config=")) {
+    return { path: resolveMcpConfigPath(token.slice("--mcp-config=".length), cwd), stop: true };
+  }
+  return { skipNext: TOP_LEVEL_VERSION_VALUE_FLAGS.has(token) };
+}
+
+function resolveMcpConfigPath(value: string | undefined, cwd: string): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && trimmed !== "--" ? path.resolve(cwd, trimmed) : undefined;
+}
+
+function isCwdFlagToken(token: string): boolean {
+  return token === "--cwd" || token.startsWith("--cwd=");
+}
+
+function readCwdFlagValue(token: string, nextToken: string | undefined): string | undefined {
+  const raw = token === "--cwd" ? nextToken : readInlineFlagValue(token, "--cwd");
+  const value = raw?.trim();
+  if (!value || value === "--") {
+    return undefined;
+  }
+  return value;
 }
 
 function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): OutputFormat {
@@ -204,7 +255,8 @@ function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): Ou
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
 
-    if (token === "--") {
+    const scan = classifyTopLevelFlagScan(token);
+    if (scan.stop) {
       break;
     }
 
@@ -216,9 +268,23 @@ function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): Ou
     if (format) {
       detectedFormat = format;
     }
+
+    if (scan.skipNext) {
+      index += 1;
+    }
   }
 
   return detectedFormat;
+}
+
+function classifyTopLevelFlagScan(token: string): TopLevelFlagStep {
+  if (token === "--" || !token.startsWith("-") || token === "-") {
+    return { stop: true, skipNext: false };
+  }
+  return {
+    stop: false,
+    skipNext: TOP_LEVEL_VERSION_VALUE_FLAGS.has(token),
+  };
 }
 
 function readFormatFlagValue(
@@ -248,12 +314,17 @@ function detectJsonStrict(argv: string[]): boolean {
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
 
-    if (token === "--") {
+    const scan = classifyTopLevelFlagScan(token);
+    if (scan.stop) {
       break;
     }
 
     if (isJsonStrictToken(token)) {
       return true;
+    }
+
+    if (scan.skipNext) {
+      index += 1;
     }
   }
 
@@ -454,7 +525,10 @@ export async function main(argv: string[] = process.argv): Promise<void> {
 
   await maybeHandleSkillflag(normalizedArgv);
 
-  const config = await loadResolvedConfig(detectInitialCwd(rawArgs));
+  const initialCwd = detectInitialCwd(rawArgs);
+  const config = await loadResolvedConfig(initialCwd, {
+    mcpConfigPath: detectMcpConfigPath(rawArgs, initialCwd),
+  });
   const requestedJsonStrict = detectJsonStrict(rawArgs);
   const requestedOutputFormat = detectRequestedOutputFormat(rawArgs, config.format);
   const requestedOutputPolicy = {

@@ -4,6 +4,17 @@
 
 Repo: https://github.com/openclaw/acpx
 
+## 2026.6.23 (v0.11.2)
+
+### Changes
+
+### Breaking
+
+### Fixes
+
+- Runtime/status: persist token usage reported on successful prompt responses,
+  including adapters that only provide a sparse `usage_update`.
+
 ## Unreleased
 
 ### Changes
@@ -11,6 +22,30 @@ Repo: https://github.com/openclaw/acpx
 ### Breaking
 
 ### Fixes
+
+## 2026.6.23 (v0.11.1)
+
+### Changes
+
+- Runtime/embedding: preserve per-agent environment variables across ACP session
+  creation, queue handoff, persistence, and reconnects. Thanks @zhangguiping-xydt.
+
+### Breaking
+
+### Fixes
+
+- CLI/queue: harden command parsing, queue-owner startup, stale process cleanup,
+  and release/CI checks found by `clawpatch`.
+- Windows/Claude: only export a native `.exe` as `CLAUDE_CODE_EXECUTABLE`;
+  unresolved `.cmd`, `.bat`, and `.ps1` shims now fall back to the Claude ACP
+  adapter's bundled native binary. Fixes openclaw/openclaw#93465.
+- Client/ACP: ignore non-object JSON lines from adapter stdout before ACP
+  dispatch, preventing primitive frames from crashing the SDK message path.
+- ACP/models: call the current SDK `session/set_model` method for legacy model
+  metadata instead of the generic extension fallback.
+- CLI/config: add `--mcp-config` for session-scoped MCP servers without writing
+  a project config file. Live persistent sessions reject MCP config changes until
+  closed. Fixes #387.
 
 ## 2026.6.17 (v0.11.0)
 
@@ -26,6 +61,10 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- Runtime/embedding: export a stable typed error and predicate for requested model
+  selectors that an ACP agent does not support, including whether model
+  capability is missing or the requested id is unadvertised, so embedders do not
+  need to match error text.
 - CLI/Claude: isolate built-in Claude ACP sessions from user settings by default so globally enabled channel and daemon plugins cannot interfere with a spawned session. Set `ACPX_CLAUDE_INCLUDE_USER_SETTINGS=1` to restore user settings deliberately. Fixes #361.
 - ACP/models: support SDK 0.25 model config options while preserving `session/set_model` compatibility for adapters that explicitly advertise legacy model metadata.
 - CLI/Claude: let Claude Code adjudicate model selectors missing from a stale advertised model list on later persistent turns, and preserve the adapter-reported current model after model switches. Thanks @oakif.

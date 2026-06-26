@@ -17,6 +17,8 @@ export type QueueOwnerRecord = {
   heartbeatAt: string;
   ownerGeneration: number;
   queueDepth: number;
+  mcpConfigPath?: string;
+  mcpConfigFingerprint?: string;
 };
 
 export type QueueOwnerLease = {
@@ -25,6 +27,8 @@ export type QueueOwnerLease = {
   socketPath: string;
   createdAt: string;
   ownerGeneration: number;
+  mcpConfigPath?: string;
+  mcpConfigFingerprint?: string;
 };
 
 export type QueueOwnerStatus = {
@@ -55,6 +59,10 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     heartbeatAt: record.heartbeatAt,
     ownerGeneration: record.ownerGeneration,
     queueDepth: record.queueDepth,
+    ...(typeof record.mcpConfigPath === "string" ? { mcpConfigPath: record.mcpConfigPath } : {}),
+    ...(typeof record.mcpConfigFingerprint === "string"
+      ? { mcpConfigFingerprint: record.mcpConfigFingerprint }
+      : {}),
   };
 }
 
@@ -160,6 +168,17 @@ async function cleanupStaleQueueOwner(
   });
 }
 
+async function retireStaleQueueOwner(
+  sessionId: string,
+  owner: QueueOwnerRecord | undefined,
+): Promise<void> {
+  if (owner && isProcessAlive(owner.pid)) {
+    await terminateProcess(owner.pid);
+  }
+
+  await cleanupStaleQueueOwner(sessionId, owner);
+}
+
 export async function readQueueOwnerRecord(
   sessionId: string,
 ): Promise<QueueOwnerRecord | undefined> {
@@ -208,12 +227,7 @@ export async function ensureOwnerIsUsable(
     return true;
   }
 
-  if (alive) {
-    await terminateProcess(owner.pid).catch(() => {
-      // best effort stale owner termination
-    });
-  }
-  await cleanupStaleQueueOwner(sessionId, owner);
+  await retireStaleQueueOwner(sessionId, owner);
   return false;
 }
 
@@ -243,12 +257,22 @@ export async function readQueueOwnerStatus(
 
 export async function tryAcquireQueueOwnerLease(
   sessionId: string,
+  mcpConfigOrNowIsoFactory?:
+    | string
+    | {
+        path?: string;
+        fingerprint?: string;
+      }
+    | (() => string),
   nowIsoFactory: () => string = nowIso,
 ): Promise<QueueOwnerLease | undefined> {
+  const { mcpConfigPath, clock } = resolveLeaseArguments(mcpConfigOrNowIsoFactory, nowIsoFactory);
+  const mcpConfigFingerprint = readMcpConfigFingerprint(mcpConfigOrNowIsoFactory);
+  const mcpConfigMetadata = createMcpConfigMetadata(mcpConfigPath, mcpConfigFingerprint);
   await ensureQueueDir();
   const lockPath = queueLockFilePath(sessionId);
   const socketPath = queueSocketPath(sessionId);
-  const createdAt = nowIsoFactory();
+  const createdAt = clock();
   const ownerGeneration = createOwnerGeneration();
   const payload = JSON.stringify(
     {
@@ -259,6 +283,7 @@ export async function tryAcquireQueueOwnerLease(
       heartbeatAt: createdAt,
       ownerGeneration,
       queueDepth: 0,
+      ...mcpConfigMetadata,
     },
     null,
     2,
@@ -278,28 +303,76 @@ export async function tryAcquireQueueOwnerLease(
       socketPath,
       createdAt,
       ownerGeneration,
+      ...mcpConfigMetadata,
     };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-      throw error;
-    }
+    return await handleLeaseCollision(sessionId, error);
+  }
+}
 
-    const owner = await readQueueOwnerRecord(sessionId);
-    if (!owner) {
-      await cleanupStaleQueueOwner(sessionId, owner);
-      return undefined;
-    }
-
-    if (!isProcessAlive(owner.pid) || isQueueOwnerHeartbeatStale(owner)) {
-      if (isProcessAlive(owner.pid)) {
-        await terminateProcess(owner.pid).catch(() => {
-          // best effort stale owner termination
-        });
+function readMcpConfigFingerprint(
+  mcpConfigOrNowIsoFactory:
+    | string
+    | {
+        path?: string;
+        fingerprint?: string;
       }
-      await cleanupStaleQueueOwner(sessionId, owner);
-    }
+    | (() => string)
+    | undefined,
+): string | undefined {
+  return typeof mcpConfigOrNowIsoFactory === "object"
+    ? mcpConfigOrNowIsoFactory?.fingerprint
+    : undefined;
+}
+
+function createMcpConfigMetadata(
+  mcpConfigPath: string | undefined,
+  mcpConfigFingerprint: string | undefined,
+): { mcpConfigPath?: string; mcpConfigFingerprint?: string } {
+  return {
+    ...(mcpConfigPath ? { mcpConfigPath } : {}),
+    ...(mcpConfigFingerprint ? { mcpConfigFingerprint } : {}),
+  };
+}
+
+async function handleLeaseCollision(sessionId: string, error: unknown): Promise<undefined> {
+  if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+    throw error;
+  }
+
+  const owner = await readQueueOwnerRecord(sessionId);
+  if (!owner) {
+    await cleanupStaleQueueOwner(sessionId, owner);
     return undefined;
   }
+
+  if (!isProcessAlive(owner.pid) || isQueueOwnerHeartbeatStale(owner)) {
+    await retireStaleQueueOwner(sessionId, owner);
+  }
+  return undefined;
+}
+
+function resolveLeaseArguments(
+  mcpConfigOrNowIsoFactory:
+    | string
+    | {
+        path?: string;
+        fingerprint?: string;
+      }
+    | (() => string)
+    | undefined,
+  nowIsoFactory: () => string,
+): { mcpConfigPath: string | undefined; clock: () => string } {
+  if (typeof mcpConfigOrNowIsoFactory === "string") {
+    return { mcpConfigPath: mcpConfigOrNowIsoFactory, clock: nowIsoFactory };
+  }
+  if (typeof mcpConfigOrNowIsoFactory === "function") {
+    return { mcpConfigPath: undefined, clock: mcpConfigOrNowIsoFactory };
+  }
+  if (mcpConfigOrNowIsoFactory) {
+    return { mcpConfigPath: mcpConfigOrNowIsoFactory.path, clock: nowIsoFactory };
+  }
+  return { mcpConfigPath: undefined, clock: nowIsoFactory };
 }
 
 export async function refreshQueueOwnerLease(
@@ -318,6 +391,8 @@ export async function refreshQueueOwnerLease(
       heartbeatAt: nowIsoFactory(),
       ownerGeneration: lease.ownerGeneration,
       queueDepth: Math.max(0, Math.round(options.queueDepth)),
+      ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
+      ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
     },
     null,
     2,

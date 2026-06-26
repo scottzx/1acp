@@ -99,11 +99,12 @@ import {
   waitForSpawn,
 } from "./client-process.js";
 import { extractAcpError } from "./error-shapes.js";
-import { isSessionUpdateNotification } from "./jsonrpc.js";
+import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
   modelStateFromConfigOptions,
   modelStateFromSessionResponse,
   RequestedModelUnsupportedError,
+  resolveRequestedModelId,
   type SessionModelState,
 } from "./model-support.js";
 import {
@@ -262,7 +263,8 @@ type SessionUpdateSuppressionState = {
 };
 
 type ModelControl = { kind: "config_option"; configId: string } | { kind: "legacy_set_model" };
-type ModelControlOverride = Pick<SessionModelState, "configId">;
+type ModelControlOverride = Pick<SessionModelState, "configId"> &
+  Partial<Pick<SessionModelState, "availableModels">>;
 
 export type AgentExitInfo = {
   exitCode: number | null;
@@ -328,11 +330,18 @@ function enqueueNdJsonLine(
     return;
   }
   try {
-    const message = JSON.parse(trimmedLine) as AnyMessage;
-    controller.enqueue(message);
+    const message = parseAcpJsonMessageLine(trimmedLine);
+    if (message) {
+      controller.enqueue(message);
+    }
   } catch (err) {
     console.error("Failed to parse JSON message:", trimmedLine, err);
   }
+}
+
+export function parseAcpJsonMessageLine(line: string): AnyMessage | undefined {
+  const message: unknown = JSON.parse(line);
+  return isAcpMessageObject(message) ? message : undefined;
 }
 
 function enqueueNdJsonLines(
@@ -659,7 +668,11 @@ export class AcpClient {
       geminiAcp: isGeminiAcpCommand(spawnCommand, args),
       copilotAcp: isCopilotAcpCommand(spawnCommand, args),
       claudeAcp: isClaudeAcpCommand(spawnCommand, args),
-      spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials),
+      spawnOptions: buildAgentSpawnOptions(
+        this.options.cwd,
+        this.options.authCredentials,
+        this.options.sessionOptions?.env,
+      ),
     };
   }
 
@@ -731,7 +744,11 @@ export class AcpClient {
           if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
             return {};
           }
-          throw RequestError.methodNotFound(method);
+          const error = RequestError.methodNotFound(method);
+          if (!this.options.suppressSdkConsoleErrors) {
+            console.error(error.message);
+          }
+          throw error;
         },
         readTextFile: async (params: ReadTextFileRequest): Promise<ReadTextFileResponse> => {
           return this.handleReadTextFile(params);
@@ -1123,11 +1140,19 @@ export class AcpClient {
     if (!control) {
       throw new RequestedModelUnsupportedError(
         `Cannot set model "${modelId}": the ACP session did not advertise a model config option or legacy session/set_model support.`,
+        "missing-capability",
       );
     }
+    const resolvedModelId = resolveRequestedModelId({
+      requestedModel: modelId,
+      models: controlOverride?.availableModels
+        ? { availableModels: controlOverride.availableModels }
+        : undefined,
+      agentCommand: this.options.agentCommand,
+    });
     return control.kind === "config_option"
-      ? await this.setSessionModelThroughConfig(sessionId, modelId, control.configId)
-      : await this.setSessionModelThroughLegacyMethod(sessionId, modelId);
+      ? await this.setSessionModelThroughConfig(sessionId, resolvedModelId, control.configId)
+      : await this.setSessionModelThroughLegacyMethod(sessionId, resolvedModelId);
   }
 
   private async setSessionModelThroughConfig(

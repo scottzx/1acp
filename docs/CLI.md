@@ -43,6 +43,10 @@ acpx [global_options] <agent> status [-s <name>]
 acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
+The global `--mcp-config <path>` option loads an external JSON file's `mcpServers` array for the
+invocation, replacing project/global MCP configuration. Relative paths resolve from `--cwd`.
+For a persistent session, close the existing session before switching its MCP config.
+
 `<agent>` can be:
 
 - built-in friendly name from [the README](https://github.com/openclaw/acpx/blob/main/README.md)

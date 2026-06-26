@@ -17,6 +17,7 @@ import type {
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
+  ensureOwnerIsUsable,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   terminateQueueOwnerForSession,
@@ -301,6 +302,8 @@ export type SubmitToQueueOwnerOptions = {
   sessionId: string;
   message: string;
   prompt?: PromptInput;
+  mcpConfigPath?: string;
+  mcpConfigFingerprint?: string;
   permissionMode: PermissionMode;
   resumePolicy?: SessionResumePolicy;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
@@ -668,6 +671,33 @@ async function submitCloseSessionToQueueOwner(
   return response.closed;
 }
 
+function queueOwnerMcpConfigMatches(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): boolean {
+  return (
+    owner.mcpConfigPath === options.mcpConfigPath &&
+    owner.mcpConfigFingerprint === options.mcpConfigFingerprint
+  );
+}
+
+function assertQueueOwnerMcpConfigMatches(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): void {
+  if (queueOwnerMcpConfigMatches(owner, options)) {
+    return;
+  }
+  throw new QueueConnectionError(
+    "Session queue owner uses a different MCP config; close the session before retrying",
+    {
+      detailCode: "QUEUE_MCP_CONFIG_CONFLICT",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
@@ -675,6 +705,10 @@ export async function trySubmitToRunningOwner(
   if (!owner) {
     return undefined;
   }
+  if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
+    return undefined;
+  }
+  assertQueueOwnerMcpConfigMatches(owner, options);
 
   let submitted: SessionSendOutcome | undefined;
   try {

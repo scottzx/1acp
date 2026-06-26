@@ -2236,6 +2236,97 @@ test("integration: configured mcpServers are sent to session/new and session/loa
   });
 });
 
+test("integration: --mcp-config loads session-scoped MCP servers", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-mcp-config-cwd-"));
+    const mcpConfigPath = path.join(homeDir, "job-mcp.json");
+    await fs.writeFile(
+      mcpConfigPath,
+      `${JSON.stringify(
+        {
+          mcpServers: [
+            {
+              name: "job-stdio",
+              type: "stdio",
+              command: "./bin/job-mcp",
+              args: ["--serve"],
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--mcp-config",
+          mcpConfigPath,
+          "--format",
+          "json",
+          "exec",
+          "echo mcp-config",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const messages = parseJsonRpcOutputLines(result.stdout);
+      const newSessionRequest = messages.find(
+        (message) => message.method === "session/new" && extractJsonRpcId(message) !== undefined,
+      );
+      assert(newSessionRequest, `expected session/new request in output:\n${result.stdout}`);
+      assert.deepEqual(
+        (newSessionRequest.params as { mcpServers?: unknown } | undefined)?.mcpServers,
+        [
+          {
+            name: "job-stdio",
+            command: "./bin/job-mcp",
+            args: ["--serve"],
+            env: [],
+          },
+        ],
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt text after the command does not trigger --mcp-config loading", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-mcp-config-prompt-cwd-"));
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "--",
+          "--mcp-config",
+          "missing-mcp.json",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /unrecognized prompt: --mcp-config missing-mcp\.json/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: prompt reconnect uses session/resume when advertised", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -5008,6 +5099,62 @@ test("runPromptTurn: post-success drain runs before closing the turn", async () 
     ["prompt", "drain(1000/5000)"],
     "post-success drain must run before runPromptTurn returns",
   );
+});
+
+test("runPromptTurn: prompt response usage is recorded after usage update drain", async () => {
+  const conversation = createSessionConversation();
+  const promptMessageId = recordPromptSubmission(conversation, "hello");
+  assert.ok(promptMessageId);
+
+  const client = {
+    prompt: async () => ({
+      stopReason: "end_turn" as const,
+      usage: {
+        inputTokens: 8,
+        outputTokens: 1317,
+        cachedReadTokens: 68370,
+        cachedWriteTokens: 15156,
+        thoughtTokens: 42,
+        totalTokens: 84893,
+      },
+    }),
+    waitForSessionUpdatesIdle: async () => {
+      recordSessionUpdate(conversation, undefined, {
+        sessionId: "session-response-usage",
+        update: {
+          sessionUpdate: "usage_update",
+          used: 84,
+          size: 1000,
+        },
+      });
+    },
+  };
+
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-response-usage",
+    prompt: "hello",
+    conversation,
+    promptMessageId,
+  });
+
+  assert.equal(result.source, "rpc");
+  assert.deepEqual(conversation.cumulative_token_usage, {
+    input_tokens: 8,
+    output_tokens: 1317,
+    cache_read_input_tokens: 68370,
+    cache_creation_input_tokens: 15156,
+    thought_tokens: 42,
+    total_tokens: 84893,
+  });
+  assert.deepEqual(conversation.request_token_usage[promptMessageId], {
+    input_tokens: 8,
+    output_tokens: 1317,
+    cache_read_input_tokens: 68370,
+    cache_creation_input_tokens: 15156,
+    thought_tokens: 42,
+    total_tokens: 84893,
+  });
 });
 
 test("runPromptTurn: late session updates after successful prompt reach the drain", async () => {

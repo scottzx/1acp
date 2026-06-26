@@ -7,6 +7,7 @@ import {
   AcpClient,
   buildAgentSpawnOptions,
   buildQoderAcpCommandArgs,
+  parseAcpJsonMessageLine,
   resolveClaudeCodeSettingSources,
   resolveAgentCloseAfterStdinEndMs,
   shouldIgnoreNonJsonAgentOutputLine,
@@ -19,6 +20,19 @@ import {
   PermissionPromptUnavailableError,
   UnsupportedPromptContentError,
 } from "../src/errors.js";
+
+test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
+  for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
+    assert.equal(parseAcpJsonMessageLine(line), undefined);
+  }
+});
+
+test("parseAcpJsonMessageLine preserves object-shaped protocol values", () => {
+  assert.deepEqual(parseAcpJsonMessageLine('{"jsonrpc":"2.0","method":"session/update"}'), {
+    jsonrpc: "2.0",
+    method: "session/update",
+  });
+});
 
 type ClientInternals = {
   selectAuthMethod?: (methods: Array<{ id: string }>) =>
@@ -867,6 +881,23 @@ test("AcpClient setSessionModel honors an advertised custom config id", async ()
 
   await client.setSessionModel("session-456", "GPT-5-2", { configId: "llm" });
   assert.equal(capturedConfigId, "llm");
+});
+
+test("AcpClient normalizes a Cursor model alias to its unique advertised id", async () => {
+  const client = makeClient({ agentCommand: "cursor-agent acp" });
+  let capturedValue: string | undefined;
+  asInternals(client).connection = {
+    setSessionConfigOption: async (params: { value: string }) => {
+      capturedValue = params.value;
+      return { configOptions: [] };
+    },
+  };
+
+  await client.setSessionModel("session-456", "composer-2.5", {
+    configId: "model",
+    availableModels: [{ modelId: "composer-2.5[fast=false]", name: "Composer 2.5" }],
+  });
+  assert.equal(capturedValue, "composer-2.5[fast=false]");
 });
 
 test("AcpClient setSessionModel rejects sessions without advertised model control", async () => {

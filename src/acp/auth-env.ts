@@ -39,38 +39,99 @@ export function readEnvCredential(methodId: string): string | undefined {
   return undefined;
 }
 
-function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): void {
+function protectedEnvKey(key: string): string {
+  return process.platform === "win32" ? key.toUpperCase() : key;
+}
+
+function isAuthEnvKey(key: string): boolean {
+  return protectedEnvKey(key).startsWith(AUTH_ENV_PREFIX);
+}
+
+function authEnvSuffix(key: string): string {
+  return key.slice(AUTH_ENV_PREFIX.length);
+}
+
+function protectEnvKey(protectedKeys: Set<string>, key: string): void {
+  protectedKeys.add(protectedEnvKey(key));
+}
+
+function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): Set<string> {
+  const protectedKeys = new Set<string>();
   for (const [key, value] of Object.entries(env)) {
-    if (!key.startsWith(AUTH_ENV_PREFIX)) {
+    if (!isAuthEnvKey(key)) {
       continue;
     }
     if (typeof value !== "string" || value.trim().length === 0) {
       continue;
     }
 
-    const normalized = key.slice(AUTH_ENV_PREFIX.length);
-    if (!normalized || env[normalized] != null) {
+    const normalized = toEnvToken(authEnvSuffix(key));
+    if (!normalized) {
       continue;
     }
 
-    env[normalized] = value;
+    protectEnvKey(protectedKeys, key);
+    protectEnvKey(protectedKeys, normalized);
+    if (env[normalized] == null) {
+      env[normalized] = value;
+    }
   }
+  return protectedKeys;
 }
 
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
+  sessionEnv: Record<string, string> | undefined,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  promotePrefixedAuthEnvironment(env);
-  if (!authCredentials) {
-    return env;
+  const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
+  if (authCredentials) {
+    for (const [methodId, credential] of Object.entries(authCredentials)) {
+      addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
+      assignAuthCredentialEnv(env, methodId, credential);
+    }
   }
 
-  for (const [methodId, credential] of Object.entries(authCredentials)) {
-    assignAuthCredentialEnv(env, methodId, credential);
+  if (sessionEnv) {
+    for (const [key, value] of Object.entries(sessionEnv)) {
+      if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) {
+        continue;
+      }
+      assignSessionEnv(env, key, value);
+    }
   }
 
   return env;
+}
+
+function assignSessionEnv(env: NodeJS.ProcessEnv, key: string, value: string): void {
+  const normalizedKey = protectedEnvKey(key);
+  for (const existingKey of Object.keys(env)) {
+    if (protectedEnvKey(existingKey) === normalizedKey) {
+      delete env[existingKey];
+    }
+  }
+  env[key] = value;
+}
+
+function addAuthCredentialEnvKeys(
+  protectedKeys: Set<string>,
+  methodId: string,
+  credential: string,
+): void {
+  if (typeof credential !== "string" || credential.trim().length === 0) {
+    return;
+  }
+
+  if (!methodId.includes("=") && !methodId.includes("\u0000")) {
+    protectEnvKey(protectedKeys, methodId);
+  }
+
+  const normalized = toEnvToken(methodId);
+  if (normalized) {
+    protectEnvKey(protectedKeys, `${AUTH_ENV_PREFIX}${normalized}`);
+    protectEnvKey(protectedKeys, normalized);
+  }
 }
 
 function assignAuthCredentialEnv(
@@ -110,6 +171,7 @@ export function resolveConfiguredAuthCredential(
 export function buildAgentSpawnOptions(
   cwd: string,
   authCredentials: Record<string, string> | undefined,
+  sessionEnv?: Record<string, string>,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -118,7 +180,7 @@ export function buildAgentSpawnOptions(
 } {
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials),
+    env: buildAgentEnvironment(authCredentials, sessionEnv),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };

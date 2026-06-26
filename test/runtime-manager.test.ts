@@ -4,7 +4,11 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import type { SessionModelState } from "../src/acp/model-support.js";
 import { AcpxOperationalError } from "../src/errors.js";
 import { AcpRuntimeManager } from "../src/runtime/engine/manager.js";
-import { persistSessionOptions } from "../src/runtime/engine/session-options.js";
+import {
+  mergeSessionOptions,
+  persistSessionOptions,
+  sessionOptionsFromRecord,
+} from "../src/runtime/engine/session-options.js";
 import type {
   AcpRuntimeEvent,
   AcpRuntimeHandle,
@@ -76,6 +80,7 @@ type FakeClient = {
     input: unknown,
   ) => Promise<{
     stopReason: string;
+    usage?: Record<string, unknown>;
   }>;
   closeSession?: (sessionId: string) => Promise<void>;
   waitForSessionUpdatesIdle?: (options?: { idleMs?: number; timeoutMs?: number }) => Promise<void>;
@@ -389,6 +394,187 @@ test("AcpRuntimeManager streams runtime events and saves updated status", async 
   assert.equal(saved?.lastPromptAt != null, true);
   assert.equal(saved?.pid, 999);
   assert.equal(saved?.protocolVersion, 1);
+});
+
+test("AcpRuntimeManager persists prompt response usage and surfaces it in status", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "response-usage-session",
+    acpSessionId: "response-usage-sid",
+    agentCommand: "claude --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([record]);
+  let handlers: FakeClientHandlers = {};
+  const client: FakeClient = {
+    initializeResult: {
+      protocolVersion: 1,
+      agentCapabilities: { prompt: true },
+    },
+    start: async () => {},
+    close: async () => {},
+    createSession: async () => ({ sessionId: "unused" }),
+    loadSession: async () => ({ agentSessionId: "unused" }),
+    hasReusableSession: (sessionId) => sessionId === "response-usage-sid",
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+    getAgentLifecycleSnapshot: () => ({ running: true }),
+    prompt: async (sessionId) => {
+      assert.equal(sessionId, "response-usage-sid");
+      return {
+        stopReason: "end_turn",
+        usage: {
+          inputTokens: 8,
+          outputTokens: 1317,
+          cachedReadTokens: 68370,
+          cachedWriteTokens: 15156,
+          thoughtTokens: 42,
+          totalTokens: 84893,
+        },
+      };
+    },
+    waitForSessionUpdatesIdle: async () => {
+      handlers.onSessionUpdate?.({
+        sessionId: "response-usage-sid",
+        update: {
+          sessionUpdate: "usage_update",
+          used: 84,
+          size: 1000,
+        },
+      });
+    },
+    requestCancelActivePrompt: async () => false,
+    hasActivePrompt: () => false,
+    setSessionMode: async () => {},
+    setSessionConfigOption: async () => {},
+    clearEventHandlers: () => {
+      handlers = {};
+    },
+    setEventHandlers: (nextHandlers) => {
+      handlers = nextHandlers;
+    },
+  };
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () => client as never,
+    },
+  );
+
+  const turn = manager.startTurn({
+    handle: createHandle("response-usage-session"),
+    text: "hello",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "req-response-usage",
+  });
+  const { result } = await collectTurn(turn);
+
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+  const saved = await store.load("response-usage-session");
+  assert.ok(saved);
+  const userMessage = saved.messages.find(
+    (message) => typeof message === "object" && "User" in message,
+  );
+  assert.ok(typeof userMessage === "object" && userMessage !== null && "User" in userMessage);
+  const userId = userMessage.User.id;
+
+  assert.deepEqual(saved.cumulative_token_usage, {
+    input_tokens: 8,
+    output_tokens: 1317,
+    cache_read_input_tokens: 68370,
+    cache_creation_input_tokens: 15156,
+    thought_tokens: 42,
+    total_tokens: 84893,
+  });
+  assert.deepEqual(saved.request_token_usage[userId], saved.cumulative_token_usage);
+
+  const status = await manager.getStatus(createHandle("response-usage-session"));
+  assert.deepEqual(status.usage, {
+    cumulative: {
+      inputTokens: 8,
+      outputTokens: 1317,
+      cachedReadTokens: 68370,
+      cachedWriteTokens: 15156,
+      thoughtTokens: 42,
+      totalTokens: 84893,
+    },
+    perRequest: {
+      [userId]: {
+        inputTokens: 8,
+        outputTokens: 1317,
+        cachedReadTokens: 68370,
+        cachedWriteTokens: 15156,
+        thoughtTokens: 42,
+        totalTokens: 84893,
+      },
+    },
+  });
+});
+
+test("AcpRuntimeManager restores persisted session env when reconnecting startTurn", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "turn-env-session",
+    acpSessionId: "turn-env-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      session_options: {
+        env: {
+          GIT_AUTHOR_EMAIL: "turn-env@example.local",
+        },
+      },
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  const factoryCalls: unknown[] = [];
+  const client: FakeClient = {
+    initializeResult: { protocolVersion: 1, agentCapabilities: { prompt: true } },
+    start: async () => {},
+    close: async () => {},
+    createSession: async () => ({ sessionId: "unused" }),
+    loadSession: async () => ({ agentSessionId: "unused" }),
+    hasReusableSession: () => false,
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => ({ agentSessionId: "turn-env-agent" }),
+    getAgentLifecycleSnapshot: () => ({ running: true }),
+    prompt: async (sessionId) => {
+      assert.equal(sessionId, "turn-env-sid");
+      return { stopReason: "end_turn" };
+    },
+    requestCancelActivePrompt: async () => false,
+    hasActivePrompt: () => false,
+    setSessionMode: async () => {},
+    setSessionConfigOption: async () => {},
+    clearEventHandlers: () => {},
+    setEventHandlers: () => {},
+  };
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: (options) => {
+        factoryCalls.push(options);
+        return client as never;
+      },
+    },
+  );
+
+  const turn = manager.startTurn({
+    handle: createHandle("turn-env-session"),
+    text: "hello",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "req-env",
+  });
+  const { result } = await collectTurn(turn);
+
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+  assert.deepEqual((factoryCalls[0] as { sessionOptions?: unknown }).sessionOptions, {
+    env: {
+      GIT_AUTHOR_EMAIL: "turn-env@example.local",
+    },
+  });
 });
 
 test("AcpRuntimeManager keeps reusable persistent clients pooled across turns and closes them on runtime close", async () => {
@@ -2793,6 +2979,7 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
     allowed_tools: undefined,
     max_turns: undefined,
     system_prompt: "Be terse.",
+    env: undefined,
   });
 });
 
@@ -2864,6 +3051,7 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
     allowed_tools: ["read", "edit"],
     max_turns: 5,
     system_prompt: { append: "Also review tests." },
+    env: undefined,
   });
 });
 
@@ -2882,6 +3070,76 @@ test("persistSessionOptions preserves an explicit empty allowedTools list", () =
     allowed_tools: [],
     max_turns: undefined,
     system_prompt: undefined,
+    env: undefined,
+  });
+});
+
+test("persistSessionOptions preserves session env as a serialized record", () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "env-session",
+    acpSessionId: "env-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+  });
+
+  persistSessionOptions(record, {
+    env: {
+      GIT_AUTHOR_EMAIL: "agent-pm@example.local",
+      GIT_COMMITTER_NAME: "Agent PM",
+    },
+  });
+
+  assert.deepEqual(record.acpx?.session_options, {
+    model: undefined,
+    allowed_tools: undefined,
+    max_turns: undefined,
+    system_prompt: undefined,
+    env: {
+      GIT_AUTHOR_EMAIL: "agent-pm@example.local",
+      GIT_COMMITTER_NAME: "Agent PM",
+    },
+  });
+});
+
+test("sessionOptionsFromRecord restores session env from a persisted record", () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "env-restore-session",
+    acpSessionId: "env-restore-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      session_options: {
+        env: {
+          GIT_AUTHOR_EMAIL: "restored-pm@example.local",
+        },
+      },
+    },
+  });
+
+  const restored = sessionOptionsFromRecord(record);
+  assert.deepEqual(restored?.env, { GIT_AUTHOR_EMAIL: "restored-pm@example.local" });
+});
+
+test("mergeSessionOptions merges session env per key with preferred overriding fallback", () => {
+  const merged = mergeSessionOptions(
+    {
+      env: {
+        GIT_AUTHOR_EMAIL: "preferred@example.local",
+        PREFERRED_ONLY: "preferred",
+      },
+    },
+    {
+      env: {
+        GIT_AUTHOR_EMAIL: "fallback@example.local",
+        FALLBACK_ONLY: "fallback",
+      },
+    },
+  );
+
+  assert.deepEqual(merged?.env, {
+    GIT_AUTHOR_EMAIL: "preferred@example.local",
+    PREFERRED_ONLY: "preferred",
+    FALLBACK_ONLY: "fallback",
   });
 });
 

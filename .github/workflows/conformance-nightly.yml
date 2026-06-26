@@ -18,7 +18,7 @@ on:
 
 concurrency:
   group: conformance-nightly-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   NODE_VERSION: 24
@@ -32,14 +32,14 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 1
           fetch-tags: false
           submodules: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.0.8
+        uses: pnpm/action-setup@v6.0.9
         with:
           version: ${{ env.PNPM_VERSION }}
 
@@ -96,6 +96,7 @@ jobs:
     continue-on-error: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.strict_real_adapters == 'true') }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - id: pi
@@ -106,14 +107,14 @@ jobs:
             command: "npx -y @zed-industries/claude-agent-acp"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 1
           fetch-tags: false
           submodules: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6.0.8
+        uses: pnpm/action-setup@v6.0.9
         with:
           version: ${{ env.PNPM_VERSION }}
 
