@@ -59,6 +59,43 @@ function unregisterAgentSessionMapping(handle) {
 }
 
 // ----------------------------------------------------
+// Tool display name helpers
+// ----------------------------------------------------
+
+// Map ACP tool-kind values to friendly display names used in the chat UI.
+// This prevents agents like Codex from leaking the raw command string as
+// the tool "name" — the command belongs in the arguments/summary row instead.
+const TOOL_KIND_LABELS = {
+  execute: "Bash",
+  read: "Read",
+  edit: "Edit",
+  delete: "Delete",
+  move: "Move",
+  search: "Search",
+  fetch: "Fetch",
+  think: "Think",
+  other: "Tool",
+};
+
+/**
+ * Derive the best human-readable tool name to surface in the chat card header.
+ *
+ * Priority:
+ *  1. event.toolName – explicitly set by claudeCode adapter via _meta
+ *  2. TOOL_KIND_LABELS[event.kind] – semantic kind → friendly label (covers Codex)
+ *  3. event.title – only when it looks like a proper name (no spaces, ≤40 chars)
+ *  4. "Tool" fallback
+ */
+function resolveToolDisplayName(event) {
+  if (event.toolName) {return event.toolName;}
+  if (event.kind && TOOL_KIND_LABELS[event.kind]) {return TOOL_KIND_LABELS[event.kind];}
+  const title = event.title || event.text || "";
+  // Use title only when it looks like an identifier (no whitespace, reasonable length)
+  if (title && !/\s/.test(title) && title.length <= 40) {return title;}
+  return "Tool";
+}
+
+// ----------------------------------------------------
 // Permission helpers
 // ----------------------------------------------------
 
@@ -947,7 +984,7 @@ function runPromptTurn(session, sessionId, promptItem) {
             JSON.stringify({
               event: "tool_call",
               sessionId,
-              toolName: event.toolName || event.title || event.text || "tool",
+              toolName: resolveToolDisplayName(event),
               toolCallId: event.toolCallId,
               ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
             }),
@@ -969,7 +1006,7 @@ function runPromptTurn(session, sessionId, promptItem) {
                 event: "tool_result",
                 sessionId,
                 toolCallId: event.toolCallId,
-                toolName: event.toolName || event.title || event.text || "tool",
+                toolName: resolveToolDisplayName(event),
                 text: textContent,
                 isError: event.status === "failed",
               }),
@@ -1128,7 +1165,7 @@ async function handlePermissionRequestCallback(req, ctx) {
         sessionId: clientSessionId,
         requestId,
         toolCallId: req.raw.toolCall.toolCallId,
-        toolName: req.raw.toolCall.title || "Unknown Tool",
+        toolName: resolveToolDisplayName(req.raw.toolCall),
         arguments: req.raw.toolCall.rawInput || {},
       },
     });
@@ -1152,7 +1189,7 @@ async function handlePermissionRequestCallback(req, ctx) {
         sessionId: clientSessionId,
         requestId,
         toolCallId: req.raw.toolCall.toolCallId,
-        toolName: req.raw.toolCall.title || "Unknown Tool",
+        toolName: resolveToolDisplayName(req.raw.toolCall),
         arguments: req.raw.toolCall.rawInput || {},
       }),
     );
