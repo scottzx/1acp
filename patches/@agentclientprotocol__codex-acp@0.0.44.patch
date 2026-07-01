@@ -1,8 +1,29 @@
 diff --git a/dist/index.js b/dist/index.js
-index 1b1f5d508f39ec47ff1826516f9c106a02004cf9..599361b2c5d7c1adea92a4e3f0a0cfd98210d352 100755
+index 1b1f5d508f39ec47ff1826516f9c106a02004cf9..8007ca57092c6507ca5c377fda9c8450931ad1bc 100755
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -19306,11 +19306,18 @@ var CodexAcpClient = class {
+@@ -19203,6 +19203,9 @@ var CodexAcpClient = class {
+   }
+   async newSession(request) {
+     await this.refreshSkills(request.cwd, request._meta);
++    const __acpxSystemPrompt = request._meta?.systemPrompt;
++    const __acpxBaseInstructions = typeof __acpxSystemPrompt === "string" ? __acpxSystemPrompt : null;
++    const __acpxDeveloperInstructions = __acpxSystemPrompt && typeof __acpxSystemPrompt === "object" && typeof __acpxSystemPrompt.append === "string" ? __acpxSystemPrompt.append : null;
+     const response = await this.codexClient.threadStart({
+       config: await this.createSessionConfig(request.cwd, request.mcpServers),
+       modelProvider: this.getModelProvider(),
+@@ -19210,8 +19213,8 @@ var CodexAcpClient = class {
+       cwd: request.cwd,
+       approvalPolicy: null,
+       sandbox: null,
+-      baseInstructions: null,
+-      developerInstructions: null,
++      baseInstructions: __acpxBaseInstructions,
++      developerInstructions: __acpxDeveloperInstructions,
+       personality: null,
+       ephemeral: null
+     });
+@@ -19306,11 +19309,18 @@ var CodexAcpClient = class {
     * Falls back to model defaults if parameters are missing or unsupported.
     */
    createModelId(availableModels, modelId, reasoningEffort) {
