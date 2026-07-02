@@ -9,6 +9,11 @@ import { createAcpRuntime, createRuntimeStore, createAgentRegistry } from "./src
 // ----------------------------------------------------
 const PORT = process.env.ACPX_PORT ? Number.parseInt(process.env.ACPX_PORT, 10) : 38082;
 const DEFAULT_STATE_DIR = path.join(os.homedir(), ".1agents", "acpx-state");
+// "总是允许" allowlists are project-level: one file per workspace, stored inside
+// the project folder (see allowRulesFile). Shared by every session in that
+// project and living on disk means a recorded rule survives idle-reap, resume
+// and bridge restart — the very cases where the agent's own allowlist is lost.
+const ALLOW_RULES_FILENAME = path.join(".1agents", "allow-rules.json");
 
 console.log(`[acpx-server] Starting server on port ${PORT}...`);
 
@@ -87,11 +92,17 @@ const TOOL_KIND_LABELS = {
  *  4. "Tool" fallback
  */
 function resolveToolDisplayName(event) {
-  if (event.toolName) {return event.toolName;}
-  if (event.kind && TOOL_KIND_LABELS[event.kind]) {return TOOL_KIND_LABELS[event.kind];}
+  if (event.toolName) {
+    return event.toolName;
+  }
+  if (event.kind && TOOL_KIND_LABELS[event.kind]) {
+    return TOOL_KIND_LABELS[event.kind];
+  }
   const title = event.title || event.text || "";
   // Use title only when it looks like an identifier (no whitespace, reasonable length)
-  if (title && !/\s/.test(title) && title.length <= 40) {return title;}
+  if (title && !/\s/.test(title) && title.length <= 40) {
+    return title;
+  }
   return "Tool";
 }
 
@@ -128,6 +139,99 @@ function normalizePermissionOutcome(behavior) {
       );
       return "reject_once";
   }
+}
+
+// ── "总是允许" persistent allowlist (project-level) ─────────────────────────
+// A single click on 总是允许 records a "tool + argument prefix" rule for the
+// whole project; future matching requests are auto-allowed without a card.
+// Granularity is intentionally coarse-but-safe: command tools key on the first
+// two command tokens (so every `git commit …` matches, but `git push …` still
+// prompts); file tools key on the target path; anything else falls back to the
+// tool name. Rules are read fresh from disk on each check (no in-memory cache),
+// so concurrent sessions in the same project share them immediately and writes
+// never clobber each other.
+
+function firstString(obj, keys) {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && v.trim() !== "") {
+      return v;
+    }
+  }
+  return null;
+}
+
+function permissionRuleKey(toolName, rawInput) {
+  const name = toolName || "Tool";
+  const input =
+    typeof rawInput === "string"
+      ? { command: rawInput }
+      : rawInput && typeof rawInput === "object"
+        ? rawInput
+        : {};
+  let sig = "";
+  const command = firstString(input, ["command", "cmd", "script", "command_line", "commandLine"]);
+  if (command) {
+    // First two whitespace tokens → e.g. "git commit", "npm run".
+    sig = command.trim().split(/\s+/).slice(0, 2).join(" ");
+  } else {
+    const targetPath = firstString(input, [
+      "file_path",
+      "filePath",
+      "path",
+      "abspath",
+      "absolute_path",
+    ]);
+    if (targetPath) {
+      sig = targetPath.trim();
+    }
+  }
+  // A single space joins the two fields; tool names are whitespace-free
+  // identifiers, so the first space is always the name|prefix boundary.
+  return `${name} ${sig}`;
+}
+
+function allowRulesFile(workspacePath) {
+  return path.join(workspacePath, ALLOW_RULES_FILENAME);
+}
+
+function loadAllowRules(workspacePath) {
+  try {
+    const arr = JSON.parse(fs.readFileSync(allowRulesFile(workspacePath), "utf8"));
+    if (Array.isArray(arr)) {
+      return new Set(arr.filter((x) => typeof x === "string"));
+    }
+  } catch {
+    // Missing or corrupt file → no rules yet.
+  }
+  return new Set();
+}
+
+function isAllowRuleMatched(workspacePath, ruleKey) {
+  if (!workspacePath) {
+    return false;
+  }
+  return loadAllowRules(workspacePath).has(ruleKey);
+}
+
+// Union the new rule into the on-disk set (read-merge-write) so a concurrent
+// session's rules are never clobbered. Returns true if it was newly added.
+function addAllowRule(workspacePath, ruleKey) {
+  if (!workspacePath || !ruleKey) {
+    return false;
+  }
+  const rules = loadAllowRules(workspacePath);
+  if (rules.has(ruleKey)) {
+    return false;
+  }
+  rules.add(ruleKey);
+  try {
+    fs.mkdirSync(path.dirname(allowRulesFile(workspacePath)), { recursive: true });
+    fs.writeFileSync(allowRulesFile(workspacePath), JSON.stringify([...rules]), "utf8");
+  } catch (err) {
+    console.warn(`[acpx-server] Failed to persist allow rule for ${workspacePath}:`, err.message);
+  }
+  return true;
 }
 
 // Map of pending permission requests
@@ -650,6 +754,16 @@ wss.on("connection", (ws) => {
           // shorthand from older clients. Anything unrecognized falls back
           // to reject_once — better to deny than to misforward intent.
           const outcome = normalizePermissionOutcome(behavior);
+
+          // "总是允许" → persist a project-level rule so future matching calls
+          // skip the prompt (survives reap/resume/restart). We still forward
+          // allow_always to the agent so its own allowlist records it too.
+          if (outcome === "allow_always" && addAllowRule(pending.workspacePath, pending.ruleKey)) {
+            console.log(
+              `[acpx-server] Recorded allow_always rule (${pending.ruleKey}) for project ${pending.workspacePath}`,
+            );
+          }
+
           pending.resolve({ outcome });
           break;
         }
@@ -819,6 +933,38 @@ wss.on("connection", (ws) => {
               items,
             }),
           );
+          break;
+        }
+
+        case "cancel_turn": {
+          // Composer "停止": stop generating without tearing the session down.
+          // Cancels the active turn and drops any queued prompts, but keeps
+          // the session in activeSessions so the user can immediately continue
+          // the conversation. (Full teardown is close_session, below.) The
+          // cancelled turn settles with status "cancelled", so runPromptTurn
+          // emits a normal `done` — no error is surfaced to the client.
+          if (!sessionId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId is required");
+            return;
+          }
+
+          const session = activeSessions.get(sessionId);
+          if (!session) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+
+          // Drop the queue first so the active turn's finally block doesn't
+          // auto-start a queued prompt after we cancel it.
+          cancelSessionQueue(session, sessionId);
+          if (session.activeTurn) {
+            try {
+              await session.activeTurn.cancel({ reason: "Stopped by user" });
+            } catch (err) {
+              console.error(`[acpx-server] Error cancelling turn for ${sessionId}:`, err);
+            }
+          }
+          console.log(`[acpx-server] Cancelled active turn for session: ${sessionId}`);
           break;
         }
 
@@ -1041,6 +1187,13 @@ function runPromptTurn(session, sessionId, promptItem) {
             }),
           );
         } else {
+          // A user "停止" cancels the turn (status "cancelled"); a natural
+          // finish is "completed". Both end with `done`, but the cancelled
+          // one carries `stopped: true` so the Go side records the partial
+          // reply without flipping the task to Completed (a manual stop must
+          // not change task status).
+          const stopped = result.status === "cancelled";
+
           // Retrieve status summary for ending message
           let summary = "Execution completed successfully.";
           try {
@@ -1055,6 +1208,7 @@ function runPromptTurn(session, sessionId, promptItem) {
               event: "done",
               sessionId,
               summary,
+              ...(stopped ? { stopped: true } : {}),
             }),
           );
         }
@@ -1126,6 +1280,22 @@ async function handlePermissionRequestCallback(req, ctx) {
     return { outcome: "reject_once" };
   }
 
+  // Project-level "总是允许" allowlist: a prior allow_always for this
+  // tool+prefix auto-approves without prompting again. Read fresh from the
+  // project file so it survives reap/resume/restart and is shared across
+  // sessions in the same project.
+  const workspacePath = session.handle?.cwd;
+  const ruleKey = permissionRuleKey(
+    resolveToolDisplayName(req.raw.toolCall),
+    req.raw.toolCall.rawInput,
+  );
+  if (isAllowRuleMatched(workspacePath, ruleKey)) {
+    console.log(
+      `[acpx-server] permission allowlisted (${ruleKey}) → auto allow_once for ${req.raw.toolCall.title}`,
+    );
+    return { outcome: "allow_once" };
+  }
+
   const requestId = `perm_${nextRequestId++}`;
   console.log(
     `[acpx-server] Intercepted permission request: ${req.raw.toolCall.title}. RequestId: ${requestId} for client session: ${clientSessionId}`,
@@ -1160,6 +1330,10 @@ async function handlePermissionRequestCallback(req, ctx) {
       reject,
       timer,
       sessionId: clientSessionId,
+      // Captured at request time so an allow_always response records the exact
+      // same rule against the same project file (no recomputation drift).
+      ruleKey,
+      workspacePath,
       payload: {
         event: "permission_request",
         sessionId: clientSessionId,
