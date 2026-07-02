@@ -3,6 +3,7 @@ import path from "node:path";
 import { AcpClient } from "../../acp/client.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
+import { modeStateFromConfigOptions } from "../../acp/mode-support.js";
 import { modelStateFromConfigOptions } from "../../acp/model-support.js";
 import { withTimeout } from "../../async-control.js";
 import { textPrompt, type PromptInput } from "../../prompt-content.js";
@@ -47,6 +48,7 @@ import type {
   AcpRuntimeOptions,
   AcpRuntimePromptMode,
   AcpRuntimeSessionModels,
+  AcpRuntimeSessionModes,
   AcpRuntimeSessionUsage,
   AcpRuntimeStatus,
   AcpRuntimeTurnAttachment,
@@ -296,6 +298,23 @@ function buildModelsField(record: SessionRecord): { models?: AcpRuntimeSessionMo
     models: {
       ...(currentModelId !== undefined ? { currentModelId } : {}),
       availableModelIds: [...available],
+    },
+  };
+}
+
+function buildModesField(record: SessionRecord): { modes?: AcpRuntimeSessionModes } {
+  // availableModes come from the persisted mode select config option; the
+  // live current_mode_update (persisted as acpx.current_mode_id) wins over
+  // the option's snapshot currentValue when both exist.
+  const modes = modeStateFromConfigOptions(record.acpx?.config_options);
+  if (!modes) {
+    return {};
+  }
+  const liveModeId = record.acpx?.current_mode_id;
+  return {
+    modes: {
+      ...modes,
+      ...(liveModeId ? { currentModeId: liveModeId } : {}),
     },
   };
 }
@@ -685,24 +704,9 @@ export class AcpRuntimeManager {
   }): Promise<SessionRecord> {
     const cwd = path.resolve(input.cwd?.trim() || this.options.cwd);
     const agentCommand = this.options.agentRegistry.resolve(input.agent);
-    const existing = await this.options.sessionStore.load(input.sessionKey);
-    if (
-      input.mode === "persistent" &&
-      existing &&
-      shouldReuseExistingRecord(existing, {
-        cwd,
-        agentCommand,
-        resumeSessionId: input.resumeSessionId,
-      })
-    ) {
-      // sessionOptions on a reused record are intentionally ignored: system
-      // prompts are fixed at newSession time; callers who need a different
-      // prompt must use a distinct sessionKey or close the prior record.
-      existing.closed = false;
-      existing.closedAt = undefined;
-      this.closingActiveRecords.delete(existing.acpxRecordId);
-      await this.options.sessionStore.save(existing);
-      return existing;
+    const reused = await this.reuseExistingRecord(input, cwd, agentCommand);
+    if (reused) {
+      return reused;
     }
 
     const client = this.createClient({
@@ -711,10 +715,7 @@ export class AcpRuntimeManager {
       // Per-session mcpServers (e.g. the AI Project Manager's project-locked
       // task tools) are appended to the runtime-level servers for this new
       // session's client.
-      mcpServers: [
-        ...(this.options.mcpServers ?? []),
-        ...(input.sessionOptions?.mcpServers ?? []),
-      ],
+      mcpServers: [...(this.options.mcpServers ?? []), ...(input.sessionOptions?.mcpServers ?? [])],
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
@@ -740,6 +741,36 @@ export class AcpRuntimeManager {
         await client.close();
       }
     }
+  }
+
+  // Reopen the persisted record when it still matches this ensure request.
+  // sessionOptions on a reused record are intentionally ignored: system
+  // prompts are fixed at newSession time; callers who need a different
+  // prompt must use a distinct sessionKey or close the prior record.
+  private async reuseExistingRecord(
+    input: { sessionKey: string; mode: "persistent" | "oneshot"; resumeSessionId?: string },
+    cwd: string,
+    agentCommand: string,
+  ): Promise<SessionRecord | undefined> {
+    if (input.mode !== "persistent") {
+      return undefined;
+    }
+    const existing = await this.options.sessionStore.load(input.sessionKey);
+    if (
+      !existing ||
+      !shouldReuseExistingRecord(existing, {
+        cwd,
+        agentCommand,
+        resumeSessionId: input.resumeSessionId,
+      })
+    ) {
+      return undefined;
+    }
+    existing.closed = false;
+    existing.closedAt = undefined;
+    this.closingActiveRecords.delete(existing.acpxRecordId);
+    await this.options.sessionStore.save(existing);
+    return existing;
   }
 
   private async createAndSaveRuntimeRecord(params: {
@@ -1304,6 +1335,7 @@ export class AcpRuntimeManager {
       backendSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
       ...buildModelsField(record),
+      ...buildModesField(record),
       ...buildUsageField(record),
       ...buildAvailableCommandsField(record),
       details: {

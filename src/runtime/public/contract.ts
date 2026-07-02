@@ -89,6 +89,28 @@ export type AcpRuntimeSessionModels = {
 };
 
 /**
+ * One session mode the agent advertised (ACP `SessionMode`). `name` is the
+ * agent-facing display label; ids differ across agents (Claude Code:
+ * default/acceptEdits/plan/..., Codex: read-only/agent/...), so consumers
+ * must render data-driven rather than assume a fixed id set.
+ */
+export type AcpRuntimeSessionModeInfo = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
+/**
+ * Session-mode state extracted from the persisted record: the mode select
+ * config option supplies `availableModes`; the last `current_mode_update`
+ * (or the option's currentValue) supplies `currentModeId`.
+ */
+export type AcpRuntimeSessionModes = {
+  currentModeId?: string;
+  availableModes: AcpRuntimeSessionModeInfo[];
+};
+
+/**
  * Cumulative session cost as reported by the agent. Mirrors ACP's
  * `Cost`, but both fields are optional here because not every adapter
  * populates them on every event.
@@ -144,6 +166,12 @@ export type AcpRuntimeStatus = {
   backendSessionId?: string;
   agentSessionId?: string;
   models?: AcpRuntimeSessionModels;
+  /**
+   * Session modes the agent advertised, plus the current one. Parsed from
+   * the persisted record's config options / current_mode_id; absent when
+   * the agent never advertised a mode select (mode-less agents).
+   */
+  modes?: AcpRuntimeSessionModes;
   /** Token usage and cost from the persisted session record. */
   usage?: AcpRuntimeSessionUsage;
   /**
@@ -192,6 +220,12 @@ export type AcpRuntimeEvent =
        * non-null `input` schema.
        */
       availableCommands?: AcpRuntimeAvailableCommand[];
+      /**
+       * Populated on `current_mode_update` events: the mode the agent
+       * switched to (e.g. plan → default after ExitPlanMode). Consumers
+       * that mirror mode state should treat this as authoritative.
+       */
+      currentModeId?: string;
     }
   | {
       type: "tool_call";

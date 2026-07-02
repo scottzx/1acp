@@ -254,6 +254,7 @@ test("parsePromptEventLine handles runtime status-style updates", () => {
       type: "status",
       text: "mode updated: architect",
       tag: "current_mode_update",
+      currentModeId: "architect",
     },
   );
 
@@ -455,6 +456,7 @@ test("parsePromptEventLine covers status and tool summary fallbacks", () => {
       type: "status",
       text: "mode updated: fast",
       tag: "current_mode_update",
+      currentModeId: "fast",
     },
   );
   assert.deepEqual(

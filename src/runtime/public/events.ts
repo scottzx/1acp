@@ -494,7 +494,7 @@ const PROMPT_EVENT_PARSERS: Record<string, PromptEventParser> = {
     resolveTextChunk({ payload, stream: "thought", tag: "agent_thought_chunk" }),
   usage_update: usageUpdateEvent,
   available_commands_update: availableCommandsUpdateEvent,
-  current_mode_update: (payload) => statusUpdateEvent("current_mode_update", payload),
+  current_mode_update: currentModeUpdateEvent,
   config_option_update: (payload) => statusUpdateEvent("config_option_update", payload),
   session_info_update: (payload) => statusUpdateEvent("session_info_update", payload),
   plan: (payload) => statusUpdateEvent("plan", payload),
@@ -536,6 +536,27 @@ function buildUsageUpdateEvent(parts: {
     ...(size != null ? { size } : {}),
     ...(cost ? { cost } : {}),
     ...(breakdown ? { breakdown } : {}),
+  };
+}
+
+// Structured variant of the generic status text: keeps `currentModeId` on the
+// event so hosts can mirror live mode switches (e.g. ExitPlanMode → default)
+// instead of parsing the display text. Falls back to the text-only status
+// event when the payload carries no mode id.
+function currentModeUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
+  // Same alias chain as currentModeStatusText so wire variants stay covered.
+  const currentModeId =
+    asTrimmedString(payload.currentModeId) ||
+    asTrimmedString(payload.modeId) ||
+    asTrimmedString(payload.mode);
+  if (!currentModeId) {
+    return statusUpdateEvent("current_mode_update", payload);
+  }
+  return {
+    type: "status",
+    text: `mode updated: ${currentModeId}`,
+    tag: "current_mode_update",
+    currentModeId,
   };
 }
 

@@ -603,6 +603,7 @@ wss.on("connection", (ws) => {
                   existingSession.handle.agentSessionId || existingSession.handle.backendSessionId,
               }),
             );
+            void sendSessionMeta(ws, sessionId, existingSession.handle);
             break;
           }
 
@@ -627,6 +628,7 @@ wss.on("connection", (ws) => {
                   agentSessionId: handle.agentSessionId || handle.backendSessionId,
                 }),
               );
+              void sendSessionMeta(ws, sessionId, handle);
             } catch (err) {
               sendError(ws, sessionId, "INITIALIZATION_FAILED", err.message);
             }
@@ -671,6 +673,7 @@ wss.on("connection", (ws) => {
                 agentSessionId: handle.agentSessionId || handle.backendSessionId,
               }),
             );
+            void sendSessionMeta(ws, sessionId, handle);
           } finally {
             initializingSessions.delete(sessionId);
           }
@@ -800,24 +803,15 @@ wss.on("connection", (ws) => {
           }
           session.permissionMode = mode;
           console.log(`[acpx-server] permission mode for ${sessionId} set to ${mode}`);
-          // Push the mode down to the live ACP session so the runtime's
-          // own fast-path (filesystem.ts permissionGate, permissions.ts)
-          // honors it on the very next tool call. Without this, the
-          // runtime continues to use whatever permissionMode it was
-          // created with — a stale "approve-reads" lets writes through
-          // regardless of the user's toggle, and an "approve-all"
-          // makes deny-all a no-op.
-          try {
-            await runtime.setMode({ handle: session.handle, mode });
-            console.log(
-              `[acpx-server] runtime.setMode pushed ${mode} to ACP session for ${sessionId}`,
-            );
-          } catch (err) {
-            console.warn(
-              `[acpx-server] runtime.setMode failed for ${sessionId} (in-memory mode still ${mode}):`,
-              err.message,
-            );
-          }
+          // The gate lives ENTIRELY in handlePermissionRequestCallback (plus
+          // the project allow-rules file) — every permission request funnels
+          // through it, so deny-all/approve-all take effect on the very next
+          // tool call with no runtime involvement. Do NOT push these values
+          // via runtime.setMode: that is ACP session/set_mode, whose ids are
+          // the agent's NATIVE modes (default/plan/read-only/…). Adapters
+          // reject foreign ids like "approve-reads", and once native modes
+          // are user-visible the call would clobber the user's chosen mode
+          // and corrupt the persisted desiredModeId.
           ws.send(
             JSON.stringify({
               event: "permission_mode_changed",
@@ -825,6 +819,47 @@ wss.on("connection", (ws) => {
               permissionMode: mode,
             }),
           );
+          break;
+        }
+
+        case "set_session_mode": {
+          // Switch the agent's NATIVE session mode (ACP session/set_mode) —
+          // e.g. Claude Code's default/acceptEdits/plan or Codex's
+          // read-only/agent. Distinct from set_permission_mode, which only
+          // moves the bridge's own permission gate. runtime.setMode persists
+          // desiredModeId and replays it onto fresh ACP sessions after
+          // reap/resume, so the choice sticks across reconnects for free.
+          const modeId = payload.payload?.modeId;
+          if (!sessionId || !modeId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and payload.modeId are required");
+            return;
+          }
+          const session = activeSessions.get(sessionId);
+          if (!session) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+          try {
+            await runtime.setMode({ handle: session.handle, mode: modeId });
+            console.log(`[acpx-server] session mode for ${sessionId} set to ${modeId}`);
+            ws.send(
+              JSON.stringify({
+                event: "mode_changed",
+                sessionId,
+                payload: { currentModeId: modeId },
+              }),
+            );
+          } catch (err) {
+            // Adapters validate against availableModes — surface the refusal
+            // and resend the authoritative snapshot so an optimistic UI can
+            // roll back to the real current mode.
+            console.warn(
+              `[acpx-server] set_session_mode ${modeId} failed for ${sessionId}:`,
+              err.message,
+            );
+            sendError(ws, sessionId, "SET_MODE_FAILED", err.message);
+            void sendSessionMeta(ws, sessionId, session.handle);
+          }
           break;
         }
 
@@ -1034,6 +1069,37 @@ wss.on("connection", (ws) => {
   });
 });
 
+// Send the session's advertised capability snapshot (native modes, models,
+// slash commands) right after session_ready. Structured data rides a single
+// `payload` object — the Go relay forwards frames verbatim and never parses
+// payload. Re-sent on every ensure_session, so a reconnecting client always
+// converges on the authoritative state (modes are live-only, never in
+// history). Failures are non-fatal: a mode-less agent just gets no picker.
+async function sendSessionMeta(ws, sessionId, handle) {
+  try {
+    const status = await runtime.getStatus({ handle });
+    const payload = {};
+    if (status.modes) {
+      payload.modes = status.modes;
+    }
+    if (status.models) {
+      payload.models = status.models;
+    }
+    if (status.availableCommands) {
+      payload.availableCommands = status.availableCommands;
+    }
+    if (Object.keys(payload).length === 0) {
+      return;
+    }
+    if (ws.readyState !== 1 /* OPEN */) {
+      return;
+    }
+    ws.send(JSON.stringify({ event: "session_meta", sessionId, payload }));
+  } catch (err) {
+    console.warn(`[acpx-server] sendSessionMeta failed for ${sessionId}:`, err.message);
+  }
+}
+
 // Helper for sending error events
 function sendError(ws, sessionId, errorCode, message) {
   ws.send(
@@ -1164,6 +1230,21 @@ function runPromptTurn(session, sessionId, promptItem) {
               event: "error",
               sessionId,
               message: event.message,
+            }),
+          );
+        } else if (
+          event.type === "status" &&
+          event.tag === "current_mode_update" &&
+          event.currentModeId
+        ) {
+          // The agent switched its own native mode mid-turn (e.g. ExitPlanMode
+          // flips plan → default). Mirror it so the client's mode picker
+          // follows without a reconnect.
+          targetWs.send(
+            JSON.stringify({
+              event: "mode_changed",
+              sessionId,
+              payload: { currentModeId: event.currentModeId },
             }),
           );
         }
