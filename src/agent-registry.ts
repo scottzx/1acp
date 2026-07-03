@@ -17,6 +17,8 @@ type BuiltInAgentPackageSpec = {
   fallbackCommand: string;
   legacyFallbackCommands?: string[];
   extraArgs?: string[];
+  /** Set when the resolved bin is a native executable and must be spawned directly, not via `node <binPath>`. */
+  nativeBinary?: boolean;
 };
 
 type BuiltInAgentLaunch = {
@@ -83,6 +85,7 @@ export const BUILT_IN_AGENT_PACKAGES = {
     fallbackCommand: AGENT_REGISTRY.opencode,
     legacyFallbackCommands: [],
     extraArgs: ["acp"],
+    nativeBinary: true,
   },
 } as const satisfies Record<string, BuiltInAgentPackageSpec>;
 
@@ -222,14 +225,14 @@ export function resolveInstalledBuiltInAgentLaunch(
       return undefined;
     }
 
-    const args = [resolved.binPath];
+    const args: string[] = spec.nativeBinary ? [] : [resolved.binPath];
     if (spec.extraArgs) {
       args.push(...spec.extraArgs);
     }
 
     return {
       source: "installed",
-      command: process.execPath,
+      command: spec.nativeBinary ? resolved.binPath : process.execPath,
       args,
       packageName: spec.packageName,
       packageRange: spec.packageRange,
