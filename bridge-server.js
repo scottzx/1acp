@@ -1247,6 +1247,20 @@ function runPromptTurn(session, sessionId, promptItem) {
               payload: { currentModeId: event.currentModeId },
             }),
           );
+        } else if (
+          event.type === "status" &&
+          event.tag === "available_commands_update" &&
+          Array.isArray(event.availableCommands)
+        ) {
+          // Live refresh of the slash-command list (rare mid-session; the
+          // session_meta snapshot covers the common case at session start).
+          targetWs.send(
+            JSON.stringify({
+              event: "available_commands_update",
+              sessionId,
+              payload: { availableCommands: event.availableCommands },
+            }),
+          );
         }
       }
 
@@ -1292,6 +1306,11 @@ function runPromptTurn(session, sessionId, promptItem) {
               ...(stopped ? { stopped: true } : {}),
             }),
           );
+          // Refresh the capability snapshot: slash commands are advertised via
+          // an out-of-turn notification the runtime only records while a turn's
+          // event handlers are installed, so they first become available now.
+          // Re-sending session_meta lights up the `/` palette after turn one.
+          void sendSessionMeta(targetWs, sessionId, currentSession.handle);
         }
       }
     } catch (err) {
