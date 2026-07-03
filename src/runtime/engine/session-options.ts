@@ -29,12 +29,15 @@ export function mergeSessionOptions(
   fallback: SessionAgentOptions | undefined,
 ): SessionAgentOptions | undefined {
   const merged: SessionAgentOptions = { ...fallback };
-  assignDefinedOption(merged, "model", preferred?.model);
-  assignDefinedOption(merged, "allowedTools", preferred?.allowedTools);
-  assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
-  assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
-  assignDefinedOption(merged, "mcpServers", preferred?.mcpServers);
-  assignDefinedOption(merged, "env", mergeEnvRecords(fallback?.env, preferred?.env));
+  if (preferred) {
+    assignDefinedOption(merged, "model", preferred.model);
+    assignDefinedOption(merged, "allowedTools", preferred.allowedTools);
+    assignDefinedOption(merged, "maxTurns", preferred.maxTurns);
+    assignDefinedOption(merged, "systemPrompt", preferred.systemPrompt);
+    assignDefinedOption(merged, "mcpServers", preferred.mcpServers);
+  }
+  const preferredEnv = preferred ? preferred.env : undefined;
+  assignDefinedOption(merged, "env", mergeEnvRecords(fallback?.env, preferredEnv));
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 

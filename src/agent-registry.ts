@@ -7,6 +7,7 @@ const ACP_ADAPTER_PACKAGE_RANGES = {
   codex: "^0.0.44",
   claude: "^0.37.0",
   mux: "^0.27.0",
+  opencode: "^1.17.0",
 } as const;
 
 type BuiltInAgentPackageSpec = {
@@ -15,6 +16,7 @@ type BuiltInAgentPackageSpec = {
   preferredBinName: string;
   fallbackCommand: string;
   legacyFallbackCommands?: string[];
+  extraArgs?: string[];
 };
 
 type BuiltInAgentLaunch = {
@@ -73,6 +75,14 @@ export const BUILT_IN_AGENT_PACKAGES = {
     legacyFallbackCommands: [
       `npm exec @agentclientprotocol/claude-agent-acp@${ACP_ADAPTER_PACKAGE_RANGES.claude}`,
     ],
+  },
+  opencode: {
+    packageName: "opencode-ai",
+    packageRange: ACP_ADAPTER_PACKAGE_RANGES.opencode,
+    preferredBinName: "opencode",
+    fallbackCommand: AGENT_REGISTRY.opencode,
+    legacyFallbackCommands: [],
+    extraArgs: ["acp"],
   },
 } as const satisfies Record<string, BuiltInAgentPackageSpec>;
 
@@ -181,6 +191,16 @@ function defaultResolveNpmCliPath(execPath: string): string {
   return candidate;
 }
 
+function getResolveOptions(options: BuiltInLaunchResolverOptions) {
+  return {
+    readFileSync: options.readFileSync ?? fs.readFileSync,
+    existsSync: options.existsSync ?? fs.existsSync,
+    resolvePackageRoot: options.resolvePackageRoot ?? defaultResolvePackageRoot,
+    execPath: options.execPath ?? process.execPath,
+    resolveNpmCliPath: options.resolveNpmCliPath ?? defaultResolveNpmCliPath,
+  };
+}
+
 export function resolveInstalledBuiltInAgentLaunch(
   agentCommand: string,
   options: BuiltInLaunchResolverOptions = {},
@@ -190,9 +210,7 @@ export function resolveInstalledBuiltInAgentLaunch(
     return undefined;
   }
 
-  const readFileSync = options.readFileSync ?? fs.readFileSync;
-  const existsSync = options.existsSync ?? fs.existsSync;
-  const resolvePackageRoot = options.resolvePackageRoot ?? defaultResolvePackageRoot;
+  const { readFileSync, existsSync, resolvePackageRoot } = getResolveOptions(options);
 
   try {
     const resolved = resolveInstalledBuiltInAgentPackage(spec, {
@@ -204,10 +222,15 @@ export function resolveInstalledBuiltInAgentLaunch(
       return undefined;
     }
 
+    const args = [resolved.binPath];
+    if (spec.extraArgs) {
+      args.push(...spec.extraArgs);
+    }
+
     return {
       source: "installed",
       command: process.execPath,
-      args: [resolved.binPath],
+      args,
       packageName: spec.packageName,
       packageRange: spec.packageRange,
       packageVersion: resolved.packageVersion,
@@ -254,9 +277,7 @@ export function resolvePackageExecBuiltInAgentLaunch(
     return undefined;
   }
 
-  const existsSync = options.existsSync ?? fs.existsSync;
-  const execPath = options.execPath ?? process.execPath;
-  const resolveNpmCliPath = options.resolveNpmCliPath ?? defaultResolveNpmCliPath;
+  const { existsSync, execPath, resolveNpmCliPath } = getResolveOptions(options);
 
   try {
     const npmCliPath = resolveNpmCliPath(execPath);
@@ -264,17 +285,22 @@ export function resolvePackageExecBuiltInAgentLaunch(
       return undefined;
     }
 
+    const args = [
+      npmCliPath,
+      "exec",
+      "--yes",
+      `--package=${spec.packageName}@${spec.packageRange}`,
+      "--",
+      spec.preferredBinName,
+    ];
+    if (spec.extraArgs) {
+      args.push(...spec.extraArgs);
+    }
+
     return {
       source: "package-exec",
       command: execPath,
-      args: [
-        npmCliPath,
-        "exec",
-        "--yes",
-        `--package=${spec.packageName}@${spec.packageRange}`,
-        "--",
-        spec.preferredBinName,
-      ],
+      args,
       packageName: spec.packageName,
       packageRange: spec.packageRange,
       npmCliPath,
