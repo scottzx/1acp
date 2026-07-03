@@ -101,6 +101,31 @@ const TOOL_KIND_LABELS = {
  *  3. event.title – only when it looks like a proper name (no spaces, ≤40 chars)
  *  4. "Tool" fallback
  */
+// Pull the file-diff blocks out of an ACP tool_call `content` array. Each ACP
+// diff block is {type:"diff", path, oldText?, newText}; everything else
+// (text/terminal blocks) is left for the normal output rendering.
+function extractToolDiffs(content) {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const diffs = [];
+  for (const block of content) {
+    if (
+      block &&
+      block.type === "diff" &&
+      typeof block.path === "string" &&
+      typeof block.newText === "string"
+    ) {
+      diffs.push({
+        path: block.path,
+        newText: block.newText,
+        ...(typeof block.oldText === "string" ? { oldText: block.oldText } : {}),
+      });
+    }
+  }
+  return diffs;
+}
+
 function resolveToolDisplayName(event) {
   if (event.toolName) {
     return event.toolName;
@@ -1243,7 +1268,10 @@ function runPromptTurn(session, sessionId, promptItem) {
           // Forward rawInput as-is. During streaming the runtime may
           // emit a tool_call event before rawInput is populated; in
           // that case `arguments` is omitted on the wire and the
-          // client skips rendering the placeholder card.
+          // client skips rendering the placeholder card. kind/locations/
+          // diffs ride along when the agent supplied them (Phase 6): kind
+          // → card icon, locations → file links, diffs → inline diff view.
+          const toolDiffs = extractToolDiffs(event.content);
           targetWs.send(
             JSON.stringify({
               event: "tool_call",
@@ -1251,6 +1279,11 @@ function runPromptTurn(session, sessionId, promptItem) {
               toolName: resolveToolDisplayName(event),
               toolCallId: event.toolCallId,
               ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
+              ...(event.kind ? { kind: event.kind } : {}),
+              ...(Array.isArray(event.locations) && event.locations.length > 0
+                ? { locations: event.locations }
+                : {}),
+              ...(toolDiffs.length > 0 ? { diffs: toolDiffs } : {}),
             }),
           );
           if (
