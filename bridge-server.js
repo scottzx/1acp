@@ -873,6 +873,45 @@ wss.on("connection", (ws) => {
           break;
         }
 
+        case "set_config_option": {
+          // Switch a NATIVE session config option (ACP session/set_config_option)
+          // — model, reasoning effort, etc. Distinct from set_session_mode: the
+          // "mode" option has its own action + picker. setConfigOption persists
+          // the new value so the session_meta re-send below reflects it and it
+          // replays across reconnects.
+          const optKey = payload.payload?.key;
+          const optValue = payload.payload?.value;
+          if (!sessionId || !optKey || optValue == null) {
+            sendError(
+              ws,
+              sessionId,
+              "INVALID_PARAMS",
+              "sessionId and payload.{key,value} are required",
+            );
+            return;
+          }
+          const session = activeSessions.get(sessionId);
+          if (!session) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+          try {
+            await runtime.setConfigOption({ handle: session.handle, key: optKey, value: optValue });
+            console.log(`[acpx-server] config option ${optKey}=${optValue} for ${sessionId}`);
+            // Re-send the authoritative snapshot: the new currentValue is
+            // persisted, so this reconciles any optimistic UI update.
+            void sendSessionMeta(ws, sessionId, session.handle);
+          } catch (err) {
+            console.warn(
+              `[acpx-server] set_config_option ${optKey}=${optValue} failed for ${sessionId}:`,
+              err.message,
+            );
+            sendError(ws, sessionId, "SET_CONFIG_OPTION_FAILED", err.message);
+            void sendSessionMeta(ws, sessionId, session.handle);
+          }
+          break;
+        }
+
         case "cancel_queued": {
           if (!sessionId || !payload.requestId) {
             sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and requestId are required");
@@ -1098,6 +1137,9 @@ async function sendSessionMeta(ws, sessionId, handle) {
     if (status.availableCommands) {
       payload.availableCommands = status.availableCommands;
     }
+    if (status.configOptions) {
+      payload.configOptions = status.configOptions;
+    }
     if (Object.keys(payload).length === 0) {
       return;
     }
@@ -1299,6 +1341,11 @@ function runPromptTurn(session, sessionId, promptItem) {
           if (Object.keys(usage).length > 0) {
             targetWs.send(JSON.stringify({ event: "usage", sessionId, payload: usage }));
           }
+        } else if (event.type === "status" && event.tag === "config_option_update") {
+          // The agent changed a config option itself (rare — model/effort are
+          // usually user-driven). The update is folded into the record, so
+          // re-send the authoritative snapshot to refresh the pickers.
+          void sendSessionMeta(targetWs, sessionId, currentSession.handle);
         }
       }
 

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { AcpClient } from "../../acp/client.js";
+import { configOptionsFromConfigOptions } from "../../acp/config-option-support.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { modeStateFromConfigOptions } from "../../acp/mode-support.js";
@@ -43,6 +44,7 @@ import type {
 } from "../../types.js";
 import type {
   AcpRuntimeAvailableCommand,
+  AcpRuntimeConfigOption,
   AcpRuntimeEvent,
   AcpRuntimeHandle,
   AcpRuntimeOptions,
@@ -317,6 +319,13 @@ function buildModesField(record: SessionRecord): { modes?: AcpRuntimeSessionMode
       ...(liveModeId ? { currentModeId: liveModeId } : {}),
     },
   };
+}
+
+function buildConfigOptionsField(record: SessionRecord): {
+  configOptions?: AcpRuntimeConfigOption[];
+} {
+  const configOptions = configOptionsFromConfigOptions(record.acpx?.config_options);
+  return configOptions ? { configOptions } : {};
 }
 
 function tokenUsageToBreakdown(
@@ -1377,6 +1386,7 @@ export class AcpRuntimeManager {
       agentSessionId: record.agentSessionId,
       ...buildModelsField(record),
       ...buildModesField(record),
+      ...buildConfigOptionsField(record),
       ...buildUsageField(record),
       ...buildAvailableCommandsField(record),
       details: {

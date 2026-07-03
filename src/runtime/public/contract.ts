@@ -134,6 +134,27 @@ export type AcpRuntimeUsageBreakdown = {
   totalTokens?: number;
 };
 
+export type AcpRuntimeConfigOptionChoice = {
+  value: string;
+  name: string;
+  description?: string;
+};
+
+/**
+ * A normalized ACP session config option (a `select` — model, reasoning
+ * effort, etc.). `category` echoes the agent's grouping ("model" / "effort" /
+ * "mode" / …) when present; the "mode" option is surfaced separately via
+ * `modes`, so config-option consumers should skip it. Model option groups are
+ * flattened into a single `options` list.
+ */
+export type AcpRuntimeConfigOption = {
+  id: string;
+  name: string;
+  category?: string;
+  currentValue?: string;
+  options: AcpRuntimeConfigOptionChoice[];
+};
+
 export type AcpRuntimePlanEntryStatus = "pending" | "in_progress" | "completed";
 
 /**
@@ -186,6 +207,12 @@ export type AcpRuntimeStatus = {
    * the agent never advertised a mode select (mode-less agents).
    */
   modes?: AcpRuntimeSessionModes;
+  /**
+   * Normalized session config options the agent advertised (model, reasoning
+   * effort, …). The "mode" select is surfaced via `modes` instead and omitted
+   * here. Absent when the agent advertised no non-mode config options.
+   */
+  configOptions?: AcpRuntimeConfigOption[];
   /** Token usage and cost from the persisted session record. */
   usage?: AcpRuntimeSessionUsage;
   /**
