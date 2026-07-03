@@ -1271,6 +1271,20 @@ function runPromptTurn(session, sessionId, promptItem) {
               payload: { availableCommands: event.availableCommands },
             }),
           );
+        } else if (event.type === "status" && event.tag === "usage_update") {
+          // Token/context usage + cost for the composer badge. used/size feed
+          // the context-window % gauge; cost (when the adapter reports it) is
+          // cumulative USD; breakdown is the hover detail. Live-only state —
+          // the badge naturally refreshes each turn and resets on reconnect.
+          const usage = {
+            ...(event.used != null ? { used: event.used } : {}),
+            ...(event.size != null ? { size: event.size } : {}),
+            ...(event.cost ? { cost: event.cost } : {}),
+            ...(event.breakdown ? { breakdown: event.breakdown } : {}),
+          };
+          if (Object.keys(usage).length > 0) {
+            targetWs.send(JSON.stringify({ event: "usage", sessionId, payload: usage }));
+          }
         }
       }
 
