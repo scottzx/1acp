@@ -291,14 +291,31 @@ test("parsePromptEventLine handles runtime status-style updates", () => {
     parsePromptEventLine(
       JSON.stringify({
         sessionUpdate: "plan",
-        entries: [{ content: "first step" }],
+        entries: [
+          { content: "first step", status: "completed", priority: "high" },
+          { content: "second step", status: "in_progress" },
+          { content: "third step", status: "bogus" },
+        ],
       }),
     ),
     {
       type: "status",
-      text: "plan: first step",
+      text: "plan updated (3)",
       tag: "plan",
+      planEntries: [
+        { content: "first step", status: "completed", priority: "high" },
+        { content: "second step", status: "in_progress" },
+        // Unknown status falls back to "pending"; missing priority stays off.
+        { content: "third step", status: "pending" },
+      ],
     },
+  );
+
+  // A plan with no renderable entries falls back to the text-only status,
+  // which yields null (nothing to show) rather than a bogus checklist.
+  assert.equal(
+    parsePromptEventLine(JSON.stringify({ sessionUpdate: "plan", entries: [{}] })),
+    null,
   );
 
   assert.deepEqual(

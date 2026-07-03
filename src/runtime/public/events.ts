@@ -2,6 +2,8 @@ import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientpr
 import type {
   AcpRuntimeAvailableCommand,
   AcpRuntimeEvent,
+  AcpRuntimePlanEntry,
+  AcpRuntimePlanEntryStatus,
   AcpRuntimeUsageBreakdown,
   AcpRuntimeUsageCost,
   AcpSessionUpdateTag,
@@ -497,7 +499,7 @@ const PROMPT_EVENT_PARSERS: Record<string, PromptEventParser> = {
   current_mode_update: currentModeUpdateEvent,
   config_option_update: (payload) => statusUpdateEvent("config_option_update", payload),
   session_info_update: (payload) => statusUpdateEvent("session_info_update", payload),
-  plan: (payload) => statusUpdateEvent("plan", payload),
+  plan: planUpdateEvent,
   client_operation: clientOperationEvent,
   update: updateStatusEvent,
   done: () => null,
@@ -558,6 +560,70 @@ function currentModeUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEve
     tag: "current_mode_update",
     currentModeId,
   };
+}
+
+// Structured variant of the plan status: keeps the full entry list on the
+// event so hosts can render a live checklist instead of a one-line summary.
+// Falls back to the text-only status when no renderable entries are present.
+function planUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
+  const planEntries = normalizePlanEntries(payload.entries);
+  if (!planEntries) {
+    return statusUpdateEvent("plan", payload);
+  }
+  return {
+    type: "status",
+    text: `plan updated (${planEntries.length})`,
+    tag: "plan",
+    planEntries,
+  };
+}
+
+const PLAN_ENTRY_STATUSES: ReadonlySet<AcpRuntimePlanEntryStatus> = new Set([
+  "pending",
+  "in_progress",
+  "completed",
+]);
+
+const PLAN_ENTRY_PRIORITIES: ReadonlySet<"high" | "medium" | "low"> = new Set([
+  "high",
+  "medium",
+  "low",
+]);
+
+function normalizePlanStatus(value: unknown): AcpRuntimePlanEntryStatus {
+  const raw = asTrimmedString(value) as AcpRuntimePlanEntryStatus;
+  return PLAN_ENTRY_STATUSES.has(raw) ? raw : "pending";
+}
+
+function normalizePlanPriority(value: unknown): "high" | "medium" | "low" | undefined {
+  const raw = asTrimmedString(value) as "high" | "medium" | "low";
+  return PLAN_ENTRY_PRIORITIES.has(raw) ? raw : undefined;
+}
+
+function normalizePlanEntry(entry: unknown): AcpRuntimePlanEntry | undefined {
+  if (!isRecord(entry)) {
+    return undefined;
+  }
+  const content = asTrimmedString(entry.content);
+  if (!content) {
+    return undefined;
+  }
+  const priority = normalizePlanPriority(entry.priority);
+  return { content, status: normalizePlanStatus(entry.status), ...(priority ? { priority } : {}) };
+}
+
+function normalizePlanEntries(value: unknown): AcpRuntimePlanEntry[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const entries: AcpRuntimePlanEntry[] = [];
+  for (const entry of value) {
+    const normalized = normalizePlanEntry(entry);
+    if (normalized) {
+      entries.push(normalized);
+    }
+  }
+  return entries.length > 0 ? entries : undefined;
 }
 
 function availableCommandsUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {

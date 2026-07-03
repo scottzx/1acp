@@ -1271,6 +1271,20 @@ function runPromptTurn(session, sessionId, promptItem) {
               payload: { availableCommands: event.availableCommands },
             }),
           );
+        } else if (
+          event.type === "status" &&
+          event.tag === "plan" &&
+          Array.isArray(event.planEntries)
+        ) {
+          // The agent's execution plan (TodoWrite / Codex plan). Full list on
+          // every update — the client replaces its checklist wholesale.
+          targetWs.send(
+            JSON.stringify({
+              event: "plan",
+              sessionId,
+              payload: { entries: event.planEntries },
+            }),
+          );
         } else if (event.type === "status" && event.tag === "usage_update") {
           // Token/context usage + cost for the composer badge. used/size feed
           // the context-window % gauge; cost (when the adapter reports it) is

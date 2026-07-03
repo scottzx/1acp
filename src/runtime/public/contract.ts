@@ -134,6 +134,20 @@ export type AcpRuntimeUsageBreakdown = {
   totalTokens?: number;
 };
 
+export type AcpRuntimePlanEntryStatus = "pending" | "in_progress" | "completed";
+
+/**
+ * One entry of the agent's execution plan (ACP `PlanEntry`, emitted by
+ * Claude Code's TodoWrite and Codex's plan updates). The agent re-sends the
+ * FULL list on every update — consumers replace their plan wholesale, never
+ * merge.
+ */
+export type AcpRuntimePlanEntry = {
+  content: string;
+  status: AcpRuntimePlanEntryStatus;
+  priority?: "high" | "medium" | "low";
+};
+
 /**
  * Agent-advertised slash command. The runtime only surfaces enough to
  * drive a picker UI ("does the agent advertise /compact?"). The full
@@ -226,6 +240,12 @@ export type AcpRuntimeEvent =
        * that mirror mode state should treat this as authoritative.
        */
       currentModeId?: string;
+      /**
+       * Populated on `plan` events: the agent's full execution plan
+       * (TodoWrite / Codex plan). The complete list on every update — the
+       * host replaces its checklist wholesale.
+       */
+      planEntries?: AcpRuntimePlanEntry[];
     }
   | {
       type: "tool_call";
