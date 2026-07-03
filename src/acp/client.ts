@@ -431,6 +431,13 @@ export class AcpClient {
   private observedSessionUpdates = 0;
   private processedSessionUpdates = 0;
   private suppressSessionUpdates = false;
+  // Session notifications that arrived with no onSessionUpdate handler
+  // installed — chiefly the available_commands_update the adapter emits via
+  // setTimeout(0) right after newSession, before any turn (or the persistent
+  // recorder) installs a handler. Flushed in setEventHandlers so they are not
+  // lost. Bounded so a handler that is never installed can't grow it forever.
+  private bufferedSessionUpdates: SessionNotification[] = [];
+  private static readonly MAX_BUFFERED_SESSION_UPDATES = 64;
   private suppressReplaySessionUpdateMessages = false;
   private activePrompt?: {
     sessionId: string;
@@ -529,10 +536,35 @@ export class AcpClient {
     >,
   ): void {
     this.eventHandlers = { ...handlers };
+    // Replay anything that arrived before a consumer existed (e.g. the initial
+    // available_commands_update). Cleared first so a handler that re-enters
+    // setEventHandlers can't double-drain.
+    if (handlers.onSessionUpdate && this.bufferedSessionUpdates.length > 0) {
+      const pending = this.bufferedSessionUpdates;
+      this.bufferedSessionUpdates = [];
+      for (const notification of pending) {
+        try {
+          handlers.onSessionUpdate(notification);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.log(`buffered session update handler failed: ${message}`);
+        }
+      }
+    }
   }
 
   clearEventHandlers(): void {
     this.eventHandlers = {};
+  }
+
+  private bufferSessionUpdate(notification: SessionNotification): void {
+    // Drop the oldest when saturated: a session that never installs a handler
+    // must not leak. available_commands_update is idempotent, so losing a stale
+    // one is harmless anyway.
+    if (this.bufferedSessionUpdates.length >= AcpClient.MAX_BUFFERED_SESSION_UPDATES) {
+      this.bufferedSessionUpdates.shift();
+    }
+    this.bufferedSessionUpdates.push(notification);
   }
 
   updateRuntimeOptions(options: {
@@ -1924,7 +1956,11 @@ export class AcpClient {
     this.sessionUpdateChain = this.sessionUpdateChain.then(async () => {
       try {
         if (!this.suppressSessionUpdates) {
-          this.eventHandlers.onSessionUpdate?.(notification);
+          if (this.eventHandlers.onSessionUpdate) {
+            this.eventHandlers.onSessionUpdate(notification);
+          } else {
+            this.bufferSessionUpdate(notification);
+          }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

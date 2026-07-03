@@ -1056,6 +1056,29 @@ test("AcpClient session update handling drains queued callbacks and swallows han
   assert.deepEqual(notifications, ["good", "bad"]);
 });
 
+test("AcpClient buffers session updates with no handler, then flushes on setEventHandlers", async () => {
+  const client = makeClient(); // constructed without an onSessionUpdate handler
+  const internals = asInternals(client);
+
+  // A notification that arrives before any consumer (the adapter's initial
+  // available_commands_update after newSession) must be buffered, not lost.
+  await internals.handleSessionUpdate?.({ sessionId: "early" } as never);
+
+  const received: string[] = [];
+  client.setEventHandlers({
+    onSessionUpdate: (n) => {
+      received.push((n as { sessionId: string }).sessionId);
+    },
+  });
+  // Installing the handler replays the buffered notification.
+  assert.deepEqual(received, ["early"]);
+
+  // Later notifications dispatch directly (buffer already drained).
+  await internals.handleSessionUpdate?.({ sessionId: "later" } as never);
+  await internals.waitForSessionUpdateDrain?.(0, 100);
+  assert.deepEqual(received, ["early", "later"]);
+});
+
 test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt state", async () => {
   const client = makeClient();
   const internals = asInternals(client);

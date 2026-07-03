@@ -340,6 +340,14 @@ export type AcpRuntimeOptions = {
     req: AcpPermissionRequest,
     ctx: { signal: AbortSignal },
   ) => Promise<AcpPermissionDecision | undefined>;
+  /**
+   * Fired after an OUT-OF-TURN session notification (one that arrived between
+   * newSession and the first turn, e.g. available_commands_update) has been
+   * folded into the persisted record. Lets a host push a fresh capability
+   * snapshot immediately instead of waiting for the next turn/reconnect.
+   * `sessionKey` is the ensureSession key (the persistent record id).
+   */
+  onOutOfTurnSessionUpdate?: (sessionKey: string) => void;
 };
 
 export type AcpFileSessionStoreOptions = {

@@ -582,6 +582,8 @@ async function createOrLoadRuntimeSession(
 export class AcpRuntimeManager {
   private readonly activeControllers = new Map<string, ActiveSessionController>();
   private readonly pendingPersistentClients = new Map<string, AcpClient>();
+  // Per-record serialization for out-of-turn session-update writes.
+  private readonly outOfTurnUpdateChains = new Map<string, Promise<void>>();
   private readonly closingActiveRecords = new Set<string>();
 
   constructor(
@@ -834,8 +836,47 @@ export class AcpRuntimeManager {
     }
     const previousClient = this.pendingPersistentClients.get(recordId);
     this.pendingPersistentClients.set(recordId, client);
+    // Record out-of-turn session notifications into the persisted record.
+    // Installing the handler also flushes anything the client buffered before
+    // now (the adapter's available_commands_update fires via setTimeout(0)
+    // right after newSession, before this handler exists). A turn's
+    // installRuntimeTurnEventHandlers replaces this during the turn; it is not
+    // restored afterwards because the notifications this catches (commands,
+    // out-of-turn mode/config changes) are advertised at session start.
+    client.setEventHandlers({
+      onSessionUpdate: (notification) => {
+        this.recordOutOfTurnSessionUpdate(recordId, notification);
+      },
+    });
     await previousClient?.close().catch(() => {});
     return true;
+  }
+
+  // Serialize per record so two notifications can't race on load→apply→save
+  // (which would drop one update). Best effort: a failure only means slightly
+  // stale session metadata, never a broken turn.
+  private recordOutOfTurnSessionUpdate(
+    recordId: string,
+    notification: Parameters<typeof recordSessionUpdate>[2],
+  ): void {
+    const previous = this.outOfTurnUpdateChains.get(recordId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(async () => {
+        const record = await this.options.sessionStore.load(recordId);
+        if (!record) {
+          return;
+        }
+        record.acpx = recordSessionUpdate(record, record.acpx, notification);
+        await this.options.sessionStore.save(record);
+        // Level 2: let the host push a fresh capability snapshot right away
+        // (recordId === sessionKey for persistent sessions).
+        this.options.onOutOfTurnSessionUpdate?.(recordId);
+      })
+      .catch(() => {
+        // metadata only — never fail a session over a dropped out-of-turn update
+      });
+    this.outOfTurnUpdateChains.set(recordId, next);
   }
 
   startTurn(input: {

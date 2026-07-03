@@ -27,6 +27,16 @@ const runtime = createAcpRuntime({
   agentRegistry: createAgentRegistry(),
   permissionMode: "approve-reads", // default, will be overridden by session or client options
   onPermissionRequest: handlePermissionRequestCallback,
+  // Level 2 live push: when an out-of-turn notification (e.g. the initial
+  // available_commands_update) lands in the record, re-send the capability
+  // snapshot so the client's `/` palette lights up without waiting for a turn.
+  // sessionKey === the client sessionId for persistent sessions.
+  onOutOfTurnSessionUpdate: (sessionKey) => {
+    const session = activeSessions.get(sessionKey);
+    if (session) {
+      void sendSessionMeta(session.ws, sessionKey, session.handle);
+    }
+  },
 });
 
 // Map of active session handles and turn contexts
