@@ -120,6 +120,9 @@ importers:
       opencode-ai:
         specifier: ^1.17.0
         version: 1.17.13
+      pi-acp:
+        specifier: ^0.0.26
+        version: 0.0.26
 
 packages:
 
@@ -130,6 +133,11 @@ packages:
   '@agentclientprotocol/codex-acp@0.0.44':
     resolution: {integrity: sha512-iHzFWKzJ0Z8I6yJCkuLZ+nb9mF2WYmfTcHFFvc7sU/awBsQmVBmpSOXOpZ+IK2Dy9cR3iRoML/B2/Wq2/zKBCA==}
     hasBin: true
+
+  '@agentclientprotocol/sdk@0.12.0':
+    resolution: {integrity: sha512-V8uH/KK1t7utqyJmTA7y7DzKu6+jKFIXM+ZVouz8E55j8Ej2RV42rEvPKn3/PpBJlliI5crcGk1qQhZ7VwaepA==}
+    peerDependencies:
+      zod: ^3.25.0 || ^4.0.0
 
   '@agentclientprotocol/sdk@0.21.1':
     resolution: {integrity: sha512-ZTLH+o9QxcZDLX/9ww+W7C2iExnXFM+vD/uGFVSlR61Kzj9FaxUqBC6Rv/kwgA7qVWYUEI9c5ZNqCuO9PM4rKg==}
@@ -2715,6 +2723,11 @@ packages:
   pathe@2.0.3:
     resolution: {integrity: sha512-WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w==}
 
+  pi-acp@0.0.26:
+    resolution: {integrity: sha512-RaldAyZJ6pjVjMGHvxuwCDHqv5JD7OPoTUOwdhOK5oshrqZl+kC4XzuuFCauAma6kvfWCJXb0MBqTPne4YWrzA==}
+    engines: {node: '>=20'}
+    hasBin: true
+
   picocolors@1.1.1:
     resolution: {integrity: sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==}
 
@@ -3259,6 +3272,9 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
+  zod@3.25.76:
+    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
+
   zod@4.4.3:
     resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
 
@@ -3297,6 +3313,11 @@ snapshots:
       vscode-jsonrpc: 8.2.1
     transitivePeerDependencies:
       - zod
+
+  '@agentclientprotocol/sdk@0.12.0(zod@3.25.76)':
+    dependencies:
+      zod: 3.25.76
+    optional: true
 
   '@agentclientprotocol/sdk@0.21.1(zod@4.4.3)':
     dependencies:
@@ -5615,6 +5636,12 @@ snapshots:
 
   pathe@2.0.3: {}
 
+  pi-acp@0.0.26:
+    dependencies:
+      '@agentclientprotocol/sdk': 0.12.0(zod@3.25.76)
+      zod: 3.25.76
+    optional: true
+
   picocolors@1.1.1: {}
 
   picomatch@2.3.2: {}
@@ -6150,6 +6177,9 @@ snapshots:
   zod-to-json-schema@3.25.2(zod@4.4.3):
     dependencies:
       zod: 4.4.3
+
+  zod@3.25.76:
+    optional: true
 
   zod@4.4.3: {}
 

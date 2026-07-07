@@ -62,6 +62,13 @@ export const AGENT_REGISTRY: Record<string, string> = {
 };
 
 export const BUILT_IN_AGENT_PACKAGES = {
+  pi: {
+    packageName: "pi-acp",
+    packageRange: ACP_ADAPTER_PACKAGE_RANGES.pi,
+    preferredBinName: "pi-acp",
+    fallbackCommand: AGENT_REGISTRY.pi,
+    legacyFallbackCommands: [],
+  },
   codex: {
     packageName: "@agentclientprotocol/codex-acp",
     packageRange: ACP_ADAPTER_PACKAGE_RANGES.codex,
