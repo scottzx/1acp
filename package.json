@@ -81,7 +81,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "^0.37.0",
-    "@agentclientprotocol/codex-acp": "^0.0.44",
+    "@agentclientprotocol/codex-acp": "^1.1.0",
     "@agentclientprotocol/sdk": "^0.25.0",
     "commander": "^15.0.0",
     "skillflag": "^0.2.0",
@@ -132,9 +132,5 @@
     "node": ">=22.13.0"
   },
   "packageManager": "pnpm@10.33.2",
-  "pnpm": {
-    "patchedDependencies": {
-      "@agentclientprotocol/codex-acp@0.0.44": "patches/@agentclientprotocol__codex-acp@0.0.44.patch"
-    }
-  }
+  "pnpm": {}
 }
