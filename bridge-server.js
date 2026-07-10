@@ -612,6 +612,7 @@ wss.on("connection", (ws) => {
           const existingSession = activeSessions.get(sessionId);
           if (existingSession) {
             console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
+            notifySessionTakenOver(existingSession.ws, ws, sessionId);
             existingSession.ws = ws;
             // Only seed the in-memory mode from the store when nothing is
             // set yet. Never overwrite a live mode with a (possibly stale)
@@ -650,6 +651,7 @@ wss.on("connection", (ws) => {
               const handle = await initializingSessions.get(sessionId);
               const sess = activeSessions.get(sessionId);
               if (sess) {
+                notifySessionTakenOver(sess.ws, ws, sessionId);
                 sess.ws = ws;
                 if (seededMode) {
                   sess.permissionMode = seededMode;
@@ -1174,6 +1176,25 @@ async function sendSessionMeta(ws, sessionId, handle) {
     ws.send(JSON.stringify({ event: "session_meta", sessionId, payload }));
   } catch (err) {
     console.warn(`[acpx-server] sendSessionMeta failed for ${sessionId}:`, err.message);
+  }
+}
+
+// Notify a session's previous, still-open WebSocket that a newer client has
+// taken the session over. Both bridge clients key behavior on this event: the
+// browser chat UI shows a "session opened elsewhere" banner and stops
+// auto-reconnecting; the headless Go task runner hands the run off instead of
+// blocking until its idle timeout and recording a false failure. No-op when the
+// previous ws is the same socket or already closed, so the ordinary
+// drop-and-reconnect case (old ws not OPEN) never fires it.
+function notifySessionTakenOver(previousWs, nextWs, sessionId) {
+  if (!previousWs || previousWs === nextWs || previousWs.readyState !== 1 /* OPEN */) {
+    return;
+  }
+  try {
+    previousWs.send(JSON.stringify({ event: "session_taken_over", sessionId }));
+    console.log(`[acpx-server] Notified previous ws of takeover for session: ${sessionId}`);
+  } catch (err) {
+    console.warn(`[acpx-server] Failed to notify taken-over ws for ${sessionId}:`, err.message);
   }
 }
 
