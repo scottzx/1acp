@@ -1447,6 +1447,7 @@ export class AcpRuntimeManager {
   async getStatus(handle: AcpRuntimeHandle): Promise<AcpRuntimeStatus> {
     const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
     return {
+      forkSupported: Boolean(record.agentCapabilities?.sessionCapabilities?.fork),
       summary: statusSummary(record),
       acpxRecordId: record.acpxRecordId,
       backendSessionId: record.acpSessionId,

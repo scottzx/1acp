@@ -196,6 +196,8 @@ export type AcpRuntimeSessionUsage = {
 };
 
 export type AcpRuntimeStatus = {
+  /** Whether the connected agent advertised ACP session fork support. */
+  forkSupported?: boolean;
   summary?: string;
   acpxRecordId?: string;
   backendSessionId?: string;

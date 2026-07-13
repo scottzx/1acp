@@ -1438,6 +1438,9 @@ async function sendSessionMeta(ws, sessionId, handle) {
     if (status.configOptions) {
       payload.configOptions = status.configOptions;
     }
+    if (typeof status.forkSupported === "boolean") {
+      payload.forkSupported = status.forkSupported;
+    }
     if (Object.keys(payload).length === 0) {
       return;
     }
