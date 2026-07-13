@@ -1103,6 +1103,277 @@ wss.on("connection", (ws) => {
           break;
         }
 
+        case "logout": {
+          // ACP 1.2.1 agent/logout — terminate the agent's authenticated
+          // session without tearing down the session_id (the persisted
+          // record + active session entry stay intact, so a later
+          // authRequired event re-runs authenticateIfRequired against the
+          // same credentials pipeline). Capability gate reads the
+          // persisted record's agentCapabilities.auth.logout; success pushes
+          // {type:'logged_out', sessionId}; failure pushes
+          // {type:'error', code:'capability_unsupported' | 'LOGOUT_FAILED'}.
+          if (!sessionId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId is required");
+            return;
+          }
+
+          if (typeof runtime.logoutSession !== "function") {
+            sendError(
+              ws,
+              sessionId,
+              "LOGOUT_UNAVAILABLE",
+              "Runtime does not implement logoutSession",
+            );
+            return;
+          }
+
+          const activeSession = activeSessions.get(sessionId);
+          if (!activeSession) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+
+          const record = await loadActiveSessionRecord(runtime, activeSession.handle);
+          if (!record) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session record not found on disk");
+            return;
+          }
+
+          if (!record.agentCapabilities?.auth?.logout) {
+            console.log(
+              `[acpx-server] logout rejected for ${sessionId}: agent does not advertise auth.logout`,
+            );
+            sendLogoutError(ws, sessionId, "capability_unsupported", "logout not supported");
+            return;
+          }
+
+          try {
+            await runtime.logoutSession({ handle: activeSession.handle });
+            if (ws.readyState !== 1 /* OPEN */) {
+              return;
+            }
+            ws.send(JSON.stringify({ type: "logged_out", sessionId }));
+            console.log(`[acpx-server] Logged out session ${sessionId}`);
+          } catch (err) {
+            console.error(`[acpx-server] logout failed for ${sessionId}:`, err);
+            sendLogoutError(ws, sessionId, "LOGOUT_FAILED", err?.message || String(err));
+          }
+          break;
+        }
+
+        case "list_sessions": {
+          const sessionsDir = path.join(DEFAULT_STATE_DIR, "sessions");
+          try {
+            if (!fs.existsSync(sessionsDir)) {
+              ws.send(
+                JSON.stringify({
+                  type: "sessions_list",
+                  sessionId: sessionId,
+                  payload: { sessions: [] },
+                }),
+              );
+              break;
+            }
+            const files = await fs.promises.readdir(sessionsDir);
+            const sessions = [];
+            for (const file of files) {
+              if (!file.endsWith(".json")) {
+                continue;
+              }
+              try {
+                const content = await fs.promises.readFile(path.join(sessionsDir, file), "utf8");
+                const record = JSON.parse(content);
+                if (record && record.acpxRecordId) {
+                  const sId = record.acpxRecordId;
+                  const activeSession = activeSessions.get(sId);
+
+                  let status = "idle";
+                  if (activeSession) {
+                    status = activeSession.activeTurn ? "running" : "idle";
+                  }
+
+                  sessions.push({
+                    id: record.acpxRecordId,
+                    acpxRecordId: record.acpxRecordId,
+                    acpSessionId: record.acpSessionId,
+                    cwd: record.cwd,
+                    name: record.name || record.acpxRecordId,
+                    agentCommand: record.agentCommand,
+                    createdAt: record.createdAt,
+                    lastUsedAt: record.lastUsedAt,
+                    status: status,
+                    closed: record.closed || false,
+                  });
+                }
+              } catch (e) {
+                console.warn(`[acpx-server] Failed to read/parse session file ${file}:`, e.message);
+              }
+            }
+
+            ws.send(
+              JSON.stringify({
+                type: "sessions_list",
+                sessionId: sessionId,
+                payload: {
+                  sessions: sessions,
+                },
+              }),
+            );
+          } catch (err) {
+            console.error("[acpx-server] Failed to list sessions:", err);
+            sendError(ws, sessionId, "LIST_SESSIONS_FAILED", err.message);
+          }
+          break;
+        }
+
+        case "fork_session": {
+          if (!sessionId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId is required");
+            return;
+          }
+
+          if (typeof runtime.forkSession !== "function") {
+            sendError(ws, sessionId, "FORK_UNAVAILABLE", "Runtime does not implement forkSession");
+            return;
+          }
+
+          const activeSession = activeSessions.get(sessionId);
+          if (!activeSession) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+
+          try {
+            const result = await runtime.forkSession({ handle: activeSession.handle });
+            const newSessionRecord = await loadActiveSessionRecord(runtime, {
+              acpxRecordId: result.sessionId,
+              sessionKey: result.sessionId,
+            });
+
+            ws.send(
+              JSON.stringify({
+                type: "session_forked",
+                sessionId: result.sessionId,
+                payload: {
+                  session: {
+                    id: result.sessionId,
+                    acpxRecordId: result.sessionId,
+                    acpSessionId: result.agentSessionId || result.sessionId,
+                    cwd: newSessionRecord?.cwd || activeSession.handle.cwd,
+                    name: newSessionRecord?.name || result.sessionId,
+                    agentCommand: newSessionRecord?.agentCommand,
+                    createdAt: newSessionRecord?.createdAt || new Date().toISOString(),
+                    status: "idle",
+                  },
+                  parentSessionId: sessionId,
+                },
+              }),
+            );
+            console.log(`[acpx-server] Forked session ${sessionId} to ${result.sessionId}`);
+          } catch (err) {
+            console.error(`[acpx-server] fork failed for ${sessionId}:`, err);
+            sendError(ws, sessionId, "FORK_FAILED", err?.message || String(err));
+          }
+          break;
+        }
+
+        case "delete_session": {
+          if (!sessionId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId is required");
+            return;
+          }
+
+          const activeSession = activeSessions.get(sessionId);
+
+          try {
+            if (activeSession && typeof runtime.deleteSession === "function") {
+              await runtime
+                .deleteSession({ handle: activeSession.handle, sessionId })
+                .catch((err) => {
+                  console.warn(
+                    `[acpx-server] Runtime deleteSession failed for ${sessionId}, proceeding with local deletion:`,
+                    err.message,
+                  );
+                });
+            } else {
+              try {
+                const record = await runtime.options.sessionStore.load(sessionId);
+                if (record) {
+                  record.closed = true;
+                  record.closedAt = new Date().toISOString();
+                  await runtime.options.sessionStore.save(record);
+                }
+              } catch (e) {
+                console.warn(
+                  `[acpx-server] Failed to mark record closed on disk for ${sessionId}:`,
+                  e.message,
+                );
+              }
+            }
+
+            if (activeSession) {
+              activeSessions.delete(sessionId);
+            }
+
+            ws.send(
+              JSON.stringify({
+                type: "session_deleted",
+                sessionId: sessionId,
+              }),
+            );
+            console.log(`[acpx-server] Deleted session ${sessionId}`);
+          } catch (err) {
+            console.error(`[acpx-server] delete failed for ${sessionId}:`, err);
+            sendError(ws, sessionId, "DELETE_FAILED", err?.message || String(err));
+          }
+          break;
+        }
+
+        case "authenticate": {
+          const { methodId, credentials } = payload;
+          if (!sessionId || !methodId) {
+            sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and methodId are required");
+            return;
+          }
+
+          if (typeof runtime.authenticateSession !== "function") {
+            sendError(
+              ws,
+              sessionId,
+              "AUTHENTICATE_UNAVAILABLE",
+              "Runtime does not implement authenticateSession",
+            );
+            return;
+          }
+
+          const activeSession = activeSessions.get(sessionId);
+          if (!activeSession) {
+            sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
+            return;
+          }
+
+          try {
+            await runtime.authenticateSession({
+              handle: activeSession.handle,
+              methodId,
+              credentials,
+            });
+            ws.send(JSON.stringify({ type: "auth_completed", sessionId }));
+            console.log(`[acpx-server] Authenticated session ${sessionId} via ${methodId}`);
+          } catch (err) {
+            console.error(`[acpx-server] authenticate failed for ${sessionId}:`, err);
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                sessionId,
+                code: "auth_failed",
+                message: err?.message || String(err),
+              }),
+            );
+          }
+          break;
+        }
+
         case "close_all_sessions": {
           console.log("[acpx-server] Closing all sessions by request...");
           await killAllManagedAgents();
@@ -1208,6 +1479,39 @@ function sendError(ws, sessionId, errorCode, message) {
       message,
     }),
   );
+}
+
+// sendLogoutError emits the {type:'error', sessionId, code, message} envelope
+// for the logout action. The success path uses {type:'logged_out', sessionId}
+// instead so the frontend can route on a single field; this helper covers
+// everything else (capability_unsupported, LOGOUT_FAILED, etc.).
+function sendLogoutError(ws, sessionId, code, message) {
+  if (!ws || ws.readyState !== 1 /* OPEN */) {
+    return;
+  }
+  ws.send(
+    JSON.stringify({
+      type: "error",
+      sessionId,
+      code,
+      message,
+    }),
+  );
+}
+
+async function loadActiveSessionRecord(runtime, handle) {
+  if (!handle) {
+    return null;
+  }
+  try {
+    return await runtime.options.sessionStore.load(handle.acpxRecordId || handle.sessionKey);
+  } catch (err) {
+    console.warn(
+      `[acpx-server] Failed to load session record for ${handle.sessionKey}:`,
+      err.message,
+    );
+    return null;
+  }
 }
 
 // Send a prompt_cancelled event to the ws that originally submitted the

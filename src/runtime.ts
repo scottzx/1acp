@@ -171,6 +171,37 @@ export class AcpxRuntime implements AcpxRuntimeLike {
     return handle;
   }
 
+  async logoutSession(input: { handle: AcpRuntimeHandle }): Promise<void> {
+    const { handle } = this.resolveManagerHandle(input.handle);
+    const manager = await this.getManager();
+    await manager.logoutSession({ handle });
+  }
+
+  async authenticateSession(input: {
+    handle: AcpRuntimeHandle;
+    methodId: string;
+    credentials?: Record<string, string>;
+  }): Promise<void> {
+    const { handle } = this.resolveManagerHandle(input.handle);
+    const manager = await this.getManager();
+    await manager.authenticateSession({ ...input, handle });
+  }
+
+  async forkSession(input: {
+    handle: AcpRuntimeHandle;
+    cwd?: string;
+  }): Promise<{ sessionId: string; agentSessionId?: string }> {
+    const { handle } = this.resolveManagerHandle(input.handle);
+    const manager = await this.getManager();
+    return await manager.forkSession({ ...input, handle });
+  }
+
+  async deleteSession(input: { handle: AcpRuntimeHandle; sessionId: string }): Promise<void> {
+    const { handle } = this.resolveManagerHandle(input.handle);
+    const manager = await this.getManager();
+    await manager.deleteSession({ ...input, handle });
+  }
+
   startTurn(input: AcpRuntimeTurnInput) {
     const { handle, state } = this.resolveManagerHandle(input.handle);
     const managerPromise = this.getManager();

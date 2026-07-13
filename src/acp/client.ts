@@ -6,6 +6,7 @@ import {
   RequestError,
   type AnyMessage,
   type AuthMethod,
+  type AuthenticateRequest,
   type ClientCapabilities,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
@@ -523,6 +524,18 @@ export class AcpClient {
 
   supportsListSessions(): boolean {
     return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.list);
+  }
+
+  supportsForkSession(): boolean {
+    return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.fork);
+  }
+
+  supportsDeleteSession(): boolean {
+    return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.delete);
+  }
+
+  supportsLogout(): boolean {
+    return Boolean(this.initResult?.agentCapabilities?.auth?.logout);
   }
 
   setEventHandlers(
@@ -1309,6 +1322,61 @@ export class AcpClient {
   async listSessions(params: ListSessionsRequest = {}): Promise<ListSessionsResponse> {
     const connection = this.getConnection();
     return await this.runConnectionRequest(() => connection.listSessions(params));
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const connection = this.getConnection();
+    await this.runConnectionRequest(() => connection.deleteSession({ sessionId }));
+    if (this.loadedSessionId === sessionId) {
+      this.loadedSessionId = undefined;
+    }
+    this.modelConfigIds.delete(sessionId);
+    this.legacyModelSessionIds.delete(sessionId);
+  }
+
+  async forkSession(input: { sessionId: string; cwd?: string }): Promise<SessionCreateResult> {
+    const connection = this.getConnection();
+    const sessionCwd = await resolveAgentSessionCwd(
+      input.cwd ?? this.options.cwd,
+      this.options.agentCommand,
+    );
+    const response = await this.runConnectionRequest(() =>
+      connection.unstable_forkSession({
+        sessionId: input.sessionId,
+        cwd: sessionCwd,
+        mcpServers: this.options.mcpServers ?? [],
+      }),
+    );
+    this.loadedSessionId = response.sessionId;
+    const configOptions = normalizeResponseConfigOptions(response);
+    const models = modelStateFromSessionResponse({ configOptions, response });
+    this.rememberSessionModels(response.sessionId, models);
+    return {
+      sessionId: response.sessionId,
+      agentSessionId: extractRuntimeSessionId(response._meta),
+      configOptions,
+      models,
+      configOptionsPresent: hasResponseField(response, "configOptions"),
+      legacyModelMetadataPresent: hasResponseField(response, "models"),
+    };
+  }
+
+  async logout(): Promise<void> {
+    const connection = this.getConnection();
+    await this.runConnectionRequest(() => connection.logout({}));
+  }
+
+  async authenticate(methodId: string, credentials?: Record<string, string>): Promise<void> {
+    const connection = this.getConnection();
+    await this.runConnectionRequest(() =>
+      connection.authenticate({
+        methodId,
+        credentials,
+        _meta: {
+          credentials,
+        },
+      } as unknown as AuthenticateRequest),
+    );
   }
 
   async requestCancelActivePrompt(): Promise<boolean> {

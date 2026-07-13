@@ -754,6 +754,73 @@ export class AcpRuntimeManager {
     }
   }
 
+  // Terminate the agent's authenticated session via ACP `agent/logout`. The
+  // capability gate lives in the bridge so this layer is the dumb forwarder;
+  // the connection's existing client keeps its loaded sessionId so a later
+  // authRequired event re-runs authenticateIfRequired against the same
+  // credentials pipeline without a session restart.
+  async logoutSession(input: { handle: AcpRuntimeHandle }): Promise<void> {
+    const record = await this.requireRecord(input.handle.acpxRecordId ?? input.handle.sessionKey);
+    await this.withRuntimeControlSession(record, "persistent", async ({ client }) => {
+      await client.logout();
+    });
+  }
+
+  async authenticateSession(input: {
+    handle: AcpRuntimeHandle;
+    methodId: string;
+    credentials?: Record<string, string>;
+  }): Promise<void> {
+    const record = await this.requireRecord(input.handle.acpxRecordId ?? input.handle.sessionKey);
+    await this.withRuntimeControlSession(record, "persistent", async ({ client }) => {
+      await client.authenticate(input.methodId, input.credentials);
+    });
+  }
+
+  async forkSession(input: {
+    handle: AcpRuntimeHandle;
+    cwd?: string;
+  }): Promise<{ sessionId: string; agentSessionId?: string }> {
+    const record = await this.requireRecord(input.handle.acpxRecordId ?? input.handle.sessionKey);
+    if (!record.agentCapabilities?.sessionCapabilities?.fork) {
+      throw new Error("capability_unsupported");
+    }
+    const { value: result } = await this.withRuntimeControlSession(
+      record,
+      "persistent",
+      async ({ client }) => {
+        return await client.forkSession({ sessionId: record.acpSessionId, cwd: input.cwd });
+      },
+    );
+
+    const newRecord: SessionRecord = {
+      ...record,
+      acpxRecordId: result.sessionId,
+      acpSessionId: result.agentSessionId || result.sessionId,
+      agentSessionId: result.agentSessionId,
+      createdAt: new Date().toISOString(),
+      lastUsedAt: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      messages: [...record.messages],
+      name: `${record.name || record.acpxRecordId} (Fork)`,
+    };
+    await this.options.sessionStore.save(newRecord);
+    return result;
+  }
+
+  async deleteSession(input: { handle: AcpRuntimeHandle; sessionId: string }): Promise<void> {
+    const record = await this.requireRecord(input.handle.acpxRecordId ?? input.handle.sessionKey);
+    if (!record.agentCapabilities?.sessionCapabilities?.delete) {
+      throw new Error("capability_unsupported");
+    }
+    await this.withRuntimeControlSession(record, "persistent", async ({ client }) => {
+      await client.deleteSession(record.acpSessionId);
+    });
+    record.closed = true;
+    record.closedAt = new Date().toISOString();
+    await this.options.sessionStore.save(record);
+  }
+
   // Reopen the persisted record when it still matches this ensure request.
   // sessionOptions on a reused record are intentionally ignored: system
   // prompts are fixed at newSession time; callers who need a different

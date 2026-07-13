@@ -211,7 +211,7 @@ test("conversation model preserves assistant text beyond the runtime text limit"
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text },
     },
-  } as SessionNotification);
+  });
 
   const message = conversation.messages[0];
   assert.ok(typeof message === "object" && message !== null && "Agent" in message);

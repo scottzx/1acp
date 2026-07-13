@@ -339,6 +339,17 @@ export interface AcpRuntimeTurn {
 
 export interface AcpRuntime {
   ensureSession(input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle>;
+  logoutSession?(input: { handle: AcpRuntimeHandle }): Promise<void>;
+  authenticateSession?(input: {
+    handle: AcpRuntimeHandle;
+    methodId: string;
+    credentials?: Record<string, string>;
+  }): Promise<void>;
+  forkSession?(input: {
+    handle: AcpRuntimeHandle;
+    cwd?: string;
+  }): Promise<{ sessionId: string; agentSessionId?: string }>;
+  deleteSession?(input: { handle: AcpRuntimeHandle; sessionId: string }): Promise<void>;
   startTurn(input: AcpRuntimeTurnInput): AcpRuntimeTurn;
   /**
    * Compatibility adapter for consumers that expect terminal status in the
