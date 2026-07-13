@@ -4,6 +4,28 @@
 
 Repo: https://github.com/openclaw/acpx
 
+## Unreleased
+
+### Changes
+
+### Breaking
+
+### Fixes
+
+## 2026.7.4 (v0.12.0)
+
+### Changes
+
+- Agents/built-ins: add Grok Build via `grok agent stdio`, including cached-login and `XAI_API_KEY` authentication selection. Thanks @TheAngryPit.
+
+### Breaking
+
+### Fixes
+
+- CLI/queue: drain active turns before releasing queue-owner leases and preserve typed retryable shutdown responses while terminating agent bridges. Thanks @superWorldSavior.
+
+- CLI/quiet output: emit exactly one structured stderr diagnostic for direct and queued prompt failures without adding diagnostics to stdout. Thanks @superWorldSavior.
+
 ## 2026.6.23 (v0.11.2)
 
 ### Changes
@@ -14,14 +36,6 @@ Repo: https://github.com/openclaw/acpx
 
 - Runtime/status: persist token usage reported on successful prompt responses,
   including adapters that only provide a sparse `usage_update`.
-
-## Unreleased
-
-### Changes
-
-### Breaking
-
-### Fixes
 
 ## 2026.6.23 (v0.11.1)
 

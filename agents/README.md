@@ -11,6 +11,7 @@ Built-in agents:
 - `copilot -> copilot --acp --stdio`
 - `droid -> droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
 - `fast-agent -> uvx fast-agent-mcp acp`
+- `grok-build -> grok agent stdio`
 - `iflow -> iflow --experimental-acp`
 - `kilocode -> npx -y @kilocode/cli acp`
 - `kimi -> kimi acp`
@@ -25,11 +26,12 @@ Harness-specific docs in this directory:
 
 - [Codex](Codex.md): built-in `codex -> npx -y @agentclientprotocol/codex-acp`
 - [Claude](Claude.md): built-in `claude -> npx -y @agentclientprotocol/claude-agent-acp`
+- [Gemini](Gemini.md): built-in `gemini -> gemini --acp`
+- [Cursor](Cursor.md): built-in `cursor -> cursor-agent acp`
 - [Copilot](Copilot.md): built-in `copilot -> copilot --acp --stdio`
 - [Droid](Droid.md): built-in `droid -> droid exec --output-format acp` with `factory-droid` and `factorydroid` aliases
 - [fast-agent](FastAgent.md): built-in `fast-agent -> uvx fast-agent-mcp acp`
-- [Cursor](Cursor.md): built-in `cursor -> cursor-agent acp`
-- [Gemini](Gemini.md): built-in `gemini -> gemini --acp`
+- [Grok Build](GrokBuild.md): built-in `grok-build -> grok agent stdio`
 - [iFlow](Iflow.md): built-in `iflow -> iflow --experimental-acp`
 - [Kilocode](Kilocode.md): built-in `kilocode -> npx -y @kilocode/cli acp`
 - [Kimi](Kimi.md): built-in `kimi -> kimi acp`

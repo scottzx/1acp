@@ -1,6 +1,6 @@
 {
   "name": "acpx",
-  "version": "0.11.2",
+  "version": "0.12.0",
   "description": "Headless CLI client for the Agent Client Protocol (ACP) — talk to coding agents from the command line",
   "keywords": [
     "acp",
@@ -37,7 +37,7 @@
   "scripts": {
     "build": "tsdown src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
     "build:quiet": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
-    "build:test": "node -e \"require('node:fs').rmSync('dist-test',{recursive:true,force:true})\" && tsgo -p tsconfig.test.json",
+    "build:test": "node -e \"require('node:fs').rmSync('dist-test',{recursive:true,force:true})\" && tsc -p tsconfig.test.json",
     "check": "pnpm run format:check && pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run viewer:typecheck && pnpm run viewer:build && pnpm run test:coverage",
     "check:changed": "pnpm run check",
     "check:docs": "pnpm run format:docs:check && pnpm run lint:docs && pnpm run docs:site",
@@ -68,8 +68,8 @@
     "test:changed": "pnpm run test:coverage",
     "test:coverage": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js && c8 --all --check-coverage --lines 85 --branches 85 --functions 85 --statements 85 --include 'dist-test/src/flows/authoring.js' --include 'dist-test/src/flows/decision.js' --include 'dist-test/src/flows/definition.js' --include 'dist-test/src/flows/json.js' --include 'dist-test/src/flows/schema.js' --include 'dist-test/src/flows/store.js' --include 'dist-test/src/runtime/public/**/*.js' --include 'dist-test/src/runtime/engine/manager.js' --exclude 'dist-test/test/**/*.js' --exclude 'dist/**/*.js' node --test dist-test/test/flows.test.js dist-test/test/flows-store.test.js dist-test/test/runtime.test.js dist-test/test/runtime-events.test.js dist-test/test/runtime-manager.test.js dist-test/test/runtime-probe.test.js",
     "test:live": "pnpm run build:test && node --test dist-test/test/cursor-live.integration.js",
-    "typecheck": "tsgo --noEmit",
-    "typecheck:tsc": "tsgo --noEmit",
+    "typecheck": "tsc --noEmit",
+    "typecheck:tsc": "tsc --noEmit",
     "viewer": "tsx examples/flows/replay-viewer/server.ts",
     "viewer:build": "vite build --config examples/flows/replay-viewer/vite.config.ts",
     "viewer:dev": "tsx examples/flows/replay-viewer/server.ts start",
@@ -77,47 +77,41 @@
     "viewer:preview": "tsx examples/flows/replay-viewer/server.ts start",
     "viewer:status": "tsx examples/flows/replay-viewer/server.ts status",
     "viewer:stop": "tsx examples/flows/replay-viewer/server.ts stop",
-    "viewer:typecheck": "tsgo -p examples/flows/replay-viewer/tsconfig.json --noEmit && tsgo -p examples/flows/replay-viewer/tsconfig.server.json --noEmit"
+    "viewer:typecheck": "tsc -p examples/flows/replay-viewer/tsconfig.json --noEmit && tsc -p examples/flows/replay-viewer/tsconfig.server.json --noEmit"
   },
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "^0.37.0",
-    "@agentclientprotocol/codex-acp": "^1.1.0",
-    "@agentclientprotocol/sdk": "^0.25.0",
+    "@agentclientprotocol/sdk": "^1.2.1",
     "commander": "^15.0.0",
     "skillflag": "^0.2.0",
-    "tsx": "^4.22.4",
+    "tsx": "^4.23.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@stryker-mutator/core": "^9.6.1",
-    "@types/node": "^25.9.2",
+    "@types/node": "^26.1.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@types/react-test-renderer": "^19.1.0",
     "@types/ws": "^8.18.1",
-    "@typescript/native-preview": "7.0.0-dev.20260616.1",
-    "@vitejs/plugin-react": "^6.0.2",
-    "@xyflow/react": "^12.11.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "@vitejs/plugin-react": "^6.0.3",
+    "@xyflow/react": "^12.11.2",
     "c8": "^11.0.0",
     "elkjs": "^0.11.1",
     "fast-json-patch": "^3.1.1",
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.7",
-    "markdownlint-cli2": "^0.22.1",
-    "oxfmt": "^0.55.0",
-    "oxlint": "^1.70.0",
-    "oxlint-tsgolint": "^0.23.0",
+    "lint-staged": "^17.0.8",
+    "markdownlint-cli2": "^0.23.0",
+    "oxfmt": "^0.58.0",
+    "oxlint": "^1.73.0",
+    "oxlint-tsgolint": "^0.24.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-test-renderer": "^19.2.7",
-    "tsdown": "^0.22.2",
-    "typescript": "^6.0.3",
-    "vite": "^8.0.16",
+    "tsdown": "^0.22.4",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vite": "^8.1.4",
     "ws": "^8.21.0"
-  },
-  "optionalDependencies": {
-    "opencode-ai": "^1.17.0",
-    "pi-acp": "^0.0.26"
   },
   "lint-staged": {
     "*.{js,ts}": [
@@ -131,6 +125,5 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "packageManager": "pnpm@10.33.2",
-  "pnpm": {}
+  "packageManager": "pnpm@10.33.2"
 }

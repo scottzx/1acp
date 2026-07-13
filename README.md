@@ -310,7 +310,7 @@ acpx --format json codex exec 'review this PR' \
 # json-strict: suppresses non-JSON stderr output (requires --format json)
 acpx --format json --json-strict codex exec 'review this PR'
 
-# quiet: final assistant text only
+# quiet: final assistant text on stdout; one structured stderr line on failure
 acpx --format quiet codex 'give me a 3-line summary'
 
 # suppress read payloads while keeping the selected output format
@@ -319,7 +319,7 @@ acpx --suppress-reads codex exec 'inspect the repo and report tool usage'
 
 - `text`: human-readable stream with assistant text and tool updates
 - `json`: raw ACP NDJSON stream for automation
-- `quiet`: final assistant text only
+- `quiet`: final assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr
 - `--suppress-reads`: replace raw read-file contents with `[read output suppressed]` in `text` and `json` output
 
 JSON events include a stable envelope for correlation:
@@ -356,6 +356,7 @@ Built-ins:
 | `copilot`    | native (`copilot --acp --stdio`)                                            | [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-chat/use-copilot-chat-in-the-command-line) |
 | `droid`      | native (`droid exec --output-format acp`)                                   | [Factory Droid](https://www.factory.ai)                                                                         |
 | `fast-agent` | `uvx fast-agent-mcp acp`                                                    | [fast-agent](https://fast-agent.ai)                                                                             |
+| `grok-build` | native (`grok agent stdio`)                                                 | [Grok Build](https://docs.x.ai/build/overview)                                                                  |
 | `iflow`      | native (`iflow --experimental-acp`)                                         | [iFlow CLI](https://github.com/iflow-ai/iflow-cli)                                                              |
 | `kilocode`   | `npx -y @kilocode/cli acp`                                                  | [Kilocode](https://kilocode.ai)                                                                                 |
 | `kimi`       | native (`kimi acp`)                                                         | [Kimi CLI](https://github.com/MoonshotAI/kimi-cli)                                                              |

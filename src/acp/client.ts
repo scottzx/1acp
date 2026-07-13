@@ -237,8 +237,8 @@ type PendingConnectionRequest = {
 
 type AuthSelection = {
   methodId: string;
-  credential: string;
-  source: "env" | "config";
+  credential?: string;
+  source: "env" | "config" | "agent";
 };
 
 type AgentLaunchPlan = {
@@ -1613,9 +1613,54 @@ export class AcpClient {
           source: "config",
         };
       }
+
+      const agentSpecificEnvCredential = this.readAgentSpecificEnvCredential(method.id);
+      if (agentSpecificEnvCredential) {
+        return {
+          methodId: method.id,
+          credential: agentSpecificEnvCredential,
+          source: "env",
+        };
+      }
+    }
+
+    for (const method of methods) {
+      const agentManagedSelection = this.selectAgentManagedAuthMethod(method.id);
+      if (agentManagedSelection) {
+        return agentManagedSelection;
+      }
     }
 
     return undefined;
+  }
+
+  private readAgentSpecificEnvCredential(methodId: string): string | undefined {
+    if (!this.isGrokBuildAcpCommand() || methodId !== "xai.api_key") {
+      return undefined;
+    }
+    const value = process.env.XAI_API_KEY;
+    return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+  }
+
+  private selectAgentManagedAuthMethod(methodId: string): AuthSelection | undefined {
+    if (!this.isGrokBuildAcpCommand() || methodId !== "cached_token") {
+      return undefined;
+    }
+    return {
+      methodId,
+      source: "agent",
+    };
+  }
+
+  private isGrokBuildAcpCommand(): boolean {
+    const { command, args } = splitCommandLine(this.options.agentCommand);
+    const executable = command
+      .replace(/\\/g, "/")
+      .split("/")
+      .pop()
+      ?.replace(/\.(cmd|exe|ps1)$/iu, "")
+      .toLowerCase();
+    return executable === "grok" && args[0] === "agent" && args[1] === "stdio";
   }
 
   private async authenticateIfRequired(

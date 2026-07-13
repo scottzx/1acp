@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import readline from "node:readline";
 import test from "node:test";
-import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   MAX_MESSAGE_BUFFER_SIZE,
   SessionQueueOwner,
@@ -526,10 +525,9 @@ test("SessionQueueOwner emits typed invalid request payload errors", async () =>
       setSessionModel: async () => {
         // no-op
       },
-      setSessionConfigOption: async () =>
-        ({
-          configOptions: [],
-        }) as SetSessionConfigOptionResponse,
+      setSessionConfigOption: async () => ({
+        configOptions: [],
+      }),
     });
 
     const socket = await connectSocket(lease.socketPath);
@@ -574,10 +572,9 @@ test("SessionQueueOwner emits typed shutdown errors for pending prompts", async 
       setSessionModel: async () => {
         // no-op
       },
-      setSessionConfigOption: async () =>
-        ({
-          configOptions: [],
-        }) as SetSessionConfigOptionResponse,
+      setSessionConfigOption: async () => ({
+        configOptions: [],
+      }),
     });
 
     const socket = await connectSocket(lease.socketPath);
@@ -627,6 +624,65 @@ test("SessionQueueOwner emits typed shutdown errors for pending prompts", async 
   });
 });
 
+test("SessionQueueOwner preserves request ids for clients arriving during shutdown", async () => {
+  await withTempHome(async () => {
+    const sessionId = "owner-shutdown-new-client";
+    const lease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(lease);
+
+    const owner = await SessionQueueOwner.start(lease, {
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {
+        // no-op
+      },
+      setSessionModel: async () => {
+        // no-op
+      },
+      setSessionConfigOption: async () => ({
+        configOptions: [],
+      }),
+    });
+
+    try {
+      owner.beginShutdown();
+      const socket = await connectSocket(lease.socketPath);
+      const lines = readline.createInterface({ input: socket });
+      const iterator = lines[Symbol.asyncIterator]();
+      socket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "req-during-shutdown",
+          ownerGeneration: lease.ownerGeneration,
+          message: "arrived during shutdown",
+          permissionMode: "approve-reads",
+          waitForCompletion: true,
+        })}\n`,
+      );
+
+      const payload = (await nextJsonLine(iterator)) as {
+        type: string;
+        requestId: string;
+        detailCode?: string;
+        origin?: string;
+        retryable?: boolean;
+        message: string;
+      };
+      assert.equal(payload.type, "error");
+      assert.equal(payload.requestId, "req-during-shutdown");
+      assert.equal(payload.detailCode, "QUEUE_OWNER_CLOSED");
+      assert.equal(payload.origin, "queue");
+      assert.equal(payload.retryable, true);
+      assert.match(payload.message, /shutting down/i);
+      lines.close();
+      socket.destroy();
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
 test("SessionQueueOwner rejects no-wait prompts when queue depth exceeds the limit", async () => {
   await withTempHome(async () => {
     const lease = await tryAcquireQueueOwnerLease("owner-overloaded");
@@ -643,10 +699,9 @@ test("SessionQueueOwner rejects no-wait prompts when queue depth exceeds the lim
         setSessionModel: async () => {
           // no-op
         },
-        setSessionConfigOption: async () =>
-          ({
-            configOptions: [],
-          }) as SetSessionConfigOptionResponse,
+        setSessionConfigOption: async () => ({
+          configOptions: [],
+        }),
       },
       {
         maxQueueDepth: 1,
@@ -823,6 +878,105 @@ test("trySubmitToRunningOwner recovers stale owners before MCP conflict checks",
       await assert.rejects(fs.access(lockPath));
       assert.equal(keeper.exitCode == null && keeper.signalCode == null, false);
     } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("trySubmitToRunningOwner marks quiet errors as outputAlreadyEmitted after formatter emits", async () => {
+  // Regression test for double-emission in quiet mode.
+  //
+  // When the owner has not emitted an ACP error event, emitQueueOwnerError()
+  // calls formatter.onError() to emit the structured error line, then must
+  // return a QueueConnectionError with
+  // outputAlreadyEmitted === true so that the top-level emitRequestedError
+  // handler in cli-core.ts does not emit the same error a second time on
+  // stderr.  Without the fix, two stderr lines would appear: one structured
+  // "[acpx] error: …" from the formatter and one raw line from the catch.
+  await withTempHome(async (homeDir) => {
+    const sessionId = "quiet-double-emit-session";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+    });
+
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      socket.write(
+        `${JSON.stringify({
+          type: "accepted",
+          requestId: request.requestId,
+        })}\n`,
+      );
+      socket.write(
+        `${JSON.stringify({
+          type: "error",
+          requestId: request.requestId,
+          code: "RUNTIME",
+          detailCode: "QUEUE_RUNTIME_PROMPT_FAILED",
+          origin: "queue",
+          retryable: false,
+          message: "prompt failed in queue owner",
+        })}\n`,
+      );
+      socket.end();
+    });
+
+    await listenServer(server, socketPath);
+
+    const onErrorCalls: string[] = [];
+    const spyFormatter: OutputFormatter = {
+      setContext() {
+        // no-op
+      },
+      onAcpMessage() {
+        // no-op
+      },
+      onError(params) {
+        onErrorCalls.push(params.code);
+      },
+      onPermissionEscalation() {
+        // no-op
+      },
+      flush() {
+        // no-op
+      },
+    };
+
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: spyFormatter,
+            errorEmissionPolicy: { queueErrorAlreadyEmitted: true },
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError, "expected QueueConnectionError");
+          // After the fix: formatter emitted once → error must be marked so
+          // the top-level handler does not emit a second time.
+          assert.equal(
+            error.outputAlreadyEmitted,
+            true,
+            "QueueConnectionError must carry outputAlreadyEmitted=true when formatter already emitted",
+          );
+          return true;
+        },
+      );
+
+      // The formatter's onError must have been called exactly once.
+      assert.equal(onErrorCalls.length, 1, "formatter.onError must be called exactly once");
+      assert.equal(onErrorCalls[0], "RUNTIME");
+    } finally {
+      await closeServer(server);
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);
     }

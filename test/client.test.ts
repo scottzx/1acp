@@ -297,6 +297,85 @@ test("AcpClient ignores ambient normalized provider env vars for auth selection"
   );
 });
 
+test("AcpClient uses XAI_API_KEY for Grok Build xai.api_key auth", async () => {
+  await withEnv(
+    {
+      XAI_API_KEY: "xai-ambient",
+      ACPX_AUTH_XAI_API_KEY: undefined,
+    },
+    async () => {
+      const client = makeClient({ agentCommand: "grok agent stdio" });
+      const internals = asInternals(client);
+
+      const selection = internals.selectAuthMethod?.([{ id: "xai.api_key" }]);
+      assert.deepEqual(selection, {
+        methodId: "xai.api_key",
+        credential: "xai-ambient",
+        source: "env",
+      });
+
+      let authenticatedMethod: string | undefined;
+      await internals.authenticateIfRequired?.(
+        {
+          authenticate: async ({ methodId }: { methodId: string }) => {
+            authenticatedMethod = methodId;
+          },
+        },
+        [{ id: "xai.api_key" }],
+      );
+
+      assert.equal(authenticatedMethod, "xai.api_key");
+    },
+  );
+});
+
+test("AcpClient keeps XAI_API_KEY scoped to Grok Build auth", async () => {
+  await withEnv(
+    {
+      XAI_API_KEY: "xai-ambient",
+      ACPX_AUTH_XAI_API_KEY: undefined,
+    },
+    async () => {
+      const client = makeClient({ agentCommand: "custom-acp-server" });
+      const internals = asInternals(client);
+
+      const selection = internals.selectAuthMethod?.([{ id: "xai.api_key" }]);
+      assert.equal(selection, undefined);
+    },
+  );
+});
+
+test("AcpClient selects Grok Build cached_token as agent-managed auth", async () => {
+  await withEnv(
+    {
+      XAI_API_KEY: undefined,
+      ACPX_AUTH_CACHED_TOKEN: undefined,
+    },
+    async () => {
+      const client = makeClient({ agentCommand: "grok agent stdio" });
+      const internals = asInternals(client);
+
+      const selection = internals.selectAuthMethod?.([{ id: "cached_token" }]);
+      assert.deepEqual(selection, {
+        methodId: "cached_token",
+        source: "agent",
+      });
+
+      let authenticatedMethod: string | undefined;
+      await internals.authenticateIfRequired?.(
+        {
+          authenticate: async ({ methodId }: { methodId: string }) => {
+            authenticatedMethod = methodId;
+          },
+        },
+        [{ id: "cached_token" }],
+      );
+
+      assert.equal(authenticatedMethod, "cached_token");
+    },
+  );
+});
+
 test("AcpClient authenticateIfRequired throws when auth policy is fail and credentials are missing", async () => {
   const client = makeClient({ authPolicy: "fail" });
   const internals = asInternals(client);
@@ -1042,8 +1121,8 @@ test("AcpClient session update handling drains queued callbacks and swallows han
   const internals = asInternals(client);
 
   await Promise.all([
-    internals.handleSessionUpdate?.({ sessionId: "good" } as never),
-    internals.handleSessionUpdate?.({ sessionId: "bad" } as never),
+    internals.handleSessionUpdate?.({ sessionId: "good" }),
+    internals.handleSessionUpdate?.({ sessionId: "bad" }),
   ]);
   await internals.waitForSessionUpdateDrain?.(0, 100);
 
@@ -1052,7 +1131,7 @@ test("AcpClient session update handling drains queued callbacks and swallows han
   assert.equal(internals.processedSessionUpdates, 2);
 
   internals.suppressSessionUpdates = true;
-  await internals.handleSessionUpdate?.({ sessionId: "suppressed" } as never);
+  await internals.handleSessionUpdate?.({ sessionId: "suppressed" });
   assert.deepEqual(notifications, ["good", "bad"]);
 });
 
