@@ -202,6 +202,31 @@ test("conversation model captures prompt, chunks, tool calls, and metadata", () 
   ]);
 });
 
+test("conversation model preserves assistant text beyond the runtime text limit", () => {
+  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+  const text = "a".repeat(12_000);
+
+  recordSessionUpdate(conversation, undefined, {
+    sessionId: "session-1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text },
+    },
+  } as SessionNotification);
+
+  const message = conversation.messages[0];
+  assert.ok(typeof message === "object" && message !== null && "Agent" in message);
+  if (!(typeof message === "object" && message !== null && "Agent" in message)) {
+    assert.fail("expected Agent message");
+  }
+  const content = message.Agent.content[0];
+  assert.ok(content && "Text" in content);
+  if (!(content && "Text" in content)) {
+    assert.fail("expected agent text content");
+  }
+  assert.equal(content.Text, text);
+});
+
 test("config option updates synchronize and clear advertised model state", () => {
   const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
   let acpxState: SessionAcpxState = {

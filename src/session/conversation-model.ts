@@ -33,7 +33,7 @@ export type LegacyHistoryEntry = {
 };
 
 const MAX_RUNTIME_MESSAGES = 200;
-const MAX_RUNTIME_AGENT_TEXT_CHARS = 8_000;
+const MAX_RUNTIME_USER_TEXT_CHARS = 8_000;
 const MAX_RUNTIME_THINKING_CHARS = 4_000;
 const MAX_RUNTIME_TOOL_IO_CHARS = 4_000;
 const MAX_RUNTIME_REQUEST_TOKEN_USAGE = 100;
@@ -242,7 +242,7 @@ function appendAgentText(agent: SessionAgentMessage, text: string): void {
 
   const last = agent.content.at(-1);
   if (last && isAgentTextContent(last)) {
-    last.Text = trimRuntimeText(`${last.Text}${text}`, MAX_RUNTIME_AGENT_TEXT_CHARS);
+    last.Text = `${last.Text}${text}`;
     return;
   }
 
@@ -683,7 +683,7 @@ export function recordPromptSubmission(
       content: userContent.map((content) => {
         if ("Text" in content) {
           return {
-            Text: trimRuntimeText(content.Text, MAX_RUNTIME_AGENT_TEXT_CHARS),
+            Text: trimRuntimeText(content.Text, MAX_RUNTIME_USER_TEXT_CHARS),
           };
         }
         return content;
@@ -931,7 +931,7 @@ function trimRuntimeUserMessage(message: { content: SessionUserContent[] }): voi
   message.content = message.content.map((content) => {
     if ("Text" in content) {
       return {
-        Text: trimRuntimeText(content.Text, MAX_RUNTIME_AGENT_TEXT_CHARS),
+        Text: trimRuntimeText(content.Text, MAX_RUNTIME_USER_TEXT_CHARS),
       };
     }
     return content;
@@ -949,9 +949,7 @@ function trimRuntimeAgentMessage(message: SessionAgentMessage): void {
 }
 
 function trimRuntimeAgentContent(content: SessionAgentContent): void {
-  if ("Text" in content) {
-    content.Text = trimRuntimeText(content.Text, MAX_RUNTIME_AGENT_TEXT_CHARS);
-  } else if ("Thinking" in content) {
+  if ("Thinking" in content) {
     content.Thinking.text = trimRuntimeText(content.Thinking.text, MAX_RUNTIME_THINKING_CHARS);
   } else if ("ToolUse" in content) {
     content.ToolUse.raw_input = trimRuntimeText(
