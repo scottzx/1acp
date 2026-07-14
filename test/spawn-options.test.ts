@@ -56,6 +56,40 @@ test("buildAgentSpawnOptions leaves the agent env untouched when no session env 
   assert.equal(options.env.ACPX_TEST_SESSION_ENV_INJECTED, undefined);
 });
 
+test("buildAgentSpawnOptions injects Claude settings only when requested", async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-claude-settings-"));
+  const claudeDir = path.join(home, ".claude");
+  await fs.mkdir(claudeDir);
+  await fs.writeFile(
+    path.join(claudeDir, "settings.json"),
+    JSON.stringify({
+      env: {
+        ANTHROPIC_AUTH_TOKEN: "settings-token",
+        ANTHROPIC_BASE_URL: "https://settings.example.test",
+      },
+    }),
+  );
+
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const claudeOptions = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, undefined, true);
+    assert.equal(claudeOptions.env.ANTHROPIC_AUTH_TOKEN, "settings-token");
+    assert.equal(claudeOptions.env.ANTHROPIC_BASE_URL, "https://settings.example.test");
+
+    const otherAgentOptions = buildAgentSpawnOptions("/tmp/acpx-agent", undefined);
+    assert.notEqual(otherAgentOptions.env.ANTHROPIC_AUTH_TOKEN, "settings-token");
+    assert.notEqual(otherAgentOptions.env.ANTHROPIC_BASE_URL, "https://settings.example.test");
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    await fs.rm(home, { recursive: true, force: true });
+  }
+});
+
 test("spawned agent child process receives session env with parent-override precedence", async () => {
   const script =
     "process.stdout.write(JSON.stringify({injected:process.env.ACPX_TEST_E2E_INJECTED,parent:process.env.ACPX_TEST_E2E_PARENT}))";

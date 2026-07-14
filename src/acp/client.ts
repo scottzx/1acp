@@ -85,6 +85,7 @@ import {
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
 import {
+  applyClaudeSettingsEnvironment,
   buildAgentSpawnOptions,
   readEnvCredential,
   resolveConfiguredAuthCredential,
@@ -717,6 +718,7 @@ export class AcpClient {
         this.options.cwd,
         this.options.authCredentials,
         this.options.sessionOptions?.env,
+        isClaudeAcpCommand(spawnCommand, args),
       ),
     };
   }
@@ -755,6 +757,9 @@ export class AcpClient {
   private async spawnAgentProcess(
     plan: AgentLaunchPlan,
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
+    if (plan.claudeAcp) {
+      applyClaudeSettingsEnvironment(plan.spawnOptions.env);
+    }
     const spawnedChild = spawn(
       plan.spawnCommand,
       plan.args,

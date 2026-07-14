@@ -1,6 +1,42 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AcpClientOptions } from "../types.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
+const CLAUDE_SETTINGS_ENV_KEYS = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"] as const;
+
+type ClaudeSettings = {
+  env?: Record<string, unknown>;
+};
+
+function readClaudeSettingsEnvironment(): Record<string, string> {
+  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+  let parsed: ClaudeSettings;
+  try {
+    parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as ClaudeSettings;
+  } catch {
+    return {};
+  }
+
+  const settingsEnv = parsed.env;
+  if (!settingsEnv || typeof settingsEnv !== "object") {
+    return {};
+  }
+
+  const env: Record<string, string> = {};
+  for (const key of CLAUDE_SETTINGS_ENV_KEYS) {
+    const value = settingsEnv[key];
+    if (typeof value === "string" && value.length > 0) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
+export function applyClaudeSettingsEnvironment(env: NodeJS.ProcessEnv): void {
+  Object.assign(env, readClaudeSettingsEnvironment());
+}
 
 function toEnvToken(value: string): string {
   return value
@@ -82,8 +118,12 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): Set<string> {
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionEnv: Record<string, string> | undefined,
+  includeClaudeSettings: boolean,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  if (includeClaudeSettings) {
+    applyClaudeSettingsEnvironment(env);
+  }
   const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
   if (authCredentials) {
     for (const [methodId, credential] of Object.entries(authCredentials)) {
@@ -172,6 +212,7 @@ export function buildAgentSpawnOptions(
   cwd: string,
   authCredentials: Record<string, string> | undefined,
   sessionEnv?: Record<string, string>,
+  includeClaudeSettings = false,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -180,7 +221,7 @@ export function buildAgentSpawnOptions(
 } {
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials, sessionEnv),
+    env: buildAgentEnvironment(authCredentials, sessionEnv, includeClaudeSettings),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };
