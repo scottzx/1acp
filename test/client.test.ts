@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -918,6 +920,95 @@ test("AcpClient createSession forwards codex model metadata without setting it e
   assert.equal(setConfigCalled, false);
 });
 
+test("AcpClient exposes and enforces Grok Build permission modes through ACP", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-grok-mode-"));
+  const permissionRequests: RequestPermissionRequest[] = [];
+  const client = makeClient({
+    agentCommand: "grok agent stdio",
+    cwd,
+    onPermissionRequest: async (request) => {
+      permissionRequests.push(request.raw);
+      return request.inferredKind === "execute"
+        ? { outcome: "reject_once" }
+        : { outcome: "allow_once" };
+    },
+  });
+  let forwardedModeCalls = 0;
+  asInternals(client).connection = {
+    newSession: async () => ({ sessionId: "grok-session" }),
+    setSessionMode: async () => {
+      forwardedModeCalls += 1;
+      return {};
+    },
+  };
+
+  try {
+    const created = await client.createSession(cwd);
+    assert.deepEqual(created.configOptions, [
+      {
+        id: "mode",
+        name: "Permission Mode",
+        category: "mode",
+        type: "select",
+        currentValue: "default",
+        options: [
+          { value: "default", name: "Ask" },
+          { value: "acceptEdits", name: "Accept Edits" },
+          { value: "dontAsk", name: "Deny" },
+          { value: "bypassPermissions", name: "Always Approve" },
+        ],
+      },
+    ]);
+    assert.equal(created.configOptionsPresent, true);
+
+    const filePath = path.join(cwd, "grok-mode.txt");
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "approved",
+    });
+    assert.equal(permissionRequests.length, 1);
+    assert.equal(permissionRequests[0]?.toolCall.kind, "edit");
+    assert.equal(await fs.readFile(filePath, "utf8"), "approved");
+
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleCreateTerminal?.({
+          sessionId: created.sessionId,
+          command: "pwd",
+        }),
+      PermissionDeniedError,
+    );
+    assert.equal(permissionRequests.length, 2);
+    assert.equal(permissionRequests[1]?.toolCall.kind, "execute");
+
+    await client.setSessionMode(created.sessionId, "acceptEdits");
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "accepted edit",
+    });
+    assert.equal(permissionRequests.length, 2);
+    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
+
+    await client.setSessionMode(created.sessionId, "dontAsk");
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleWriteTextFile?.({
+          sessionId: created.sessionId,
+          path: filePath,
+          content: "denied",
+        }),
+      PermissionDeniedError,
+    );
+    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
+    assert.equal(forwardedModeCalls, 0);
+  } finally {
+    await client.close();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("AcpClient setSessionModel uses the model session config option", async () => {
   const client = makeClient();
 
@@ -1141,7 +1232,7 @@ test("AcpClient buffers session updates with no handler, then flushes on setEven
 
   // A notification that arrives before any consumer (the adapter's initial
   // available_commands_update after newSession) must be buffered, not lost.
-  await internals.handleSessionUpdate?.({ sessionId: "early" } as never);
+  await internals.handleSessionUpdate?.({ sessionId: "early" });
 
   const received: string[] = [];
   client.setEventHandlers({
@@ -1153,7 +1244,7 @@ test("AcpClient buffers session updates with no handler, then flushes on setEven
   assert.deepEqual(received, ["early"]);
 
   // Later notifications dispatch directly (buffer already drained).
-  await internals.handleSessionUpdate?.({ sessionId: "later" } as never);
+  await internals.handleSessionUpdate?.({ sessionId: "later" });
   await internals.waitForSessionUpdateDrain?.(0, 100);
   assert.deepEqual(received, ["early", "later"]);
 });

@@ -18,7 +18,7 @@ export type FileSystemHandlersOptions = {
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   onOperation?: (operation: ClientOperation) => void;
-  confirmWrite?: (filePath: string, preview: string) => Promise<boolean>;
+  confirmWrite?: (filePath: string, preview: string, sessionId: string) => Promise<boolean>;
 };
 
 function nowIso(): string {
@@ -65,7 +65,11 @@ export class FileSystemHandlers {
   private nonInteractivePermissions: NonInteractivePermissionPolicy;
   private readonly onOperation?: (operation: ClientOperation) => void;
   private readonly usesDefaultConfirmWrite: boolean;
-  private readonly confirmWrite: (filePath: string, preview: string) => Promise<boolean>;
+  private readonly confirmWrite: (
+    filePath: string,
+    preview: string,
+    sessionId: string,
+  ) => Promise<boolean>;
 
   constructor(options: FileSystemHandlersOptions) {
     this.rootDir = path.resolve(options.cwd);
@@ -138,7 +142,7 @@ export class FileSystemHandlers {
     });
 
     try {
-      if (!(await this.isWriteApproved(filePath, preview))) {
+      if (!(await this.isWriteApproved(filePath, preview, params.sessionId))) {
         throw new PermissionDeniedError("Permission denied for fs/write_text_file");
       }
 
@@ -166,7 +170,11 @@ export class FileSystemHandlers {
     }
   }
 
-  private async isWriteApproved(filePath: string, preview: string): Promise<boolean> {
+  private async isWriteApproved(
+    filePath: string,
+    preview: string,
+    sessionId: string,
+  ): Promise<boolean> {
     if (this.permissionMode === "approve-all") {
       return true;
     }
@@ -180,7 +188,7 @@ export class FileSystemHandlers {
     ) {
       throw new PermissionPromptUnavailableError();
     }
-    return await this.confirmWrite(filePath, preview);
+    return await this.confirmWrite(filePath, preview, sessionId);
   }
 
   private resolvePathWithinRoot(rawPath: string): string {

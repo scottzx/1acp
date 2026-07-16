@@ -47,7 +47,7 @@ export type TerminalManagerOptions = {
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   onOperation?: (operation: ClientOperation) => void;
-  confirmExecute?: (commandLine: string) => Promise<boolean>;
+  confirmExecute?: (commandLine: string, sessionId: string) => Promise<boolean>;
   killGraceMs?: number;
 };
 
@@ -159,7 +159,7 @@ export class TerminalManager {
   private nonInteractivePermissions: NonInteractivePermissionPolicy;
   private readonly onOperation?: (operation: ClientOperation) => void;
   private readonly usesDefaultConfirmExecute: boolean;
-  private readonly confirmExecute: (commandLine: string) => Promise<boolean>;
+  private readonly confirmExecute: (commandLine: string, sessionId: string) => Promise<boolean>;
   private readonly killGraceMs: number;
   private readonly terminals = new Map<string, ManagedTerminal>();
 
@@ -193,7 +193,7 @@ export class TerminalManager {
     });
 
     try {
-      if (!(await this.isExecuteApproved(commandLine))) {
+      if (!(await this.isExecuteApproved(commandLine, params.sessionId))) {
         throw new PermissionDeniedError("Permission denied for terminal/create");
       }
 
@@ -418,7 +418,7 @@ export class TerminalManager {
     this.onOperation?.(operation);
   }
 
-  private async isExecuteApproved(commandLine: string): Promise<boolean> {
+  private async isExecuteApproved(commandLine: string, sessionId: string): Promise<boolean> {
     if (this.permissionMode === "approve-all") {
       return true;
     }
@@ -432,7 +432,7 @@ export class TerminalManager {
     ) {
       throw new PermissionPromptUnavailableError();
     }
-    return await this.confirmExecute(commandLine);
+    return await this.confirmExecute(commandLine, sessionId);
   }
 
   private isRunning(terminal: ManagedTerminal): boolean {

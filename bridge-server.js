@@ -653,6 +653,8 @@ wss.on("connection", (ws) => {
               if (sess) {
                 notifySessionTakenOver(sess.ws, ws, sessionId);
                 sess.ws = ws;
+                sess.agentType = agentType;
+                sess.sessionMode = await resolveGrokPermissionMode(handle, agentType);
                 if (seededMode) {
                   sess.permissionMode = seededMode;
                 }
@@ -693,6 +695,8 @@ wss.on("connection", (ws) => {
               activeTurn: null,
               promptQueue: [],
               ws,
+              agentType,
+              sessionMode: await resolveGrokPermissionMode(handle, agentType),
               // permissionMode is per-session and overrides the runtime
               // default in handlePermissionRequestCallback. The Composer's
               // mode toggle later updates this via set_permission_mode.
@@ -878,6 +882,7 @@ wss.on("connection", (ws) => {
           }
           try {
             await runtime.setMode({ handle: session.handle, mode: modeId });
+            session.sessionMode = modeId;
             console.log(`[acpx-server] session mode for ${sessionId} set to ${modeId}`);
             ws.send(
               JSON.stringify({
@@ -1453,6 +1458,18 @@ async function sendSessionMeta(ws, sessionId, handle) {
   }
 }
 
+async function resolveGrokPermissionMode(handle, agentType) {
+  if (agentType !== "grok-build") {
+    return undefined;
+  }
+  try {
+    const status = await runtime.getStatus({ handle });
+    return status.modes?.currentModeId || "default";
+  } catch {
+    return "default";
+  }
+}
+
 // Notify a session's previous, still-open WebSocket that a newer client has
 // taken the session over. Both bridge clients key behavior on this event: the
 // browser chat UI shows a "session opened elsewhere" banner and stops
@@ -1808,18 +1825,36 @@ async function handlePermissionRequestCallback(req, ctx) {
     `mode=${session.permissionMode}, requestId=${req.raw.toolCall.toolCallId}`,
   );
 
+  // Grok Build's synthesized ACP permission mode is authoritative for its
+  // permission callbacks and client-capability requests. Ignore the legacy
+  // three-state shield for Grok so a stale persisted approve-all value cannot
+  // silently override the visible native "Ask" mode.
+  const grokMode = session.agentType === "grok-build" ? session.sessionMode || "default" : null;
+  if (grokMode === "bypassPermissions") {
+    return { outcome: "allow_once" };
+  }
+  if (grokMode === "dontAsk") {
+    return { outcome: "reject_once" };
+  }
+  if (
+    grokMode === "acceptEdits" &&
+    (req.inferredKind === "edit" || req.inferredKind === "move" || req.inferredKind === "delete")
+  ) {
+    return { outcome: "allow_once" };
+  }
+
   // Per-session mode shortcut — gates the prompt without round-tripping
   // through the UI. approve-reads falls through to the normal flow
   // (1acp internally auto-allows read/search; everything else prompts).
   // approve-all and deny-all are blanket decisions for the entire
   // session until the user toggles the mode again.
-  if (session.permissionMode === "approve-all") {
+  if (!grokMode && session.permissionMode === "approve-all") {
     console.log(
       `[acpx-server] permission mode=approve-all → auto allow_once for ${req.raw.toolCall.title}`,
     );
     return { outcome: "allow_once" };
   }
-  if (session.permissionMode === "deny-all") {
+  if (!grokMode && session.permissionMode === "deny-all") {
     console.log(
       `[acpx-server] permission mode=deny-all → auto reject_once for ${req.raw.toolCall.title}`,
     );

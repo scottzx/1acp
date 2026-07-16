@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -136,6 +137,41 @@ const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
 const DEVIN_COMPATIBILITY_CLIENT_NAME = "windsurf";
 // This is the embedded Windsurf IDE version bundled with Devin Desktop 3.1.7, the first locally verified version that passes Devin's server-side ACP precondition.
 const DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION = "1.110.1";
+const GROK_PERMISSION_MODE_IDS = [
+  "default",
+  "acceptEdits",
+  "dontAsk",
+  "bypassPermissions",
+] as const;
+type GrokPermissionMode = (typeof GROK_PERMISSION_MODE_IDS)[number];
+
+function isGrokPermissionMode(value: string): value is GrokPermissionMode {
+  return GROK_PERMISSION_MODE_IDS.includes(value as GrokPermissionMode);
+}
+
+function grokPermissionModeOption(currentValue: GrokPermissionMode): SessionConfigOption {
+  return {
+    id: "mode",
+    name: "Permission Mode",
+    category: "mode",
+    type: "select",
+    currentValue,
+    options: [
+      { value: "default", name: "Ask" },
+      { value: "acceptEdits", name: "Accept Edits" },
+      { value: "dontAsk", name: "Deny" },
+      { value: "bypassPermissions", name: "Always Approve" },
+    ],
+  };
+}
+
+function hasModeConfigOption(configOptions: SessionConfigOption[] | undefined): boolean {
+  return Boolean(
+    configOptions?.some(
+      (option) => option.type === "select" && (option.category === "mode" || option.id === "mode"),
+    ),
+  );
+}
 
 function resolveClientInfo(devinAcp: boolean): { name: string; version: string } {
   if (!devinAcp) {
@@ -455,6 +491,8 @@ export class AcpClient {
   private readonly pendingConnectionRequests = new Set<PendingConnectionRequest>();
   private readonly modelConfigIds = new Map<string, string>();
   private readonly legacyModelSessionIds = new Set<string>();
+  private readonly grokPermissionModes = new Map<string, GrokPermissionMode>();
+  private readonly grokConfigOptions = new Map<string, SessionConfigOption[]>();
 
   constructor(options: AcpClientOptions) {
     this.options = {
@@ -470,10 +508,20 @@ export class AcpClient {
       onPermissionEscalation: this.options.onPermissionEscalation,
     };
 
+    const grokBuildAcp = this.isGrokBuildAcpCommand();
     this.filesystem = new FileSystemHandlers({
       cwd: this.options.cwd,
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
+      ...(grokBuildAcp
+        ? {
+            confirmWrite: async (filePath: string, preview: string, sessionId: string) =>
+              await this.confirmGrokClientOperation(sessionId, "edit", `Write ${filePath}`, {
+                path: filePath,
+                preview,
+              }),
+          }
+        : {}),
       onOperation: (operation) => {
         this.eventHandlers.onClientOperation?.(operation);
       },
@@ -482,6 +530,14 @@ export class AcpClient {
       cwd: this.options.cwd,
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
+      ...(grokBuildAcp
+        ? {
+            confirmExecute: async (commandLine: string, sessionId: string) =>
+              await this.confirmGrokClientOperation(sessionId, "execute", `Run ${commandLine}`, {
+                command: commandLine,
+              }),
+          }
+        : {}),
       onOperation: (operation) => {
         this.eventHandlers.onClientOperation?.(operation);
       },
@@ -988,7 +1044,10 @@ export class AcpClient {
     }
 
     this.loadedSessionId = result.sessionId;
-    const configOptions = normalizeResponseConfigOptions(result);
+    const configOptions = this.applyGrokPermissionModeCompatibility(
+      result.sessionId,
+      normalizeResponseConfigOptions(result),
+    );
     const models = modelStateFromSessionResponse({ configOptions, response: result });
     this.rememberSessionModels(result.sessionId, models);
 
@@ -997,7 +1056,8 @@ export class AcpClient {
       agentSessionId: extractRuntimeSessionId(result._meta),
       configOptions,
       models,
-      configOptionsPresent: hasResponseField(result, "configOptions"),
+      configOptionsPresent:
+        hasResponseField(result, "configOptions") || configOptions !== undefined,
       legacyModelMetadataPresent: hasResponseField(result, "models"),
     };
   }
@@ -1039,6 +1099,11 @@ export class AcpClient {
 
     this.loadedSessionId = sessionId;
     const result = toReconnectedSessionResult(response);
+    result.configOptions = this.applyGrokPermissionModeCompatibility(
+      sessionId,
+      result.configOptions,
+    );
+    result.configOptionsPresent = result.configOptionsPresent || result.configOptions !== undefined;
     this.updateRememberedSessionModels(sessionId, result);
     return result;
   }
@@ -1056,6 +1121,11 @@ export class AcpClient {
 
     this.loadedSessionId = sessionId;
     const result = toReconnectedSessionResult(response);
+    result.configOptions = this.applyGrokPermissionModeCompatibility(
+      sessionId,
+      result.configOptions,
+    );
+    result.configOptionsPresent = result.configOptionsPresent || result.configOptions !== undefined;
     this.updateRememberedSessionModels(sessionId, result);
     return result;
   }
@@ -1145,6 +1215,28 @@ export class AcpClient {
   }
 
   async setSessionMode(sessionId: string, modeId: string): Promise<void> {
+    if (this.grokPermissionModes.has(sessionId)) {
+      if (!isGrokPermissionMode(modeId)) {
+        throw new Error(
+          `Unsupported Grok Build permission mode "${modeId}". Expected one of: ${GROK_PERMISSION_MODE_IDS.join(", ")}`,
+        );
+      }
+      this.grokPermissionModes.set(sessionId, modeId);
+      const configOptions = (this.grokConfigOptions.get(sessionId) ?? []).map((option) =>
+        option.type === "select" && (option.category === "mode" || option.id === "mode")
+          ? grokPermissionModeOption(modeId)
+          : option,
+      );
+      this.grokConfigOptions.set(sessionId, configOptions);
+      await this.handleSessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions,
+        },
+      });
+      return;
+    }
     const connection = this.getConnection();
     try {
       await this.runConnectionRequest(() =>
@@ -1322,6 +1414,8 @@ export class AcpClient {
     }
     this.modelConfigIds.delete(sessionId);
     this.legacyModelSessionIds.delete(sessionId);
+    this.grokPermissionModes.delete(sessionId);
+    this.grokConfigOptions.delete(sessionId);
   }
 
   async listSessions(params: ListSessionsRequest = {}): Promise<ListSessionsResponse> {
@@ -1337,6 +1431,8 @@ export class AcpClient {
     }
     this.modelConfigIds.delete(sessionId);
     this.legacyModelSessionIds.delete(sessionId);
+    this.grokPermissionModes.delete(sessionId);
+    this.grokConfigOptions.delete(sessionId);
   }
 
   async forkSession(input: { sessionId: string; cwd?: string }): Promise<SessionCreateResult> {
@@ -1353,7 +1449,10 @@ export class AcpClient {
       }),
     );
     this.loadedSessionId = response.sessionId;
-    const configOptions = normalizeResponseConfigOptions(response);
+    const configOptions = this.applyGrokPermissionModeCompatibility(
+      response.sessionId,
+      normalizeResponseConfigOptions(response),
+    );
     const models = modelStateFromSessionResponse({ configOptions, response });
     this.rememberSessionModels(response.sessionId, models);
     return {
@@ -1361,7 +1460,8 @@ export class AcpClient {
       agentSessionId: extractRuntimeSessionId(response._meta),
       configOptions,
       models,
-      configOptionsPresent: hasResponseField(response, "configOptions"),
+      configOptionsPresent:
+        hasResponseField(response, "configOptions") || configOptions !== undefined,
       legacyModelMetadataPresent: hasResponseField(response, "models"),
     };
   }
@@ -1471,6 +1571,8 @@ export class AcpClient {
     this.loadedSessionId = undefined;
     this.modelConfigIds.clear();
     this.legacyModelSessionIds.clear();
+    this.grokPermissionModes.clear();
+    this.grokConfigOptions.clear();
     this.initResult = undefined;
     this.connection = undefined;
     this.agent = undefined;
@@ -1736,6 +1838,70 @@ export class AcpClient {
     return executable === "grok" && args[0] === "agent" && args[1] === "stdio";
   }
 
+  private applyGrokPermissionModeCompatibility(
+    sessionId: string,
+    configOptions: SessionConfigOption[] | undefined,
+  ): SessionConfigOption[] | undefined {
+    if (!this.isGrokBuildAcpCommand() || hasModeConfigOption(configOptions)) {
+      return configOptions;
+    }
+    const mode = this.grokPermissionModes.get(sessionId) ?? "default";
+    this.grokPermissionModes.set(sessionId, mode);
+    const compatibleOptions = [...(configOptions ?? []), grokPermissionModeOption(mode)];
+    this.grokConfigOptions.set(sessionId, compatibleOptions);
+    return compatibleOptions;
+  }
+
+  private resolveGrokPermissionModeDecision(
+    params: RequestPermissionRequest,
+  ): RequestPermissionResponse | undefined {
+    const mode = this.grokPermissionModes.get(params.sessionId);
+    if (!mode || mode === "default") {
+      return undefined;
+    }
+    if (mode === "bypassPermissions") {
+      return decisionToResponse(params, { outcome: "allow_once" });
+    }
+    if (mode === "dontAsk") {
+      return decisionToResponse(params, { outcome: "reject_once" });
+    }
+    const kind = inferToolKind(params);
+    if (kind === "edit" || kind === "move" || kind === "delete") {
+      return decisionToResponse(params, { outcome: "allow_once" });
+    }
+    return undefined;
+  }
+
+  private async confirmGrokClientOperation(
+    sessionId: string,
+    kind: "edit" | "execute",
+    title: string,
+    rawInput: unknown,
+  ): Promise<boolean> {
+    const request: RequestPermissionRequest = {
+      sessionId,
+      toolCall: {
+        toolCallId: `acpx-client-${randomUUID()}`,
+        title,
+        kind,
+        rawInput,
+      },
+      options: [
+        { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+        { optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+        { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+      ],
+      _meta: {
+        acpx: {
+          source: kind === "edit" ? "fs/write_text_file" : "terminal/create",
+          grokPermissionMode: this.grokPermissionModes.get(sessionId) ?? "default",
+        },
+      },
+    };
+    const response = await this.handlePermissionRequest(request);
+    return classifyPermissionDecision(request, response) === "approved";
+  }
+
   private async authenticateIfRequired(
     connection: ClientSideConnection,
     methods: AuthMethod[],
@@ -1770,6 +1936,12 @@ export class AcpClient {
   ): Promise<RequestPermissionResponse> {
     if (this.cancellingSessionIds.has(params.sessionId)) {
       return cancelledPermissionResponse();
+    }
+
+    const grokModeResponse = this.resolveGrokPermissionModeDecision(params);
+    if (grokModeResponse) {
+      this.recordPermissionDecision(classifyPermissionDecision(params, grokModeResponse));
+      return grokModeResponse;
     }
 
     const hostResponse = await this.tryHandlePermissionRequestWithHost(params);
