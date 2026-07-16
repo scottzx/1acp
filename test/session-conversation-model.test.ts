@@ -226,6 +226,70 @@ test("conversation model preserves assistant text beyond the runtime text limit"
   assert.equal(content.Text, text);
 });
 
+test("conversation model preserves whitespace-only agent chunks", () => {
+  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+
+  for (const text of ["Hello", "\n\n", "## Heading"]) {
+    recordSessionUpdate(conversation, undefined, {
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+      },
+    });
+  }
+
+  for (const text of ["Plan", "\n", "Next"]) {
+    recordSessionUpdate(conversation, undefined, {
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text },
+      },
+    });
+  }
+
+  const message = conversation.messages[0];
+  assert.ok(typeof message === "object" && message !== null && "Agent" in message);
+  if (!(typeof message === "object" && message !== null && "Agent" in message)) {
+    assert.fail("expected Agent message");
+  }
+  assert.deepEqual(message.Agent.content, [
+    { Text: "Hello\n\n## Heading" },
+    { Thinking: { text: "Plan\nNext", signature: null } },
+  ]);
+});
+
+test("conversation model ignores an ACP user echo without hiding repeated prompts", () => {
+  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+  const echo = {
+    sessionId: "session-1",
+    update: {
+      sessionUpdate: "user_message_chunk" as const,
+      content: { type: "text" as const, text: "hello" },
+    },
+  };
+
+  recordPromptSubmission(conversation, "hello");
+  recordSessionUpdate(conversation, undefined, echo);
+  assert.equal(conversation.messages.length, 1);
+
+  recordSessionUpdate(conversation, undefined, {
+    sessionId: "session-1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "response" },
+    },
+  });
+  recordPromptSubmission(conversation, "hello");
+  recordSessionUpdate(conversation, undefined, echo);
+
+  const userMessages = conversation.messages.filter(
+    (message) => typeof message === "object" && message !== null && "User" in message,
+  );
+  assert.equal(userMessages.length, 2);
+});
+
 test("config option updates synchronize and clear advertised model state", () => {
   const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
   let acpxState: SessionAcpxState = {

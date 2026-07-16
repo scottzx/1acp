@@ -236,7 +236,7 @@ function ensureAgentMessage(conversation: SessionConversation): SessionAgentMess
 }
 
 function appendAgentText(agent: SessionAgentMessage, text: string): void {
-  if (!text.trim()) {
+  if (text.length === 0) {
     return;
   }
 
@@ -253,7 +253,7 @@ function appendAgentText(agent: SessionAgentMessage, text: string): void {
 }
 
 function appendAgentThinking(agent: SessionAgentMessage, text: string): void {
-  if (!text.trim()) {
+  if (text.length === 0) {
     return;
   }
 
@@ -830,6 +830,22 @@ function appendUserMessageChunk(conversation: SessionConversation, content: Cont
   if (!userContent) {
     return;
   }
+
+  // ACP agents may echo the prompt as `user_message_chunk` even though the
+  // runtime already persisted it through recordPromptSubmission. Treat an
+  // exact match on the trailing User message as that echo, while preserving a
+  // genuinely repeated prompt because each new turn records a new trailing
+  // User before its echo arrives.
+  const last = conversation.messages.at(-1);
+  if (
+    last &&
+    isUserMessage(last) &&
+    "Text" in userContent &&
+    last.User.content.some((entry) => "Text" in entry && entry.Text === userContent.Text)
+  ) {
+    return;
+  }
+
   conversation.messages.push({
     User: {
       id: nextUserMessageId(),
