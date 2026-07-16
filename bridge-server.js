@@ -529,7 +529,7 @@ for (const t of [
 // ----------------------------------------------------
 // WebSocket Server Setup
 // ----------------------------------------------------
-const wss = new WebSocketServer({ port: PORT });
+const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
 
 wss.on("connection", (ws) => {
   console.log("[acpx-server] Go backend client connected.");
