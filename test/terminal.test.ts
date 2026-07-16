@@ -83,6 +83,39 @@ test("terminal manager runs a no-arg shell command line from command", async (t)
   }
 });
 
+test("terminal manager shell-falls back when a long command line exceeds executable name limits", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX executable name limit assertion");
+    return;
+  }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-test-"));
+  try {
+    const manager = new TerminalManager({
+      cwd: tmp,
+      permissionMode: "approve-all",
+    });
+
+    const created = await manager.createTerminal({
+      sessionId: "session-1",
+      command: `printf long-command-ok${" ".repeat(2_000)}`,
+    });
+
+    const waitResult = await manager.waitForTerminalExit({
+      sessionId: "session-1",
+      terminalId: created.terminalId,
+    });
+    assert.equal(waitResult.exitCode, 0);
+
+    const outputResult = await manager.terminalOutput({
+      sessionId: "session-1",
+      terminalId: created.terminalId,
+    });
+    assert.equal(outputResult.output, "long-command-ok");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("terminal manager runs no-arg command lines with path arguments", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX shell assertion");

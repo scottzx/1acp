@@ -39,6 +39,38 @@ test("readTextFile respects line/limit and logs operations", async () => {
   }
 });
 
+test("readTextFile accepts canonical path casing inside cwd on case-insensitive filesystems", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fs-test-"));
+  try {
+    const root = path.join(tmp, "ProjectRoot");
+    const filePath = path.join(root, "notes.txt");
+    await fs.mkdir(root);
+    await fs.writeFile(filePath, "hello", "utf8");
+
+    const differentlyCasedRoot = path.join(tmp, "projectroot");
+    try {
+      await fs.access(differentlyCasedRoot);
+    } catch {
+      t.skip("filesystem is case-sensitive");
+      return;
+    }
+
+    const handlers = new FileSystemHandlers({
+      cwd: differentlyCasedRoot,
+      permissionMode: "approve-reads",
+    });
+
+    const response = await handlers.readTextFile({
+      sessionId: "session-1",
+      path: filePath,
+    });
+
+    assert.equal(response.content, "hello");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("readTextFile is denied in deny-all mode", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fs-test-"));
   try {

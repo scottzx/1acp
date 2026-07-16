@@ -551,7 +551,7 @@ async function spawnTerminalProcess(
     };
   } catch (error) {
     const fallbackCommand =
-      params.args === undefined && isNotFoundSpawnError(error)
+      params.args === undefined && isCommandLineSpawnError(error)
         ? buildTerminalFallbackSpawnCommand(params.command, params.cwd ?? defaultCwd)
         : undefined;
     if (!fallbackCommand) {
@@ -586,8 +586,12 @@ async function spawnAndWait(
   return proc;
 }
 
-function isNotFoundSpawnError(error: unknown): boolean {
-  return error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT";
+function isCommandLineSpawnError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENAMETOOLONG";
 }
 
 function buildTerminalFallbackSpawnCommand(

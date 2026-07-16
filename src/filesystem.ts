@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -28,6 +29,24 @@ function nowIso(): string {
 function isWithinRoot(rootDir: string, targetPath: string): boolean {
   const relative = path.relative(rootDir, targetPath);
   return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function canonicalizePath(filePath: string): string {
+  let existingPath = filePath;
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      return path.join(fsSync.realpathSync.native(existingPath), ...missingSegments.toReversed());
+    } catch {
+      const parentPath = path.dirname(existingPath);
+      if (parentPath === existingPath) {
+        return filePath;
+      }
+      missingSegments.push(path.basename(existingPath));
+      existingPath = parentPath;
+    }
+  }
 }
 
 function toWritePreview(content: string): string {
@@ -72,7 +91,7 @@ export class FileSystemHandlers {
   ) => Promise<boolean>;
 
   constructor(options: FileSystemHandlersOptions) {
-    this.rootDir = path.resolve(options.cwd);
+    this.rootDir = canonicalizePath(path.resolve(options.cwd));
     this.permissionMode = options.permissionMode;
     this.nonInteractivePermissions = options.nonInteractivePermissions ?? "deny";
     this.onOperation = options.onOperation;
@@ -195,7 +214,7 @@ export class FileSystemHandlers {
     if (!path.isAbsolute(rawPath)) {
       throw new Error(`Path must be absolute: ${rawPath}`);
     }
-    const resolved = path.resolve(rawPath);
+    const resolved = canonicalizePath(path.resolve(rawPath));
     if (!isWithinRoot(this.rootDir, resolved)) {
       throw new Error(`Path is outside allowed cwd subtree: ${resolved}`);
     }
