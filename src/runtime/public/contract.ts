@@ -401,10 +401,10 @@ export type AcpRuntimeOptions = {
     ctx: { signal: AbortSignal },
   ) => Promise<AcpPermissionDecision | undefined>;
   /**
-   * Fired after an OUT-OF-TURN session notification (one that arrived between
-   * newSession and the first turn, e.g. available_commands_update) has been
-   * folded into the persisted record. Lets a host push a fresh capability
-   * snapshot immediately instead of waiting for the next turn/reconnect.
+   * Fired after an OUT-OF-TURN session notification (one received while no
+   * runtime turn is active) has been folded into the persisted record. Lets a
+   * host refresh history or capabilities without waiting for the next
+   * turn/reconnect.
    * `sessionKey` is the ensureSession key (the persistent record id).
    */
   onOutOfTurnSessionUpdate?: (sessionKey: string) => void;

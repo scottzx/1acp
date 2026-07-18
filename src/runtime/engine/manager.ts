@@ -657,6 +657,7 @@ export class AcpRuntimeManager {
     if (!isPersistentRecord || record.closed || !client.hasReusableSession(record.acpSessionId)) {
       return false;
     }
+    this.installOutOfTurnSessionUpdateHandler(record.acpxRecordId, client);
     const previousClient = this.pendingPersistentClients.get(record.acpxRecordId);
     this.pendingPersistentClients.set(record.acpxRecordId, client);
     if (previousClient && previousClient !== client) {
@@ -912,20 +913,20 @@ export class AcpRuntimeManager {
     }
     const previousClient = this.pendingPersistentClients.get(recordId);
     this.pendingPersistentClients.set(recordId, client);
-    // Record out-of-turn session notifications into the persisted record.
-    // Installing the handler also flushes anything the client buffered before
-    // now (the adapter's available_commands_update fires via setTimeout(0)
-    // right after newSession, before this handler exists). A turn's
-    // installRuntimeTurnEventHandlers replaces this during the turn; it is not
-    // restored afterwards because the notifications this catches (commands,
-    // out-of-turn mode/config changes) are advertised at session start.
+    this.installOutOfTurnSessionUpdateHandler(recordId, client);
+    await previousClient?.close().catch(() => {});
+    return true;
+  }
+
+  // Keep persistent clients observed while no runtime turn is active. Installing
+  // the handler also flushes updates buffered during client creation or the
+  // turn-handler -> idle-handler transition.
+  private installOutOfTurnSessionUpdateHandler(recordId: string, client: AcpClient): void {
     client.setEventHandlers({
       onSessionUpdate: (notification) => {
         this.recordOutOfTurnSessionUpdate(recordId, notification);
       },
     });
-    await previousClient?.close().catch(() => {});
-    return true;
   }
 
   // Serialize per record so two notifications can't race on load→apply→save
@@ -945,8 +946,8 @@ export class AcpRuntimeManager {
         }
         record.acpx = recordSessionUpdate(record, record.acpx, notification);
         await this.options.sessionStore.save(record);
-        // Level 2: let the host push a fresh capability snapshot right away
-        // (recordId === sessionKey for persistent sessions).
+        // Notify the host only after persistence so any immediate history or
+        // capability refresh observes the newly applied update.
         this.options.onOutOfTurnSessionUpdate?.(recordId);
       })
       .catch(() => {

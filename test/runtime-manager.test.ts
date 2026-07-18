@@ -587,7 +587,21 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
   let factoryCalls = 0;
   let closeCalls = 0;
   let promptCalls = 0;
+  let outOfTurnUpdateCalls = 0;
+  let resolveOutOfTurnUpdate: (() => void) | undefined;
+  const outOfTurnUpdate = new Promise<void>((resolve) => {
+    resolveOutOfTurnUpdate = resolve;
+  });
   let handlers: FakeClientHandlers = {};
+  let bufferedSessionUpdates: Record<string, unknown>[] = [];
+  let injectTransitionUpdate = true;
+  const emitSessionUpdate = (notification: Record<string, unknown>) => {
+    if (handlers.onSessionUpdate) {
+      handlers.onSessionUpdate(notification);
+    } else {
+      bufferedSessionUpdates.push(notification);
+    }
+  };
   const client: FakeClient = {
     initializeResult: {
       protocolVersion: 1,
@@ -611,7 +625,7 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
     prompt: async (sessionId) => {
       promptCalls += 1;
       assert.equal(sessionId, "pooled-sid");
-      handlers.onSessionUpdate?.({
+      emitSessionUpdate({
         sessionId: "pooled-sid",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -627,13 +641,35 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
     setSessionConfigOption: async () => {},
     clearEventHandlers: () => {
       handlers = {};
+      if (injectTransitionUpdate) {
+        injectTransitionUpdate = false;
+        emitSessionUpdate({
+          sessionId: "pooled-sid",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "idle update" },
+          },
+        });
+      }
     },
     setEventHandlers: (nextHandlers) => {
       handlers = nextHandlers;
+      const pending = bufferedSessionUpdates;
+      bufferedSessionUpdates = [];
+      for (const notification of pending) {
+        handlers.onSessionUpdate?.(notification);
+      }
     },
   };
   const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      onOutOfTurnSessionUpdate: (sessionKey) => {
+        assert.equal(sessionKey, "pooled-persistent-session");
+        outOfTurnUpdateCalls += 1;
+        resolveOutOfTurnUpdate?.();
+      },
+    },
     {
       clientFactory: () => {
         factoryCalls += 1;
@@ -651,6 +687,10 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
       requestId: "req-pooled-1",
     }),
   );
+  await outOfTurnUpdate;
+  assert.equal(typeof handlers.onSessionUpdate, "function");
+  assert.equal(handlers.onClientOperation, undefined);
+
   const secondEvents = await collectEvents(
     manager.runTurn({
       handle: createHandle("pooled-persistent-session"),
@@ -664,6 +704,7 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
   assert.equal(factoryCalls, 1);
   assert.equal(promptCalls, 2);
   assert.equal(closeCalls, 0);
+  assert.equal(outOfTurnUpdateCalls, 1);
   assert.deepEqual(firstEvents, [
     { type: "text_delta", text: "turn 1", stream: "output", tag: "agent_message_chunk" },
     { type: "done", stopReason: "end_turn" },
@@ -672,6 +713,8 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
     { type: "text_delta", text: "turn 2", stream: "output", tag: "agent_message_chunk" },
     { type: "done", stopReason: "end_turn" },
   ]);
+  const saved = await store.load("pooled-persistent-session");
+  assert.equal(JSON.stringify(saved?.messages).includes("idle update"), true);
 
   await manager.close(createHandle("pooled-persistent-session"));
 
@@ -1360,7 +1403,8 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
   assert.equal(cancelRequested, 1);
   assert.deepEqual(events, []);
   assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
-  assert.equal(handlers.onSessionUpdate, undefined);
+  assert.equal(typeof handlers.onSessionUpdate, "function");
+  assert.equal(handlers.onClientOperation, undefined);
 });
 
 test("AcpRuntimeManager rejects unsupported advertised config option keys after refresh", async () => {

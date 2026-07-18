@@ -35,6 +35,7 @@ const runtime = createAcpRuntime({
     const session = activeSessions.get(sessionKey);
     if (session) {
       void sendSessionMeta(session.ws, sessionKey, session.handle);
+      scheduleSessionHistoryPush(sessionKey);
     }
   },
 });
@@ -42,6 +43,12 @@ const runtime = createAcpRuntime({
 // Map of active session handles and turn contexts
 // sessionId -> { handle, activeTurn }
 const activeSessions = new Map();
+
+// Per-session coalescing state for authoritative history snapshots triggered
+// by out-of-turn updates. The bridge pushes at most one snapshot every 300ms
+// and sends one trailing snapshot when updates arrive during a read.
+const HISTORY_PUSH_INTERVAL_MS = 300;
+const historyPushStates = new Map();
 
 // Map of currently initializing sessions: sessionId -> Promise<handle>
 const initializingSessions = new Map();
@@ -509,6 +516,7 @@ function extractFromRuntimeRecord(record) {
   return items;
 }
 
+historyAdapters.claude = loadClaudeCodeHistory;
 historyAdapters.claudecode = loadClaudeCodeHistory;
 for (const t of [
   "codex",
@@ -524,6 +532,130 @@ for (const t of [
   "tmux",
 ]) {
   historyAdapters[t] = defaultHistoryAdapter;
+}
+
+async function loadRuntimeHistory(sessionId, session) {
+  if (!session) {
+    return [];
+  }
+  try {
+    const record = await runtime.options.sessionStore.load(
+      session.handle.acpxRecordId || sessionId,
+    );
+    return extractFromRuntimeRecord(record);
+  } catch (err) {
+    console.warn(`[acpx-server] Runtime store load failed for ${sessionId}:`, err.message);
+    return [];
+  }
+}
+
+async function loadNativeHistory({ sessionId, agentType, acpSessionId, workspacePath }) {
+  const adapter = historyAdapters[agentType] || defaultHistoryAdapter;
+  try {
+    return await adapter({ agentType, acpSessionId, workspacePath });
+  } catch (err) {
+    console.warn(
+      `[acpx-server] History adapter for ${agentType} failed for ${sessionId}:`,
+      err.message,
+    );
+    return [];
+  }
+}
+
+async function loadSessionHistory(sessionId, payload = {}) {
+  const session = activeSessions.get(sessionId);
+  const agentType = payload.agentType || session?.agentType || session?.handle?.agent;
+  const acpSessionId =
+    session?.handle?.agentSessionId || session?.handle?.backendSessionId || payload.acpSessionId;
+  const workspacePath = session?.handle?.cwd;
+  const historyContext = { sessionId, agentType, acpSessionId, workspacePath };
+  const prefersNativeHistory = agentType === "claude" || agentType === "claudecode";
+
+  if (prefersNativeHistory) {
+    const nativeItems = await loadNativeHistory(historyContext);
+    if (nativeItems.length > 0) {
+      return nativeItems;
+    }
+  }
+
+  const runtimeItems = await loadRuntimeHistory(sessionId, session);
+  if (runtimeItems.length > 0) {
+    return runtimeItems;
+  }
+
+  if (!prefersNativeHistory) {
+    return await loadNativeHistory(historyContext);
+  }
+  return [];
+}
+
+function clearSessionHistoryPush(sessionId) {
+  const state = historyPushStates.get(sessionId);
+  if (state?.timer) {
+    clearTimeout(state.timer);
+  }
+  historyPushStates.delete(sessionId);
+}
+
+function scheduleSessionHistoryPush(sessionId) {
+  let state = historyPushStates.get(sessionId);
+  if (!state) {
+    state = {
+      timer: null,
+      inFlight: false,
+      dirty: false,
+      lastSentAt: 0,
+    };
+    historyPushStates.set(sessionId, state);
+  }
+
+  state.dirty = true;
+  if (state.timer || state.inFlight) {
+    return;
+  }
+
+  const delay = Math.max(0, HISTORY_PUSH_INTERVAL_MS - (Date.now() - state.lastSentAt));
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    void flushSessionHistoryPush(sessionId, state);
+  }, delay);
+}
+
+async function flushSessionHistoryPush(sessionId, state) {
+  if (state.inFlight || historyPushStates.get(sessionId) !== state) {
+    return;
+  }
+
+  const session = activeSessions.get(sessionId);
+  if (!session || !session.ws || session.ws.readyState !== 1 /* OPEN */) {
+    clearSessionHistoryPush(sessionId);
+    return;
+  }
+
+  state.inFlight = true;
+  state.dirty = false;
+  try {
+    const items = await loadSessionHistory(sessionId);
+    const currentSession = activeSessions.get(sessionId);
+    const targetWs = currentSession?.ws;
+    if (targetWs && targetWs.readyState === 1 /* OPEN */) {
+      targetWs.send(
+        JSON.stringify({
+          event: "history_response",
+          sessionId,
+          items,
+        }),
+      );
+      state.lastSentAt = Date.now();
+    }
+  } catch (err) {
+    console.warn(`[acpx-server] Out-of-turn history push failed for ${sessionId}:`, err.message);
+  } finally {
+    state.inFlight = false;
+    if (state.dirty && historyPushStates.get(sessionId) === state) {
+      scheduleSessionHistoryPush(sessionId);
+    }
+  }
 }
 
 // ----------------------------------------------------
@@ -994,53 +1126,7 @@ wss.on("connection", (ws) => {
             }
           }
 
-          const session = activeSessions.get(sessionId);
-          const agentType = payload.agentType || session?.handle?.agent;
-          // The agent-side session id is the runtime's own field — it's the
-          // canonical ACP id (e.g. Claude Code's UUID) that names the JSONL
-          // on disk. We prefer it over anything in the payload so the
-          // history is bound to the actual agent process, not whatever the
-          // cc-connect / IM side happens to be tracking.
-          const acpSessionId =
-            session?.handle?.agentSessionId ||
-            session?.handle?.backendSessionId ||
-            payload.acpSessionId;
-          const workspacePath = session?.handle?.cwd;
-
-          // Fast path: in-process runtime session store.
-          let items = [];
-          if (session) {
-            try {
-              const record = await runtime.options.sessionStore.load(
-                session.handle.acpxRecordId || sessionId,
-              );
-              items = extractFromRuntimeRecord(record);
-            } catch (err) {
-              console.warn(
-                `[acpx-server] Runtime store load failed for ${sessionId}; falling back to native adapter:`,
-                err.message,
-              );
-            }
-          }
-
-          // Fallback: agent-type native storage (e.g. Claude Code's JSONL).
-          // An empty result is a normal "no history yet" outcome — the UI
-          // shows the empty hint, not an error.
-          if (items.length === 0) {
-            const adapter = historyAdapters[agentType] || defaultHistoryAdapter;
-            try {
-              items = await adapter({ agentType, acpSessionId, workspacePath });
-              console.log(
-                `[acpx-server] History adapter for ${agentType} returned ${items.length} item(s) for ${sessionId} (acp=${acpSessionId || "<none>"})`,
-              );
-            } catch (err) {
-              console.warn(
-                `[acpx-server] History adapter for ${agentType} failed for ${sessionId}:`,
-                err.message,
-              );
-              items = [];
-            }
-          }
+          const items = await loadSessionHistory(sessionId, payload);
 
           ws.send(
             JSON.stringify({
@@ -1105,6 +1191,7 @@ wss.on("connection", (ws) => {
             }
             activeSessions.delete(sessionId);
           }
+          clearSessionHistoryPush(sessionId);
           break;
         }
 
@@ -1319,6 +1406,7 @@ wss.on("connection", (ws) => {
             if (activeSession) {
               activeSessions.delete(sessionId);
             }
+            clearSessionHistoryPush(sessionId);
 
             ws.send(
               JSON.stringify({
@@ -1617,6 +1705,11 @@ function runPromptTurn(session, sessionId, promptItem) {
           // diffs ride along when the agent supplied them (Phase 6): kind
           // → card icon, locations → file links, diffs → inline diff view.
           const toolDiffs = extractToolDiffs(event.content);
+          // ACP ToolCallStatus: pending | in_progress | completed | failed.
+          // Older runtimes may still emit "success" — normalize to "completed"
+          // so the frontend can treat status as authoritative over heuristics.
+          const rawStatus = typeof event.status === "string" ? event.status : undefined;
+          const toolStatus = rawStatus === "success" ? "completed" : rawStatus || undefined;
           targetWs.send(
             JSON.stringify({
               event: "tool_call",
@@ -1625,16 +1718,20 @@ function runPromptTurn(session, sessionId, promptItem) {
               toolCallId: event.toolCallId,
               ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
               ...(event.kind ? { kind: event.kind } : {}),
+              ...(toolStatus ? { status: toolStatus } : {}),
               ...(Array.isArray(event.locations) && event.locations.length > 0
                 ? { locations: event.locations }
                 : {}),
               ...(toolDiffs.length > 0 ? { diffs: toolDiffs } : {}),
             }),
           );
+          // Terminal tool outcomes also surface as tool_result so older clients
+          // that only watch results still update. Prefer ACP "completed"/"failed";
+          // accept legacy "success" for the same gate.
           if (
             event.rawOutput !== undefined ||
-            event.status === "success" ||
-            event.status === "failed"
+            toolStatus === "completed" ||
+            toolStatus === "failed"
           ) {
             let textContent = "";
             if (event.rawOutput !== undefined && event.rawOutput !== null) {
@@ -1650,7 +1747,7 @@ function runPromptTurn(session, sessionId, promptItem) {
                 toolCallId: event.toolCallId,
                 toolName: resolveToolDisplayName(event),
                 text: textContent,
-                isError: event.status === "failed",
+                isError: toolStatus === "failed",
               }),
             );
           }
@@ -1970,6 +2067,9 @@ async function killAllManagedAgents() {
     }
   }
   await Promise.all(promises);
+  for (const sessionId of historyPushStates.keys()) {
+    clearSessionHistoryPush(sessionId);
+  }
   activeSessions.clear();
   agentSessionToClientSession.clear();
 }
