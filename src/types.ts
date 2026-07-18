@@ -11,6 +11,16 @@ import type {
   ToolKind,
 } from "@agentclientprotocol/sdk";
 export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
+import type {
+  GrokAskUserAnswers,
+  GrokAskUserQuestionRequest,
+  GrokAskUserQuestionResponse,
+} from "./acp/grok-ask-user.js";
+import type {
+  GrokExitPlanModeRequest,
+  GrokExitPlanModeResponse,
+  GrokExitPlanOutcome,
+} from "./acp/grok-exit-plan.js";
 import type { PromptInput } from "./prompt-content.js";
 
 export type AcpPermissionRequest = {
@@ -228,6 +238,24 @@ export type AcpClientOptions = {
     req: AcpPermissionRequest,
     ctx: { signal: AbortSignal },
   ) => Promise<AcpPermissionDecision | undefined>;
+  /**
+   * Host-driven handler for Grok Build's `_x.ai/ask_user_question` extension.
+   * Return a wire response, a bare answers map, or undefined to fall through
+   * to the interactive CLI prompt (TTY) / cancelled (non-TTY).
+   */
+  onAskUserQuestion?: (
+    req: GrokAskUserQuestionRequest,
+    ctx: { signal: AbortSignal },
+  ) => Promise<GrokAskUserQuestionResponse | GrokAskUserAnswers | undefined>;
+  /**
+   * Host-driven handler for Grok Build's `_x.ai/exit_plan_mode` extension.
+   * Return a wire response, a bare outcome string, or undefined to fall through
+   * to the interactive CLI prompt (TTY) / abandoned (non-TTY).
+   */
+  onExitPlanMode?: (
+    req: GrokExitPlanModeRequest,
+    ctx: { signal: AbortSignal },
+  ) => Promise<GrokExitPlanModeResponse | GrokExitPlanOutcome | undefined>;
 };
 
 export const SESSION_RECORD_SCHEMA = "acpx.session.v1" as const;
