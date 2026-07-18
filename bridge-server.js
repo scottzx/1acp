@@ -42,6 +42,7 @@ const runtime = createAcpRuntime({
   permissionMode: "approve-reads", // default, will be overridden by session or client options
   onPermissionRequest: handlePermissionRequestCallback,
   onAskUserQuestion: handleAskUserQuestionCallback,
+  onExitPlanMode: handleExitPlanModeCallback,
   // Level 2 live push: when an out-of-turn notification (e.g. the initial
   // available_commands_update) lands in the record, re-send the capability
   // snapshot so the client's `/` palette lights up without waiting for a turn.
@@ -302,6 +303,9 @@ const pendingPermissions = new Map();
 // Map of pending Grok `_x.ai/ask_user_question` requests
 // requestId -> { resolve, reject, timer, sessionId }
 const pendingAskUserQuestions = new Map();
+// Map of pending Grok `_x.ai/exit_plan_mode` requests
+// requestId -> { resolve, reject, timer, sessionId }
+const pendingExitPlanModes = new Map();
 let nextRequestId = 1;
 
 // ----------------------------------------------------
@@ -1022,6 +1026,49 @@ wss.on("connection", (ws) => {
 
           // Unknown outcome → safe cancel rather than crash the agent turn.
           pending.resolve({ outcome: "cancelled" });
+          break;
+        }
+
+        case "respond_exit_plan_mode": {
+          // Reply to a Grok `_x.ai/exit_plan_mode` approval prompt.
+          // Wire: { outcome: "approved"|"rejected"|"abandoned", comments?: string }
+          const { requestId, outcome, comments } = payload;
+          if (!sessionId || !requestId || !outcome) {
+            sendError(
+              ws,
+              sessionId,
+              "INVALID_PARAMS",
+              "sessionId, requestId, and outcome are required",
+            );
+            return;
+          }
+
+          const pending = pendingExitPlanModes.get(requestId);
+          if (!pending) {
+            sendError(
+              ws,
+              sessionId,
+              "EXIT_PLAN_NOT_FOUND",
+              "No pending exit_plan_mode request matches this ID",
+            );
+            return;
+          }
+
+          console.log(`[acpx-server] exit_plan_mode response: ${outcome} for ${requestId}`);
+          clearTimeout(pending.timer);
+          pendingExitPlanModes.delete(requestId);
+
+          if (outcome === "approved" || outcome === "rejected" || outcome === "abandoned") {
+            const response = { outcome };
+            if (typeof comments === "string" && comments.trim()) {
+              response.comments = comments.trim();
+            }
+            pending.resolve(response);
+            break;
+          }
+
+          // Unknown outcome → abandon rather than silently approve.
+          pending.resolve({ outcome: "abandoned" });
           break;
         }
 
@@ -1978,6 +2025,89 @@ function runPromptTurn(session, sessionId, promptItem) {
       }
     }
   })();
+}
+
+// ----------------------------------------------------
+// Grok exit_plan_mode Handling Callback
+// ----------------------------------------------------
+async function handleExitPlanModeCallback(req, ctx) {
+  const { sessionId, toolCallId, planContent } = req;
+  const clientSessionId = agentSessionToClientSession.get(sessionId) || sessionId;
+  const session = activeSessions.get(clientSessionId);
+  if (!session) {
+    console.warn(
+      `[acpx-server] exit_plan_mode for unknown session: ${sessionId} (mapped: ${clientSessionId})`,
+    );
+    return { outcome: "abandoned" };
+  }
+
+  const requestId = `plan_${nextRequestId++}`;
+  console.log(
+    `[acpx-server] Intercepted exit_plan_mode. RequestId: ${requestId} session: ${clientSessionId}`,
+  );
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(
+      () => {
+        console.warn(`[acpx-server] exit_plan_mode ${requestId} timed out. Abandoning.`);
+        pendingExitPlanModes.delete(requestId);
+        resolve({ outcome: "abandoned" });
+        try {
+          session.ws.send(
+            JSON.stringify({
+              event: "exit_plan_mode_timeout",
+              sessionId: clientSessionId,
+              requestId,
+              toolCallId,
+              message: "exit_plan_mode auto-abandoned after 5min timeout.",
+            }),
+          );
+        } catch {
+          // socket may already be closed
+        }
+      },
+      5 * 60 * 1000,
+    );
+
+    pendingExitPlanModes.set(requestId, {
+      resolve,
+      timer,
+      sessionId: clientSessionId,
+    });
+
+    const onAbort = () => {
+      if (!pendingExitPlanModes.has(requestId)) {
+        return;
+      }
+      clearTimeout(timer);
+      pendingExitPlanModes.delete(requestId);
+      resolve({ outcome: "abandoned" });
+    };
+    if (ctx?.signal) {
+      if (ctx.signal.aborted) {
+        onAbort();
+        return;
+      }
+      ctx.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    try {
+      session.ws.send(
+        JSON.stringify({
+          event: "exit_plan_mode",
+          sessionId: clientSessionId,
+          requestId,
+          toolCallId,
+          planContent: planContent ?? "",
+        }),
+      );
+    } catch (err) {
+      console.warn(`[acpx-server] failed to send exit_plan_mode event:`, err.message);
+      clearTimeout(timer);
+      pendingExitPlanModes.delete(requestId);
+      resolve({ outcome: "abandoned" });
+    }
+  });
 }
 
 // ----------------------------------------------------

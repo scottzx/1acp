@@ -697,6 +697,7 @@ export class AcpRuntimeManager {
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
+      onExitPlanMode: this.options.onExitPlanMode,
       verbose: this.options.verbose,
       timeoutMs: this.options.timeoutMs,
       resumePolicy: resumePolicyForSessionMode(sessionMode),
@@ -733,6 +734,7 @@ export class AcpRuntimeManager {
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
+      onExitPlanMode: this.options.onExitPlanMode,
       verbose: this.options.verbose,
       sessionOptions: input.sessionOptions,
     });
@@ -1125,6 +1127,7 @@ export class AcpRuntimeManager {
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
+      onExitPlanMode: this.options.onExitPlanMode,
       verbose: this.options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
     });
@@ -1566,6 +1569,7 @@ export class AcpRuntimeManager {
         nonInteractivePermissions: this.options.nonInteractivePermissions,
         onPermissionRequest: this.options.onPermissionRequest,
         onAskUserQuestion: this.options.onAskUserQuestion,
+        onExitPlanMode: this.options.onExitPlanMode,
         verbose: this.options.verbose,
       });
 

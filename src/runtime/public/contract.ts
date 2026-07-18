@@ -5,6 +5,11 @@ import type {
   GrokAskUserQuestionResponse,
 } from "../../acp/grok-ask-user.js";
 import type {
+  GrokExitPlanModeRequest,
+  GrokExitPlanModeResponse,
+  GrokExitPlanOutcome,
+} from "../../acp/grok-exit-plan.js";
+import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
   McpServer,
@@ -413,6 +418,14 @@ export type AcpRuntimeOptions = {
     req: GrokAskUserQuestionRequest,
     ctx: { signal: AbortSignal },
   ) => Promise<GrokAskUserQuestionResponse | GrokAskUserAnswers | undefined>;
+  /**
+   * Host-driven handler for Grok Build's `_x.ai/exit_plan_mode` extension.
+   * Used by bridge-server to surface plan approval over WebSocket.
+   */
+  onExitPlanMode?: (
+    req: GrokExitPlanModeRequest,
+    ctx: { signal: AbortSignal },
+  ) => Promise<GrokExitPlanModeResponse | GrokExitPlanOutcome | undefined>;
   /**
    * Fired after an OUT-OF-TURN session notification (one received while no
    * runtime turn is active) has been folded into the persisted record. Lets a

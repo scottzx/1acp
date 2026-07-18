@@ -111,6 +111,14 @@ import {
   promptGrokAskUserQuestion,
   type GrokAskUserQuestionResponse,
 } from "./grok-ask-user.js";
+import {
+  abandonedExitPlanResponse,
+  isGrokExitPlanModeMethod,
+  normalizeHostExitPlanResponse,
+  parseGrokExitPlanModeRequest,
+  promptGrokExitPlanMode,
+  type GrokExitPlanModeResponse,
+} from "./grok-exit-plan.js";
 import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
   modelStateFromConfigOptions,
@@ -870,6 +878,9 @@ export class AcpClient {
         ): Promise<Record<string, unknown>> => {
           if (isGrokAskUserQuestionMethod(method)) {
             return await this.handleGrokAskUserQuestion(params);
+          }
+          if (isGrokExitPlanModeMethod(method)) {
+            return await this.handleGrokExitPlanMode(params);
           }
           if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
             return {};
@@ -1997,6 +2008,50 @@ export class AcpClient {
     }
 
     return await promptGrokAskUserQuestion(request);
+  }
+
+  // oxlint-disable-next-line complexity -- cancellation and host fallback paths must stay explicit.
+  private async handleGrokExitPlanMode(
+    params: Record<string, unknown>,
+  ): Promise<GrokExitPlanModeResponse> {
+    const request = parseGrokExitPlanModeRequest(params);
+    if (!request) {
+      this.log("ignoring malformed _x.ai/exit_plan_mode params");
+      return abandonedExitPlanResponse();
+    }
+
+    if (this.cancellingSessionIds.has(request.sessionId)) {
+      return abandonedExitPlanResponse();
+    }
+
+    const signal = this.cancellationSignalForSession(request.sessionId);
+    if (this.options.onExitPlanMode) {
+      try {
+        const hostValue = await this.options.onExitPlanMode(request, { signal });
+        if (signal.aborted || this.cancellingSessionIds.has(request.sessionId)) {
+          return abandonedExitPlanResponse();
+        }
+        const normalized = normalizeHostExitPlanResponse(hostValue);
+        if (normalized) {
+          return normalized;
+        }
+      } catch (error) {
+        if (signal.aborted || this.cancellingSessionIds.has(request.sessionId)) {
+          return abandonedExitPlanResponse();
+        }
+        this.log(
+          `onExitPlanMode threw, falling through to interactive prompt: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    if (signal.aborted || this.cancellingSessionIds.has(request.sessionId)) {
+      return abandonedExitPlanResponse();
+    }
+
+    return await promptGrokExitPlanMode(request);
   }
 
   private async handlePermissionRequest(

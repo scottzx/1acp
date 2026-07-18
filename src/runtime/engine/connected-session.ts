@@ -48,6 +48,7 @@ export type WithConnectedSessionOptions<T> = {
     ctx: { signal: AbortSignal },
   ) => Promise<AcpPermissionDecision | undefined>;
   onAskUserQuestion?: ConstructorParameters<typeof AcpClient>[0]["onAskUserQuestion"];
+  onExitPlanMode?: ConstructorParameters<typeof AcpClient>[0]["onExitPlanMode"];
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
   terminal?: boolean;
@@ -105,6 +106,7 @@ export async function withConnectedSession<T>(
       nonInteractivePermissions: options.nonInteractivePermissions,
       onPermissionRequest: options.onPermissionRequest,
       onAskUserQuestion: options.onAskUserQuestion,
+      onExitPlanMode: options.onExitPlanMode,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
       terminal: options.terminal,
@@ -119,6 +121,7 @@ export async function withConnectedSession<T>(
       nonInteractivePermissions: options.nonInteractivePermissions,
       onPermissionRequest: options.onPermissionRequest,
       onAskUserQuestion: options.onAskUserQuestion,
+      onExitPlanMode: options.onExitPlanMode,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
       terminal: options.terminal,
