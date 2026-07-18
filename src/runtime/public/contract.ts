@@ -1,5 +1,10 @@
 import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import type {
+  GrokAskUserAnswers,
+  GrokAskUserQuestionRequest,
+  GrokAskUserQuestionResponse,
+} from "../../acp/grok-ask-user.js";
+import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
   McpServer,
@@ -401,13 +406,21 @@ export type AcpRuntimeOptions = {
     ctx: { signal: AbortSignal },
   ) => Promise<AcpPermissionDecision | undefined>;
   /**
+   * Host-driven handler for Grok Build's `_x.ai/ask_user_question` extension.
+   * Used by bridge-server to surface the questionnaire over WebSocket.
+   */
+  onAskUserQuestion?: (
+    req: GrokAskUserQuestionRequest,
+    ctx: { signal: AbortSignal },
+  ) => Promise<GrokAskUserQuestionResponse | GrokAskUserAnswers | undefined>;
+  /**
    * Fired after an OUT-OF-TURN session notification (one received while no
    * runtime turn is active) has been folded into the persisted record. Lets a
    * host refresh history or capabilities without waiting for the next
    * turn/reconnect.
    * `sessionKey` is the ensureSession key (the persistent record id).
    */
-  onOutOfTurnSessionUpdate?: (sessionKey: string) => void;
+  onOutOfTurnSessionUpdate?: (sessionKey: string, updateTag: AcpSessionUpdateTag) => void;
 };
 
 export type AcpFileSessionStoreOptions = {

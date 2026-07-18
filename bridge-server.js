@@ -20,6 +20,20 @@ console.log(`[acpx-server] Starting server on port ${PORT}...`);
 // Ensure state dir exists
 fs.mkdirSync(DEFAULT_STATE_DIR, { recursive: true });
 
+const HISTORY_UPDATE_TAGS = new Set([
+  "user_message_chunk",
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+]);
+const META_UPDATE_TAGS = new Set([
+  "available_commands_update",
+  "current_mode_update",
+  "config_option_update",
+  "session_info_update",
+]);
+
 // Setup session runtime manager options
 const runtime = createAcpRuntime({
   cwd: process.cwd(),
@@ -27,14 +41,20 @@ const runtime = createAcpRuntime({
   agentRegistry: createAgentRegistry(),
   permissionMode: "approve-reads", // default, will be overridden by session or client options
   onPermissionRequest: handlePermissionRequestCallback,
+  onAskUserQuestion: handleAskUserQuestionCallback,
   // Level 2 live push: when an out-of-turn notification (e.g. the initial
   // available_commands_update) lands in the record, re-send the capability
   // snapshot so the client's `/` palette lights up without waiting for a turn.
   // sessionKey === the client sessionId for persistent sessions.
-  onOutOfTurnSessionUpdate: (sessionKey) => {
+  onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
     const session = activeSessions.get(sessionKey);
-    if (session) {
+    if (!session) {
+      return;
+    }
+    if (META_UPDATE_TAGS.has(updateTag)) {
       void sendSessionMeta(session.ws, sessionKey, session.handle);
+    }
+    if (HISTORY_UPDATE_TAGS.has(updateTag)) {
       scheduleSessionHistoryPush(sessionKey);
     }
   },
@@ -279,6 +299,9 @@ function addAllowRule(workspacePath, ruleKey) {
 // Map of pending permission requests
 // requestId -> { resolve, reject, timer }
 const pendingPermissions = new Map();
+// Map of pending Grok `_x.ai/ask_user_question` requests
+// requestId -> { resolve, reject, timer, sessionId }
+const pendingAskUserQuestions = new Map();
 let nextRequestId = 1;
 
 // ----------------------------------------------------
@@ -941,6 +964,64 @@ wss.on("connection", (ws) => {
           }
 
           pending.resolve({ outcome });
+          break;
+        }
+
+        case "respond_ask_user_question": {
+          // Reply to a Grok `_x.ai/ask_user_question` prompt forwarded by the
+          // bridge. Wire response is adjacently tagged on `outcome`:
+          //   { outcome: "accepted", answers: { "<question>": "label"|["a","b"] } }
+          //   { outcome: "skip_interview" | "chat_about_this" | "cancelled" }
+          const { requestId, outcome, answers, partial_answers: partialAnswers } = payload;
+          if (!sessionId || !requestId || !outcome) {
+            sendError(
+              ws,
+              sessionId,
+              "INVALID_PARAMS",
+              "sessionId, requestId, and outcome are required",
+            );
+            return;
+          }
+
+          const pending = pendingAskUserQuestions.get(requestId);
+          if (!pending) {
+            sendError(
+              ws,
+              sessionId,
+              "ASK_USER_NOT_FOUND",
+              "No pending ask_user_question request matches this ID",
+            );
+            return;
+          }
+
+          console.log(`[acpx-server] ask_user_question response: ${outcome} for ${requestId}`);
+          clearTimeout(pending.timer);
+          pendingAskUserQuestions.delete(requestId);
+
+          if (outcome === "accepted") {
+            if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+              pending.resolve({ outcome: "cancelled" });
+              break;
+            }
+            pending.resolve({
+              outcome: "accepted",
+              answers,
+              ...(partialAnswers !== undefined ? { partial_answers: partialAnswers } : {}),
+            });
+            break;
+          }
+
+          if (
+            outcome === "skip_interview" ||
+            outcome === "chat_about_this" ||
+            outcome === "cancelled"
+          ) {
+            pending.resolve({ outcome });
+            break;
+          }
+
+          // Unknown outcome → safe cancel rather than crash the agent turn.
+          pending.resolve({ outcome: "cancelled" });
           break;
         }
 
@@ -1897,6 +1978,90 @@ function runPromptTurn(session, sessionId, promptItem) {
       }
     }
   })();
+}
+
+// ----------------------------------------------------
+// Grok ask_user_question Handling Callback
+// ----------------------------------------------------
+async function handleAskUserQuestionCallback(req, ctx) {
+  const { sessionId, toolCallId, questions, mode } = req;
+  const clientSessionId = agentSessionToClientSession.get(sessionId) || sessionId;
+  const session = activeSessions.get(clientSessionId);
+  if (!session) {
+    console.warn(
+      `[acpx-server] ask_user_question for unknown session: ${sessionId} (mapped: ${clientSessionId})`,
+    );
+    return { outcome: "cancelled" };
+  }
+
+  const requestId = `ask_${nextRequestId++}`;
+  console.log(
+    `[acpx-server] Intercepted ask_user_question (${questions?.length ?? 0} q). RequestId: ${requestId} session: ${clientSessionId}`,
+  );
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(
+      () => {
+        console.warn(`[acpx-server] ask_user_question ${requestId} timed out. Cancelling.`);
+        pendingAskUserQuestions.delete(requestId);
+        resolve({ outcome: "cancelled" });
+        try {
+          session.ws.send(
+            JSON.stringify({
+              event: "ask_user_question_timeout",
+              sessionId: clientSessionId,
+              requestId,
+              toolCallId,
+              message: "ask_user_question auto-cancelled after 5min timeout.",
+            }),
+          );
+        } catch {
+          // socket may already be closed
+        }
+      },
+      5 * 60 * 1000,
+    );
+
+    pendingAskUserQuestions.set(requestId, {
+      resolve,
+      timer,
+      sessionId: clientSessionId,
+    });
+
+    const onAbort = () => {
+      if (!pendingAskUserQuestions.has(requestId)) {
+        return;
+      }
+      clearTimeout(timer);
+      pendingAskUserQuestions.delete(requestId);
+      resolve({ outcome: "cancelled" });
+    };
+    if (ctx?.signal) {
+      if (ctx.signal.aborted) {
+        onAbort();
+        return;
+      }
+      ctx.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    try {
+      session.ws.send(
+        JSON.stringify({
+          event: "ask_user_question",
+          sessionId: clientSessionId,
+          requestId,
+          toolCallId,
+          mode: mode ?? "default",
+          questions,
+        }),
+      );
+    } catch (err) {
+      console.warn(`[acpx-server] failed to send ask_user_question event:`, err.message);
+      clearTimeout(timer);
+      pendingAskUserQuestions.delete(requestId);
+      resolve({ outcome: "cancelled" });
+    }
+  });
 }
 
 // ----------------------------------------------------

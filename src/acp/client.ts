@@ -103,6 +103,14 @@ import {
 } from "./client-process.js";
 import { isCodexAcpCommand, resolveCodexExecutable } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
+import {
+  cancelledAskUserResponse,
+  isGrokAskUserQuestionMethod,
+  normalizeHostAskUserResponse,
+  parseGrokAskUserQuestionRequest,
+  promptGrokAskUserQuestion,
+  type GrokAskUserQuestionResponse,
+} from "./grok-ask-user.js";
 import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
   modelStateFromConfigOptions,
@@ -856,7 +864,13 @@ export class AcpClient {
         ): Promise<RequestPermissionResponse> => {
           return this.handlePermissionRequest(params);
         },
-        extMethod: async (method: string): Promise<Record<string, unknown>> => {
+        extMethod: async (
+          method: string,
+          params: Record<string, unknown>,
+        ): Promise<Record<string, unknown>> => {
+          if (isGrokAskUserQuestionMethod(method)) {
+            return await this.handleGrokAskUserQuestion(params);
+          }
           if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
             return {};
           }
@@ -1939,6 +1953,50 @@ export class AcpClient {
     });
 
     this.log(`authenticated with method ${selected.methodId} (${selected.source})`);
+  }
+
+  // oxlint-disable-next-line complexity -- cancellation and host fallback paths must stay explicit.
+  private async handleGrokAskUserQuestion(
+    params: Record<string, unknown>,
+  ): Promise<GrokAskUserQuestionResponse> {
+    const request = parseGrokAskUserQuestionRequest(params);
+    if (!request) {
+      this.log("ignoring malformed _x.ai/ask_user_question params");
+      return cancelledAskUserResponse();
+    }
+
+    if (this.cancellingSessionIds.has(request.sessionId)) {
+      return cancelledAskUserResponse();
+    }
+
+    const signal = this.cancellationSignalForSession(request.sessionId);
+    if (this.options.onAskUserQuestion) {
+      try {
+        const hostValue = await this.options.onAskUserQuestion(request, { signal });
+        if (signal.aborted || this.cancellingSessionIds.has(request.sessionId)) {
+          return cancelledAskUserResponse();
+        }
+        const normalized = normalizeHostAskUserResponse(hostValue);
+        if (normalized) {
+          return normalized;
+        }
+      } catch (error) {
+        if (signal.aborted || this.cancellingSessionIds.has(request.sessionId)) {
+          return cancelledAskUserResponse();
+        }
+        this.log(
+          `onAskUserQuestion threw, falling through to interactive prompt: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    if (signal.aborted || this.cancellingSessionIds.has(request.sessionId)) {
+      return cancelledAskUserResponse();
+    }
+
+    return await promptGrokAskUserQuestion(request);
   }
 
   private async handlePermissionRequest(

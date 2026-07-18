@@ -664,8 +664,9 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
   const manager = new AcpRuntimeManager(
     {
       ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-      onOutOfTurnSessionUpdate: (sessionKey) => {
+      onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
         assert.equal(sessionKey, "pooled-persistent-session");
+        assert.equal(updateTag, "agent_message_chunk");
         outOfTurnUpdateCalls += 1;
         resolveOutOfTurnUpdate?.();
       },

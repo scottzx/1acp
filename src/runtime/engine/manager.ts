@@ -696,6 +696,7 @@ export class AcpRuntimeManager {
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
+      onAskUserQuestion: this.options.onAskUserQuestion,
       verbose: this.options.verbose,
       timeoutMs: this.options.timeoutMs,
       resumePolicy: resumePolicyForSessionMode(sessionMode),
@@ -731,6 +732,7 @@ export class AcpRuntimeManager {
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
+      onAskUserQuestion: this.options.onAskUserQuestion,
       verbose: this.options.verbose,
       sessionOptions: input.sessionOptions,
     });
@@ -948,7 +950,7 @@ export class AcpRuntimeManager {
         await this.options.sessionStore.save(record);
         // Notify the host only after persistence so any immediate history or
         // capability refresh observes the newly applied update.
-        this.options.onOutOfTurnSessionUpdate?.(recordId);
+        this.options.onOutOfTurnSessionUpdate?.(recordId, notification.update.sessionUpdate);
       })
       .catch(() => {
         // metadata only — never fail a session over a dropped out-of-turn update
@@ -1122,6 +1124,7 @@ export class AcpRuntimeManager {
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       onPermissionRequest: this.options.onPermissionRequest,
+      onAskUserQuestion: this.options.onAskUserQuestion,
       verbose: this.options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
     });
@@ -1562,6 +1565,7 @@ export class AcpRuntimeManager {
         permissionMode: this.options.permissionMode,
         nonInteractivePermissions: this.options.nonInteractivePermissions,
         onPermissionRequest: this.options.onPermissionRequest,
+        onAskUserQuestion: this.options.onAskUserQuestion,
         verbose: this.options.verbose,
       });
 
