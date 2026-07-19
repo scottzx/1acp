@@ -780,12 +780,24 @@ wss.on("connection", (ws) => {
             if (seededMode && !existingSession.permissionMode) {
               existingSession.permissionMode = seededMode;
             }
-            // Re-deliver any permission requests that were in-flight when the
+            // Re-deliver any interactive prompts that were in-flight when the
             // previous WebSocket dropped. The ACP runtime is still blocked
             // waiting for the response; re-sending the event lets the newly
             // connected client surface the prompt without a page reload.
+            // Client UI shows these one-at-a-time in stream order; redelivery
+            // order here is Map insertion order (request arrival).
             for (const pending of pendingPermissions.values()) {
-              if (pending.sessionId === sessionId) {
+              if (pending.sessionId === sessionId && pending.payload) {
+                ws.send(JSON.stringify(pending.payload));
+              }
+            }
+            for (const pending of pendingAskUserQuestions.values()) {
+              if (pending.sessionId === sessionId && pending.payload) {
+                ws.send(JSON.stringify(pending.payload));
+              }
+            }
+            for (const pending of pendingExitPlanModes.values()) {
+              if (pending.sessionId === sessionId && pending.payload) {
                 ws.send(JSON.stringify(pending.payload));
               }
             }
@@ -2069,10 +2081,18 @@ async function handleExitPlanModeCallback(req, ctx) {
       5 * 60 * 1000,
     );
 
+    const payload = {
+      event: "exit_plan_mode",
+      sessionId: clientSessionId,
+      requestId,
+      toolCallId,
+      planContent: planContent ?? "",
+    };
     pendingExitPlanModes.set(requestId, {
       resolve,
       timer,
       sessionId: clientSessionId,
+      payload,
     });
 
     const onAbort = () => {
@@ -2092,15 +2112,7 @@ async function handleExitPlanModeCallback(req, ctx) {
     }
 
     try {
-      session.ws.send(
-        JSON.stringify({
-          event: "exit_plan_mode",
-          sessionId: clientSessionId,
-          requestId,
-          toolCallId,
-          planContent: planContent ?? "",
-        }),
-      );
+      session.ws.send(JSON.stringify(payload));
     } catch (err) {
       console.warn(`[acpx-server] failed to send exit_plan_mode event:`, err.message);
       clearTimeout(timer);
@@ -2152,10 +2164,19 @@ async function handleAskUserQuestionCallback(req, ctx) {
       5 * 60 * 1000,
     );
 
+    const payload = {
+      event: "ask_user_question",
+      sessionId: clientSessionId,
+      requestId,
+      toolCallId,
+      mode: mode ?? "default",
+      questions,
+    };
     pendingAskUserQuestions.set(requestId, {
       resolve,
       timer,
       sessionId: clientSessionId,
+      payload,
     });
 
     const onAbort = () => {
@@ -2175,16 +2196,7 @@ async function handleAskUserQuestionCallback(req, ctx) {
     }
 
     try {
-      session.ws.send(
-        JSON.stringify({
-          event: "ask_user_question",
-          sessionId: clientSessionId,
-          requestId,
-          toolCallId,
-          mode: mode ?? "default",
-          questions,
-        }),
-      );
+      session.ws.send(JSON.stringify(payload));
     } catch (err) {
       console.warn(`[acpx-server] failed to send ask_user_question event:`, err.message);
       clearTimeout(timer);
