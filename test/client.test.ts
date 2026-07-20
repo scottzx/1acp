@@ -950,10 +950,12 @@ test("AcpClient exposes and enforces Grok Build permission modes through ACP", a
         name: "Permission Mode",
         category: "mode",
         type: "select",
-        currentValue: "default",
+        currentValue: "acceptEdits",
         options: [
           { value: "default", name: "Ask" },
           { value: "acceptEdits", name: "Accept Edits" },
+          { value: "auto", name: "Auto" },
+          { value: "plan", name: "Plan" },
           { value: "dontAsk", name: "Deny" },
           { value: "bypassPermissions", name: "Always Approve" },
         ],
@@ -962,15 +964,16 @@ test("AcpClient exposes and enforces Grok Build permission modes through ACP", a
     assert.equal(created.configOptionsPresent, true);
 
     const filePath = path.join(cwd, "grok-mode.txt");
+    // Default acceptEdits auto-allows file writes without asking the host.
     await asInternals(client).handleWriteTextFile?.({
       sessionId: created.sessionId,
       path: filePath,
       content: "approved",
     });
-    assert.equal(permissionRequests.length, 1);
-    assert.equal(permissionRequests[0]?.toolCall.kind, "edit");
+    assert.equal(permissionRequests.length, 0);
     assert.equal(await fs.readFile(filePath, "utf8"), "approved");
 
+    // Execute still prompts under acceptEdits.
     await assert.rejects(
       async () =>
         await asInternals(client).handleCreateTerminal?.({
@@ -979,10 +982,24 @@ test("AcpClient exposes and enforces Grok Build permission modes through ACP", a
         }),
       PermissionDeniedError,
     );
+    assert.equal(permissionRequests.length, 1);
+    assert.equal(permissionRequests[0]?.toolCall.kind, "execute");
+
+    // Ask mode (default) routes edits through the host callback.
+    // setSessionMode must forward to the agent (not only the local cache).
+    await client.setSessionMode(created.sessionId, "default");
+    assert.equal(forwardedModeCalls, 1);
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "asked edit",
+    });
     assert.equal(permissionRequests.length, 2);
-    assert.equal(permissionRequests[1]?.toolCall.kind, "execute");
+    assert.equal(permissionRequests[1]?.toolCall.kind, "edit");
+    assert.equal(await fs.readFile(filePath, "utf8"), "asked edit");
 
     await client.setSessionMode(created.sessionId, "acceptEdits");
+    assert.equal(forwardedModeCalls, 2);
     await asInternals(client).handleWriteTextFile?.({
       sessionId: created.sessionId,
       path: filePath,
@@ -991,7 +1008,23 @@ test("AcpClient exposes and enforces Grok Build permission modes through ACP", a
     assert.equal(permissionRequests.length, 2);
     assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
 
+    // plan: deny writes/execute (read-only) without host prompt.
+    await client.setSessionMode(created.sessionId, "plan");
+    assert.equal(forwardedModeCalls, 3);
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleWriteTextFile?.({
+          sessionId: created.sessionId,
+          path: filePath,
+          content: "plan blocked",
+        }),
+      PermissionDeniedError,
+    );
+    assert.equal(permissionRequests.length, 2);
+    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
+
     await client.setSessionMode(created.sessionId, "dontAsk");
+    assert.equal(forwardedModeCalls, 4);
     await assert.rejects(
       async () =>
         await asInternals(client).handleWriteTextFile?.({
@@ -1002,7 +1035,6 @@ test("AcpClient exposes and enforces Grok Build permission modes through ACP", a
       PermissionDeniedError,
     );
     assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
-    assert.equal(forwardedModeCalls, 0);
   } finally {
     await client.close();
     await fs.rm(cwd, { recursive: true, force: true });

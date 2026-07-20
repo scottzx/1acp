@@ -154,16 +154,61 @@ const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
 const DEVIN_COMPATIBILITY_CLIENT_NAME = "windsurf";
 // This is the embedded Windsurf IDE version bundled with Devin Desktop 3.1.7, the first locally verified version that passes Devin's server-side ACP precondition.
 const DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION = "1.110.1";
+// Align with Grok CLI `--permission-mode` / config `defaultMode`:
+// default | acceptEdits | auto | dontAsk | bypassPermissions | plan
 const GROK_PERMISSION_MODE_IDS = [
   "default",
   "acceptEdits",
+  "auto",
+  "plan",
   "dontAsk",
   "bypassPermissions",
 ] as const;
 type GrokPermissionMode = (typeof GROK_PERMISSION_MODE_IDS)[number];
+/** New Grok sessions start in acceptEdits so file writes skip the permission card. */
+const DEFAULT_GROK_PERMISSION_MODE: GrokPermissionMode = "acceptEdits";
 
 function isGrokPermissionMode(value: string): value is GrokPermissionMode {
   return GROK_PERMISSION_MODE_IDS.includes(value as GrokPermissionMode);
+}
+
+type GrokShortCircuitOutcome = "allow_once" | "reject_once";
+
+function isMutationKind(kind: string | undefined): boolean {
+  return kind === "edit" || kind === "move" || kind === "delete";
+}
+
+/** Map Grok permission mode + tool kind → short-circuit outcome (or none). */
+function grokModeOutcome(
+  mode: GrokPermissionMode,
+  kind: string | undefined,
+): GrokShortCircuitOutcome | undefined {
+  const fixed: Partial<Record<GrokPermissionMode, GrokShortCircuitOutcome>> = {
+    bypassPermissions: "allow_once",
+    dontAsk: "reject_once",
+  };
+  if (mode in fixed) {
+    return fixed[mode];
+  }
+  // plan: TUI-equivalent read-only — deny writes and shell, let reads through.
+  if (mode === "plan" && (isMutationKind(kind) || kind === "execute")) {
+    return "reject_once";
+  }
+  // acceptEdits: auto-allow file mutations; execute still falls through.
+  if (mode === "acceptEdits" && isMutationKind(kind)) {
+    return "allow_once";
+  }
+  // default / auto / unmatched kinds: no short-circuit.
+  return undefined;
+}
+
+function grokModeShortCircuit<T>(
+  mode: GrokPermissionMode,
+  kind: string | undefined,
+  decide: (outcome: GrokShortCircuitOutcome) => T,
+): T | undefined {
+  const outcome = grokModeOutcome(mode, kind);
+  return outcome ? decide(outcome) : undefined;
 }
 
 function grokPermissionModeOption(currentValue: GrokPermissionMode): SessionConfigOption {
@@ -176,6 +221,8 @@ function grokPermissionModeOption(currentValue: GrokPermissionMode): SessionConf
     options: [
       { value: "default", name: "Ask" },
       { value: "acceptEdits", name: "Accept Edits" },
+      { value: "auto", name: "Auto" },
+      { value: "plan", name: "Plan" },
       { value: "dontAsk", name: "Deny" },
       { value: "bypassPermissions", name: "Always Approve" },
     ],
@@ -1250,28 +1297,16 @@ export class AcpClient {
   }
 
   async setSessionMode(sessionId: string, modeId: string): Promise<void> {
-    if (this.grokPermissionModes.has(sessionId)) {
-      if (!isGrokPermissionMode(modeId)) {
-        throw new Error(
-          `Unsupported Grok Build permission mode "${modeId}". Expected one of: ${GROK_PERMISSION_MODE_IDS.join(", ")}`,
-        );
-      }
-      this.grokPermissionModes.set(sessionId, modeId);
-      const configOptions = (this.grokConfigOptions.get(sessionId) ?? []).map((option) =>
-        option.type === "select" && (option.category === "mode" || option.id === "mode")
-          ? grokPermissionModeOption(modeId)
-          : option,
+    const isGrokSession = this.grokPermissionModes.has(sessionId);
+    if (isGrokSession && !isGrokPermissionMode(modeId)) {
+      throw new Error(
+        `Unsupported Grok Build permission mode "${modeId}". Expected one of: ${GROK_PERMISSION_MODE_IDS.join(", ")}`,
       );
-      this.grokConfigOptions.set(sessionId, configOptions);
-      await this.handleSessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "config_option_update",
-          configOptions,
-        },
-      });
-      return;
     }
+
+    // Always forward to the agent. For Grok the local map is only a permission
+    // short-circuit cache — it must not replace session/set_mode (plan /
+    // acceptEdits only take effect on the agent when forwarded).
     const connection = this.getConnection();
     try {
       await this.runConnectionRequest(() =>
@@ -1283,6 +1318,31 @@ export class AcpClient {
     } catch (error) {
       throw maybeWrapSessionControlError("session/set_mode", error, `for mode "${modeId}"`);
     }
+
+    if (isGrokSession && isGrokPermissionMode(modeId)) {
+      this.rememberGrokPermissionMode(sessionId, modeId);
+    }
+  }
+
+  /** Keep the Grok permission cache + synthetic mode select in sync with agent state. */
+  private rememberGrokPermissionMode(sessionId: string, modeId: GrokPermissionMode): void {
+    this.grokPermissionModes.set(sessionId, modeId);
+    const configOptions = (this.grokConfigOptions.get(sessionId) ?? []).map((option) =>
+      option.type === "select" && (option.category === "mode" || option.id === "mode")
+        ? grokPermissionModeOption(modeId)
+        : option,
+    );
+    if (configOptions.length === 0) {
+      return;
+    }
+    this.grokConfigOptions.set(sessionId, configOptions);
+    void this.handleSessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions,
+      },
+    });
   }
 
   async setSessionConfigOption(
@@ -1880,7 +1940,7 @@ export class AcpClient {
     if (!this.isGrokBuildAcpCommand() || hasModeConfigOption(configOptions)) {
       return configOptions;
     }
-    const mode = this.grokPermissionModes.get(sessionId) ?? "default";
+    const mode = this.grokPermissionModes.get(sessionId) ?? DEFAULT_GROK_PERMISSION_MODE;
     this.grokPermissionModes.set(sessionId, mode);
     const compatibleOptions = [...(configOptions ?? []), grokPermissionModeOption(mode)];
     this.grokConfigOptions.set(sessionId, compatibleOptions);
@@ -1890,21 +1950,13 @@ export class AcpClient {
   private resolveGrokPermissionModeDecision(
     params: RequestPermissionRequest,
   ): RequestPermissionResponse | undefined {
-    const mode = this.grokPermissionModes.get(params.sessionId);
-    if (!mode || mode === "default") {
+    if (!this.isGrokBuildAcpCommand()) {
       return undefined;
     }
-    if (mode === "bypassPermissions") {
-      return decisionToResponse(params, { outcome: "allow_once" });
-    }
-    if (mode === "dontAsk") {
-      return decisionToResponse(params, { outcome: "reject_once" });
-    }
-    const kind = inferToolKind(params);
-    if (kind === "edit" || kind === "move" || kind === "delete") {
-      return decisionToResponse(params, { outcome: "allow_once" });
-    }
-    return undefined;
+    const mode = this.grokPermissionModes.get(params.sessionId) ?? DEFAULT_GROK_PERMISSION_MODE;
+    return grokModeShortCircuit(mode, inferToolKind(params), (outcome) =>
+      decisionToResponse(params, { outcome }),
+    );
   }
 
   private async confirmGrokClientOperation(
@@ -1929,7 +1981,8 @@ export class AcpClient {
       _meta: {
         acpx: {
           source: kind === "edit" ? "fs/write_text_file" : "terminal/create",
-          grokPermissionMode: this.grokPermissionModes.get(sessionId) ?? "default",
+          grokPermissionMode:
+            this.grokPermissionModes.get(sessionId) ?? DEFAULT_GROK_PERMISSION_MODE,
         },
       },
     };
@@ -2368,13 +2421,8 @@ export class AcpClient {
     const sequence = ++this.observedSessionUpdates;
     this.sessionUpdateChain = this.sessionUpdateChain.then(async () => {
       try {
-        if (!this.suppressSessionUpdates) {
-          if (this.eventHandlers.onSessionUpdate) {
-            this.eventHandlers.onSessionUpdate(notification);
-          } else {
-            this.bufferSessionUpdate(notification);
-          }
-        }
+        this.syncGrokModeFromSessionUpdate(notification);
+        this.dispatchSessionUpdate(notification);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.log(`session update handler failed: ${message}`);
@@ -2384,6 +2432,35 @@ export class AcpClient {
     });
 
     await this.sessionUpdateChain;
+  }
+
+  /** Keep Grok permission short-circuit cache aligned with agent mode flips. */
+  private syncGrokModeFromSessionUpdate(notification: SessionNotification): void {
+    const update = notification.update as { sessionUpdate?: string; currentModeId?: string };
+    if (update?.sessionUpdate !== "current_mode_update") {
+      return;
+    }
+    if (typeof update.currentModeId !== "string") {
+      return;
+    }
+    if (!this.grokPermissionModes.has(notification.sessionId)) {
+      return;
+    }
+    if (!isGrokPermissionMode(update.currentModeId)) {
+      return;
+    }
+    this.rememberGrokPermissionMode(notification.sessionId, update.currentModeId);
+  }
+
+  private dispatchSessionUpdate(notification: SessionNotification): void {
+    if (this.suppressSessionUpdates) {
+      return;
+    }
+    if (this.eventHandlers.onSessionUpdate) {
+      this.eventHandlers.onSessionUpdate(notification);
+      return;
+    }
+    this.bufferSessionUpdate(notification);
   }
 
   private async waitForSessionUpdateDrain(idleMs: number, timeoutMs: number): Promise<void> {

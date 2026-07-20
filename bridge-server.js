@@ -952,6 +952,13 @@ wss.on("connection", (ws) => {
 
           const pending = pendingPermissions.get(requestId);
           if (!pending) {
+            // Common when the UI double-clicks, or still shows a prompt after
+            // timeout/abort (especially Grok client-side confirms that used to
+            // stay unresolved in the frontend pending pool). Log for diagnosis;
+            // the client treats this as a non-fatal control error.
+            console.warn(
+              `[acpx-server] PERMISSION_NOT_FOUND for requestId=${requestId} session=${sessionId} behavior=${behavior}`,
+            );
             sendError(
               ws,
               sessionId,
@@ -1686,15 +1693,19 @@ async function sendSessionMeta(ws, sessionId, handle) {
   }
 }
 
+// Match AcpClient DEFAULT_GROK_PERMISSION_MODE — new Grok sessions auto-allow
+// file edits without a permission card; execute still prompts.
+const DEFAULT_GROK_PERMISSION_MODE = "acceptEdits";
+
 async function resolveGrokPermissionMode(handle, agentType) {
   if (agentType !== "grok-build") {
     return undefined;
   }
   try {
     const status = await runtime.getStatus({ handle });
-    return status.modes?.currentModeId || "default";
+    return status.modes?.currentModeId || DEFAULT_GROK_PERMISSION_MODE;
   } catch {
-    return "default";
+    return DEFAULT_GROK_PERMISSION_MODE;
   }
 }
 
@@ -1906,7 +1917,12 @@ function runPromptTurn(session, sessionId, promptItem) {
         ) {
           // The agent switched its own native mode mid-turn (e.g. ExitPlanMode
           // flips plan → default). Mirror it so the client's mode picker
-          // follows without a reconnect.
+          // follows without a reconnect, and keep the bridge permission gate
+          // (session.sessionMode) aligned for Grok short-circuit checks.
+          const liveSession = activeSessions.get(sessionId);
+          if (liveSession) {
+            liveSession.sessionMode = event.currentModeId;
+          }
           targetWs.send(
             JSON.stringify({
               event: "mode_changed",
@@ -2233,11 +2249,22 @@ async function handlePermissionRequestCallback(req, ctx) {
   // permission callbacks and client-capability requests. Ignore the legacy
   // three-state shield for Grok so a stale persisted approve-all value cannot
   // silently override the visible native "Ask" mode.
-  const grokMode = session.agentType === "grok-build" ? session.sessionMode || "default" : null;
+  const grokMode =
+    session.agentType === "grok-build" ? session.sessionMode || DEFAULT_GROK_PERMISSION_MODE : null;
   if (grokMode === "bypassPermissions") {
     return { outcome: "allow_once" };
   }
   if (grokMode === "dontAsk") {
+    return { outcome: "reject_once" };
+  }
+  // plan: TUI-equivalent read-only — deny mutations/shell without prompting.
+  if (
+    grokMode === "plan" &&
+    (req.inferredKind === "edit" ||
+      req.inferredKind === "move" ||
+      req.inferredKind === "delete" ||
+      req.inferredKind === "execute")
+  ) {
     return { outcome: "reject_once" };
   }
   if (
@@ -2335,8 +2362,26 @@ async function handlePermissionRequestCallback(req, ctx) {
       () => {
         console.log(`[acpx-server] Permission request ${requestId} aborted by runtime.`);
         clearTimeout(timer);
-        pendingPermissions.delete(requestId);
+        // Only notify/clear when we still owned the pending entry — a prior
+        // user response already deleted it and resolved the promise.
+        if (!pendingPermissions.delete(requestId)) {
+          return;
+        }
         resolve({ outcome: "cancel" });
+        // Tell the client to collapse the composer prompt so a late click
+        // does not race into PERMISSION_NOT_FOUND.
+        try {
+          session.ws.send(
+            JSON.stringify({
+              event: "permission_timeout",
+              sessionId: clientSessionId,
+              requestId,
+              message: `Permission request for "${req.raw.toolCall.title}" was cancelled.`,
+            }),
+          );
+        } catch (err) {
+          console.warn(`[acpx-server] failed to send permission abort event:`, err.message);
+        }
       },
       { once: true },
     );
