@@ -118,6 +118,7 @@ import {
   parseGrokExitPlanModeRequest,
   promptGrokExitPlanMode,
   type GrokExitPlanModeResponse,
+  type GrokExitPlanOutcome,
 } from "./grok-exit-plan.js";
 import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
@@ -2086,6 +2087,7 @@ export class AcpClient {
         }
         const normalized = normalizeHostExitPlanResponse(hostValue);
         if (normalized) {
+          this.applyGrokExitPlanModeOutcome(request.sessionId, normalized.outcome);
           return normalized;
         }
       } catch (error) {
@@ -2104,7 +2106,36 @@ export class AcpClient {
       return abandonedExitPlanResponse();
     }
 
-    return await promptGrokExitPlanMode(request);
+    const interactive = await promptGrokExitPlanMode(request);
+    this.applyGrokExitPlanModeOutcome(request.sessionId, interactive.outcome);
+    return interactive;
+  }
+
+  /**
+   * Wire contract: approved → leave plan and implement; abandoned → quit plan.
+   * rejected stays in plan. Grok often does not emit current_mode_update after
+   * ExitPlanMode, so the host must flip local short-circuit state and notify
+   * consumers (bridge → mode picker) itself.
+   */
+  private applyGrokExitPlanModeOutcome(sessionId: string, outcome: GrokExitPlanOutcome): void {
+    if (outcome !== "approved" && outcome !== "abandoned") {
+      return;
+    }
+    if (!this.grokPermissionModes.has(sessionId)) {
+      return;
+    }
+    if (this.grokPermissionModes.get(sessionId) !== "plan") {
+      return;
+    }
+    const nextMode = DEFAULT_GROK_PERMISSION_MODE;
+    this.rememberGrokPermissionMode(sessionId, nextMode);
+    void this.handleSessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "current_mode_update",
+        currentModeId: nextMode,
+      },
+    });
   }
 
   private async handlePermissionRequest(
