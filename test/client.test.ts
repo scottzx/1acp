@@ -1041,6 +1041,56 @@ test("AcpClient exposes and enforces Grok Build permission modes through ACP", a
   }
 });
 
+test("AcpClient leaves plan mode after ExitPlanMode approved", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-grok-exit-plan-"));
+  const client = makeClient({
+    agentCommand: "grok agent stdio",
+    cwd,
+    onExitPlanMode: async () => ({ outcome: "approved" }),
+  });
+  asInternals(client).connection = {
+    newSession: async () => ({ sessionId: "grok-exit-plan" }),
+    setSessionMode: async () => ({}),
+  };
+
+  try {
+    const created = await client.createSession(cwd);
+    await client.setSessionMode(created.sessionId, "plan");
+
+    const filePath = path.join(cwd, "after-plan.txt");
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleWriteTextFile?.({
+          sessionId: created.sessionId,
+          path: filePath,
+          content: "blocked",
+        }),
+      PermissionDeniedError,
+    );
+
+    const internals = asInternals(client) as ClientInternals & {
+      handleGrokExitPlanMode?: (params: Record<string, unknown>) => Promise<{ outcome: string }>;
+    };
+    const response = await internals.handleGrokExitPlanMode?.({
+      sessionId: created.sessionId,
+      toolCallId: "tc-exit-1",
+      planContent: "# ship it",
+    });
+    assert.deepEqual(response, { outcome: "approved" });
+
+    // approved → acceptEdits: file writes skip the host prompt again
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "implemented",
+    });
+    assert.equal(await fs.readFile(filePath, "utf8"), "implemented");
+  } finally {
+    await client.close();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("AcpClient setSessionModel uses the model session config option", async () => {
   const client = makeClient();
 
