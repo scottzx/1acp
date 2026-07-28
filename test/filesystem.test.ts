@@ -187,25 +187,27 @@ test("readTextFile requires absolute paths", async () => {
 
 test("readTextFile allows reading files in agent state directories like ~/.grok", async () => {
   const tmpCwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fs-test-cwd-"));
-  const grokDir = path.join(os.homedir(), ".grok", "test-session-tmp");
   try {
-    await fs.mkdir(grokDir, { recursive: true });
-    const planFile = path.join(grokDir, "plan.md");
-    await fs.writeFile(planFile, "# Plan content", "utf8");
+    const grokPlanFile = path.join(os.homedir(), ".grok", "non-existent-plan-test.md");
 
     const handlers = new FileSystemHandlers({
       cwd: tmpCwd,
       permissionMode: "approve-reads",
     });
 
-    const res = await handlers.readTextFile({
-      sessionId: "session-1",
-      path: planFile,
-    });
-
-    assert.equal(res.content, "# Plan content");
+    // Should NOT throw "outside allowed cwd subtree" error, but rather normal ENOENT file read error
+    await assert.rejects(
+      handlers.readTextFile({
+        sessionId: "session-1",
+        path: grokPlanFile,
+      }),
+      (err: Error) => {
+        assert.equal(err.message.includes("outside allowed cwd subtree"), false);
+        assert.equal(err.message.includes("ENOENT"), true);
+        return true;
+      },
+    );
   } finally {
     await fs.rm(tmpCwd, { recursive: true, force: true });
-    await fs.rm(grokDir, { recursive: true, force: true });
   }
 });

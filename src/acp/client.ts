@@ -888,7 +888,6 @@ export class AcpClient {
   private async spawnAgentProcess(
     plan: AgentLaunchPlan,
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
-    console.time(`agent_spawn_${plan.agentType || 'unknown'}`);
     if (plan.claudeAcp) {
       applyClaudeSettingsEnvironment(plan.spawnOptions.env);
     }
@@ -902,7 +901,6 @@ export class AcpClient {
     } catch (error) {
       throw new AgentSpawnError(this.options.agentCommand, error);
     }
-    console.timeEnd(`agent_spawn_${plan.agentType || 'unknown'}`);
     return requireAgentStdio(spawnedChild);
   }
 
