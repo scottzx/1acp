@@ -184,3 +184,28 @@ test("readTextFile requires absolute paths", async () => {
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
+
+test("readTextFile allows reading files in agent state directories like ~/.grok", async () => {
+  const tmpCwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fs-test-cwd-"));
+  const grokDir = path.join(os.homedir(), ".grok", "test-session-tmp");
+  try {
+    await fs.mkdir(grokDir, { recursive: true });
+    const planFile = path.join(grokDir, "plan.md");
+    await fs.writeFile(planFile, "# Plan content", "utf8");
+
+    const handlers = new FileSystemHandlers({
+      cwd: tmpCwd,
+      permissionMode: "approve-reads",
+    });
+
+    const res = await handlers.readTextFile({
+      sessionId: "session-1",
+      path: planFile,
+    });
+
+    assert.equal(res.content, "# Plan content");
+  } finally {
+    await fs.rm(tmpCwd, { recursive: true, force: true });
+    await fs.rm(grokDir, { recursive: true, force: true });
+  }
+});

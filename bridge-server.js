@@ -61,9 +61,63 @@ const runtime = createAcpRuntime({
   },
 });
 
+// Trigger initial background pre-warm for grok-build
+setTimeout(() => {
+  prewarmGrokSession().catch((err) => {
+    console.warn("[PRE-WARM] Initial background pre-warm caught:", err.message);
+  });
+}, 1500);
+
 // Map of active session handles and turn contexts
 // sessionId -> { handle, activeTurn }
 const activeSessions = new Map();
+
+// Phase 2 Pre-warm pool for grok-build (scoped to the most recent CWD)
+let prewarmedGrokHandle = null;
+let prewarmedGrokCwd = null;
+let lastUsedCwd = process.cwd();
+let isWarmingGrok = false;
+
+async function prewarmGrokSession(targetCwd) {
+  const cwdToUse = targetCwd || lastUsedCwd || process.cwd();
+  if (isWarmingGrok) return;
+
+  // If we already have a pre-warmed handle for this exact CWD, keep it
+  if (prewarmedGrokHandle && prewarmedGrokCwd === cwdToUse) {
+    return;
+  }
+
+  isWarmingGrok = true;
+  try {
+    // If there was an old pre-warmed handle for a different CWD, close it first
+    if (prewarmedGrokHandle && prewarmedGrokCwd !== cwdToUse) {
+      console.log(`[PRE-WARM] Closing previous pre-warm handle for obsolete CWD: ${prewarmedGrokCwd}`);
+      try {
+        await runtime.close({ handle: prewarmedGrokHandle, reason: "CWD mismatch pre-warm refresh" });
+      } catch (e) {
+        // ignore close errors
+      }
+      prewarmedGrokHandle = null;
+      prewarmedGrokCwd = null;
+    }
+
+    const prewarmKey = `prewarm_grok_${Date.now()}`;
+    console.log(`[PRE-WARM] Background pre-warming grok-build session for CWD: ${cwdToUse} (${prewarmKey})...`);
+    const handle = await runtime.ensureSession({
+      sessionKey: prewarmKey,
+      agent: "grok-build",
+      mode: "persistent",
+      cwd: cwdToUse,
+    });
+    prewarmedGrokHandle = handle;
+    prewarmedGrokCwd = cwdToUse;
+    console.log(`[PRE-WARM] Background grok-build pre-warm ready for CWD=${cwdToUse} (${handle.agentSessionId || handle.backendSessionId})!`);
+  } catch (err) {
+    console.warn("[PRE-WARM] Pre-warm failed:", err.message);
+  } finally {
+    isWarmingGrok = false;
+  }
+}
 
 // Per-session coalescing state for authoritative history snapshots triggered
 // by out-of-turn updates. The bridge pushes at most one snapshot every 300ms
@@ -722,6 +776,10 @@ wss.on("connection", (ws) => {
             acpSessionId,
             permissionMode,
           } = payload;
+
+          console.time(`ensure_session_${sessionId}`);
+          console.log(`[DEBUG] ensure_session started for agent=${agentType || 'unknown'}, session=${sessionId}`);
+
           if (!sessionId || !workspacePath || !agentType) {
             sendError(
               ws,
@@ -811,6 +869,7 @@ wss.on("connection", (ws) => {
               }),
             );
             void sendSessionMeta(ws, sessionId, existingSession.handle);
+            console.timeEnd(`ensure_session_${sessionId}`);
             break;
           }
 
@@ -845,10 +904,60 @@ wss.on("connection", (ws) => {
             break;
           }
 
+          // Track the most recent CWD for background pre-warm
+          if (normalizedPath) {
+            lastUsedCwd = normalizedPath;
+          }
+
+          // Phase 2: Instant pre-warm hit for fresh grok-build sessions if CWD matches!
+          if (agentType === "grok-build" && !resumeId && prewarmedGrokHandle) {
+            if (prewarmedGrokCwd === normalizedPath) {
+              console.time(`ensure_session_${sessionId}`);
+              console.log(`[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`);
+              const handle = prewarmedGrokHandle;
+              prewarmedGrokHandle = null;
+              prewarmedGrokCwd = null;
+              console.timeEnd(`ensure_session_${sessionId}`);
+
+              // Asynchronously trigger background pre-warm for the next session using the same CWD
+              setTimeout(() => prewarmGrokSession(normalizedPath), 500);
+
+              activeSessions.set(sessionId, {
+                handle,
+                activeTurn: null,
+                promptQueue: [],
+                ws,
+                agentType,
+                sessionMode: await resolveGrokPermissionMode(handle, agentType),
+                permissionMode: seededMode ?? "approve-reads",
+              });
+              registerAgentSessionMapping(sessionId, handle);
+              ws.send(
+                JSON.stringify({
+                  event: "session_ready",
+                  sessionId,
+                  agentSessionId: handle.agentSessionId || handle.backendSessionId,
+                }),
+              );
+              void sendSessionMeta(ws, sessionId, handle);
+              break;
+            } else {
+              console.log(`[PRE-WARM] CWD mismatch (prewarmed=${prewarmedGrokCwd}, requested=${normalizedPath}). Discarding obsolete pre-warm handle.`);
+              try {
+                void runtime.close({ handle: prewarmedGrokHandle, reason: "CWD mismatch" });
+              } catch (e) {
+                // ignore
+              }
+              prewarmedGrokHandle = null;
+              prewarmedGrokCwd = null;
+            }
+          }
+
           console.log(
             `[acpx-server] Initializing session. Agent: ${agentType}, Cwd: ${normalizedPath}, ResumeSessionId: ${resumeId || "<none>"}`,
           );
 
+          console.time(`ensure_session_${sessionId}`);
           const sessionPromise = runtime.ensureSession({
             sessionKey: sessionId,
             agent: agentType,
@@ -861,6 +970,14 @@ wss.on("connection", (ws) => {
 
           try {
             const handle = await sessionPromise;
+            console.timeEnd(`ensure_session_${sessionId}`);
+            console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);
+
+            // Asynchronously trigger background pre-warm after a cold spawn using the new CWD
+            if (agentType === "grok-build") {
+              setTimeout(() => prewarmGrokSession(normalizedPath), 500);
+            }
+
             activeSessions.set(sessionId, {
               handle,
               activeTurn: null,
@@ -1642,9 +1759,10 @@ wss.on("connection", (ws) => {
       // `npx … codex-acp` fallback fell through to PATH). Surface an
       // actionable message instead of the opaque raw shell error.
       if (
-        err?.detailCode === "AGENT_STARTUP_FAILED" &&
-        (err.exitCode === 127 ||
-          /command not found|ENOENT|not found/i.test(err.stderrSummary || err.message || ""))
+        (err?.detailCode === "AGENT_STARTUP_FAILED" &&
+          (err.exitCode === 127 ||
+            /command not found|ENOENT|not found/i.test(err.stderrSummary || err.message || ""))) ||
+        err?.message?.startsWith("Failed to spawn agent command:")
       ) {
         const cmd = err.agentCommand || "the ACP adapter";
         sendError(

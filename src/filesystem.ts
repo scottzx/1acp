@@ -1,3 +1,4 @@
+import os from "node:os";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -28,7 +29,31 @@ function nowIso(): string {
 
 function isWithinRoot(rootDir: string, targetPath: string): boolean {
   const relative = path.relative(rootDir, targetPath);
-  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  if (relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    return true;
+  }
+
+  // Also allow access to agent session & state directories in user home (e.g. ~/.grok, ~/.codex, ~/.claude, ~/.acpx)
+  try {
+    const homeDir = canonicalizePath(path.resolve(os.homedir()));
+    const allowedAgentDirs = [
+      path.join(homeDir, ".grok"),
+      path.join(homeDir, ".codex"),
+      path.join(homeDir, ".claude"),
+      path.join(homeDir, ".acpx"),
+    ];
+
+    for (const agentDir of allowedAgentDirs) {
+      const rel = path.relative(agentDir, targetPath);
+      if (rel.length === 0 || (!rel.startsWith("..") && !path.isAbsolute(rel))) {
+        return true;
+      }
+    }
+  } catch {
+    // Ignore errors resolving home directory
+  }
+
+  return false;
 }
 
 function canonicalizePath(filePath: string): string {

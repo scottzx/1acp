@@ -180,6 +180,19 @@ export type AcpRuntimePlanEntry = {
 };
 
 /**
+ * Background task snapshot from Grok Build runtime (emitted as `background_task` event).
+ * Treated as top-level panel in chat UI (similar to plan checklist).
+ */
+export type AcpRuntimeBackgroundTask = {
+  id: string;
+  status: "running" | "completed" | "failed" | "cancelled" | "killed";
+  command: string;
+  duration?: string;
+  exitCode?: number;
+  output?: string;
+};
+
+/**
  * Agent-advertised slash command. The runtime only surfaces enough to
  * drive a picker UI ("does the agent advertise /compact?"). The full
  * `AvailableCommandInput` schema from ACP is intentionally not plumbed
@@ -285,6 +298,14 @@ export type AcpRuntimeEvent =
        * host replaces its checklist wholesale.
        */
       planEntries?: AcpRuntimePlanEntry[];
+    }
+  | {
+      type: "background_task";
+      tasks?: AcpRuntimeBackgroundTask[];
+    }
+  | {
+      type: "background_task";
+      tasks?: AcpRuntimeBackgroundTask[];
     }
   | {
       type: "tool_call";

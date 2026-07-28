@@ -557,10 +557,12 @@ async function createOrLoadRuntimeSession(
   client: AcpClient,
   resumeSessionId: string | undefined,
   cwd: string,
+  seatRole?: string,
 ): Promise<CreatedRuntimeSession> {
   if (resumeSessionId) {
     if (client.supportsResumeSession()) {
       const resumed = await client.resumeSession(resumeSessionId, cwd);
+      console.log(`[1acp-resume] market/product check resumeSessionId=${resumeSessionId} seatRole=${seatRole} resumed=true agentSessionId=${resumed.agentSessionId}`);
       return {
         sessionId: resumeSessionId,
         agentSessionId: resumed.agentSessionId,
@@ -573,6 +575,7 @@ async function createOrLoadRuntimeSession(
       );
     }
     const loaded = await client.loadSession(resumeSessionId, cwd);
+    console.log(`[1acp-resume] market/product check resumeSessionId=${resumeSessionId} seatRole=${seatRole} loaded=true agentSessionId=${loaded.agentSessionId}`);
     return {
       sessionId: resumeSessionId,
       agentSessionId: loaded.agentSessionId,
@@ -581,6 +584,7 @@ async function createOrLoadRuntimeSession(
   }
 
   const created = await client.createSession(cwd);
+  console.log(`[1acp-resume] market/product check fresh session seatRole=${seatRole}`);
   return {
     sessionId: created.sessionId,
     agentSessionId: created.agentSessionId,
@@ -742,7 +746,7 @@ export class AcpRuntimeManager {
 
     try {
       await client.start();
-      const session = await createOrLoadRuntimeSession(client, input.resumeSessionId, cwd);
+      const session = await createOrLoadRuntimeSession(client, input.resumeSessionId, cwd, "unknown");
       const record = await this.createAndSaveRuntimeRecord({
         input,
         client,

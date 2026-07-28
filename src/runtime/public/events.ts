@@ -78,6 +78,7 @@ const STATUS_TEXT_RESOLVERS: Partial<Record<AcpSessionUpdateTag, StatusTextResol
   config_option_update: configOptionStatusText,
   session_info_update: sessionInfoStatusText,
   plan: planStatusText,
+  background_task: backgroundTaskStatusText,
 };
 
 function availableCommandsStatusText(payload: Record<string, unknown>): string {
@@ -116,6 +117,16 @@ function planStatusText(payload: Record<string, unknown>): string | null {
   const first = entries.find((entry) => isRecord(entry));
   const content = asTrimmedString(first?.content);
   return content ? `plan: ${content}` : null;
+}
+
+function backgroundTaskStatusText(payload: Record<string, unknown>): string | null {
+  const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+  const running = tasks.filter(t => t.status === "running").length;
+  const completed = tasks.filter(t => t.status === "completed").length;
+  const failed = tasks.filter(t => t.status === "failed" || t.status === "cancelled" || t.status === "killed").length;
+  const total = tasks.length;
+  if (total === 0) return null;
+  return `background tasks: ${completed}/${total} (${running} running, ${failed} failed)`;
 }
 
 function resolveTextChunk(params: {

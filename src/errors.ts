@@ -46,6 +46,9 @@ export class AgentSpawnError extends AcpxOperationalError {
   constructor(agentCommand: string, cause?: unknown) {
     super(`Failed to spawn agent command: ${agentCommand}`, {
       cause: cause instanceof Error ? cause : undefined,
+      outputCode: "RUNTIME",
+      detailCode: "AGENT_ADAPTER_MISSING",
+      origin: "acp",
     });
     this.agentCommand = agentCommand;
   }
@@ -69,7 +72,11 @@ export class AgentStartupError extends AcpxOperationalError {
       typeof params.stderrSummary === "string" && params.stderrSummary.trim().length > 0
         ? `: ${params.stderrSummary.trim()}`
         : "";
-    super(`ACP agent exited before initialize completed (${exitSummary})${stderrSuffix}`, {
+    let message = `ACP agent exited before initialize completed (${exitSummary})${stderrSuffix}`;
+    if (process.platform === 'darwin') {
+      message += ' On macOS, this usually means the agent CLI is not installed/executable in your PATH, or a required device (e.g. for full-screen or hardware access) is not configured in System Settings. Check `which <agent>` and ensure the binary exists and is executable; also verify device permissions in System Settings → Privacy & Security.';
+    }
+    super(message, {
       cause: params.cause instanceof Error ? params.cause : undefined,
       outputCode: "RUNTIME",
       detailCode: "AGENT_STARTUP_FAILED",
