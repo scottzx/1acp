@@ -1,7 +1,16 @@
-import type {
-  AcpRuntimeConfigOption,
-  AcpRuntimeConfigOptionChoice,
-} from "../runtime/public/contract.js";
+export type AcpRuntimeConfigOptionChoice = {
+  value: string;
+  name: string;
+  description?: string;
+};
+
+export type AcpRuntimeConfigOption = {
+  id: string;
+  name: string;
+  category?: string;
+  currentValue?: string;
+  options: AcpRuntimeConfigOptionChoice[];
+};
 
 // Generic normalization of ACP session config options (select type) — the
 // data-driven sibling of mode-support.ts / model-support.ts. Surfaces every

@@ -9,6 +9,23 @@ type AcpxErrorOptions = ErrorOptions & {
   outputAlreadyEmitted?: boolean;
 };
 
+function agentStartupMessage(params: {
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stderrSummary?: string;
+}): string {
+  const exitSummary = `exit=${params.exitCode ?? "null"}, signal=${params.signal ?? "null"}`;
+  const stderrSuffix =
+    typeof params.stderrSummary === "string" && params.stderrSummary.trim().length > 0
+      ? `: ${params.stderrSummary.trim()}`
+      : "";
+  const base = `ACP agent exited before initialize completed (${exitSummary})${stderrSuffix}`;
+  if (process.platform !== "darwin") {
+    return base;
+  }
+  return `${base} On macOS, this usually means the agent CLI is not installed/executable in your PATH, or a required device (e.g. for full-screen or hardware access) is not configured in System Settings. Check \`which <agent>\` and ensure the binary exists and is executable; also verify device permissions in System Settings → Privacy & Security.`;
+}
+
 export class AcpxOperationalError extends Error {
   readonly outputCode?: OutputErrorCode;
   readonly detailCode?: string;
@@ -67,16 +84,7 @@ export class AgentStartupError extends AcpxOperationalError {
     stderrSummary?: string;
     cause?: unknown;
   }) {
-    const exitSummary = `exit=${params.exitCode ?? "null"}, signal=${params.signal ?? "null"}`;
-    const stderrSuffix =
-      typeof params.stderrSummary === "string" && params.stderrSummary.trim().length > 0
-        ? `: ${params.stderrSummary.trim()}`
-        : "";
-    let message = `ACP agent exited before initialize completed (${exitSummary})${stderrSuffix}`;
-    if (process.platform === 'darwin') {
-      message += ' On macOS, this usually means the agent CLI is not installed/executable in your PATH, or a required device (e.g. for full-screen or hardware access) is not configured in System Settings. Check `which <agent>` and ensure the binary exists and is executable; also verify device permissions in System Settings → Privacy & Security.';
-    }
-    super(message, {
+    super(agentStartupMessage(params), {
       cause: params.cause instanceof Error ? params.cause : undefined,
       outputCode: "RUNTIME",
       detailCode: "AGENT_STARTUP_FAILED",

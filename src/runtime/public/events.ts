@@ -120,12 +120,16 @@ function planStatusText(payload: Record<string, unknown>): string | null {
 }
 
 function backgroundTaskStatusText(payload: Record<string, unknown>): string | null {
-  const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-  const running = tasks.filter(t => t.status === "running").length;
-  const completed = tasks.filter(t => t.status === "completed").length;
-  const failed = tasks.filter(t => t.status === "failed" || t.status === "cancelled" || t.status === "killed").length;
+  const tasks = Array.isArray(payload.tasks) ? payload.tasks.filter(isRecord) : [];
+  const running = tasks.filter((t) => t.status === "running").length;
+  const completed = tasks.filter((t) => t.status === "completed").length;
+  const failed = tasks.filter(
+    (t) => t.status === "failed" || t.status === "cancelled" || t.status === "killed",
+  ).length;
   const total = tasks.length;
-  if (total === 0) return null;
+  if (total === 0) {
+    return null;
+  }
   return `background tasks: ${completed}/${total} (${running} running, ${failed} failed)`;
 }
 

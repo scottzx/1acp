@@ -88,11 +88,7 @@ export function normalizeHostExitPlanResponse(
     return abandonedExitPlanResponse();
   }
   const comments =
-    value.comments === undefined
-      ? undefined
-      : value.comments === null
-        ? null
-        : String(value.comments);
+    value.comments === undefined ? undefined : value.comments === null ? null : value.comments;
   return comments !== undefined && comments !== null && comments.length > 0
     ? { outcome, comments }
     : { outcome };

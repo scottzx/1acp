@@ -1,4 +1,5 @@
 import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
+import type { AcpRuntimeConfigOption } from "../../acp/config-option-support.js";
 import type {
   GrokAskUserAnswers,
   GrokAskUserQuestionRequest,
@@ -9,6 +10,7 @@ import type {
   GrokExitPlanModeResponse,
   GrokExitPlanOutcome,
 } from "../../acp/grok-exit-plan.js";
+import type { AcpRuntimeSessionModes } from "../../acp/mode-support.js";
 import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
@@ -22,6 +24,11 @@ import type { SessionAgentOptions } from "../engine/session-options.js";
 export type { SessionAgentOptions, SystemPromptOption } from "../engine/session-options.js";
 
 export type { AcpPermissionDecision, AcpPermissionRequest } from "../../types.js";
+export type {
+  AcpRuntimeConfigOption,
+  AcpRuntimeConfigOptionChoice,
+} from "../../acp/config-option-support.js";
+export type { AcpRuntimeSessionModeInfo, AcpRuntimeSessionModes } from "../../acp/mode-support.js";
 
 export type AcpRuntimePromptMode = "prompt" | "steer";
 
@@ -104,22 +111,6 @@ export type AcpRuntimeSessionModels = {
  * default/acceptEdits/plan/..., Codex: read-only/agent/...), so consumers
  * must render data-driven rather than assume a fixed id set.
  */
-export type AcpRuntimeSessionModeInfo = {
-  id: string;
-  name: string;
-  description?: string;
-};
-
-/**
- * Session-mode state extracted from the persisted record: the mode select
- * config option supplies `availableModes`; the last `current_mode_update`
- * (or the option's currentValue) supplies `currentModeId`.
- */
-export type AcpRuntimeSessionModes = {
-  currentModeId?: string;
-  availableModes: AcpRuntimeSessionModeInfo[];
-};
-
 /**
  * Cumulative session cost as reported by the agent. Mirrors ACP's
  * `Cost`, but both fields are optional here because not every adapter
@@ -144,12 +135,6 @@ export type AcpRuntimeUsageBreakdown = {
   totalTokens?: number;
 };
 
-export type AcpRuntimeConfigOptionChoice = {
-  value: string;
-  name: string;
-  description?: string;
-};
-
 /**
  * A normalized ACP session config option (a `select` — model, reasoning
  * effort, etc.). `category` echoes the agent's grouping ("model" / "effort" /
@@ -157,14 +142,6 @@ export type AcpRuntimeConfigOptionChoice = {
  * `modes`, so config-option consumers should skip it. Model option groups are
  * flattened into a single `options` list.
  */
-export type AcpRuntimeConfigOption = {
-  id: string;
-  name: string;
-  category?: string;
-  currentValue?: string;
-  options: AcpRuntimeConfigOptionChoice[];
-};
-
 export type AcpRuntimePlanEntryStatus = "pending" | "in_progress" | "completed";
 
 /**

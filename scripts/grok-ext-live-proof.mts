@@ -8,15 +8,19 @@
  * Writes PASS/FAIL artifacts under docs/proof-2026-07-18-grok-ext-methods/.
  */
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 import { AcpClient } from "../src/acp/client.ts";
 
-const outDir = process.env.PROOF_DIR || path.join(process.cwd(), "docs/proof-2026-07-18-grok-ext-methods");
+const outDir =
+  process.env.PROOF_DIR || path.join(process.cwd(), "docs/proof-2026-07-18-grok-ext-methods");
 fs.mkdirSync(outDir, { recursive: true });
 
 type Event = { t: string; kind: string; data?: unknown };
 const events: Event[] = [];
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
 const log = (kind: string, data?: unknown) => {
   const row = { t: new Date().toISOString(), kind, data };
   events.push(row);
@@ -40,7 +44,7 @@ async function withClient(
     onAskUserQuestion: opts.onAskUserQuestion,
     onExitPlanMode: opts.onExitPlanMode,
     onSessionUpdate: (n) => {
-      const u = n.update as any;
+      const u = isRecord(n.update) ? n.update : undefined;
       if (u?.sessionUpdate === "tool_call" || u?.sessionUpdate === "tool_call_update") {
         log(`${label}.tool`, {
           update: u.sessionUpdate,
@@ -66,7 +70,6 @@ async function withClient(
 
 async function proofAskUser() {
   let sawReq: unknown;
-  let completed = false;
   await withClient(
     "ask_user",
     {
@@ -156,7 +159,10 @@ async function proofExitPlan(outcome: "approved" | "abandoned" | "rejected") {
   const okReq = Boolean(sawReq);
   let okTool = false;
   if (outcome === "approved") {
-    okTool = toolJson.includes("PlanReady") || toolJson.includes("approved") || toolJson.includes("start coding");
+    okTool =
+      toolJson.includes("PlanReady") ||
+      toolJson.includes("approved") ||
+      toolJson.includes("start coding");
   } else if (outcome === "abandoned") {
     okTool =
       toolJson.includes("abandon") ||
@@ -188,7 +194,7 @@ async function main() {
   try {
     await proofAskUser();
   } catch (e) {
-    failures.push(`ask_user: ${e}`);
+    failures.push(`ask_user: ${String(e)}`);
     log("ask_user.error", String(e));
   }
 
@@ -196,7 +202,7 @@ async function main() {
     try {
       await proofExitPlan(outcome);
     } catch (e) {
-      failures.push(`exit_plan_${outcome}: ${e}`);
+      failures.push(`exit_plan_${outcome}: ${String(e)}`);
       log(`exit_plan_${outcome}.error`, String(e));
     }
   }
@@ -211,7 +217,12 @@ async function main() {
     eventCount: events.length,
     transcript: path.relative(process.cwd(), transcriptPath),
     highlights: events
-      .filter((e) => e.kind.endsWith(".verdict") || e.kind.endsWith(".request") || e.kind.endsWith(".response"))
+      .filter(
+        (e) =>
+          e.kind.endsWith(".verdict") ||
+          e.kind.endsWith(".request") ||
+          e.kind.endsWith(".response"),
+      )
       .map((e) => ({ kind: e.kind, data: e.data })),
   };
   fs.writeFileSync(path.join(outDir, "SUMMARY.json"), JSON.stringify(summary, null, 2));

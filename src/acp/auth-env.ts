@@ -115,38 +115,52 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): Set<string> {
   return protectedKeys;
 }
 
+function baseAgentEnvironment(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/local/share:/opt/homebrew/bin",
+    HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || "",
+    HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || "",
+    NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || "",
+  };
+}
+
+function applyAuthCredentials(
+  env: NodeJS.ProcessEnv,
+  authCredentials: Record<string, string> | undefined,
+): Set<string> {
+  const protectedKeys = promotePrefixedAuthEnvironment(env);
+  for (const [methodId, credential] of Object.entries(authCredentials ?? {})) {
+    addAuthCredentialEnvKeys(protectedKeys, methodId, credential);
+    assignAuthCredentialEnv(env, methodId, credential);
+  }
+  return protectedKeys;
+}
+
+function applySessionEnvironment(
+  env: NodeJS.ProcessEnv,
+  sessionEnv: Record<string, string> | undefined,
+  protectedKeys: Set<string>,
+): void {
+  for (const [key, value] of Object.entries(sessionEnv ?? {})) {
+    if (typeof value !== "string" || protectedKeys.has(protectedEnvKey(key))) {
+      continue;
+    }
+    assignSessionEnv(env, key, value);
+  }
+}
+
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionEnv: Record<string, string> | undefined,
   includeClaudeSettings: boolean,
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { 
-    ...process.env,
-    PATH: process.env.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/local/share:/opt/homebrew/bin',
-    HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || '',
-    HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || '',
-    NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || '',
-  };
+  const env = baseAgentEnvironment();
   if (includeClaudeSettings) {
     applyClaudeSettingsEnvironment(env);
   }
-  const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
-  if (authCredentials) {
-    for (const [methodId, credential] of Object.entries(authCredentials)) {
-      addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
-      assignAuthCredentialEnv(env, methodId, credential);
-    }
-  }
-
-  if (sessionEnv) {
-    for (const [key, value] of Object.entries(sessionEnv)) {
-      if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) {
-        continue;
-      }
-      assignSessionEnv(env, key, value);
-    }
-  }
-
+  const protectedKeys = applyAuthCredentials(env, authCredentials);
+  applySessionEnvironment(env, sessionEnv, protectedKeys);
   return env;
 }
 

@@ -1,6 +1,6 @@
-import os from "node:os";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type {
   ReadTextFileRequest,
@@ -27,9 +27,13 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function isWithinRoot(rootDir: string, targetPath: string): boolean {
+function isPathInside(rootDir: string, targetPath: string): boolean {
   const relative = path.relative(rootDir, targetPath);
-  if (relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function isWithinRoot(rootDir: string, targetPath: string): boolean {
+  if (isPathInside(rootDir, targetPath)) {
     return true;
   }
 
@@ -43,12 +47,7 @@ function isWithinRoot(rootDir: string, targetPath: string): boolean {
       path.join(homeDir, ".acpx"),
     ];
 
-    for (const agentDir of allowedAgentDirs) {
-      const rel = path.relative(agentDir, targetPath);
-      if (rel.length === 0 || (!rel.startsWith("..") && !path.isAbsolute(rel))) {
-        return true;
-      }
-    }
+    return allowedAgentDirs.some((agentDir) => isPathInside(agentDir, targetPath));
   } catch {
     // Ignore errors resolving home directory
   }

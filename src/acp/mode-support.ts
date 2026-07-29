@@ -1,7 +1,13 @@
-import type {
-  AcpRuntimeSessionModeInfo,
-  AcpRuntimeSessionModes,
-} from "../runtime/public/contract.js";
+export type AcpRuntimeSessionModeInfo = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
+export type AcpRuntimeSessionModes = {
+  currentModeId?: string;
+  availableModes: AcpRuntimeSessionModeInfo[];
+};
 
 // Session-mode extraction from ACP config options — the mode-flavored sibling
 // of model-support.ts modelStateFromConfigOptions. Agents advertise their mode
