@@ -90,6 +90,50 @@ test("serialized session record satisfies persisted key policy", () => {
   assertPersistedKeyPolicy(persisted);
 });
 
+test("persisted key policy allows environment variable names in session options", () => {
+  const persisted = serializeSessionRecordForDisk(makeRecord());
+  const acpx = persisted.acpx as Record<string, unknown>;
+  acpx.session_options = {
+    env: {
+      ONEAGENTS_SESSION_ID: "session-1",
+      ONEAGENTS_SESSION_TOKEN: "signed",
+    },
+  };
+
+  assert.deepEqual(findPersistedKeyPolicyViolations(persisted), []);
+  assertPersistedKeyPolicy(persisted);
+});
+
+test("persisted key policy allows dynamic Turn IDs in turn results", () => {
+  const persisted = serializeSessionRecordForDisk(makeRecord());
+  const acpx = persisted.acpx as Record<string, unknown>;
+  acpx.turn_results = {
+    "9ed0939cd26cdefe9a2bead8c14fb88c": {
+      status: "running",
+      prompt_message_id: "9ed0939cd26cdefe9a2bead8c14fb88c",
+      started_at: "2026-07-29T06:20:07.412Z",
+    },
+  };
+
+  assert.deepEqual(findPersistedKeyPolicyViolations(persisted), []);
+  assertPersistedKeyPolicy(persisted);
+});
+
+test("persisted key policy still validates fields inside Turn result values", () => {
+  const persisted = serializeSessionRecordForDisk(makeRecord());
+  const acpx = persisted.acpx as Record<string, unknown>;
+  acpx.turn_results = {
+    "9ed0939cd26cdefe9a2bead8c14fb88c": {
+      status: "running",
+      promptMessageId: "9ed0939cd26cdefe9a2bead8c14fb88c",
+    },
+  };
+
+  assert.deepEqual(findPersistedKeyPolicyViolations(persisted), [
+    "acpx.turn_results.9ed0939cd26cdefe9a2bead8c14fb88c.promptMessageId",
+  ]);
+});
+
 test("persisted key policy rejects camelCase acpx-owned keys", () => {
   const persisted = serializeSessionRecordForDisk(makeRecord());
   persisted.requestId = "bad";

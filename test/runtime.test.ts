@@ -292,6 +292,14 @@ test("createFileSessionStore persists records inside the provided state director
   const record = createSessionRecord({
     acpxRecordId: "agent:codex:acp:stored",
     acpSessionId: "sid-stored",
+    acpx: {
+      session_options: {
+        env: {
+          ONEAGENTS_SESSION_ID: "session-1",
+          ONEAGENTS_SESSION_TOKEN: "signed",
+        },
+      },
+    },
   });
 
   await store.save(record);
@@ -299,6 +307,10 @@ test("createFileSessionStore persists records inside the provided state director
 
   assert.equal(loaded?.acpxRecordId, "agent:codex:acp:stored");
   assert.equal(loaded?.acpSessionId, "sid-stored");
+  assert.deepEqual(loaded?.acpx?.session_options?.env, {
+    ONEAGENTS_SESSION_ID: "session-1",
+    ONEAGENTS_SESSION_TOKEN: "signed",
+  });
   assert.equal(
     await fs
       .readFile(path.join(stateDir, "sessions", "agent%3Acodex%3Aacp%3Astored.json"), "utf8")
