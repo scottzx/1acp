@@ -380,6 +380,16 @@ export type SessionConversation = {
   request_token_usage: Record<string, SessionTokenUsage>;
 };
 
+export type RuntimeTurnResultSnapshot = {
+  status: "running" | "completed" | "failed" | "cancelled";
+  prompt_message_id: string;
+  started_at: string;
+  completed_at?: string;
+  stop_reason?: string;
+  last_event_seq?: number;
+  error_code?: string;
+};
+
 export type SessionAcpxState = {
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
@@ -397,6 +407,7 @@ export type SessionAcpxState = {
     system_prompt?: string | { append: string };
     env?: Record<string, string>;
   };
+  turn_results?: Record<string, RuntimeTurnResultSnapshot>;
 };
 
 export type SessionImportedFrom = {

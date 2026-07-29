@@ -406,7 +406,7 @@ async function defaultHistoryAdapter() {
 function pushMerged(items, next) {
   const last = items[items.length - 1];
   const mergeable = new Set(["user", "assistant_text", "thinking"]);
-  if (last && mergeable.has(last.kind) && last.kind === next.kind) {
+  if (last && mergeable.has(last.kind) && last.kind === next.kind && last.turnId === next.turnId) {
     last.text = last.text ? `${last.text}\n${next.text}` : next.text;
     return;
   }
@@ -546,8 +546,15 @@ function extractFromRuntimeRecord(record) {
   if (!record || !Array.isArray(record.messages)) {
     return items;
   }
+  const turnResults =
+    record.acpx?.turn_results && typeof record.acpx.turn_results === "object"
+      ? record.acpx.turn_results
+      : {};
+  let currentTurnId;
   for (const msg of record.messages) {
     if (msg.User && Array.isArray(msg.User.content)) {
+      currentTurnId =
+        typeof msg.User.id === "string" && turnResults[msg.User.id] ? msg.User.id : undefined;
       const parts = [];
       for (const c of msg.User.content) {
         if (c && c.Text !== undefined) {
@@ -555,7 +562,11 @@ function extractFromRuntimeRecord(record) {
         }
       }
       if (parts.length) {
-        pushMerged(items, { kind: "user", text: parts.join("\n") });
+        pushMerged(items, {
+          kind: "user",
+          text: parts.join("\n"),
+          ...(currentTurnId ? { turnId: currentTurnId } : {}),
+        });
       }
     } else if (msg.Agent && Array.isArray(msg.Agent.content)) {
       for (const c of msg.Agent.content) {
@@ -563,11 +574,19 @@ function extractFromRuntimeRecord(record) {
           continue;
         }
         if (c.Text !== undefined) {
-          pushMerged(items, { kind: "assistant_text", text: c.Text });
+          pushMerged(items, {
+            kind: "assistant_text",
+            text: c.Text,
+            ...(currentTurnId ? { turnId: currentTurnId } : {}),
+          });
         } else if (c.Thinking) {
           const text = c.Thinking.text || "";
           if (text) {
-            pushMerged(items, { kind: "thinking", text });
+            pushMerged(items, {
+              kind: "thinking",
+              text,
+              ...(currentTurnId ? { turnId: currentTurnId } : {}),
+            });
           }
         } else if (c.ToolUse) {
           items.push({
@@ -575,6 +594,7 @@ function extractFromRuntimeRecord(record) {
             toolName: c.ToolUse.name || c.ToolUse.tool_name || c.ToolUse.toolName || "tool",
             input: c.ToolUse.input ?? c.ToolUse.raw_input ?? {},
             toolCallId: c.ToolUse.id,
+            ...(currentTurnId ? { turnId: currentTurnId } : {}),
           });
         }
       }
@@ -600,6 +620,7 @@ function extractFromRuntimeRecord(record) {
             toolName: res.tool_name || res.toolName || res.name || "tool",
             content: textContent,
             isError: !!res.is_error,
+            ...(currentTurnId ? { turnId: currentTurnId } : {}),
           });
         }
       }
@@ -663,14 +684,16 @@ async function loadSessionHistory(sessionId, payload = {}) {
   const historyContext = { sessionId, agentType, acpSessionId, workspacePath };
   const prefersNativeHistory = agentType === "claude" || agentType === "claudecode";
 
+  const runtimeItems = await loadRuntimeHistory(sessionId, session);
+  if (runtimeItems.some((item) => item.turnId)) {
+    return runtimeItems;
+  }
   if (prefersNativeHistory) {
     const nativeItems = await loadNativeHistory(historyContext);
     if (nativeItems.length > 0) {
       return nativeItems;
     }
   }
-
-  const runtimeItems = await loadRuntimeHistory(sessionId, session);
   if (runtimeItems.length > 0) {
     return runtimeItems;
   }
@@ -870,17 +893,17 @@ wss.on("connection", (ws) => {
             // order here is Map insertion order (request arrival).
             for (const pending of pendingPermissions.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                ws.send(JSON.stringify(pending.payload));
+                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
               }
             }
             for (const pending of pendingAskUserQuestions.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                ws.send(JSON.stringify(pending.payload));
+                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
               }
             }
             for (const pending of pendingExitPlanModes.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                ws.send(JSON.stringify(pending.payload));
+                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
               }
             }
             registerAgentSessionMapping(sessionId, existingSession.handle);
@@ -888,6 +911,7 @@ wss.on("connection", (ws) => {
               JSON.stringify({
                 event: "session_ready",
                 sessionId,
+                turnProtocolVersion: 2,
                 agentSessionId:
                   existingSession.handle.agentSessionId || existingSession.handle.backendSessionId,
               }),
@@ -918,6 +942,7 @@ wss.on("connection", (ws) => {
                 JSON.stringify({
                   event: "session_ready",
                   sessionId,
+                  turnProtocolVersion: 2,
                   agentSessionId: handle.agentSessionId || handle.backendSessionId,
                 }),
               );
@@ -965,6 +990,7 @@ wss.on("connection", (ws) => {
                 JSON.stringify({
                   event: "session_ready",
                   sessionId,
+                  turnProtocolVersion: 2,
                   agentSessionId: handle.agentSessionId || handle.backendSessionId,
                 }),
               );
@@ -1030,6 +1056,7 @@ wss.on("connection", (ws) => {
               JSON.stringify({
                 event: "session_ready",
                 sessionId,
+                turnProtocolVersion: 2,
                 agentSessionId: handle.agentSessionId || handle.backendSessionId,
               }),
             );
@@ -1044,7 +1071,7 @@ wss.on("connection", (ws) => {
           // attachments: optional [{ mediaType, data }] (base64) — forwarded
           // to runtime.startTurn, which maps image/* and audio/* onto ACP
           // content blocks. Other media types are rejected by the runtime.
-          const { text, attachments } = payload;
+          const { text, attachments, turnId, requestId: requestedRuntimeId } = payload;
           if (!sessionId || text === undefined) {
             sendError(ws, sessionId, "INVALID_PARAMS", "sessionId and text are required");
             return;
@@ -1054,6 +1081,40 @@ wss.on("connection", (ws) => {
           if (!session) {
             sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
             return;
+          }
+
+          if (turnId) {
+            if (requestedRuntimeId !== turnId) {
+              ws.send(
+                JSON.stringify({
+                  event: "protocol_error",
+                  sessionId,
+                  turnId,
+                  code: "TURN_ID_MISMATCH",
+                  message: "host-managed requestId must equal turnId",
+                }),
+              );
+              return;
+            }
+            if (session.activeTurn) {
+              ws.send(
+                JSON.stringify({
+                  event: "protocol_error",
+                  sessionId,
+                  turnId,
+                  code: "TURN_ALREADY_ACTIVE",
+                  message: "host-managed sessions accept only one dispatched Turn",
+                }),
+              );
+              return;
+            }
+            runPromptTurn(session, sessionId, {
+              text,
+              attachments,
+              turnId,
+              requestId: requestedRuntimeId,
+            });
+            break;
           }
 
           if (session.activeTurn || session.promptQueue.length > 0) {
@@ -1444,12 +1505,9 @@ wss.on("connection", (ws) => {
         }
 
         case "cancel_turn": {
-          // Composer "停止": stop generating without tearing the session down.
-          // Cancels the active turn and drops any queued prompts, but keeps
-          // the session in activeSessions so the user can immediately continue
-          // the conversation. (Full teardown is close_session, below.) The
-          // cancelled turn settles with status "cancelled", so runPromptTurn
-          // emits a normal `done` — no error is surfaced to the client.
+          // Composer "停止": cancel the explicitly targeted active Turn while
+          // preserving the session and host-owned durable queue. Full teardown
+          // is close_session below.
           if (!sessionId) {
             sendError(ws, sessionId, "INVALID_PARAMS", "sessionId is required");
             return;
@@ -1461,9 +1519,25 @@ wss.on("connection", (ws) => {
             return;
           }
 
-          // Drop the queue first so the active turn's finally block doesn't
-          // auto-start a queued prompt after we cancel it.
-          cancelSessionQueue(session, sessionId);
+          const requestedTurnId = payload.turnId;
+          const activeHostTurnId = session.activeTurn?.hostTurnId;
+          if (requestedTurnId && requestedTurnId !== activeHostTurnId) {
+            ws.send(
+              JSON.stringify({
+                event: "protocol_error",
+                sessionId,
+                turnId: requestedTurnId,
+                code: "STALE_TURN_CANCEL",
+                message: "cancel target is not the active Turn",
+              }),
+            );
+            return;
+          }
+          // The host owns the durable queue. Legacy callers without turnId
+          // retain the bridge-local queue until protocol v1 is removed.
+          if (!requestedTurnId) {
+            cancelSessionQueue(session, sessionId);
+          }
           if (session.activeTurn) {
             try {
               await session.activeTurn.cancel({ reason: "Stopped by user" });
@@ -1884,13 +1958,10 @@ function leavePlanModeAfterExit(sessionId, ws) {
   console.log(`[acpx-server] exit_plan_mode left plan → ${nextMode} for ${sessionId}`);
   try {
     if (ws && ws.readyState === 1 /* OPEN */) {
-      ws.send(
-        JSON.stringify({
-          event: "mode_changed",
-          sessionId,
-          payload: { currentModeId: nextMode },
-        }),
-      );
+      sendRuntimeTurnEvent(ws, sessionId, session.activeTurn, {
+        event: "mode_changed",
+        payload: { currentModeId: nextMode },
+      });
     }
   } catch (err) {
     console.warn(
@@ -1936,6 +2007,8 @@ function sendError(ws, sessionId, errorCode, message) {
       sessionId,
       code: errorCode,
       message,
+      scope: "control",
+      terminal: false,
     }),
   );
 }
@@ -2003,12 +2076,28 @@ function cancelSessionQueue(session, sessionId) {
   session.promptQueue.length = 0;
 }
 
-// Start (or continue) running a prompt on the given session and chain into
-// the next queued prompt when this turn completes. Extracted from
-// case "prompt" so the queue-drain in the finally block can re-enter it
-// without duplicating the event-consumption logic.
+function sendRuntimeTurnEvent(ws, sessionId, turn, payload) {
+  if (!ws || ws.readyState !== 1 /* OPEN */) {
+    return false;
+  }
+  const hostTurnId = turn?.hostTurnId;
+  if (hostTurnId) {
+    turn.eventSequence = (turn.eventSequence || 0) + 1;
+  }
+  ws.send(
+    JSON.stringify({
+      ...payload,
+      sessionId,
+      ...(hostTurnId ? { turnId: hostTurnId, sequence: turn.eventSequence } : {}),
+    }),
+  );
+  return true;
+}
+
+// Host-managed prompts are dispatched one-at-a-time by Go. The bridge-local
+// queue below is retained only for legacy callers that do not provide turnId.
 function runPromptTurn(session, sessionId, promptItem) {
-  const requestId = `turn_${Date.now()}`;
+  const requestId = promptItem.requestId || `turn_${Date.now()}`;
   const attachments = Array.isArray(promptItem.attachments)
     ? promptItem.attachments.filter(
         (a) => a && typeof a.mediaType === "string" && typeof a.data === "string",
@@ -2021,10 +2110,13 @@ function runPromptTurn(session, sessionId, promptItem) {
     mode: "prompt",
     requestId,
   });
+  turn.hostTurnId = promptItem.turnId || null;
+  turn.eventSequence = 0;
 
   session.activeTurn = turn;
+  let terminalSent = false;
 
-  (async () => {
+  void (async () => {
     try {
       for await (const event of turn.events) {
         const currentSession = activeSessions.get(sessionId);
@@ -2036,14 +2128,11 @@ function runPromptTurn(session, sessionId, promptItem) {
 
         // event types: text_delta, status, tool_call, error
         if (event.type === "text_delta") {
-          targetWs.send(
-            JSON.stringify({
-              event: "text_delta",
-              sessionId,
-              text: event.text,
-              type: event.stream || "output", // 'thought' or 'output'
-            }),
-          );
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "text_delta",
+            text: event.text,
+            type: event.stream || "output", // 'thought' or 'output'
+          });
         } else if (event.type === "tool_call") {
           console.log(
             "[acpx-server] Real-time tool_call event received:",
@@ -2061,21 +2150,18 @@ function runPromptTurn(session, sessionId, promptItem) {
           // so the frontend can treat status as authoritative over heuristics.
           const rawStatus = typeof event.status === "string" ? event.status : undefined;
           const toolStatus = rawStatus === "success" ? "completed" : rawStatus || undefined;
-          targetWs.send(
-            JSON.stringify({
-              event: "tool_call",
-              sessionId,
-              toolName: resolveToolDisplayName(event),
-              toolCallId: event.toolCallId,
-              ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
-              ...(event.kind ? { kind: event.kind } : {}),
-              ...(toolStatus ? { status: toolStatus } : {}),
-              ...(Array.isArray(event.locations) && event.locations.length > 0
-                ? { locations: event.locations }
-                : {}),
-              ...(toolDiffs.length > 0 ? { diffs: toolDiffs } : {}),
-            }),
-          );
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "tool_call",
+            toolName: resolveToolDisplayName(event),
+            toolCallId: event.toolCallId,
+            ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
+            ...(event.kind ? { kind: event.kind } : {}),
+            ...(toolStatus ? { status: toolStatus } : {}),
+            ...(Array.isArray(event.locations) && event.locations.length > 0
+              ? { locations: event.locations }
+              : {}),
+            ...(toolDiffs.length > 0 ? { diffs: toolDiffs } : {}),
+          });
           // Terminal tool outcomes also surface as tool_result so older clients
           // that only watch results still update. Prefer ACP "completed"/"failed";
           // accept legacy "success" for the same gate.
@@ -2091,25 +2177,22 @@ function runPromptTurn(session, sessionId, promptItem) {
                   ? event.rawOutput
                   : JSON.stringify(event.rawOutput);
             }
-            targetWs.send(
-              JSON.stringify({
-                event: "tool_result",
-                sessionId,
-                toolCallId: event.toolCallId,
-                toolName: resolveToolDisplayName(event),
-                text: textContent,
-                isError: toolStatus === "failed",
-              }),
-            );
+            sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+              event: "tool_result",
+              toolCallId: event.toolCallId,
+              toolName: resolveToolDisplayName(event),
+              text: textContent,
+              isError: toolStatus === "failed",
+            });
           }
         } else if (event.type === "error") {
-          targetWs.send(
-            JSON.stringify({
-              event: "error",
-              sessionId,
-              message: event.message,
-            }),
-          );
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "error",
+            scope: "turn",
+            terminal: false,
+            code: event.code,
+            message: event.message,
+          });
         } else if (
           event.type === "status" &&
           event.tag === "current_mode_update" &&
@@ -2123,13 +2206,10 @@ function runPromptTurn(session, sessionId, promptItem) {
           if (liveSession) {
             liveSession.sessionMode = event.currentModeId;
           }
-          targetWs.send(
-            JSON.stringify({
-              event: "mode_changed",
-              sessionId,
-              payload: { currentModeId: event.currentModeId },
-            }),
-          );
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "mode_changed",
+            payload: { currentModeId: event.currentModeId },
+          });
         } else if (
           event.type === "status" &&
           event.tag === "available_commands_update" &&
@@ -2137,13 +2217,10 @@ function runPromptTurn(session, sessionId, promptItem) {
         ) {
           // Live refresh of the slash-command list (rare mid-session; the
           // session_meta snapshot covers the common case at session start).
-          targetWs.send(
-            JSON.stringify({
-              event: "available_commands_update",
-              sessionId,
-              payload: { availableCommands: event.availableCommands },
-            }),
-          );
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "available_commands_update",
+            payload: { availableCommands: event.availableCommands },
+          });
         } else if (
           event.type === "status" &&
           event.tag === "plan" &&
@@ -2151,13 +2228,10 @@ function runPromptTurn(session, sessionId, promptItem) {
         ) {
           // The agent's execution plan (TodoWrite / Codex plan). Full list on
           // every update — the client replaces its checklist wholesale.
-          targetWs.send(
-            JSON.stringify({
-              event: "plan",
-              sessionId,
-              payload: { entries: event.planEntries },
-            }),
-          );
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "plan",
+            payload: { entries: event.planEntries },
+          });
         } else if (event.type === "status" && event.tag === "usage_update") {
           // Token/context usage + cost for the composer badge. used/size feed
           // the context-window % gauge; cost (when the adapter reports it) is
@@ -2170,7 +2244,7 @@ function runPromptTurn(session, sessionId, promptItem) {
             ...(event.breakdown ? { breakdown: event.breakdown } : {}),
           };
           if (Object.keys(usage).length > 0) {
-            targetWs.send(JSON.stringify({ event: "usage", sessionId, payload: usage }));
+            sendRuntimeTurnEvent(targetWs, sessionId, turn, { event: "usage", payload: usage });
           }
         } else if (event.type === "status" && event.tag === "config_option_update") {
           // The agent changed a config option itself (rare — model/effort are
@@ -2189,7 +2263,28 @@ function runPromptTurn(session, sessionId, promptItem) {
       const currentSession = activeSessions.get(sessionId);
       const targetWs = currentSession ? currentSession.ws : null;
       if (targetWs && targetWs.readyState === 1 /* OPEN */) {
-        if (result.status === "failed") {
+        if (turn.hostTurnId) {
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "turn_terminal",
+            status: result.status,
+            stopReason:
+              result.stopReason || (result.status === "failed" ? "runtime_error" : undefined),
+            ...(result.finalAnswer ? { finalAnswer: result.finalAnswer } : {}),
+            runtimeRequestId: result.runtimeRequestId || requestId,
+            promptMessageId: result.promptMessageId || requestId,
+            completedAt: new Date().toISOString(),
+            ...(result.status === "failed"
+              ? {
+                  error: {
+                    code: result.error?.code || "ACP_PROMPT_FAILED",
+                    message: result.error?.message || "Turn execution failed",
+                  },
+                }
+              : {}),
+          });
+          terminalSent = true;
+          void sendSessionMeta(targetWs, sessionId, currentSession.handle);
+        } else if (result.status === "failed") {
           targetWs.send(
             JSON.stringify({
               event: "error",
@@ -2233,7 +2328,21 @@ function runPromptTurn(session, sessionId, promptItem) {
       console.error(`[acpx-server] Error executing turn:`, err);
       const currentSession = activeSessions.get(sessionId);
       const targetWs = currentSession ? currentSession.ws : null;
-      if (targetWs && targetWs.readyState === 1 /* OPEN */) {
+      if (turn.hostTurnId && !terminalSent) {
+        sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+          event: "turn_terminal",
+          status: "failed",
+          stopReason: "runtime_error",
+          runtimeRequestId: requestId,
+          promptMessageId: requestId,
+          completedAt: new Date().toISOString(),
+          error: {
+            code: "ACP_PROMPT_FAILED",
+            message: err?.message || String(err),
+          },
+        });
+        terminalSent = true;
+      } else if (targetWs && targetWs.readyState === 1 /* OPEN */) {
         targetWs.send(
           JSON.stringify({
             event: "error",
@@ -2244,9 +2353,9 @@ function runPromptTurn(session, sessionId, promptItem) {
       }
     } finally {
       const currentSession = activeSessions.get(sessionId);
-      if (currentSession) {
+      if (currentSession?.activeTurn === turn) {
         currentSession.activeTurn = null;
-        if (currentSession.promptQueue.length > 0) {
+        if (!turn.hostTurnId && currentSession.promptQueue.length > 0) {
           const next = currentSession.promptQueue.shift();
           runPromptTurn(currentSession, sessionId, next);
         }
@@ -2281,15 +2390,12 @@ async function handleExitPlanModeCallback(req, ctx) {
         pendingExitPlanModes.delete(requestId);
         resolve({ outcome: "abandoned" });
         try {
-          session.ws.send(
-            JSON.stringify({
-              event: "exit_plan_mode_timeout",
-              sessionId: clientSessionId,
-              requestId,
-              toolCallId,
-              message: "exit_plan_mode auto-abandoned after 5min timeout.",
-            }),
-          );
+          sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
+            event: "exit_plan_mode_timeout",
+            requestId,
+            toolCallId,
+            message: "exit_plan_mode auto-abandoned after 5min timeout.",
+          });
         } catch {
           // socket may already be closed
         }
@@ -2328,7 +2434,7 @@ async function handleExitPlanModeCallback(req, ctx) {
     }
 
     try {
-      session.ws.send(JSON.stringify(payload));
+      sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, payload);
     } catch (err) {
       console.warn(`[acpx-server] failed to send exit_plan_mode event:`, err.message);
       clearTimeout(timer);
@@ -2364,15 +2470,12 @@ async function handleAskUserQuestionCallback(req, ctx) {
         pendingAskUserQuestions.delete(requestId);
         resolve({ outcome: "cancelled" });
         try {
-          session.ws.send(
-            JSON.stringify({
-              event: "ask_user_question_timeout",
-              sessionId: clientSessionId,
-              requestId,
-              toolCallId,
-              message: "ask_user_question auto-cancelled after 5min timeout.",
-            }),
-          );
+          sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
+            event: "ask_user_question_timeout",
+            requestId,
+            toolCallId,
+            message: "ask_user_question auto-cancelled after 5min timeout.",
+          });
         } catch {
           // socket may already be closed
         }
@@ -2412,7 +2515,7 @@ async function handleAskUserQuestionCallback(req, ctx) {
     }
 
     try {
-      session.ws.send(JSON.stringify(payload));
+      sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, payload);
     } catch (err) {
       console.warn(`[acpx-server] failed to send ask_user_question event:`, err.message);
       clearTimeout(timer);
@@ -2522,14 +2625,11 @@ async function handlePermissionRequestCallback(req, ctx) {
         resolve({ outcome: "reject_once" });
 
         // Notify Go backend of the timeout
-        session.ws.send(
-          JSON.stringify({
-            event: "permission_timeout",
-            sessionId: clientSessionId,
-            requestId,
-            message: `Permission request for "${req.raw.toolCall.title}" auto-denied after 5min timeout.`,
-          }),
-        );
+        sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
+          event: "permission_timeout",
+          requestId,
+          message: `Permission request for "${req.raw.toolCall.title}" auto-denied after 5min timeout.`,
+        });
       },
       5 * 60 * 1000,
     );
@@ -2571,14 +2671,11 @@ async function handlePermissionRequestCallback(req, ctx) {
         // Tell the client to collapse the composer prompt so a late click
         // does not race into PERMISSION_NOT_FOUND.
         try {
-          session.ws.send(
-            JSON.stringify({
-              event: "permission_timeout",
-              sessionId: clientSessionId,
-              requestId,
-              message: `Permission request for "${req.raw.toolCall.title}" was cancelled.`,
-            }),
-          );
+          sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
+            event: "permission_timeout",
+            requestId,
+            message: `Permission request for "${req.raw.toolCall.title}" was cancelled.`,
+          });
         } catch (err) {
           console.warn(`[acpx-server] failed to send permission abort event:`, err.message);
         }
@@ -2587,16 +2684,13 @@ async function handlePermissionRequestCallback(req, ctx) {
     );
 
     // Send permission request to client
-    session.ws.send(
-      JSON.stringify({
-        event: "permission_request",
-        sessionId: clientSessionId,
-        requestId,
-        toolCallId: req.raw.toolCall.toolCallId,
-        toolName: resolveToolDisplayName(req.raw.toolCall),
-        arguments: req.raw.toolCall.rawInput || {},
-      }),
-    );
+    sendRuntimeTurnEvent(session.ws, clientSessionId, session.activeTurn, {
+      event: "permission_request",
+      requestId,
+      toolCallId: req.raw.toolCall.toolCallId,
+      toolName: resolveToolDisplayName(req.raw.toolCall),
+      arguments: req.raw.toolCall.rawInput || {},
+    });
   });
 }
 

@@ -428,8 +428,74 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   }
 
   assignParsedSessionOptions(state, record.session_options);
+  assignTurnResults(state, record.turn_results);
 
   return state;
+}
+
+function assignTurnResults(state: SessionAcpxState, raw: unknown): void {
+  const results = asRecord(raw);
+  if (!results) {
+    return;
+  }
+  const parsed: NonNullable<SessionAcpxState["turn_results"]> = {};
+  for (const [turnId, value] of Object.entries(results)) {
+    const snapshot = parseRuntimeTurnSnapshot(value);
+    if (snapshot) {
+      parsed[turnId] = snapshot;
+    }
+  }
+  if (Object.keys(parsed).length > 0) {
+    state.turn_results = parsed;
+  }
+}
+
+type RuntimeTurnSnapshot = NonNullable<SessionAcpxState["turn_results"]>[string];
+
+function parseRuntimeTurnStatus(value: unknown): RuntimeTurnSnapshot["status"] | undefined {
+  if (value === "running" || value === "completed" || value === "failed" || value === "cancelled") {
+    return value;
+  }
+  return undefined;
+}
+
+function assignOptionalRuntimeTurnFields(
+  result: RuntimeTurnSnapshot,
+  snapshot: Record<string, unknown>,
+): void {
+  if (typeof snapshot.completed_at === "string") {
+    result.completed_at = snapshot.completed_at;
+  }
+  if (typeof snapshot.stop_reason === "string") {
+    result.stop_reason = snapshot.stop_reason;
+  }
+  if (typeof snapshot.last_event_seq === "number") {
+    result.last_event_seq = snapshot.last_event_seq;
+  }
+  if (typeof snapshot.error_code === "string") {
+    result.error_code = snapshot.error_code;
+  }
+}
+
+function parseRuntimeTurnSnapshot(raw: unknown): RuntimeTurnSnapshot | undefined {
+  const snapshot = asRecord(raw);
+  if (!snapshot || typeof snapshot.prompt_message_id !== "string") {
+    return undefined;
+  }
+  if (typeof snapshot.started_at !== "string") {
+    return undefined;
+  }
+  const status = parseRuntimeTurnStatus(snapshot.status);
+  if (!status) {
+    return undefined;
+  }
+  const result: RuntimeTurnSnapshot = {
+    status,
+    prompt_message_id: snapshot.prompt_message_id,
+    started_at: snapshot.started_at,
+  };
+  assignOptionalRuntimeTurnFields(result, snapshot);
+  return result;
 }
 
 function assignParsedModelState(state: SessionAcpxState, record: Record<string, unknown>): void {

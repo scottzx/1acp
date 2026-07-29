@@ -352,14 +352,22 @@ export type AcpRuntimeTurnResult =
   | {
       status: "completed";
       stopReason?: string;
+      finalAnswer?: string;
+      promptMessageId?: string;
+      runtimeRequestId?: string;
     }
   | {
       status: "cancelled";
       stopReason?: string;
+      finalAnswer?: string;
+      promptMessageId?: string;
+      runtimeRequestId?: string;
     }
   | {
       status: "failed";
       error: AcpRuntimeTurnResultError;
+      promptMessageId?: string;
+      runtimeRequestId?: string;
     };
 
 export interface AcpRuntimeTurn {

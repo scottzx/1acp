@@ -6,6 +6,7 @@ import { applyConfigOptionsToState } from "../src/session/config-options.js";
 import {
   cloneSessionAcpxState,
   createSessionConversation,
+  finalVisibleAnswerAfterPrompt,
   recordClientOperation,
   recordPromptSubmission,
   recordSessionUpdate,
@@ -510,6 +511,14 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
       allowed_tools: ["Read", "Grep"],
       max_turns: 7,
     },
+    turn_results: {
+      "turn-1": {
+        status: "completed",
+        prompt_message_id: "turn-1",
+        started_at: "2026-02-27T10:00:00.000Z",
+        completed_at: "2026-02-27T10:00:01.000Z",
+      },
+    },
   });
 
   assert.equal(cloned?.current_mode_id, "auto");
@@ -525,4 +534,25 @@ test("cloneSessionAcpxState preserves desired mode id", () => {
     allowed_tools: ["Read", "Grep"],
     max_turns: 7,
   });
+  assert.equal(cloned?.turn_results?.["turn-1"]?.status, "completed");
+});
+
+test("host Turn id defines the prompt boundary and final visible answer", () => {
+  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+  const promptId = recordPromptSubmission(
+    conversation,
+    "hello",
+    "2026-02-27T10:00:00.000Z",
+    "turn-canonical",
+  );
+  recordSessionUpdate(conversation, undefined, {
+    sessionId: "session-1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "final answer" },
+    },
+  });
+
+  assert.equal(promptId, "turn-canonical");
+  assert.equal(finalVisibleAnswerAfterPrompt(conversation, "turn-canonical"), "final answer");
 });

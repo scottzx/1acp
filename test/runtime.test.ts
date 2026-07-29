@@ -13,8 +13,18 @@ import {
   decodeAcpxRuntimeHandleState,
   encodeAcpxRuntimeHandleState,
   type AcpRuntimeEvent,
+  type AcpRuntimeTurnResult,
   type AcpSessionRecord,
 } from "../src/runtime.js";
+
+function assertTurnResult(
+  result: AcpRuntimeTurnResult,
+  status: "completed" | "cancelled",
+  stopReason: string,
+): void {
+  assert.equal(result.status, status);
+  assert.equal(result.stopReason, stopReason);
+}
 
 function createSessionRecord(overrides: Partial<AcpSessionRecord> = {}): AcpSessionRecord {
   return {
@@ -180,7 +190,7 @@ test("AcpxRuntime delegates session lifecycle to the runtime manager", async () 
   assert.equal(turnSessionMode, "oneshot");
   assert.equal(turnTimeoutMs, 42);
   assert.deepEqual(events, [{ type: "text_delta", text: "hello", stream: "output" }]);
-  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+  assertTurnResult(result, "completed", "end_turn");
 
   const legacyEvents: AcpRuntimeEvent[] = [];
   for await (const event of runtime.runTurn({
@@ -588,7 +598,7 @@ test("AcpxRuntime falls back to plain runtimeSessionName handles and reuses a si
   }
   const result = await turn.result;
   assert.deepEqual(turnEvents, []);
-  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+  assertTurnResult(result, "completed", "end_turn");
   assert.equal(managerFactoryCalls, 1);
 });
 

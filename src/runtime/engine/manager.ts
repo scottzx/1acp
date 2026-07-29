@@ -16,6 +16,7 @@ import {
   cloneSessionAcpxState,
   cloneSessionConversation,
   createSessionConversation,
+  finalVisibleAnswerAfterPrompt,
   recordClientOperation,
   recordPromptSubmission,
   recordSessionUpdate,
@@ -38,6 +39,7 @@ import {
 import { advertisedModelState } from "../../session/model-state.js";
 import type {
   ClientOperation,
+  SessionAcpxState,
   SessionRecord,
   SessionResumePolicy,
   SessionTokenUsage,
@@ -504,6 +506,55 @@ type RunningRuntimeTurn = {
   promptMessageId: string | undefined;
   activeSessionId: string;
 };
+
+function terminalPromptMessageId(turn: RunningRuntimeTurn, requestId: string): string {
+  return turn.promptMessageId ?? requestId;
+}
+
+function terminalStartedAt(
+  turn: RunningRuntimeTurn,
+  existing: NonNullable<NonNullable<SessionAcpxState["turn_results"]>[string]> | undefined,
+  completedAt: string,
+): string {
+  return existing?.started_at ?? turn.record.lastPromptAt ?? completedAt;
+}
+
+function assignTerminalDetails(
+  snapshot: NonNullable<NonNullable<SessionAcpxState["turn_results"]>[string]>,
+  stopReason: string | undefined,
+  errorCode: string | undefined,
+): void {
+  if (stopReason) {
+    snapshot.stop_reason = stopReason;
+  }
+  if (errorCode) {
+    snapshot.error_code = errorCode;
+  }
+}
+
+function applyTerminalTurnSnapshot(
+  turn: RunningRuntimeTurn,
+  status: "completed" | "failed" | "cancelled",
+  stopReason: string | undefined,
+  errorCode: string | undefined,
+  completedAt: string,
+): void {
+  const requestId = turn.record.lastRequestId;
+  if (!requestId) {
+    return;
+  }
+  const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
+  const existing = nextState.turn_results?.[requestId];
+  const snapshot: NonNullable<NonNullable<typeof nextState.turn_results>[string]> = {
+    status,
+    prompt_message_id: terminalPromptMessageId(turn, requestId),
+    started_at: terminalStartedAt(turn, existing, completedAt),
+    completed_at: completedAt,
+  };
+  assignTerminalDetails(snapshot, stopReason, errorCode);
+  nextState.turn_results = { ...nextState.turn_results, [requestId]: snapshot };
+  turn.acpxState = nextState;
+}
 
 function applyConfigOptionResponseToTurn(
   turn: RunningRuntimeTurn,
@@ -1153,6 +1204,8 @@ export class AcpRuntimeManager {
         settleResult({
           status: "cancelled",
           stopReason: "cancelled",
+          promptMessageId: input.requestId,
+          runtimeRequestId: input.requestId,
         });
         return {
           requestId: input.requestId,
@@ -1194,7 +1247,7 @@ export class AcpRuntimeManager {
       turn = await this.prepareRuntimeTurn(task);
       const { sessionId, resumed, loadError } = await this.connectRuntimeTurn(task, turn);
       await this.resolveRuntimeTurnReady(task, turn, resumed, loadError);
-      if (this.cancelRuntimeTurnBeforePrompt(task)) {
+      if (await this.cancelRuntimeTurnBeforePrompt(task, turn)) {
         return;
       }
       await this.applyPendingRuntimeTurnCancel(task, turn);
@@ -1206,13 +1259,22 @@ export class AcpRuntimeManager {
         conversation: turn.conversation,
         promptMessageId: turn.promptMessageId,
       });
-      await this.saveCompletedRuntimeTurn(turn, response.stopReason);
+      const status = response.stopReason === "cancelled" ? "cancelled" : "completed";
+      await this.saveTerminalRuntimeTurn(turn, status, response.stopReason);
+      const promptMessageId = turn.promptMessageId ?? task.input.requestId;
       task.settleResult({
-        status: response.stopReason === "cancelled" ? "cancelled" : "completed",
+        status,
         ...(response.stopReason ? { stopReason: response.stopReason } : {}),
+        ...(finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId)
+          ? {
+              finalAnswer: finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId),
+            }
+          : {}),
+        promptMessageId,
+        runtimeRequestId: task.input.requestId,
       });
     } catch (error) {
-      this.failRuntimeTurn(task, error);
+      await this.failRuntimeTurn(task, turn, error);
     } finally {
       await this.finalizeRuntimeTurn(task, turn);
     }
@@ -1225,8 +1287,23 @@ export class AcpRuntimeManager {
     const conversation = cloneSessionConversation(record);
     let acpxState = cloneSessionAcpxState(record.acpx);
     const promptStartedAt = isoNow();
-    const promptMessageId = recordPromptSubmission(conversation, task.promptInput, promptStartedAt);
+    const promptMessageId = recordPromptSubmission(
+      conversation,
+      task.promptInput,
+      promptStartedAt,
+      task.input.requestId,
+    );
     trimConversationForRuntime(conversation);
+    acpxState = cloneSessionAcpxState(acpxState) ?? {};
+    acpxState.turn_results = {
+      ...acpxState.turn_results,
+      [task.input.requestId]: {
+        status: "running",
+        prompt_message_id: promptMessageId ?? task.input.requestId,
+        started_at: promptStartedAt,
+      },
+    };
+    record.lastRequestId = task.input.requestId;
     record.lastPromptAt = promptStartedAt;
     record.lastUsedAt = promptStartedAt;
     record.acpx = acpxState;
@@ -1480,14 +1557,20 @@ export class AcpRuntimeManager {
     });
   }
 
-  private cancelRuntimeTurnBeforePrompt(task: RuntimeTurnTask): boolean {
+  private async cancelRuntimeTurnBeforePrompt(
+    task: RuntimeTurnTask,
+    turn: RunningRuntimeTurn,
+  ): Promise<boolean> {
     if (!task.state.pendingCancel && !task.input.signal?.aborted) {
       return false;
     }
     task.state.pendingCancel = false;
+    await this.saveTerminalRuntimeTurn(turn, "cancelled", "cancelled");
     task.settleResult({
       status: "cancelled",
       stopReason: "cancelled",
+      promptMessageId: turn.promptMessageId ?? task.input.requestId,
+      runtimeRequestId: task.input.requestId,
     });
     return true;
   }
@@ -1506,10 +1589,14 @@ export class AcpRuntimeManager {
     return cancelled;
   }
 
-  private async saveCompletedRuntimeTurn(
+  private async saveTerminalRuntimeTurn(
     turn: RunningRuntimeTurn,
-    _stopReason: string | undefined,
+    status: "completed" | "failed" | "cancelled",
+    stopReason: string | undefined,
+    errorCode?: string,
   ): Promise<void> {
+    const completedAt = isoNow();
+    applyTerminalTurnSnapshot(turn, status, stopReason, errorCode, completedAt);
     turn.record.acpSessionId = turn.activeSessionId;
     reconcileAgentSessionId(turn.record, turn.record.agentSessionId);
     turn.record.protocolVersion = turn.client.initializeResult?.protocolVersion;
@@ -1520,9 +1607,21 @@ export class AcpRuntimeManager {
     await this.options.sessionStore.save(turn.record);
   }
 
-  private failRuntimeTurn(task: RuntimeTurnTask, error: unknown): void {
+  private async failRuntimeTurn(
+    task: RuntimeTurnTask,
+    turn: RunningRuntimeTurn | undefined,
+    error: unknown,
+  ): Promise<void> {
     task.sessionReady.reject(error);
     const normalized = normalizeOutputError(error, { origin: "runtime" });
+    if (turn) {
+      await this.saveTerminalRuntimeTurn(
+        turn,
+        "failed",
+        "runtime_error",
+        normalized.code ?? normalized.detailCode,
+      );
+    }
     task.settleResult({
       status: "failed",
       error: {
@@ -1531,6 +1630,8 @@ export class AcpRuntimeManager {
         ...(normalized.detailCode ? { detailCode: normalized.detailCode } : {}),
         ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
       },
+      ...(turn?.promptMessageId ? { promptMessageId: turn.promptMessageId } : {}),
+      runtimeRequestId: task.input.requestId,
     });
   }
 

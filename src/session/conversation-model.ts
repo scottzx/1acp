@@ -607,6 +607,7 @@ export function cloneSessionAcpxState(
       : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     session_options: cloneSessionOptions(state.session_options),
+    turn_results: state.turn_results ? deepClone(state.turn_results) : undefined,
   };
 }
 
@@ -667,6 +668,7 @@ export function recordPromptSubmission(
   conversation: SessionConversation,
   prompt: PromptInput | string,
   timestamp = isoNow(),
+  messageId?: string,
 ): string | undefined {
   const normalizedPrompt = typeof prompt === "string" ? textPrompt(prompt) : prompt;
   const userContent = normalizedPrompt
@@ -676,7 +678,7 @@ export function recordPromptSubmission(
     return undefined;
   }
 
-  const promptMessageId = nextUserMessageId();
+  const promptMessageId = messageId ?? nextUserMessageId();
   conversation.messages.push({
     User: {
       id: promptMessageId,
@@ -693,6 +695,33 @@ export function recordPromptSubmission(
   updateConversationTimestamp(conversation, timestamp);
   trimConversationForRuntime(conversation);
   return promptMessageId;
+}
+
+export function finalVisibleAnswerAfterPrompt(
+  conversation: SessionConversation,
+  promptMessageId: string,
+): string | undefined {
+  let sawPrompt = false;
+  let finalAnswer: string | undefined;
+  for (const message of conversation.messages) {
+    if (isUserMessage(message)) {
+      if (sawPrompt) {
+        break;
+      }
+      sawPrompt = message.User.id === promptMessageId;
+      continue;
+    }
+    if (!sawPrompt || !isAgentMessage(message)) {
+      continue;
+    }
+    const text = message.Agent.content
+      .flatMap((entry) => ("Text" in entry ? [entry.Text] : []))
+      .join("");
+    if (text) {
+      finalAnswer = text;
+    }
+  }
+  return finalAnswer;
 }
 
 function agentMessageHasObservedReply(message: SessionAgentMessage): boolean {
