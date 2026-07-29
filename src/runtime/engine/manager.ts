@@ -562,7 +562,9 @@ async function createOrLoadRuntimeSession(
   if (resumeSessionId) {
     if (client.supportsResumeSession()) {
       const resumed = await client.resumeSession(resumeSessionId, cwd);
-      console.log(`[1acp-resume] market/product check resumeSessionId=${resumeSessionId} seatRole=${seatRole} resumed=true agentSessionId=${resumed.agentSessionId}`);
+      console.log(
+        `[1acp-resume] market/product check resumeSessionId=${resumeSessionId} seatRole=${seatRole} resumed=true agentSessionId=${resumed.agentSessionId}`,
+      );
       return {
         sessionId: resumeSessionId,
         agentSessionId: resumed.agentSessionId,
@@ -575,7 +577,9 @@ async function createOrLoadRuntimeSession(
       );
     }
     const loaded = await client.loadSession(resumeSessionId, cwd);
-    console.log(`[1acp-resume] market/product check resumeSessionId=${resumeSessionId} seatRole=${seatRole} loaded=true agentSessionId=${loaded.agentSessionId}`);
+    console.log(
+      `[1acp-resume] market/product check resumeSessionId=${resumeSessionId} seatRole=${seatRole} loaded=true agentSessionId=${loaded.agentSessionId}`,
+    );
     return {
       sessionId: resumeSessionId,
       agentSessionId: loaded.agentSessionId,
@@ -746,7 +750,12 @@ export class AcpRuntimeManager {
 
     try {
       await client.start();
-      const session = await createOrLoadRuntimeSession(client, input.resumeSessionId, cwd, "unknown");
+      const session = await createOrLoadRuntimeSession(
+        client,
+        input.resumeSessionId,
+        cwd,
+        "unknown",
+      );
       const record = await this.createAndSaveRuntimeRecord({
         input,
         client,
@@ -760,6 +769,126 @@ export class AcpRuntimeManager {
       if (!keepClientOpen) {
         await client.close();
       }
+    }
+  }
+
+  async adoptSession(input: {
+    handle: AcpRuntimeHandle;
+    sessionKey: string;
+  }): Promise<SessionRecord> {
+    const sourceRecordId = input.handle.acpxRecordId ?? input.handle.sessionKey;
+    const targetRecordId = input.sessionKey.trim();
+    const sourceRecord = await this.requireRecord(sourceRecordId);
+    if (sourceRecordId === targetRecordId) {
+      return sourceRecord;
+    }
+
+    const rebind = this.requireSessionStoreRebind();
+    this.assertAdoptableSessionSource(sourceRecordId, targetRecordId);
+    await this.assertAdoptionTargetAvailable(targetRecordId);
+
+    const pooledClient = this.pendingPersistentClients.get(sourceRecordId);
+    pooledClient?.clearEventHandlers();
+    await this.outOfTurnUpdateChains.get(sourceRecordId)?.catch(() => {});
+
+    try {
+      // Recheck after draining the old update chain. A concurrent ensure must
+      // never be overwritten by adoption.
+      await this.assertAdoptionTargetAvailable(targetRecordId);
+      const now = isoNow();
+      const adoptedRecord: SessionRecord = {
+        ...sourceRecord,
+        acpxRecordId: targetRecordId,
+        name: targetRecordId,
+        lastUsedAt: now,
+        updated_at: now,
+        eventLog: {
+          ...sourceRecord.eventLog,
+          active_path: defaultSessionEventLog(targetRecordId).active_path,
+        },
+      };
+      await rebind(sourceRecordId, adoptedRecord);
+      this.moveAdoptedManagerState(sourceRecordId, targetRecordId, pooledClient);
+      return adoptedRecord;
+    } catch (error) {
+      this.restoreIdleSessionUpdateHandler(sourceRecordId, pooledClient);
+      throw error instanceof AcpRuntimeError
+        ? error
+        : new AcpRuntimeError(
+            "ACP_SESSION_INIT_FAILED",
+            `Failed to adopt ACP session ${sourceRecordId} as ${targetRecordId}.`,
+            { cause: error },
+          );
+    }
+  }
+
+  private requireSessionStoreRebind(): NonNullable<AcpRuntimeOptions["sessionStore"]["rebind"]> {
+    if (!this.options.sessionStore.rebind) {
+      throw new AcpRuntimeError(
+        "ACP_SESSION_INIT_FAILED",
+        "The configured ACP session store does not support session adoption.",
+      );
+    }
+    return async (sourceSessionId, record) => {
+      await this.options.sessionStore.rebind!(sourceSessionId, record);
+    };
+  }
+
+  private assertAdoptableSessionSource(sourceRecordId: string, targetRecordId: string): void {
+    if (!targetRecordId) {
+      throw new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP session key is required.");
+    }
+    if (sourceRecordId.includes(":oneshot:")) {
+      throw new AcpRuntimeError(
+        "ACP_SESSION_INIT_FAILED",
+        `Cannot adopt oneshot ACP session: ${sourceRecordId}`,
+      );
+    }
+    if (this.activeControllers.has(sourceRecordId)) {
+      throw new AcpRuntimeError(
+        "ACP_SESSION_INIT_FAILED",
+        `Cannot adopt active ACP session: ${sourceRecordId}`,
+      );
+    }
+  }
+
+  private async assertAdoptionTargetAvailable(targetRecordId: string): Promise<void> {
+    const targetIsIndexed = [
+      this.activeControllers,
+      this.pendingPersistentClients,
+      this.outOfTurnUpdateChains,
+    ].some((records) => records.has(targetRecordId));
+    const targetExists =
+      targetIsIndexed ||
+      this.closingActiveRecords.has(targetRecordId) ||
+      Boolean(await this.options.sessionStore.load(targetRecordId));
+    if (targetExists) {
+      throw new AcpRuntimeError(
+        "ACP_SESSION_INIT_FAILED",
+        `ACP session already exists: ${targetRecordId}`,
+      );
+    }
+  }
+
+  private restoreIdleSessionUpdateHandler(recordId: string, client: AcpClient | undefined): void {
+    if (client && this.pendingPersistentClients.get(recordId) === client) {
+      this.installOutOfTurnSessionUpdateHandler(recordId, client);
+    }
+  }
+
+  private moveAdoptedManagerState(
+    sourceRecordId: string,
+    targetRecordId: string,
+    pooledClient: AcpClient | undefined,
+  ): void {
+    this.outOfTurnUpdateChains.delete(sourceRecordId);
+    this.pendingPersistentClients.delete(sourceRecordId);
+    if (this.closingActiveRecords.delete(sourceRecordId)) {
+      this.closingActiveRecords.add(targetRecordId);
+    }
+    if (pooledClient) {
+      this.pendingPersistentClients.set(targetRecordId, pooledClient);
+      this.installOutOfTurnSessionUpdateHandler(targetRecordId, pooledClient);
     }
   }
 

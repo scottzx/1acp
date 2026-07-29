@@ -372,6 +372,12 @@ export interface AcpRuntimeTurn {
 
 export interface AcpRuntime {
   ensureSession(input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle>;
+  /**
+   * Rebind a persistent runtime session to its final host-owned session key.
+   * Intended for sessions created under a temporary pre-warm key before the
+   * host session id exists.
+   */
+  adoptSession(input: { handle: AcpRuntimeHandle; sessionKey: string }): Promise<AcpRuntimeHandle>;
   logoutSession?(input: { handle: AcpRuntimeHandle }): Promise<void>;
   authenticateSession?(input: {
     handle: AcpRuntimeHandle;
@@ -410,6 +416,11 @@ export type AcpSessionRecord = SessionRecord;
 export interface AcpSessionStore {
   load(sessionId: string): Promise<AcpSessionRecord | undefined>;
   save(record: AcpSessionRecord): Promise<void>;
+  /**
+   * Persist `record` under its new acpxRecordId without overwriting an
+   * existing target, then remove the source record.
+   */
+  rebind?(sourceSessionId: string, record: AcpSessionRecord): Promise<void>;
 }
 
 export interface AcpAgentRegistry {

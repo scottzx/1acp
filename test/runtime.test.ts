@@ -209,6 +209,69 @@ test("AcpxRuntime delegates session lifecycle to the runtime manager", async () 
   assert.equal(closeDiscardPersistentState, true);
 });
 
+test("AcpxRuntime adopts a pre-warmed handle under the real host session id", async () => {
+  const sourceId = "prewarm_grok_456";
+  const targetId = "real-1agents-session-456";
+  const record = createSessionRecord({
+    acpxRecordId: targetId,
+    name: targetId,
+    acpSessionId: "sid-prewarmed",
+    agentSessionId: "agent-prewarmed",
+  });
+  const manager = {
+    adoptSession: async (input: { handle: { acpxRecordId?: string }; sessionKey: string }) => {
+      assert.equal(input.handle.acpxRecordId, sourceId);
+      assert.equal(input.sessionKey, targetId);
+      return record;
+    },
+  };
+  const runtime = new AcpxRuntime(
+    {
+      cwd: "/tmp/acpx",
+      sessionStore: createFileSessionStore({ stateDir: "/tmp/acpx-state-adopt" }),
+      agentRegistry: createAgentRegistry(),
+      permissionMode: "approve-reads",
+    },
+    {
+      managerFactory: () => manager as never,
+    },
+  );
+  const handle = {
+    sessionKey: sourceId,
+    backend: "acpx",
+    runtimeSessionName: encodeAcpxRuntimeHandleState({
+      name: sourceId,
+      agent: "grok-build",
+      cwd: "/workspace",
+      mode: "persistent",
+      acpxRecordId: sourceId,
+      backendSessionId: "sid-prewarmed",
+      agentSessionId: "agent-prewarmed",
+    }),
+    cwd: "/workspace",
+    acpxRecordId: sourceId,
+    backendSessionId: "sid-prewarmed",
+    agentSessionId: "agent-prewarmed",
+  };
+
+  const adopted = await runtime.adoptSession({ handle, sessionKey: targetId });
+
+  assert.equal(adopted, handle);
+  assert.equal(handle.sessionKey, targetId);
+  assert.equal(handle.acpxRecordId, targetId);
+  assert.equal(handle.backendSessionId, "sid-prewarmed");
+  assert.equal(handle.agentSessionId, "agent-prewarmed");
+  assert.deepEqual(decodeAcpxRuntimeHandleState(handle.runtimeSessionName), {
+    name: targetId,
+    agent: "grok-build",
+    cwd: "/tmp/acpx",
+    mode: "persistent",
+    acpxRecordId: targetId,
+    backendSessionId: "sid-prewarmed",
+    agentSessionId: "agent-prewarmed",
+  });
+});
+
 test("createFileSessionStore persists records inside the provided state directory", async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-"));
   t.after(async () => {
@@ -232,6 +295,82 @@ test("createFileSessionStore persists records inside the provided state director
       .then((payload) => payload.includes('"schema": "acpx.session.v1"')),
     true,
   );
+});
+
+test("createFileSessionStore rebinds a record without leaving the temporary source", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-rebind-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  const store = createFileSessionStore({ stateDir });
+  const sourceId = "prewarm_grok_123";
+  const targetId = "real-1agents-session";
+  await store.save(
+    createSessionRecord({
+      acpxRecordId: sourceId,
+      name: sourceId,
+      acpSessionId: "sid-prewarmed",
+    }),
+  );
+
+  await store.rebind?.(
+    sourceId,
+    createSessionRecord({
+      acpxRecordId: targetId,
+      name: targetId,
+      acpSessionId: "sid-prewarmed",
+    }),
+  );
+
+  assert.equal(await store.load(sourceId), undefined);
+  assert.equal((await store.load(targetId))?.acpSessionId, "sid-prewarmed");
+  assert.equal(
+    await fs.access(path.join(stateDir, "sessions", `${encodeURIComponent(sourceId)}.json`)).then(
+      () => true,
+      () => false,
+    ),
+    false,
+  );
+});
+
+test("createFileSessionStore rebind refuses to overwrite an existing target", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-conflict-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  const store = createFileSessionStore({ stateDir });
+  const sourceId = "prewarm_grok_conflict";
+  const targetId = "real-session-conflict";
+  await store.save(
+    createSessionRecord({
+      acpxRecordId: sourceId,
+      name: sourceId,
+      acpSessionId: "sid-source",
+    }),
+  );
+  await store.save(
+    createSessionRecord({
+      acpxRecordId: targetId,
+      name: targetId,
+      acpSessionId: "sid-target",
+    }),
+  );
+
+  await assert.rejects(
+    store.rebind!(
+      sourceId,
+      createSessionRecord({
+        acpxRecordId: targetId,
+        name: targetId,
+        acpSessionId: "sid-source",
+      }),
+    ),
+    /already exists/,
+  );
+  assert.equal((await store.load(sourceId))?.acpSessionId, "sid-source");
+  assert.equal((await store.load(targetId))?.acpSessionId, "sid-target");
 });
 
 test("createFileSessionStore.load() returns undefined for a corrupt session file (#378)", async (t) => {

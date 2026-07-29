@@ -171,6 +171,43 @@ export class AcpxRuntime implements AcpxRuntimeLike {
     return handle;
   }
 
+  async adoptSession(input: {
+    handle: AcpRuntimeHandle;
+    sessionKey: string;
+  }): Promise<AcpRuntimeHandle> {
+    const sessionKey = input.sessionKey.trim();
+    if (!sessionKey) {
+      throw new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP session key is required.");
+    }
+    const state = this.resolveHandleState(input.handle);
+    if (state.mode !== "persistent") {
+      throw new AcpRuntimeError(
+        "ACP_SESSION_INIT_FAILED",
+        "Only persistent ACP sessions can be adopted.",
+      );
+    }
+
+    const manager = await this.getManager();
+    const record = await manager.adoptSession({
+      handle: {
+        ...input.handle,
+        acpxRecordId: state.acpxRecordId ?? input.handle.acpxRecordId ?? input.handle.sessionKey,
+      },
+      sessionKey,
+    });
+
+    input.handle.sessionKey = sessionKey;
+    writeHandleState(input.handle, {
+      ...state,
+      name: sessionKey,
+      cwd: record.cwd,
+      acpxRecordId: record.acpxRecordId,
+      backendSessionId: record.acpSessionId,
+      agentSessionId: record.agentSessionId,
+    });
+    return input.handle;
+  }
+
   async logoutSession(input: { handle: AcpRuntimeHandle }): Promise<void> {
     const { handle } = this.resolveManagerHandle(input.handle);
     const manager = await this.getManager();

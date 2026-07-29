@@ -80,7 +80,9 @@ let isWarmingGrok = false;
 
 async function prewarmGrokSession(targetCwd) {
   const cwdToUse = targetCwd || lastUsedCwd || process.cwd();
-  if (isWarmingGrok) {return;}
+  if (isWarmingGrok) {
+    return;
+  }
 
   // If we already have a pre-warmed handle for this exact CWD, keep it
   if (prewarmedGrokHandle && prewarmedGrokCwd === cwdToUse) {
@@ -938,7 +940,10 @@ wss.on("connection", (ws) => {
               console.log(
                 `[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`,
               );
-              const handle = prewarmedGrokHandle;
+              const handle = await runtime.adoptSession({
+                handle: prewarmedGrokHandle,
+                sessionKey: sessionId,
+              });
               prewarmedGrokHandle = null;
               prewarmedGrokCwd = null;
               console.timeEnd(`ensure_session_${sessionId}`);

@@ -259,6 +259,135 @@ test("AcpRuntimeManager creates and resumes sessions through the client", async 
   assert.equal(constructed, 2);
 });
 
+test("AcpRuntimeManager adopts a pooled pre-warm record and moves idle updates to the real key", async () => {
+  const sourceId = "prewarm_grok_789";
+  const targetId = "real-1agents-session-789";
+  const store = new InMemorySessionStore();
+  let factoryCalls = 0;
+  let setModeCalls = 0;
+  let handlers: FakeClientHandlers = {};
+  let resolveUpdate: (() => void) | undefined;
+  const updatePersisted = new Promise<void>((resolve) => {
+    resolveUpdate = resolve;
+  });
+  const client: FakeClient = {
+    initializeResult: {
+      protocolVersion: 1,
+      agentCapabilities: { prompt: true },
+    },
+    start: async () => {},
+    close: async () => {},
+    createSession: async () => ({
+      sessionId: "sid-prewarmed",
+      agentSessionId: "agent-prewarmed",
+    }),
+    loadSession: async () => ({ agentSessionId: "agent-prewarmed" }),
+    hasReusableSession: (sessionId) => sessionId === "sid-prewarmed",
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => ({ agentSessionId: "agent-prewarmed" }),
+    getAgentLifecycleSnapshot: () => ({
+      pid: 789,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      running: true,
+    }),
+    prompt: async () => ({ stopReason: "end_turn" }),
+    requestCancelActivePrompt: async () => false,
+    hasActivePrompt: () => false,
+    setSessionMode: async () => {
+      setModeCalls += 1;
+    },
+    setSessionConfigOption: async () => {},
+    clearEventHandlers: () => {
+      handlers = {};
+    },
+    setEventHandlers: (nextHandlers) => {
+      handlers = nextHandlers;
+    },
+  };
+  const manager = new AcpRuntimeManager(
+    {
+      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
+        assert.equal(sessionKey, targetId);
+        assert.equal(updateTag, "agent_message_chunk");
+        resolveUpdate?.();
+      },
+    },
+    {
+      clientFactory: () => {
+        factoryCalls += 1;
+        return client as never;
+      },
+    },
+  );
+
+  const source = await manager.ensureSession({
+    sessionKey: sourceId,
+    agent: "grok-build",
+    mode: "persistent",
+    cwd: "/workspace",
+  });
+  const adopted = await manager.adoptSession({
+    handle: createHandle(sourceId, source.acpxRecordId),
+    sessionKey: targetId,
+  });
+
+  assert.equal(adopted.acpxRecordId, targetId);
+  assert.equal(adopted.name, targetId);
+  assert.equal(adopted.eventLog.active_path.includes(encodeURIComponent(targetId)), true);
+  assert.equal(adopted.eventLog.active_path.includes(sourceId), false);
+  assert.equal(await store.load(sourceId), undefined);
+  assert.equal((await store.load(targetId))?.acpSessionId, "sid-prewarmed");
+
+  handlers.onSessionUpdate?.({
+    sessionId: "sid-prewarmed",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "after adoption" },
+    },
+  });
+  await updatePersisted;
+  assert.equal(
+    JSON.stringify((await store.load(targetId))?.messages).includes("after adoption"),
+    true,
+  );
+  assert.equal(await store.load(sourceId), undefined);
+
+  await manager.setMode(createHandle(targetId), "auto");
+  assert.equal(factoryCalls, 1);
+  assert.equal(setModeCalls, 1);
+});
+
+test("AcpRuntimeManager refuses adoption when the real session key already exists", async () => {
+  const source = makeSessionRecord({
+    acpxRecordId: "prewarm_grok_existing",
+    acpSessionId: "sid-source",
+    agentCommand: "grok-build --acp",
+    cwd: "/workspace",
+  });
+  const target = makeSessionRecord({
+    acpxRecordId: "real-existing-session",
+    acpSessionId: "sid-target",
+    agentCommand: "grok-build --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([source, target]);
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+  );
+
+  await assert.rejects(
+    manager.adoptSession({
+      handle: createHandle(source.acpxRecordId),
+      sessionKey: target.acpxRecordId,
+    }),
+    /already exists/,
+  );
+  assert.equal((await store.load(source.acpxRecordId))?.acpSessionId, "sid-source");
+  assert.equal((await store.load(target.acpxRecordId))?.acpSessionId, "sid-target");
+});
+
 test("AcpRuntimeManager creates a fresh record for each oneshot session", async () => {
   const store = new InMemorySessionStore();
   let createdSessions = 0;

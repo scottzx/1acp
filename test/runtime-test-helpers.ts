@@ -139,6 +139,20 @@ export class InMemorySessionStore implements AcpSessionStore {
     this.savedRecordIds.push(record.acpxRecordId);
     this.records.set(record.acpxRecordId, structuredClone(record));
   }
+
+  async rebind(sourceSessionId: string, record: SessionRecord): Promise<void> {
+    if (sourceSessionId !== record.acpxRecordId && this.records.has(record.acpxRecordId)) {
+      throw new Error(`ACP session already exists: ${record.acpxRecordId}`);
+    }
+    if (!this.records.has(sourceSessionId)) {
+      throw new Error(`ACP session not found: ${sourceSessionId}`);
+    }
+    this.savedRecordIds.push(record.acpxRecordId);
+    this.records.set(record.acpxRecordId, structuredClone(record));
+    if (sourceSessionId !== record.acpxRecordId) {
+      this.records.delete(sourceSessionId);
+    }
+  }
 }
 
 export function createRuntimeOptions(params: {
