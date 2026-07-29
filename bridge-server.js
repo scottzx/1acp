@@ -80,7 +80,7 @@ let isWarmingGrok = false;
 
 async function prewarmGrokSession(targetCwd) {
   const cwdToUse = targetCwd || lastUsedCwd || process.cwd();
-  if (isWarmingGrok) return;
+  if (isWarmingGrok) {return;}
 
   // If we already have a pre-warmed handle for this exact CWD, keep it
   if (prewarmedGrokHandle && prewarmedGrokCwd === cwdToUse) {
@@ -91,10 +91,15 @@ async function prewarmGrokSession(targetCwd) {
   try {
     // If there was an old pre-warmed handle for a different CWD, close it first
     if (prewarmedGrokHandle && prewarmedGrokCwd !== cwdToUse) {
-      console.log(`[PRE-WARM] Closing previous pre-warm handle for obsolete CWD: ${prewarmedGrokCwd}`);
+      console.log(
+        `[PRE-WARM] Closing previous pre-warm handle for obsolete CWD: ${prewarmedGrokCwd}`,
+      );
       try {
-        await runtime.close({ handle: prewarmedGrokHandle, reason: "CWD mismatch pre-warm refresh" });
-      } catch (e) {
+        await runtime.close({
+          handle: prewarmedGrokHandle,
+          reason: "CWD mismatch pre-warm refresh",
+        });
+      } catch {
         // ignore close errors
       }
       prewarmedGrokHandle = null;
@@ -102,7 +107,9 @@ async function prewarmGrokSession(targetCwd) {
     }
 
     const prewarmKey = `prewarm_grok_${Date.now()}`;
-    console.log(`[PRE-WARM] Background pre-warming grok-build session for CWD: ${cwdToUse} (${prewarmKey})...`);
+    console.log(
+      `[PRE-WARM] Background pre-warming grok-build session for CWD: ${cwdToUse} (${prewarmKey})...`,
+    );
     const handle = await runtime.ensureSession({
       sessionKey: prewarmKey,
       agent: "grok-build",
@@ -111,7 +118,9 @@ async function prewarmGrokSession(targetCwd) {
     });
     prewarmedGrokHandle = handle;
     prewarmedGrokCwd = cwdToUse;
-    console.log(`[PRE-WARM] Background grok-build pre-warm ready for CWD=${cwdToUse} (${handle.agentSessionId || handle.backendSessionId})!`);
+    console.log(
+      `[PRE-WARM] Background grok-build pre-warm ready for CWD=${cwdToUse} (${handle.agentSessionId || handle.backendSessionId})!`,
+    );
   } catch (err) {
     console.warn("[PRE-WARM] Pre-warm failed:", err.message);
   } finally {
@@ -775,10 +784,13 @@ wss.on("connection", (ws) => {
             resumeSessionId,
             acpSessionId,
             permissionMode,
+            env,
           } = payload;
 
           console.time(`ensure_session_${sessionId}`);
-          console.log(`[DEBUG] ensure_session started for agent=${agentType || 'unknown'}, session=${sessionId}`);
+          console.log(
+            `[DEBUG] ensure_session started for agent=${agentType || "unknown"}, session=${sessionId}`,
+          );
 
           if (!sessionId || !workspacePath || !agentType) {
             sendError(
@@ -814,6 +826,16 @@ wss.on("connection", (ws) => {
           // the engine; only applies when this session's client is created.
           if (Array.isArray(mcpServers) && mcpServers.length > 0) {
             sessionOptions.mcpServers = mcpServers;
+          }
+          if (env && typeof env === "object" && !Array.isArray(env)) {
+            const safeEnv = Object.fromEntries(
+              Object.entries(env).filter(
+                ([key, value]) => typeof key === "string" && typeof value === "string",
+              ),
+            );
+            if (Object.keys(safeEnv).length > 0) {
+              sessionOptions.env = safeEnv;
+            }
           }
 
           // Prefer the explicit resumeSessionId (the agent-side UUID
@@ -913,7 +935,9 @@ wss.on("connection", (ws) => {
           if (agentType === "grok-build" && !resumeId && prewarmedGrokHandle) {
             if (prewarmedGrokCwd === normalizedPath) {
               console.time(`ensure_session_${sessionId}`);
-              console.log(`[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`);
+              console.log(
+                `[PRE-WARM] 🚀 Instant hit! Reusing pre-warmed grok-build handle for CWD=${normalizedPath}, session=${sessionId}`,
+              );
               const handle = prewarmedGrokHandle;
               prewarmedGrokHandle = null;
               prewarmedGrokCwd = null;
@@ -942,10 +966,12 @@ wss.on("connection", (ws) => {
               void sendSessionMeta(ws, sessionId, handle);
               break;
             } else {
-              console.log(`[PRE-WARM] CWD mismatch (prewarmed=${prewarmedGrokCwd}, requested=${normalizedPath}). Discarding obsolete pre-warm handle.`);
+              console.log(
+                `[PRE-WARM] CWD mismatch (prewarmed=${prewarmedGrokCwd}, requested=${normalizedPath}). Discarding obsolete pre-warm handle.`,
+              );
               try {
                 void runtime.close({ handle: prewarmedGrokHandle, reason: "CWD mismatch" });
-              } catch (e) {
+              } catch {
                 // ignore
               }
               prewarmedGrokHandle = null;
