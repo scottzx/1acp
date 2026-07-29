@@ -56,6 +56,21 @@ test("buildAgentSpawnOptions leaves the agent env untouched when no session env 
   assert.equal(options.env.ACPX_TEST_SESSION_ENV_INJECTED, undefined);
 });
 
+test("buildAgentSpawnOptions does not synthesize a dynamic library search path", () => {
+  const previous = process.env.DYLD_LIBRARY_PATH;
+  delete process.env.DYLD_LIBRARY_PATH;
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined);
+    assert.equal(options.env.DYLD_LIBRARY_PATH, undefined);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.DYLD_LIBRARY_PATH;
+    } else {
+      process.env.DYLD_LIBRARY_PATH = previous;
+    }
+  }
+});
+
 test("buildAgentSpawnOptions injects Claude settings only when requested", async () => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-claude-settings-"));
   const claudeDir = path.join(home, ".claude");

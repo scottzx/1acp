@@ -123,7 +123,6 @@ function buildAgentEnvironment(
   const env: NodeJS.ProcessEnv = { 
     ...process.env,
     PATH: process.env.PATH || process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/local/share:/opt/homebrew/bin',
-    DYLD_LIBRARY_PATH: process.env.DYLD_LIBRARY_PATH || process.env.DYLD_LIBRARY_PATH || '/usr/local/lib:/usr/lib:/opt/homebrew/lib',
     HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || '',
     HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || '',
     NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || '',
