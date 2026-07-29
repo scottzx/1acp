@@ -648,16 +648,12 @@ for (const t of [
 }
 
 async function loadRuntimeHistory(sessionId, session) {
-  if (!session) {
-    return [];
-  }
+  const recordId = session?.handle?.acpxRecordId || sessionId;
   try {
-    const record = await runtime.options.sessionStore.load(
-      session.handle.acpxRecordId || sessionId,
-    );
+    const record = await runtime.options.sessionStore.load(recordId);
     return extractFromRuntimeRecord(record);
   } catch (err) {
-    console.warn(`[acpx-server] Runtime store load failed for ${sessionId}:`, err.message);
+    console.warn(`[acpx-server] Runtime store load failed for ${recordId}:`, err.message);
     return [];
   }
 }
