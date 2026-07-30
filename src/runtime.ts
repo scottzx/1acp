@@ -18,8 +18,9 @@ import { createFileSessionStore } from "./runtime/public/file-session-store.js";
 import { decodeAcpxRuntimeHandleState, writeHandleState } from "./runtime/public/handle-state.js";
 import { normalizeRuntimeDetails, probeRuntime } from "./runtime/public/probe.js";
 import { deriveAgentFromSessionKey, type AcpxHandleState } from "./runtime/public/shared.js";
+import { createTurnJournal } from "./runtime/public/turn-journal.js";
 
-export { DEFAULT_AGENT_NAME, createFileSessionStore };
+export { DEFAULT_AGENT_NAME, createFileSessionStore, createTurnJournal };
 export { AcpRuntimeError, isAcpRuntimeError } from "./runtime/public/errors.js";
 export type { AcpRuntimeErrorCode } from "./runtime/public/errors.js";
 export {
@@ -67,6 +68,13 @@ export type {
   SessionAgentOptions,
   SystemPromptOption,
 } from "./runtime/public/contract.js";
+export type {
+  AcpTurnJournalMutation,
+  AcpTurnJournalRecordResult,
+  AcpTurnJournalSnapshot,
+  AcpTurnJournalStatus,
+  AcpTurnJournalTurn,
+} from "./runtime/public/turn-journal.js";
 
 export const ACPX_BACKEND_ID = "acpx";
 
