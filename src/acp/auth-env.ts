@@ -4,7 +4,20 @@ import path from "node:path";
 import type { AcpClientOptions } from "../types.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
-const CLAUDE_SETTINGS_ENV_KEYS = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"] as const;
+// Third-party API gateways (ANTHROPIC_BASE_URL) need the model ids too: user
+// settings are excluded from the spawned Claude Code's settingSources, so the
+// ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL values configured there must be
+// forwarded with the credentials or the agent falls back to built-in Anthropic
+// model ids, which the gateway rejects ("Model not exist").
+const CLAUDE_SETTINGS_ENV_KEYS = [
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+] as const;
 
 type ClaudeSettings = {
   env?: Record<string, unknown>;

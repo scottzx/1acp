@@ -81,6 +81,11 @@ test("buildAgentSpawnOptions injects Claude settings only when requested", async
       env: {
         ANTHROPIC_AUTH_TOKEN: "settings-token",
         ANTHROPIC_BASE_URL: "https://settings.example.test",
+        ANTHROPIC_MODEL: "third-party-model",
+        ANTHROPIC_SMALL_FAST_MODEL: "third-party-fast-model",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "third-party-model",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "third-party-model",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "third-party-model",
       },
     }),
   );
@@ -91,6 +96,14 @@ test("buildAgentSpawnOptions injects Claude settings only when requested", async
     const claudeOptions = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, undefined, true);
     assert.equal(claudeOptions.env.ANTHROPIC_AUTH_TOKEN, "settings-token");
     assert.equal(claudeOptions.env.ANTHROPIC_BASE_URL, "https://settings.example.test");
+    // Third-party API model ids must ride along with the credentials, or the
+    // spawned Claude Code falls back to built-in Anthropic model ids that the
+    // gateway rejects.
+    assert.equal(claudeOptions.env.ANTHROPIC_MODEL, "third-party-model");
+    assert.equal(claudeOptions.env.ANTHROPIC_SMALL_FAST_MODEL, "third-party-fast-model");
+    assert.equal(claudeOptions.env.ANTHROPIC_DEFAULT_SONNET_MODEL, "third-party-model");
+    assert.equal(claudeOptions.env.ANTHROPIC_DEFAULT_OPUS_MODEL, "third-party-model");
+    assert.equal(claudeOptions.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "third-party-model");
 
     const otherAgentOptions = buildAgentSpawnOptions("/tmp/acpx-agent", undefined);
     assert.notEqual(otherAgentOptions.env.ANTHROPIC_AUTH_TOKEN, "settings-token");
