@@ -1200,7 +1200,7 @@ wss.on("connection", (ws) => {
               );
               void sendSessionMeta(ws, sessionId, handle);
             } catch (err) {
-              sendError(ws, sessionId, "INITIALIZATION_FAILED", err.message);
+              sendError(ws, sessionId, "INITIALIZATION_FAILED", describeActionError(err));
             }
             break;
           }
@@ -2158,7 +2158,7 @@ wss.on("connection", (ws) => {
                 type: "error",
                 sessionId,
                 code: "auth_failed",
-                message: err?.message || String(err),
+                message: describeActionError(err),
               }),
             );
           }
@@ -2198,7 +2198,7 @@ wss.on("connection", (ws) => {
             `Underlying: ${err.stderrSummary || err.message}`,
         );
       } else {
-        sendError(ws, sessionId, "ACTION_FAILED", err.message);
+        sendError(ws, sessionId, "ACTION_FAILED", describeActionError(err));
       }
     }
   });
@@ -2330,6 +2330,26 @@ function sendError(ws, sessionId, errorCode, message) {
       terminal: false,
     }),
   );
+}
+
+// ACP SDK RequestErrors wrap the agent's real failure reason in
+// `data.details` while `message` stays JSON-RPC boilerplate (e.g.
+// "Internal error" for code -32603). Merge the details in so clients see
+// an actionable cause instead of an opaque generic error.
+function describeActionError(err) {
+  const base = err?.message || String(err);
+  let details = "";
+  if (typeof err?.data === "string") {
+    details = err.data.trim();
+  } else if (typeof err?.data?.details === "string") {
+    details = err.data.details.trim();
+  } else if (typeof err?.data?.message === "string") {
+    details = err.data.message.trim();
+  }
+  if (details && !base.includes(details)) {
+    return `${base}: ${details}`;
+  }
+  return base;
 }
 
 // sendLogoutError emits the {type:'error', sessionId, code, message} envelope
