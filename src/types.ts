@@ -212,6 +212,7 @@ export interface OutputFormatter {
 
 export type AcpClientOptions = {
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
@@ -219,6 +220,7 @@ export type AcpClientOptions = {
   permissionPolicy?: PermissionPolicy;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
@@ -423,6 +425,7 @@ export type SessionRecord = {
   acpSessionId: string;
   agentSessionId?: string;
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   name?: string;
   createdAt: string;

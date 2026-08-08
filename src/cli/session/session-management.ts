@@ -60,6 +60,7 @@ async function createSessionRecordWithClient(
     acpSessionId: sessionId,
     agentSessionId,
     agentCommand: options.agentCommand,
+    agentArgv: options.agentArgv,
     cwd,
     name: normalizeName(options.name),
     createdAt: now,
@@ -189,6 +190,7 @@ export async function createSessionWithClient(
 ): Promise<SessionCreateWithClientResult> {
   const client = new AcpClient({
     agentCommand: options.agentCommand,
+    agentArgv: options.agentArgv,
     cwd: absolutePath(options.cwd),
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
@@ -196,6 +198,7 @@ export async function createSessionWithClient(
     permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     verbose: options.verbose,
     sessionOptions: options.sessionOptions,
@@ -233,6 +236,7 @@ export async function createSession(options: SessionCreateOptions): Promise<Sess
 export async function listAgentSessions(options: SessionListOptions): Promise<SessionListResult> {
   const client = new AcpClient({
     agentCommand: options.agentCommand,
+    agentArgv: options.agentArgv,
     cwd: absolutePath(options.cwd),
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
@@ -240,6 +244,7 @@ export async function listAgentSessions(options: SessionListOptions): Promise<Se
     permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     verbose: options.verbose,
   });
@@ -299,6 +304,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
         nonInteractivePermissions: options.nonInteractivePermissions,
         authCredentials: options.authCredentials,
         authPolicy: options.authPolicy,
+        fs: options.fs,
         terminal: options.terminal,
         timeoutMs: options.timeoutMs,
         verbose: options.verbose,
@@ -313,6 +319,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
 
   const record = await createSession({
     agentCommand: options.agentCommand,
+    agentArgv: options.agentArgv,
     cwd,
     name: options.name,
     resumeSessionId: options.resumeSessionId,
@@ -322,6 +329,7 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     permissionPolicy: options.permissionPolicy,
     authCredentials: options.authCredentials,
     authPolicy: options.authPolicy,
+    fs: options.fs,
     terminal: options.terminal,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,

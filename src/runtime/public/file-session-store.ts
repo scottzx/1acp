@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
+import { createAtomicWriteTempPath } from "../../session/persistence/atomic-write.js";
 import { parseSessionRecord } from "../../session/persistence/parse.js";
 import { serializeSessionRecordForDisk } from "../../session/persistence/serialize.js";
 import type { AcpFileSessionStoreOptions, AcpSessionRecord, AcpSessionStore } from "./contract.js";
@@ -51,12 +52,7 @@ class FileSessionStore implements AcpSessionStore {
     assertPersistedKeyPolicy(persisted);
 
     const file = this.filePath(record.acpxRecordId);
-    // randomUUID makes the temp name collision-proof: two saves of the same
-    // record within one millisecond (e.g. a setMode persist racing an
-    // out-of-turn available_commands write) previously shared a pid+ms temp
-    // path, so the first rename left the second renaming a vanished temp
-    // (ENOENT). Uniqueness lets both renames succeed (last write wins).
-    const tempFile = `${file}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    const tempFile = createAtomicWriteTempPath(file);
     const payload = JSON.stringify(persisted, null, 2);
     await fs.writeFile(tempFile, `${payload}\n`, "utf8");
     await fs.rename(tempFile, file);

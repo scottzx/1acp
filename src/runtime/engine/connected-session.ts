@@ -51,6 +51,7 @@ export type WithConnectedSessionOptions<T> = {
   onExitPlanMode?: ConstructorParameters<typeof AcpClient>[0]["onExitPlanMode"];
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
+  fs?: boolean;
   terminal?: boolean;
   resumePolicy?: SessionResumePolicy;
   timeoutMs?: number;
@@ -100,6 +101,7 @@ export async function withConnectedSession<T>(
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,
+      agentArgv: record.agentArgv,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
@@ -109,12 +111,14 @@ export async function withConnectedSession<T>(
       onExitPlanMode: options.onExitPlanMode,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      fs: options.fs,
       terminal: options.terminal,
       verbose: options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
     new AcpClient({
       agentCommand: record.agentCommand,
+      agentArgv: record.agentArgv,
       cwd: absolutePath(record.cwd),
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
@@ -124,6 +128,7 @@ export async function withConnectedSession<T>(
       onExitPlanMode: options.onExitPlanMode,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
+      fs: options.fs,
       terminal: options.terminal,
       verbose: options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),

@@ -8,9 +8,44 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- Docs/readme: rewrite the project front door to the house standard and route detailed CLI guidance to the existing documentation.
+
 ### Breaking
 
 ### Fixes
+
+## 2026.7.27 (v0.13.0)
+
+### Highlights
+
+- Windows agent launches now use structured argv end to end. Unambiguous legacy `command` plus `args` entries migrate automatically; ambiguous/raw commands and `.sh` wrappers must move to `agents.<name>.argv`, and existing saved custom-agent sessions without argv must be recreated.
+- Built-in Pool and ZeroClaw support makes both native ACP stdio servers available without custom registry configuration.
+- The new `--no-fs` flag lets compatible agents use their native filesystem implementation instead of ACP client filesystem methods.
+- The dependency and pnpm refresh resolves all four known PostCSS, fast-uri, js-yaml, and brace-expansion advisories.
+
+### Changes
+
+- Agents/built-ins: add Pool via `pool acp`. Thanks @dan-roberts-poolside and @osolmaz.
+
+- Agents/built-ins: add ZeroClaw via `zeroclaw acp`, ZeroClaw's native ACP v1 stdio server. Thanks @JordanTheJet.
+
+- CLI/ACP: add `--no-fs` to disable advertised ACP file read/write capabilities so compatible agents can use their native filesystem implementation. Thanks @zgxkbtl.
+
+- CLI/timers: preserve tiny positive timeout and TTL values from flags or config as 1 ms instead of disabling timers, and reject delays beyond Node's supported timer range. Thanks @realmehmetali.
+
+- Dependencies/tooling: refresh the ACP SDK, runtime and development toolchain, update pnpm to 10.34.5, and resolve the PostCSS, fast-uri, js-yaml, and brace-expansion advisories.
+
+### Breaking
+
+- Windows agent launches now require structured `agents.<name>.argv`; unambiguous legacy `command` plus `args` entries migrate automatically, while raw, ambiguous, or directly executable `.sh` commands fail with explicit migration guidance instead of lossy parsing or CreateProcess ENOENT. Existing custom-agent sessions without saved argv must be recreated. Fixes #466. Thanks @MarcelCFritsche.
+
+### Fixes
+
+- Flows: swallow best-effort heartbeat write failures at the timer boundary so storage errors do not become unhandled promise rejections. Thanks @SebTardif.
+
+- Runtime/sessions: use collision-resistant temporary paths for concurrent atomic session and index writes. Thanks @henkterharmsel.
+
+- CLI/status: report a normal cold-start session as `agent starting` while preserving `needs reconnect` for an unreachable live owner. Thanks @guettli.
 
 ## 2026.7.23 (v0.12.1)
 

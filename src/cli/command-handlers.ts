@@ -215,6 +215,7 @@ function buildSessionStartOptions(params: {
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
+    agentArgv: params.agent.agentArgv,
     cwd: params.agent.cwd,
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
@@ -224,6 +225,7 @@ function buildSessionStartOptions(params: {
     permissionPolicy: params.permissionPolicy,
     authCredentials: params.config.auth,
     authPolicy: params.globalFlags.authPolicy,
+    fs: params.globalFlags.fs,
     terminal: params.globalFlags.terminal,
     timeoutMs: params.globalFlags.timeout,
     verbose: params.globalFlags.verbose,
@@ -353,6 +355,7 @@ export async function handlePrompt(
     permissionPolicy,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
+    fs: globalFlags.fs,
     terminal: globalFlags.terminal,
     outputFormatter,
     errorEmissionPolicy: {
@@ -433,6 +436,7 @@ export async function handleExec(
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
+    agentArgv: agent.agentArgv,
     cwd: agent.cwd,
     prompt,
     mcpServers: config.mcpServers,
@@ -441,6 +445,7 @@ export async function handleExec(
     permissionPolicy,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
+    fs: globalFlags.fs,
     terminal: globalFlags.terminal,
     outputFormatter,
     errorEmissionPolicy: {
@@ -602,6 +607,7 @@ export async function handleSetMode(
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
+    fs: globalFlags.fs,
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
@@ -639,6 +645,7 @@ export async function handleSetModel(
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
+    fs: globalFlags.fs,
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
@@ -683,6 +690,7 @@ export async function handleSetConfigOption(
     nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
+    fs: globalFlags.fs,
     terminal: globalFlags.terminal,
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
@@ -709,6 +717,7 @@ async function tryListAgentSessions(
   try {
     return await listAgentSessions({
       agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
       cwd: agent.cwd,
       cursor: flags.cursor,
       filterCwd: resolveSessionListFilterCwd(flags, agent.cwd),
@@ -718,6 +727,7 @@ async function tryListAgentSessions(
       permissionPolicy,
       authCredentials: config.auth,
       authPolicy: globalFlags.authPolicy,
+      fs: globalFlags.fs,
       terminal: globalFlags.terminal,
       timeoutMs: globalFlags.timeout,
       verbose: globalFlags.verbose,

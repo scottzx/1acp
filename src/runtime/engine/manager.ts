@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { normalizeAgentCommandInput } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
 import { configOptionsFromConfigOptions } from "../../acp/config-option-support.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
@@ -229,6 +230,7 @@ function createInitialRecord(params: {
   sessionName: string;
   sessionId: string;
   agentCommand: string;
+  agentArgv?: string[];
   cwd: string;
   agentSessionId?: string;
 }): SessionRecord {
@@ -239,6 +241,7 @@ function createInitialRecord(params: {
     acpSessionId: params.sessionId,
     agentSessionId: params.agentSessionId,
     agentCommand: params.agentCommand,
+    agentArgv: params.agentArgv,
     cwd: params.cwd,
     name: params.sessionName,
     createdAt: now,
@@ -776,7 +779,9 @@ export class AcpRuntimeManager {
     sessionOptions?: SessionAgentOptions;
   }): Promise<SessionRecord> {
     const cwd = path.resolve(input.cwd?.trim() || this.options.cwd);
-    const agentCommand = this.options.agentRegistry.resolve(input.agent);
+    const { agentCommand, agentArgv } = normalizeAgentCommandInput(
+      this.options.agentRegistry.resolve(input.agent),
+    );
     const reused = await this.reuseExistingRecord(input, cwd, agentCommand);
     if (reused) {
       return reused;
@@ -784,6 +789,7 @@ export class AcpRuntimeManager {
 
     const client = this.createClient({
       agentCommand,
+      agentArgv,
       cwd,
       // Per-session mcpServers (e.g. the AI Project Manager's project-locked
       // task tools) are appended to the runtime-level servers for this new
@@ -811,6 +817,7 @@ export class AcpRuntimeManager {
         input,
         client,
         agentCommand,
+        agentArgv,
         cwd,
         session,
       });
@@ -1048,15 +1055,17 @@ export class AcpRuntimeManager {
     };
     client: AcpClient;
     agentCommand: string;
+    agentArgv?: string[];
     cwd: string;
     session: CreatedRuntimeSession;
   }): Promise<SessionRecord> {
-    const { input, client, agentCommand, cwd, session } = params;
+    const { input, client, agentCommand, agentArgv, cwd, session } = params;
     const record = createInitialRecord({
       recordId: createRecordId(input.sessionKey, input.mode),
       sessionName: input.sessionKey,
       sessionId: session.sessionId,
       agentCommand,
+      agentArgv,
       cwd,
       agentSessionId: session.agentSessionId,
     });
@@ -1331,6 +1340,7 @@ export class AcpRuntimeManager {
   private createTurnClient(record: SessionRecord): AcpClient {
     return this.createClient({
       agentCommand: record.agentCommand,
+      agentArgv: record.agentArgv,
       cwd: record.cwd,
       mcpServers: [...(this.options.mcpServers ?? [])],
       permissionMode: this.options.permissionMode,
@@ -1797,6 +1807,7 @@ export class AcpRuntimeManager {
       pendingClient ??
       this.createClient({
         agentCommand: record.agentCommand,
+        agentArgv: record.agentArgv,
         cwd: record.cwd,
         mcpServers: [...(this.options.mcpServers ?? [])],
         permissionMode: this.options.permissionMode,

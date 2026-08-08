@@ -11,7 +11,7 @@ concurrency:
 
 env:
   NODE_VERSION: 24
-  PNPM_VERSION: 10.33.2
+  PNPM_VERSION: 10.34.5
 
 jobs:
   release:
@@ -25,7 +25,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -33,7 +33,7 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: true

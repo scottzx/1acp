@@ -3,7 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { normalizeAgentCommandInput } from "../src/acp/client-process.js";
 import {
+  AGENT_ARGV_REGISTRY,
   AGENT_REGISTRY,
   BUILT_IN_AGENT_PACKAGES,
   DEFAULT_AGENT_NAME,
@@ -13,6 +15,14 @@ import {
   resolvePackageExecBuiltInAgentLaunch,
   resolveAgentCommand,
 } from "../src/agent-registry.js";
+
+test("built-in command displays stay synchronized with structured argv", () => {
+  assert.deepEqual(Object.keys(AGENT_ARGV_REGISTRY), Object.keys(AGENT_REGISTRY));
+  for (const [name, argv] of Object.entries(AGENT_ARGV_REGISTRY)) {
+    assert.equal(argv.join(" "), AGENT_REGISTRY[name]);
+    assert.equal(normalizeAgentCommandInput(argv).agentCommand, AGENT_REGISTRY[name]);
+  }
+});
 
 test("resolveAgentCommand maps known agents to commands", () => {
   for (const [name, command] of Object.entries(AGENT_REGISTRY)) {
@@ -64,6 +74,18 @@ test("mux built-in runs the coder/mux ACP stdio bridge through npx", () => {
   assert.equal(resolveAgentCommand("mux"), "npx -y mux@^0.28.0 acp");
 });
 
+test("pool built-in runs the Poolside ACP entrypoint", () => {
+  assert.equal(AGENT_REGISTRY.pool, "pool acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.pool, ["pool", "acp"]);
+  assert.equal(resolveAgentCommand("pool"), "pool acp");
+});
+
+test("zeroclaw built-in launches the native ZeroClaw ACP server", () => {
+  assert.equal(AGENT_REGISTRY.zeroclaw, "zeroclaw acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.zeroclaw, ["zeroclaw", "acp"]);
+  assert.equal(resolveAgentCommand("zeroclaw"), "zeroclaw acp");
+});
+
 test("listBuiltInAgents preserves the required example prefix and alphabetical tail", () => {
   const agents = listBuiltInAgents();
   assert.deepEqual(agents, Object.keys(AGENT_REGISTRY));
@@ -86,9 +108,11 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
     "kiro",
     "mux",
     "opencode",
+    "pool",
     "qoder",
     "qwen",
     "trae",
+    "zeroclaw",
   ]);
 });
 

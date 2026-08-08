@@ -57,7 +57,7 @@ import {
 } from "../permissions.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
-import { buildSpawnCommandOptions } from "../spawn-command-options.js";
+import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -96,8 +96,8 @@ import {
   isoNow,
   isChildProcessRunning,
   requireAgentStdio,
+  resolveAgentCommandParts,
   resolveAgentSessionCwd,
-  splitCommandLine,
   waitForChildExit,
   waitForSpawn,
 } from "./client-process.js";
@@ -254,12 +254,13 @@ function resolveClientInfo(devinAcp: boolean): { name: string; version: string }
 
 function resolveClientCapabilities(params: {
   devinAcp: boolean;
+  fs: boolean;
   terminal: boolean;
 }): ClientCapabilities {
   const baseCapabilities: ClientCapabilities = {
     fs: {
-      readTextFile: true,
-      writeTextFile: true,
+      readTextFile: params.fs,
+      writeTextFile: params.fs,
     },
     terminal: params.terminal,
   };
@@ -708,6 +709,7 @@ export class AcpClient {
     permissionMode?: PermissionMode;
     nonInteractivePermissions?: NonInteractivePermissionPolicy;
     permissionPolicy?: AcpClientOptions["permissionPolicy"];
+    fs?: boolean;
     terminal?: boolean;
     suppressSdkConsoleErrors?: boolean;
     verbose?: boolean;
@@ -723,15 +725,22 @@ export class AcpClient {
     if (Object.prototype.hasOwnProperty.call(options, "permissionPolicy")) {
       this.options.permissionPolicy = options.permissionPolicy;
     }
-    if (options.terminal !== undefined) {
-      this.options.terminal = options.terminal;
-    }
+    this.updateClientCapabilityPreferences(options);
     this.refreshRuntimePermissionPolicy(shouldRefreshPermissionPolicy);
     if (options.suppressSdkConsoleErrors !== undefined) {
       this.options.suppressSdkConsoleErrors = options.suppressSdkConsoleErrors;
     }
     if (options.verbose !== undefined) {
       this.options.verbose = options.verbose;
+    }
+  }
+
+  private updateClientCapabilityPreferences(options: { fs?: boolean; terminal?: boolean }): void {
+    if (options.fs !== undefined) {
+      this.options.fs = options.fs;
+    }
+    if (options.terminal !== undefined) {
+      this.options.terminal = options.terminal;
     }
   }
 
@@ -821,7 +830,10 @@ export class AcpClient {
   }
 
   private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
-    const configuredCommand = splitCommandLine(this.options.agentCommand);
+    const configuredCommand = resolveAgentCommandParts(
+      this.options.agentCommand,
+      this.options.agentArgv,
+    );
     const resolvedBuiltInLaunch = resolveBuiltInAgentLaunch(this.options.agentCommand);
     const spawnCommand = resolvedBuiltInLaunch?.command ?? configuredCommand.command;
     let args = resolvedBuiltInLaunch?.args ?? configuredCommand.args;
@@ -891,11 +903,16 @@ export class AcpClient {
     if (plan.claudeAcp) {
       applyClaudeSettingsEnvironment(plan.spawnOptions.env);
     }
-    const spawnedChild = spawn(
+    const spawnCommand = buildAgentSpawnCommand(
       plan.spawnCommand,
       plan.args,
-      buildSpawnCommandOptions(plan.spawnCommand, plan.spawnOptions),
-    ) as ChildProcessByStdio<Writable, Readable, Readable>;
+      process.platform,
+      plan.spawnOptions.env,
+    );
+    const spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
+      ...plan.spawnOptions,
+      windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
+    }) as ChildProcessByStdio<Writable, Readable, Readable>;
     try {
       await waitForSpawn(spawnedChild);
     } catch (error) {
@@ -1001,6 +1018,7 @@ export class AcpClient {
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: resolveClientCapabilities({
         devinAcp: launch.devinAcp,
+        fs: this.options.fs !== false,
         terminal: this.options.terminal !== false,
       }),
       clientInfo: resolveClientInfo(launch.devinAcp),
@@ -1101,7 +1119,10 @@ export class AcpClient {
 
   async createSession(cwd = this.options.cwd): Promise<SessionCreateResult> {
     const connection = this.getConnection();
-    const { command, args } = splitCommandLine(this.options.agentCommand);
+    const { command, args } = resolveAgentCommandParts(
+      this.options.agentCommand,
+      this.options.agentArgv,
+    );
     const claudeAcp = isClaudeAcpCommand(command, args);
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
 
@@ -1925,7 +1946,10 @@ export class AcpClient {
   }
 
   private isGrokBuildAcpCommand(): boolean {
-    const { command, args } = splitCommandLine(this.options.agentCommand);
+    const { command, args } = resolveAgentCommandParts(
+      this.options.agentCommand,
+      this.options.agentArgv,
+    );
     const executable = command
       .replace(/\\/g, "/")
       .split("/")
