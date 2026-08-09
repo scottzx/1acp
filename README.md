@@ -5,10 +5,10 @@
 </p>
 
 [![CI](https://img.shields.io/github/actions/workflow/status/scottzx/1acp/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/scottzx/1acp/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/1acp?style=flat-square)](https://www.npmjs.com/package/1acp)
-[![Node.js](https://img.shields.io/node/v/1acp?style=flat-square)](https://nodejs.org/)
+[![npm](https://img.shields.io/npm/v/%40scottzx%2F1acp?style=flat-square)](https://www.npmjs.com/package/@scottzx/1acp)
+[![Node.js](https://img.shields.io/node/v/%40scottzx%2F1acp?style=flat-square)](https://nodejs.org/)
 [![License](https://img.shields.io/github/license/scottzx/1acp?style=flat-square)](LICENSE)
-[![npm downloads](https://img.shields.io/npm/dm/1acp?style=flat-square)](https://www.npmjs.com/package/1acp)
+[![npm downloads](https://img.shields.io/npm/dm/%40scottzx%2F1acp?style=flat-square)](https://www.npmjs.com/package/@scottzx/1acp)
 
 `acpx` is a headless command-line client for the [Agent Client Protocol (ACP)](https://agentclientprotocol.com). It gives agents, orchestrators, and developers one structured interface for persistent sessions, one-shot runs, permissions, and machine-readable output across ACP-compatible coding agents.
 
@@ -29,10 +29,10 @@ This repository contains ...
 Install the published npm package globally:
 
 ```bash
-npm install -g 1acp@latest
+npm install -g @scottzx/1acp@latest
 ```
 
-The package installs both `1acp` and the upstream-compatible `acpx` command. It requires Node.js 22.13 or newer. To try it without a global install, prefix a command with `npx 1acp@latest` instead. See the [install guide](docs/install.md) for adapter prerequisites, updates, and source builds.
+The package installs both `1acp` and the upstream-compatible `acpx` command. It requires Node.js 22.13 or newer. To try it without a global install, prefix a command with `npx @scottzx/1acp@latest` instead. See the [install guide](docs/install.md) for adapter prerequisites, updates, and source builds.
 
 ## Quick start
 

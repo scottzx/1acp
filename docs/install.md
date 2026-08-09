@@ -3,7 +3,7 @@ title: Install
 description: Install acpx globally with npm, run it ad-hoc with npx, or build from source. Covers Node version, PATH, and updating.
 ---
 
-`acpx` is published to npm as [`1acp`](https://www.npmjs.com/package/1acp). The package installs both `1acp` and the upstream-compatible `acpx` command. It is a single Node CLI — no service to host, no daemon to manage. Session state lives under `~/.acpx/`.
+`acpx` is published to npm as [`@scottzx/1acp`](https://www.npmjs.com/package/@scottzx/1acp). The package installs both `1acp` and the upstream-compatible `acpx` command. It is a single Node CLI — no service to host, no daemon to manage. Session state lives under `~/.acpx/`.
 
 ## Requirements
 
@@ -26,7 +26,7 @@ pnpm with npm avoids that bootstrap failure.
 ## Global install (recommended)
 
 ```bash
-npm install -g 1acp@latest
+npm install -g @scottzx/1acp@latest
 ```
 
 Verify:
@@ -41,7 +41,7 @@ Global install is the default for most workflows because it keeps queue owners a
 ## Run without installing
 
 ```bash
-npx 1acp@latest codex 'fix the failing tests'
+npx @scottzx/1acp@latest codex 'fix the failing tests'
 ```
 
 `npx` works for one-off use but pays a small startup cost on every invocation. For repeated session reuse, prefer the global install.
@@ -49,7 +49,7 @@ npx 1acp@latest codex 'fix the failing tests'
 ## Update
 
 ```bash
-npm install -g 1acp@latest
+npm install -g @scottzx/1acp@latest
 ```
 
 Check what changed in the [changelog](https://github.com/openclaw/acpx/blob/main/CHANGELOG.md). Pre-1.0 releases can break CLI/runtime surface area between minor versions.
@@ -97,12 +97,12 @@ I want you to use acpx to run coding agents over the Agent Client Protocol
 (ACP) instead of scraping PTY sessions. Please do the following:
 
 1. Install acpx globally (recommended) or use npx:
-   npm install -g 1acp@latest
+   npm install -g @scottzx/1acp@latest
 
 2. For Pi or OpenClaw, use the reference URL below. For Codex-style skill
    installation, install the acpx skill so you have the full reference
    available:
-   npx 1acp@latest --skill install acpx --agent codex --scope user
+   npx @scottzx/1acp@latest --skill install acpx --agent codex --scope user
    Use --agent claude for Claude Code. For another harness not listed by
    --skill install --help, use the reference URL below instead.
 

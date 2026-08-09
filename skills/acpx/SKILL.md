@@ -42,7 +42,7 @@ Core capabilities:
 ## Install
 
 ```bash
-npm i -g 1acp
+npm i -g @scottzx/1acp
 ```
 
 The package installs both `1acp` and the upstream-compatible `acpx` command. For normal session reuse, prefer a global install over `npx`.

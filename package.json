@@ -1,5 +1,5 @@
 {
-  "name": "1acp",
+  "name": "@scottzx/1acp",
   "version": "0.14.0",
   "description": "Headless CLI client for the Agent Client Protocol (ACP) — talk to coding agents from the command line",
   "keywords": [
@@ -15,7 +15,7 @@
   "author": "scottzx",
   "repository": {
     "type": "git",
-    "url": "https://github.com/scottzx/1acp"
+    "url": "git+https://github.com/scottzx/1acp.git"
   },
   "bin": {
     "1acp": "dist/cli.js",

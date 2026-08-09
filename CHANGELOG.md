@@ -12,7 +12,7 @@ Repo: https://github.com/scottzx/1acp
 
 - Agents/built-ins: add an isolated DeepSeek Build profile over `grok agent stdio`, using `DEEPSEEK_API_KEY`, DeepSeek's OpenAI-compatible endpoint, and separate session identity from Grok Build.
 
-- Distribution: publish the CLI as the `1acp` npm package with both `1acp` and upstream-compatible `acpx` executable names.
+- Distribution: publish the CLI as the `@scottzx/1acp` npm package with both `1acp` and upstream-compatible `acpx` executable names.
 
 ### Breaking
 
