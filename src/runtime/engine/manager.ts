@@ -1145,7 +1145,11 @@ export class AcpRuntimeManager {
         await this.options.sessionStore.save(record);
         // Notify the host only after persistence so any immediate history or
         // capability refresh observes the newly applied update.
-        this.options.onOutOfTurnSessionUpdate?.(recordId, notification.update.sessionUpdate);
+        this.options.onOutOfTurnSessionUpdate?.(
+          recordId,
+          notification.update.sessionUpdate,
+          notification.update,
+        );
       })
       .catch(() => {
         // metadata only — never fail a session over a dropped out-of-turn update

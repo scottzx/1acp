@@ -1,6 +1,7 @@
 import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
 import type {
   AcpRuntimeAvailableCommand,
+  AcpRuntimeBackgroundTask,
   AcpRuntimeEvent,
   AcpRuntimePlanEntry,
   AcpRuntimePlanEntryStatus,
@@ -25,10 +26,19 @@ function asOptionalFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+// The outer `_meta` carries adapter-level per-turn markers that the inner
+// update payload never sees: grok stamps `promptId` / `turnStartMs` here,
+// and Claude stamps `claudeCode.*`. Spread the result so text/tool parsers
+// can surface the turn id alongside the payload.
+function readMeta(source: unknown): { meta?: Record<string, unknown> } {
+  return isRecord(source) ? { meta: source } : {};
+}
+
 function resolveStructuredPromptPayload(parsed: Record<string, unknown>): {
   type: string;
   payload: Record<string, unknown>;
   tag?: AcpSessionUpdateTag;
+  meta?: Record<string, unknown>;
 } {
   const method = asTrimmedString(parsed.method);
   if (method === "session/update") {
@@ -40,6 +50,7 @@ function resolveStructuredPromptPayload(parsed: Record<string, unknown>): {
         type: tag ?? "",
         payload: update,
         ...(tag ? { tag } : {}),
+        ...readMeta(params._meta),
       };
     }
   }
@@ -50,6 +61,7 @@ function resolveStructuredPromptPayload(parsed: Record<string, unknown>): {
       type: sessionUpdate,
       payload: parsed,
       tag: sessionUpdate,
+      ...readMeta(parsed._meta),
     };
   }
 
@@ -59,6 +71,7 @@ function resolveStructuredPromptPayload(parsed: Record<string, unknown>): {
     type,
     payload: parsed,
     ...(tag ? { tag } : {}),
+    ...readMeta(parsed._meta),
   };
 }
 
@@ -137,6 +150,7 @@ function resolveTextChunk(params: {
   payload: Record<string, unknown>;
   stream: "output" | "thought";
   tag: AcpSessionUpdateTag;
+  meta?: Record<string, unknown>;
 }): AcpRuntimeEvent | null {
   const contentRaw = params.payload.content;
   if (isRecord(contentRaw)) {
@@ -151,6 +165,7 @@ function resolveTextChunk(params: {
         text,
         stream: params.stream,
         tag: params.tag,
+        ...readAgentTurnId(params.meta),
       };
     }
   }
@@ -163,13 +178,25 @@ function resolveTextChunk(params: {
     text,
     stream: params.stream,
     tag: params.tag,
+    ...readAgentTurnId(params.meta),
   };
+}
+
+// grok stamps the outer `_meta.promptId` on every chunk; each ACP prompt
+// (main agent turn, each spawned subagent turn) gets its own id, so this is
+// the boundary marker the frontend needs to isolate subagent content.
+function readAgentTurnId(meta: Record<string, unknown> | undefined): {
+  agentTurnId?: string;
+} {
+  const promptId = asOptionalString(meta?.promptId);
+  return promptId && promptId.length > 0 ? { agentTurnId: promptId } : {};
 }
 
 function createTextDeltaEvent(params: {
   content: string | null | undefined;
   stream: "output" | "thought";
   tag?: AcpSessionUpdateTag;
+  meta?: Record<string, unknown>;
 }): AcpRuntimeEvent | null {
   if (params.content == null || params.content.length === 0) {
     return null;
@@ -179,6 +206,7 @@ function createTextDeltaEvent(params: {
     text: params.content,
     stream: params.stream,
     ...(params.tag ? { tag: params.tag } : {}),
+    ...readAgentTurnId(params.meta),
   };
 }
 
@@ -398,6 +426,7 @@ function selectToolCallDetailSummary(params: {
 function createToolCallEvent(params: {
   payload: Record<string, unknown>;
   tag: AcpSessionUpdateTag;
+  meta?: Record<string, unknown>;
 }): AcpRuntimeEvent {
   const title = asTrimmedString(params.payload.title) || "tool call";
   const status = asTrimmedString(params.payload.status);
@@ -420,6 +449,7 @@ function createToolCallEvent(params: {
     text: detailSummary ? `${summaryText}: ${detailSummary}` : summaryText,
     tag: params.tag,
     title,
+    ...readAgentTurnId(params.meta),
   };
   assignToolCallEventMetadata(event, params.payload, { toolCallId, status, kind, toolName });
   return event;
@@ -488,33 +518,37 @@ export function parsePromptEventLine(line: string): AcpRuntimeEvent | null {
   const type = structured.type;
   const payload = structured.payload;
   const tag = structured.tag;
+  const meta = structured.meta;
   const parser = promptEventParser(type);
-  return parser ? parser(payload, tag) : null;
+  return parser ? parser(payload, tag, meta) : null;
 }
 
 type PromptEventParser = (
   payload: Record<string, unknown>,
   tag: AcpSessionUpdateTag | undefined,
+  meta?: Record<string, unknown>,
 ) => AcpRuntimeEvent | null;
 
 const PROMPT_EVENT_PARSERS: Record<string, PromptEventParser> = {
-  text: (payload, tag) =>
-    createTextDeltaEvent({ content: asString(payload.content), stream: "output", tag }),
-  thought: (payload, tag) =>
-    createTextDeltaEvent({ content: asString(payload.content), stream: "thought", tag }),
-  tool_call: (payload, tag) => createToolCallEvent({ payload, tag: tag ?? "tool_call" }),
-  tool_call_update: (payload, tag) =>
-    createToolCallEvent({ payload, tag: tag ?? "tool_call_update" }),
-  agent_message_chunk: (payload) =>
-    resolveTextChunk({ payload, stream: "output", tag: "agent_message_chunk" }),
-  agent_thought_chunk: (payload) =>
-    resolveTextChunk({ payload, stream: "thought", tag: "agent_thought_chunk" }),
+  text: (payload, tag, meta) =>
+    createTextDeltaEvent({ content: asString(payload.content), stream: "output", tag, meta }),
+  thought: (payload, tag, meta) =>
+    createTextDeltaEvent({ content: asString(payload.content), stream: "thought", tag, meta }),
+  tool_call: (payload, tag, meta) =>
+    createToolCallEvent({ payload, tag: tag ?? "tool_call", meta }),
+  tool_call_update: (payload, tag, meta) =>
+    createToolCallEvent({ payload, tag: tag ?? "tool_call_update", meta }),
+  agent_message_chunk: (payload, _tag, meta) =>
+    resolveTextChunk({ payload, stream: "output", tag: "agent_message_chunk", meta }),
+  agent_thought_chunk: (payload, _tag, meta) =>
+    resolveTextChunk({ payload, stream: "thought", tag: "agent_thought_chunk", meta }),
   usage_update: usageUpdateEvent,
   available_commands_update: availableCommandsUpdateEvent,
   current_mode_update: currentModeUpdateEvent,
   config_option_update: (payload) => statusUpdateEvent("config_option_update", payload),
   session_info_update: (payload) => statusUpdateEvent("session_info_update", payload),
   plan: planUpdateEvent,
+  background_task: backgroundTaskUpdateEvent,
   client_operation: clientOperationEvent,
   update: updateStatusEvent,
   done: () => null,
@@ -591,6 +625,66 @@ function planUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | nu
     tag: "plan",
     planEntries,
   };
+}
+
+function backgroundTaskUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
+  const tasks = normalizeBackgroundTasks(payload.tasks);
+  if (!tasks) {
+    return statusUpdateEvent("background_task", payload);
+  }
+  return {
+    type: "background_task",
+    tasks,
+  };
+}
+
+const BACKGROUND_TASK_STATUSES: ReadonlySet<AcpRuntimeBackgroundTask["status"]> = new Set([
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "killed",
+]);
+
+function normalizeBackgroundTaskStatus(value: unknown): AcpRuntimeBackgroundTask["status"] {
+  const raw = asTrimmedString(value) as AcpRuntimeBackgroundTask["status"];
+  return BACKGROUND_TASK_STATUSES.has(raw) ? raw : "running";
+}
+
+function normalizeBackgroundTask(entry: unknown): AcpRuntimeBackgroundTask | undefined {
+  if (!isRecord(entry)) {
+    return undefined;
+  }
+  const id = asOptionalString(entry.id);
+  const command = asOptionalString(entry.command);
+  if (!id || !command) {
+    return undefined;
+  }
+  const duration = asOptionalString(entry.duration);
+  const output = asOptionalString(entry.output);
+  const exitCode = typeof entry.exitCode === "number" ? entry.exitCode : undefined;
+  return {
+    id,
+    status: normalizeBackgroundTaskStatus(entry.status),
+    command,
+    ...(duration ? { duration } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(output ? { output } : {}),
+  };
+}
+
+function normalizeBackgroundTasks(value: unknown): AcpRuntimeBackgroundTask[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const tasks: AcpRuntimeBackgroundTask[] = [];
+  for (const entry of value) {
+    const normalized = normalizeBackgroundTask(entry);
+    if (normalized) {
+      tasks.push(normalized);
+    }
+  }
+  return tasks.length > 0 ? tasks : undefined;
 }
 
 const PLAN_ENTRY_STATUSES: ReadonlySet<AcpRuntimePlanEntryStatus> = new Set([

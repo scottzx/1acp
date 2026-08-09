@@ -241,6 +241,12 @@ export type AcpRuntimeEvent =
       text: string;
       stream?: "output" | "thought";
       tag?: AcpSessionUpdateTag;
+      /**
+       * The adapter's per-turn id (grok's `_meta.promptId`). Main-agent and
+       * subagent turns carry different ids, so consumers can isolate
+       * subagent text from the main feed.
+       */
+      agentTurnId?: string;
     }
   | {
       type: "status";
@@ -297,6 +303,12 @@ export type AcpRuntimeEvent =
       rawOutput?: unknown;
       content?: ToolCallContent[];
       toolName?: string;
+      /**
+       * The adapter's per-turn id (grok's `_meta.promptId`). Subagent tool
+       * calls carry the subagent turn's id, letting consumers fold them into
+       * the subagent's card instead of the main assistant message.
+       */
+      agentTurnId?: string;
     }
   /**
    * Compatibility terminal event emitted by runTurn(...). startTurn(...).events
@@ -449,8 +461,14 @@ export type AcpRuntimeOptions = {
    * host refresh history or capabilities without waiting for the next
    * turn/reconnect.
    * `sessionKey` is the ensureSession key (the persistent record id).
+   * `update` carries the full session/update payload when the host needs the
+   * data itself (e.g. live background-task snapshots), not just the tag.
    */
-  onOutOfTurnSessionUpdate?: (sessionKey: string, updateTag: AcpSessionUpdateTag) => void;
+  onOutOfTurnSessionUpdate?: (
+    sessionKey: string,
+    updateTag: AcpSessionUpdateTag,
+    update?: Record<string, unknown>,
+  ) => void;
 };
 
 export type AcpFileSessionStoreOptions = {

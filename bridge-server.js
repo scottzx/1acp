@@ -40,6 +40,58 @@ const META_UPDATE_TAGS = new Set([
   "session_info_update",
 ]);
 
+// Background-task completion reminders: the grok/deepseek runtime does not
+// emit structured `background_task` session updates. Instead, when a task
+// finishes it wakes the session with an out-of-turn `user_message_chunk`
+// whose text carries a `<system-reminder>` block:
+//
+//   <system-reminder>
+//   Background task "a5521c46-..." completed (exit code: 0).
+//   Command: /bin/bash -lc 'sleep 30' | Duration: 30.1s
+//   Use get_command_or_subagent_output("...") to see the full output.
+//   </system-reminder>
+//
+// Convert that reminder into the same `background_task` snapshot the client's
+// task panel consumes. statuses mirror the runtime's wording (canceled vs
+// cancelled normalized to the contract spelling).
+function parseBackgroundTaskReminder(update) {
+  const content =
+    update && typeof update.content === "object" && update.content !== null
+      ? update.content
+      : undefined;
+  const text = content && typeof content.text === "string" ? content.text : undefined;
+  if (!text) {
+    return null;
+  }
+  const match = text.match(
+    /Background task "([^"]+)"\s+(completed|failed|cancelled|canceled|killed)(?:\s*\(exit code:\s*(-?\d+)\))?/,
+  );
+  if (!match) {
+    return null;
+  }
+  const task = {
+    id: match[1],
+    status: match[2] === "canceled" ? "cancelled" : match[2],
+  };
+  if (match[3] !== undefined) {
+    task.exitCode = Number(match[3]);
+  }
+  const command = text.match(/Command:\s*([^|\n]+)/);
+  if (command) {
+    task.command = command[1].trim();
+  }
+  const duration = text.match(/Duration:\s*([0-9.]+)s/);
+  if (duration) {
+    task.duration = `${duration[1]}s`;
+  }
+  return task;
+}
+
+// Accumulated completed/failed background tasks per session. The snapshot is
+// a full list (the client replaces wholesale), so keep every task finished in
+// this session instead of letting later completions wipe earlier ones.
+const sessionBackgroundTasks = new Map();
+
 // Setup session runtime manager options
 const runtime = createAcpRuntime({
   cwd: process.cwd(),
@@ -53,10 +105,48 @@ const runtime = createAcpRuntime({
   // available_commands_update) lands in the record, re-send the capability
   // snapshot so the client's `/` palette lights up without waiting for a turn.
   // sessionKey === the client sessionId for persistent sessions.
-  onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
+  onOutOfTurnSessionUpdate: (sessionKey, updateTag, update) => {
     const session = activeSessions.get(sessionKey);
     if (!session) {
       return;
+    }
+    if (updateTag === "background_task" && Array.isArray(update?.tasks)) {
+      // Background-task snapshots can arrive between turns (a task finishing
+      // long after the turn that started it). Forward the full snapshot so
+      // the client's task panel stays live.
+      const ws = session.ws;
+      if (ws && ws.readyState === 1 /* OPEN */) {
+        ws.send(
+          JSON.stringify({
+            event: "background_task",
+            sessionId: sessionKey,
+            payload: { tasks: update.tasks },
+          }),
+        );
+      }
+      return;
+    }
+    if (updateTag === "user_message_chunk") {
+      // Background-task completion reminders arrive as out-of-turn
+      // user_message_chunk notifications carrying a <system-reminder> block.
+      // Convert them into the task snapshot the panel consumes. Falls through
+      // to the history push below so the chat transcript updates too.
+      const task = parseBackgroundTaskReminder(update);
+      if (task) {
+        const tasks = sessionBackgroundTasks.get(sessionKey) ?? [];
+        tasks.push(task);
+        sessionBackgroundTasks.set(sessionKey, tasks);
+        const ws = session.ws;
+        if (ws && ws.readyState === 1 /* OPEN */) {
+          ws.send(
+            JSON.stringify({
+              event: "background_task",
+              sessionId: sessionKey,
+              payload: { tasks },
+            }),
+          );
+        }
+      }
     }
     if (META_UPDATE_TAGS.has(updateTag)) {
       void sendSessionMeta(session.ws, sessionKey, session.handle);
@@ -1888,6 +1978,7 @@ wss.on("connection", (ws) => {
               console.error(`[acpx-server] Error closing runtime handle:`, err);
             }
             activeSessions.delete(sessionId);
+            sessionBackgroundTasks.delete(sessionId);
           }
           clearSessionHistoryPush(sessionId);
           break;
@@ -2103,6 +2194,7 @@ wss.on("connection", (ws) => {
 
             if (activeSession) {
               activeSessions.delete(sessionId);
+              sessionBackgroundTasks.delete(sessionId);
             }
             clearSessionHistoryPush(sessionId);
 
@@ -2504,6 +2596,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             event: "text_delta",
             text: event.text,
             type: event.stream || "output", // 'thought' or 'output'
+            ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
           });
         } else if (event.type === "tool_call") {
           console.log(
@@ -2526,6 +2619,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             event: "tool_call",
             toolName: resolveToolDisplayName(event),
             toolCallId: event.toolCallId,
+            ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
             ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
             ...(event.kind ? { kind: event.kind } : {}),
             ...(toolStatus ? { status: toolStatus } : {}),
@@ -2555,6 +2649,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
               toolName: resolveToolDisplayName(event),
               text: textContent,
               isError: toolStatus === "failed",
+              ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
             });
           }
         } else if (event.type === "error") {
@@ -2603,6 +2698,13 @@ async function runPromptTurn(session, sessionId, promptItem) {
           sendRuntimeTurnEvent(targetWs, sessionId, turn, {
             event: "plan",
             payload: { entries: event.planEntries },
+          });
+        } else if (event.type === "background_task" && Array.isArray(event.tasks)) {
+          // Background bash task snapshots (Grok Build runtime): full list on
+          // every update — the client replaces its task cards wholesale.
+          sendRuntimeTurnEvent(targetWs, sessionId, turn, {
+            event: "background_task",
+            payload: { tasks: event.tasks },
           });
         } else if (event.type === "status" && event.tag === "usage_update") {
           // Token/context usage + cost for the composer badge. used/size feed
@@ -3140,6 +3242,7 @@ async function killAllManagedAgents() {
     clearSessionHistoryPush(sessionId);
   }
   activeSessions.clear();
+  sessionBackgroundTasks.clear();
   agentSessionToClientSession.clear();
 }
 
