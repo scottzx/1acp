@@ -8,13 +8,19 @@
 
 `acpx deepseek-build` launches the installed Grok Build ACP server with an isolated DeepSeek provider profile. The profile uses DeepSeek's OpenAI-compatible API endpoint and does not reuse Grok's xAI login, cached token, or provider key.
 
-Set `DEEPSEEK_API_KEY` before starting acpx:
+Credentials are resolved in this order:
+
+1. Session environment `DEEPSEEK_API_KEY`
+2. Parent process environment `DEEPSEEK_API_KEY`
+3. The non-empty `api_key` of the `deepseek-api` provider in `~/.1agents/providers.json`
+
+You can still set the environment variable explicitly before starting acpx:
 
 ```bash
 export DEEPSEEK_API_KEY="placeholder"
 ```
 
-The built-in maps this key to the credential name expected by the Grok child process. `XAI_API_KEY` and `OPENAI_API_KEY` are not accepted as fallbacks for this profile.
+The built-in maps the resolved key to the credential name expected by the Grok child process. The active provider does not need to be DeepSeek; the providers file lookup uses the exact `deepseek-api` provider ID. `XAI_API_KEY`, `OPENAI_API_KEY`, other provider entries, and cached Grok credentials are not accepted as fallbacks for this profile.
 
 ## Quick Start
 

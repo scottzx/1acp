@@ -4,6 +4,8 @@ import path from "node:path";
 import type { AcpClientOptions } from "../types.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
+const DEEPSEEK_PROVIDER_ID = "deepseek-api";
+const ONE_AGENTS_PROVIDERS_PATH_SEGMENTS = [".1agents", "providers.json"] as const;
 // Third-party API gateways (ANTHROPIC_BASE_URL) need the model ids too: user
 // settings are excluded from the spawned Claude Code's settingSources, so the
 // ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL values configured there must be
@@ -22,6 +24,36 @@ const CLAUDE_SETTINGS_ENV_KEYS = [
 type ClaudeSettings = {
   env?: Record<string, unknown>;
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+export function readDeepSeekProviderApiKey(
+  providersPath = path.join(os.homedir(), ...ONE_AGENTS_PROVIDERS_PATH_SEGMENTS),
+): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(providersPath, "utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !isUnknownArray(parsed.providers)) {
+    return undefined;
+  }
+  const provider = parsed.providers.find(
+    (entry) => isRecord(entry) && entry.id === DEEPSEEK_PROVIDER_ID,
+  );
+  if (!isRecord(provider)) {
+    return undefined;
+  }
+  const apiKey = provider.api_key;
+  return typeof apiKey === "string" && apiKey.trim().length > 0 ? apiKey : undefined;
+}
 
 function readClaudeSettingsEnvironment(): Record<string, string> {
   const settingsPath = path.join(os.homedir(), ".claude", "settings.json");

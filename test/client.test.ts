@@ -420,13 +420,74 @@ test("AcpClient injects the isolated DeepSeek provider profile into Grok Build",
 });
 
 test("AcpClient requires DEEPSEEK_API_KEY instead of falling back to other provider keys", async () => {
-  await withEnv(
-    {
-      DEEPSEEK_API_KEY: undefined,
-      XAI_API_KEY: "fake",
-      OPENAI_API_KEY: "placeholder",
-    },
-    async () => {
+  await withTempHome(async () => {
+    await withEnv(
+      {
+        DEEPSEEK_API_KEY: undefined,
+        XAI_API_KEY: "fake",
+        OPENAI_API_KEY: "placeholder",
+      },
+      async () => {
+        const client = makeClient({
+          agentCommand: "grok agent --model deepseek-v4-flash stdio",
+          agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+        });
+
+        await assert.rejects(
+          async () => await asInternals(client).resolveAgentLaunchPlan?.(),
+          (error: unknown) =>
+            error instanceof AuthPolicyError &&
+            error.message.includes("DEEPSEEK_API_KEY") &&
+            error.detailCode === "AUTH_REQUIRED",
+        );
+      },
+    );
+  });
+});
+
+test("AcpClient loads the DeepSeek key from ~/.1agents/providers.json", async () => {
+  await withTempHome(async (homeDir) => {
+    const providersDir = path.join(homeDir, ".1agents");
+    await fs.mkdir(providersDir, { recursive: true });
+    await fs.writeFile(
+      path.join(providersDir, "providers.json"),
+      JSON.stringify({
+        active_provider_id: "other-provider",
+        providers: [
+          { id: "other-provider", api_key: "fake" },
+          { id: "deepseek-api", api_key: "test-auth-token" },
+        ],
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    await withEnv({ DEEPSEEK_API_KEY: undefined }, async () => {
+      const client = makeClient({
+        agentCommand: "grok agent --model deepseek-v4-flash stdio",
+        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+      });
+      const internals = asInternals(client);
+      const launch = await internals.resolveAgentLaunchPlan?.();
+
+      assert.ok(launch);
+      assert.equal(launch.spawnOptions.env.DEEPSEEK_API_KEY, "test-auth-token");
+      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "test-auth-token");
+      assert.deepEqual(internals.selectAuthMethod?.([{ id: "xai.api_key" }]), {
+        methodId: "xai.api_key",
+        credential: "test-auth-token",
+        source: "env",
+      });
+    });
+  });
+});
+
+test("AcpClient treats a malformed providers file as a missing DeepSeek key", async () => {
+  await withTempHome(async (homeDir) => {
+    const providersDir = path.join(homeDir, ".1agents");
+    await fs.mkdir(providersDir, { recursive: true });
+    await fs.writeFile(path.join(providersDir, "providers.json"), "{", "utf8");
+
+    await withEnv({ DEEPSEEK_API_KEY: undefined }, async () => {
       const client = makeClient({
         agentCommand: "grok agent --model deepseek-v4-flash stdio",
         agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
@@ -435,12 +496,10 @@ test("AcpClient requires DEEPSEEK_API_KEY instead of falling back to other provi
       await assert.rejects(
         async () => await asInternals(client).resolveAgentLaunchPlan?.(),
         (error: unknown) =>
-          error instanceof AuthPolicyError &&
-          error.message.includes("DEEPSEEK_API_KEY") &&
-          error.detailCode === "AUTH_REQUIRED",
+          error instanceof AuthPolicyError && error.detailCode === "AUTH_REQUIRED",
       );
-    },
-  );
+    });
+  });
 });
 
 test("AcpClient rejects an explicitly blank session DeepSeek key", async () => {
@@ -1714,6 +1773,15 @@ async function withEnv(
         process.env[key] = value;
       }
     }
+  }
+}
+
+async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-client-home-"));
+  try {
+    await withEnv({ HOME: homeDir }, async () => await run(homeDir));
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true });
   }
 }
 

@@ -89,7 +89,7 @@ Friendly agent names resolve to commands:
 - `cursor` -> `cursor-agent acp`
 - `copilot` -> `copilot --acp --stdio`
 - `deepseek-build` -> `grok agent --model deepseek-v4-flash stdio`
-  Requires `DEEPSEEK_API_KEY`; defaults to `deepseek-v4-flash` and supports `deepseek-v4-pro` through the existing `--model` option.
+  Resolves its key from session `DEEPSEEK_API_KEY`, parent `DEEPSEEK_API_KEY`, then the exact `deepseek-api` entry in `~/.1agents/providers.json`. Defaults to `deepseek-v4-flash` and supports `deepseek-v4-pro` through the existing `--model` option.
 - `droid` -> `droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
 - `fast-agent` -> `uvx fast-agent-mcp acp`
 - `grok-build` -> `grok agent stdio`

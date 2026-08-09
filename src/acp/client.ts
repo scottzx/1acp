@@ -88,6 +88,7 @@ import {
 import {
   applyClaudeSettingsEnvironment,
   buildAgentSpawnOptions,
+  readDeepSeekProviderApiKey,
   readEnvCredential,
   resolveConfiguredAuthCredential,
 } from "./auth-env.js";
@@ -209,16 +210,20 @@ function nonEmptyEnvironmentValue(value: string | undefined): string | undefined
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-function applyDeepSeekBuildEnvironment(env: NodeJS.ProcessEnv, enabled: boolean): void {
+function applyDeepSeekBuildEnvironment(
+  env: NodeJS.ProcessEnv,
+  enabled: boolean,
+  apiKey: string | undefined,
+): void {
   if (!enabled) {
     return;
   }
-  const apiKey = nonEmptyEnvironmentValue(env.DEEPSEEK_API_KEY);
   if (!apiKey) {
     throw new AuthPolicyError(
-      "deepseek-build requires a non-empty DEEPSEEK_API_KEY in the session or parent environment",
+      "deepseek-build requires a non-empty DEEPSEEK_API_KEY or deepseek-api key in ~/.1agents/providers.json",
     );
   }
+  env.DEEPSEEK_API_KEY = apiKey;
   env.GROK_XAI_API_BASE_URL = DEEPSEEK_BUILD_API_BASE_URL;
   env.GROK_MODELS_BASE_URL = DEEPSEEK_BUILD_API_BASE_URL;
   env.GROK_MODELS_LIST_URL = DEEPSEEK_BUILD_MODELS_URL;
@@ -899,7 +904,11 @@ export class AcpClient {
       this.options.sessionOptions?.env,
       isClaudeAcpCommand(spawnCommand, args),
     );
-    applyDeepSeekBuildEnvironment(spawnOptions.env, this.isDeepSeekBuildAgent());
+    applyDeepSeekBuildEnvironment(
+      spawnOptions.env,
+      this.isDeepSeekBuildAgent(),
+      this.readDeepSeekApiKey(),
+    );
     return {
       spawnCommand,
       args,
@@ -2018,7 +2027,7 @@ export class AcpClient {
     if (sessionValue !== undefined) {
       return nonEmptyEnvironmentValue(sessionValue);
     }
-    return nonEmptyEnvironmentValue(process.env.DEEPSEEK_API_KEY);
+    return nonEmptyEnvironmentValue(process.env.DEEPSEEK_API_KEY) ?? readDeepSeekProviderApiKey();
   }
 
   private applyGrokPermissionModeCompatibility(
