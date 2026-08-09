@@ -48,6 +48,7 @@ export const AGENT_REGISTRY: Record<string, string> = {
   gemini: "gemini --acp",
   cursor: "cursor-agent acp",
   copilot: "copilot --acp --stdio",
+  "deepseek-build": "grok agent --model deepseek-v4-flash stdio",
   droid: "droid exec --output-format acp",
   "fast-agent": "uvx fast-agent-mcp acp",
   "grok-build": "grok agent stdio",
@@ -76,6 +77,7 @@ export const AGENT_ARGV_REGISTRY: Record<string, string[]> = {
   gemini: ["gemini", "--acp"],
   cursor: ["cursor-agent", "acp"],
   copilot: ["copilot", "--acp", "--stdio"],
+  "deepseek-build": ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
   droid: ["droid", "exec", "--output-format", "acp"],
   "fast-agent": ["uvx", "fast-agent-mcp", "acp"],
   "grok-build": ["grok", "agent", "stdio"],
@@ -131,6 +133,7 @@ const AGENT_ALIASES: Record<string, string> = {
   "factory-droid": "droid",
   factorydroid: "droid",
   claudecode: "claude",
+  deepseekbuild: "deepseek-build",
 };
 
 export const DEFAULT_AGENT_NAME = "codex";

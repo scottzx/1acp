@@ -37,6 +37,10 @@ test("parseAcpJsonMessageLine preserves object-shaped protocol values", () => {
 });
 
 type ClientInternals = {
+  resolveAgentLaunchPlan?: () => Promise<{
+    args: string[];
+    spawnOptions: { env: NodeJS.ProcessEnv };
+  }>;
   selectAuthMethod?: (methods: Array<{ id: string }>) =>
     | {
         methodId: string;
@@ -374,6 +378,112 @@ test("AcpClient selects Grok Build cached_token as agent-managed auth", async ()
       );
 
       assert.equal(authenticatedMethod, "cached_token");
+    },
+  );
+});
+
+test("AcpClient injects the isolated DeepSeek provider profile into Grok Build", async () => {
+  await withEnv(
+    {
+      DEEPSEEK_API_KEY: "sample",
+      XAI_API_KEY: "fake",
+      OPENAI_API_KEY: "placeholder",
+      GROK_XAI_API_BASE_URL: "https://xai.example.test",
+      GROK_MODELS_BASE_URL: "https://models.example.test",
+      GROK_MODELS_LIST_URL: "https://models.example.test/list",
+      GROK_DEFAULT_MODEL: "ambient-model",
+      GROK_CODE_XAI_API_KEY: "test-token-placeholder",
+    },
+    async () => {
+      const client = makeClient({
+        agentCommand: "grok agent --model deepseek-v4-flash stdio",
+        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+        sessionOptions: {
+          env: {
+            DEEPSEEK_API_KEY: "test-auth-token",
+          },
+        },
+      });
+
+      const launch = await asInternals(client).resolveAgentLaunchPlan?.();
+      assert.ok(launch);
+      assert.deepEqual(launch.args, ["agent", "--model", "deepseek-v4-flash", "stdio"]);
+      assert.equal(launch.spawnOptions.env.DEEPSEEK_API_KEY, "test-auth-token");
+      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "test-auth-token");
+      assert.equal(launch.spawnOptions.env.GROK_XAI_API_BASE_URL, "https://api.deepseek.com");
+      assert.equal(launch.spawnOptions.env.GROK_MODELS_BASE_URL, "https://api.deepseek.com");
+      assert.equal(launch.spawnOptions.env.GROK_MODELS_LIST_URL, "https://api.deepseek.com/models");
+      assert.equal(launch.spawnOptions.env.GROK_DEFAULT_MODEL, "deepseek-v4-flash");
+      assert.equal(launch.spawnOptions.env.GROK_CODE_XAI_API_KEY, undefined);
+    },
+  );
+});
+
+test("AcpClient requires DEEPSEEK_API_KEY instead of falling back to other provider keys", async () => {
+  await withEnv(
+    {
+      DEEPSEEK_API_KEY: undefined,
+      XAI_API_KEY: "fake",
+      OPENAI_API_KEY: "placeholder",
+    },
+    async () => {
+      const client = makeClient({
+        agentCommand: "grok agent --model deepseek-v4-flash stdio",
+        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+      });
+
+      await assert.rejects(
+        async () => await asInternals(client).resolveAgentLaunchPlan?.(),
+        (error: unknown) =>
+          error instanceof AuthPolicyError &&
+          error.message.includes("DEEPSEEK_API_KEY") &&
+          error.detailCode === "AUTH_REQUIRED",
+      );
+    },
+  );
+});
+
+test("AcpClient rejects an explicitly blank session DeepSeek key", async () => {
+  await withEnv({ DEEPSEEK_API_KEY: "sample" }, async () => {
+    const client = makeClient({
+      agentCommand: "grok agent --model deepseek-v4-flash stdio",
+      agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+      sessionOptions: {
+        env: {
+          DEEPSEEK_API_KEY: "   ",
+        },
+      },
+    });
+
+    await assert.rejects(
+      async () => await asInternals(client).resolveAgentLaunchPlan?.(),
+      (error: unknown) => error instanceof AuthPolicyError && error.detailCode === "AUTH_REQUIRED",
+    );
+    assert.equal(asInternals(client).selectAuthMethod?.([{ id: "xai.api_key" }]), undefined);
+  });
+});
+
+test("AcpClient authenticates DeepSeek with its key and never selects Grok cached_token", async () => {
+  await withEnv(
+    {
+      DEEPSEEK_API_KEY: "test-auth-token",
+      XAI_API_KEY: "fake",
+      ACPX_AUTH_XAI_API_KEY: undefined,
+      ACPX_AUTH_CACHED_TOKEN: undefined,
+    },
+    async () => {
+      const client = makeClient({
+        agentCommand: "grok agent --model deepseek-v4-flash stdio",
+        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+      });
+      const internals = asInternals(client);
+
+      assert.deepEqual(internals.selectAuthMethod?.([{ id: "xai.api_key" }]), {
+        methodId: "xai.api_key",
+        credential: "test-auth-token",
+        source: "env",
+      });
+      assert.equal(internals.selectAuthMethod?.([{ id: "cached_token" }]), undefined);
     },
   );
 });

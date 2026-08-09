@@ -934,6 +934,44 @@ test("integration: built-in grok-build agent resolves to grok agent stdio", asyn
   });
 });
 
+test("integration: built-in deepseek-build injects its isolated Grok provider profile", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-deepseek-build-"));
+
+    try {
+      await writeFakeDeepSeekBuildAgent(fakeBinDir);
+
+      const result = await runCli(
+        [
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "quiet",
+          "deepseek-build",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+        {
+          env: {
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            DEEPSEEK_API_KEY: "test-auth-token",
+            XAI_API_KEY: "fake",
+          },
+        },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /hello/);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: built-in pool agent resolves to pool acp", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -4702,6 +4740,54 @@ async function writeFakeGrokBuildAgent(binDir: string): Promise<void> {
       '  echo "unexpected grok command: $*" 1>&2',
       "  exit 2",
       "fi",
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
+async function writeFakeDeepSeekBuildAgent(binDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "grok.cmd"),
+      [
+        "@echo off",
+        "setlocal",
+        'if not "%~1"=="agent" exit /b 2',
+        'if not "%~2"=="--model" exit /b 2',
+        'if not "%~3"=="deepseek-v4-flash" exit /b 2',
+        'if not "%~4"=="stdio" exit /b 2',
+        'if not "%GROK_XAI_API_BASE_URL%"=="https://api.deepseek.com" exit /b 3',
+        'if not "%GROK_MODELS_BASE_URL%"=="https://api.deepseek.com" exit /b 3',
+        'if not "%GROK_MODELS_LIST_URL%"=="https://api.deepseek.com/models" exit /b 3',
+        'if not "%GROK_DEFAULT_MODEL%"=="deepseek-v4-flash" exit /b 3',
+        'if not "%XAI_API_KEY%"=="test-auth-token" exit /b 3',
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" %5 %6 %7 %8 %9`,
+        "",
+      ].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "grok"),
+    [
+      "#!/bin/sh",
+      '[ "$1" = "agent" ] || exit 2',
+      '[ "$2" = "--model" ] || exit 2',
+      '[ "$3" = "deepseek-v4-flash" ] || exit 2',
+      '[ "$4" = "stdio" ] || exit 2',
+      '[ "$GROK_XAI_API_BASE_URL" = "https://api.deepseek.com" ] || exit 3',
+      '[ "$GROK_MODELS_BASE_URL" = "https://api.deepseek.com" ] || exit 3',
+      '[ "$GROK_MODELS_LIST_URL" = "https://api.deepseek.com/models" ] || exit 3',
+      '[ "$GROK_DEFAULT_MODEL" = "deepseek-v4-flash" ] || exit 3',
+      '[ "$XAI_API_KEY" = "test-auth-token" ] || exit 3',
+      "shift",
+      "shift",
+      "shift",
+      "shift",
       `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
       "",
     ].join("\n"),

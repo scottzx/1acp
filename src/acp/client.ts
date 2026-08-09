@@ -149,6 +149,9 @@ const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
+const DEEPSEEK_BUILD_DEFAULT_MODEL = "deepseek-v4-flash";
+const DEEPSEEK_BUILD_API_BASE_URL = "https://api.deepseek.com";
+const DEEPSEEK_BUILD_MODELS_URL = `${DEEPSEEK_BUILD_API_BASE_URL}/models`;
 const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
   "cognition.ai/requestDiagnostics": true,
 });
@@ -174,6 +177,55 @@ function isGrokPermissionMode(value: string): value is GrokPermissionMode {
 }
 
 type GrokShortCircuitOutcome = "allow_once" | "reject_once";
+
+type GrokAcpProfile = "deepseek" | "grok";
+
+function resolveGrokAcpProfile(
+  agentCommand: string,
+  agentArgv: string[] | undefined,
+): GrokAcpProfile | undefined {
+  const { command, args } = resolveAgentCommandParts(agentCommand, agentArgv);
+  const executable = command
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()
+    ?.replace(/\.(cmd|exe|ps1)$/iu, "")
+    .toLowerCase();
+  if (executable !== "grok" || args[0] !== "agent") {
+    return undefined;
+  }
+
+  const stdioIndex = args.indexOf("stdio", 1);
+  if (stdioIndex < 0) {
+    return undefined;
+  }
+  if (stdioIndex === 3 && args[1] === "--model" && args[2] === DEEPSEEK_BUILD_DEFAULT_MODEL) {
+    return "deepseek";
+  }
+  return "grok";
+}
+
+function nonEmptyEnvironmentValue(value: string | undefined): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function applyDeepSeekBuildEnvironment(env: NodeJS.ProcessEnv, enabled: boolean): void {
+  if (!enabled) {
+    return;
+  }
+  const apiKey = nonEmptyEnvironmentValue(env.DEEPSEEK_API_KEY);
+  if (!apiKey) {
+    throw new AuthPolicyError(
+      "deepseek-build requires a non-empty DEEPSEEK_API_KEY in the session or parent environment",
+    );
+  }
+  env.GROK_XAI_API_BASE_URL = DEEPSEEK_BUILD_API_BASE_URL;
+  env.GROK_MODELS_BASE_URL = DEEPSEEK_BUILD_API_BASE_URL;
+  env.GROK_MODELS_LIST_URL = DEEPSEEK_BUILD_MODELS_URL;
+  env.GROK_DEFAULT_MODEL = DEEPSEEK_BUILD_DEFAULT_MODEL;
+  env.XAI_API_KEY = apiKey;
+  delete env.GROK_CODE_XAI_API_KEY;
+}
 
 function isMutationKind(kind: string | undefined): boolean {
   return kind === "edit" || kind === "move" || kind === "delete";
@@ -841,6 +893,13 @@ export class AcpClient {
     if (isQoderAcpCommand(spawnCommand, args)) {
       args = buildQoderAcpCommandArgs(args, this.options);
     }
+    const spawnOptions = buildAgentSpawnOptions(
+      this.options.cwd,
+      this.options.authCredentials,
+      this.options.sessionOptions?.env,
+      isClaudeAcpCommand(spawnCommand, args),
+    );
+    applyDeepSeekBuildEnvironment(spawnOptions.env, this.isDeepSeekBuildAgent());
     return {
       spawnCommand,
       args,
@@ -850,12 +909,7 @@ export class AcpClient {
       copilotAcp: isCopilotAcpCommand(spawnCommand, args),
       claudeAcp: isClaudeAcpCommand(spawnCommand, args),
       codexAcp: isCodexAcpCommand(spawnCommand, args),
-      spawnOptions: buildAgentSpawnOptions(
-        this.options.cwd,
-        this.options.authCredentials,
-        this.options.sessionOptions?.env,
-        isClaudeAcpCommand(spawnCommand, args),
-      ),
+      spawnOptions,
     };
   }
 
@@ -1931,12 +1985,18 @@ export class AcpClient {
     if (!this.isGrokBuildAcpCommand() || methodId !== "xai.api_key") {
       return undefined;
     }
-    const value = process.env.XAI_API_KEY;
-    return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+    if (this.isDeepSeekBuildAgent()) {
+      return this.readDeepSeekApiKey();
+    }
+    return nonEmptyEnvironmentValue(process.env.XAI_API_KEY);
   }
 
   private selectAgentManagedAuthMethod(methodId: string): AuthSelection | undefined {
-    if (!this.isGrokBuildAcpCommand() || methodId !== "cached_token") {
+    if (
+      !this.isGrokBuildAcpCommand() ||
+      this.isDeepSeekBuildAgent() ||
+      methodId !== "cached_token"
+    ) {
       return undefined;
     }
     return {
@@ -1946,17 +2006,19 @@ export class AcpClient {
   }
 
   private isGrokBuildAcpCommand(): boolean {
-    const { command, args } = resolveAgentCommandParts(
-      this.options.agentCommand,
-      this.options.agentArgv,
-    );
-    const executable = command
-      .replace(/\\/g, "/")
-      .split("/")
-      .pop()
-      ?.replace(/\.(cmd|exe|ps1)$/iu, "")
-      .toLowerCase();
-    return executable === "grok" && args[0] === "agent" && args[1] === "stdio";
+    return resolveGrokAcpProfile(this.options.agentCommand, this.options.agentArgv) != null;
+  }
+
+  private isDeepSeekBuildAgent(): boolean {
+    return resolveGrokAcpProfile(this.options.agentCommand, this.options.agentArgv) === "deepseek";
+  }
+
+  private readDeepSeekApiKey(): string | undefined {
+    const sessionValue = this.options.sessionOptions?.env?.DEEPSEEK_API_KEY;
+    if (sessionValue !== undefined) {
+      return nonEmptyEnvironmentValue(sessionValue);
+    }
+    return nonEmptyEnvironmentValue(process.env.DEEPSEEK_API_KEY);
   }
 
   private applyGrokPermissionModeCompatibility(
