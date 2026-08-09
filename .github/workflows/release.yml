@@ -47,8 +47,8 @@ jobs:
           const { readFileSync } = require("node:fs");
 
           const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          const expectedAuthor = "OpenClaw Team <dev@openclaw.ai>";
-          const expectedRepoUrl = "https://github.com/openclaw/acpx";
+          const expectedAuthor = "scottzx";
+          const expectedRepoUrl = "https://github.com/scottzx/1acp";
 
           const normalizeRepoUrl = (value) =>
             String(value ?? "")
@@ -139,8 +139,10 @@ jobs:
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
           error_log="$(mktemp)"
 
-          if npm view "acpx@${PACKAGE_VERSION}" version >/dev/null 2>"${error_log}"; then
-            echo "acpx@$PACKAGE_VERSION is already published on npm."
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>"${error_log}"; then
+            echo "${PACKAGE_NAME}@$PACKAGE_VERSION is already published on npm."
             exit 1
           fi
 
@@ -149,7 +151,7 @@ jobs:
             exit 1
           fi
 
-          echo "Publishing acpx@$PACKAGE_VERSION"
+          echo "Publishing ${PACKAGE_NAME}@$PACKAGE_VERSION"
 
       - run: pnpm run lint
       - run: pnpm run typecheck

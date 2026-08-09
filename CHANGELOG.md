@@ -2,13 +2,17 @@
 
 <!-- markdownlint-disable MD024 -->
 
-Repo: https://github.com/openclaw/acpx
+Repo: https://github.com/scottzx/1acp
 
 ## Unreleased
 
 ### Changes
 
 - Docs/readme: rewrite the project front door to the house standard and route detailed CLI guidance to the existing documentation.
+
+- Agents/built-ins: add an isolated DeepSeek Build profile over `grok agent stdio`, using `DEEPSEEK_API_KEY`, DeepSeek's OpenAI-compatible endpoint, and separate session identity from Grok Build.
+
+- Distribution: publish the CLI as the `1acp` npm package with both `1acp` and upstream-compatible `acpx` executable names.
 
 ### Breaking
 

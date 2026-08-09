@@ -1,6 +1,6 @@
 {
-  "name": "acpx",
-  "version": "0.13.0",
+  "name": "1acp",
+  "version": "0.14.0",
   "description": "Headless CLI client for the Agent Client Protocol (ACP) — talk to coding agents from the command line",
   "keywords": [
     "acp",
@@ -12,12 +12,13 @@
     "coding-agent"
   ],
   "license": "MIT",
-  "author": "OpenClaw Team <dev@openclaw.ai>",
+  "author": "scottzx",
   "repository": {
     "type": "git",
-    "url": "https://github.com/openclaw/acpx"
+    "url": "https://github.com/scottzx/1acp"
   },
   "bin": {
+    "1acp": "dist/cli.js",
     "acpx": "dist/cli.js"
   },
   "files": [

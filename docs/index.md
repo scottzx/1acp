@@ -44,7 +44,7 @@ acpx flow run examples/flows/branch.flow.ts \
 
 ## Pick your path
 
-- **Trying it.** [Install](install.md) → [Quickstart](quickstart.md). Two minutes from `npm i -g acpx` to your first turn.
+- **Trying it.** [Install](install.md) → [Quickstart](quickstart.md). Two minutes from `npm i -g 1acp` to your first turn.
 - **Talking to a specific agent.** The [Agents](agents.md) page lists every built-in name and the upstream CLI it wraps.
 - **Wiring an automation.** [Output formats](output-formats.md) for the JSON envelope, [Sessions](sessions.md) for scope rules, [Permissions](permissions.md) for policy.
 - **Multi-step orchestration.** [Flows](flows.md) covers `acp` / `action` / `compute` / `decision` / `checkpoint` nodes and replay.

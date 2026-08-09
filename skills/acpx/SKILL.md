@@ -42,10 +42,10 @@ Core capabilities:
 ## Install
 
 ```bash
-npm i -g acpx
+npm i -g 1acp
 ```
 
-For normal session reuse, prefer a global install over `npx`.
+The package installs both `1acp` and the upstream-compatible `acpx` command. For normal session reuse, prefer a global install over `npx`.
 
 ## Command model
 
@@ -88,6 +88,8 @@ Friendly agent names resolve to commands:
 - `gemini` -> `gemini --acp`
 - `cursor` -> `cursor-agent acp`
 - `copilot` -> `copilot --acp --stdio`
+- `deepseek-build` -> `grok agent --model deepseek-v4-flash stdio`
+  Requires `DEEPSEEK_API_KEY`; defaults to `deepseek-v4-flash` and supports `deepseek-v4-pro` through the existing `--model` option.
 - `droid` -> `droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
 - `fast-agent` -> `uvx fast-agent-mcp acp`
 - `grok-build` -> `grok agent stdio`

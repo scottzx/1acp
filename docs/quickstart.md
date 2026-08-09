@@ -8,11 +8,11 @@ This walks through the smallest useful path: install `acpx`, point it at a codin
 ## 1. Install
 
 ```bash
-npm install -g acpx@latest
+npm install -g 1acp@latest
 acpx --version
 ```
 
-If you would rather not install globally, every command below works with `npx acpx@latest …`. ([Install](install.md) covers options.)
+If you would rather not install globally, every command below works with `npx 1acp@latest …`. ([Install](install.md) covers options.)
 
 ## 2. Pick an agent
 
