@@ -74,6 +74,10 @@ export type AcpRuntimeEnsureInput = {
    * different sessionKey or closing the prior record first.
    */
   sessionOptions?: SessionAgentOptions;
+  /** Host-resolved argv. Never sourced from a persisted user profile. */
+  agentArgv?: string[];
+  /** Credentials for this process lifetime only; never persisted. */
+  authCredentials?: Record<string, string>;
 };
 
 export type AcpRuntimeTurnAttachment = {

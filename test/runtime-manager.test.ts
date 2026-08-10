@@ -3167,10 +3167,21 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
     agent: "codex",
     mode: "persistent",
     sessionOptions: { systemPrompt: "Be terse." },
+    agentArgv: ["grok", "agent", "--model", "provider-model", "stdio"],
+    authCredentials: { "xai.api_key": "must-not-persist" },
   });
 
   assert.equal(factoryCalls.length, 1);
   assert.deepEqual(factoryCalls[0]?.sessionOptions, { systemPrompt: "Be terse." });
+  assert.deepEqual(factoryCalls[0]?.agentArgv, [
+    "grok",
+    "agent",
+    "--model",
+    "provider-model",
+    "stdio",
+  ]);
+  assert.deepEqual(factoryCalls[0]?.authCredentials, { "xai.api_key": "must-not-persist" });
+  assert.equal(JSON.stringify(record).includes("must-not-persist"), false);
   assert.deepEqual(record.acpx?.session_options, {
     model: undefined,
     allowed_tools: undefined,

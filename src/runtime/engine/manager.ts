@@ -656,6 +656,8 @@ export class AcpRuntimeManager {
   // Per-record serialization for out-of-turn session-update writes.
   private readonly outOfTurnUpdateChains = new Map<string, Promise<void>>();
   private readonly closingActiveRecords = new Set<string>();
+  // Refreshed on every ensure and deliberately excluded from SessionRecord.
+  private readonly transientCredentials = new Map<string, Record<string, string>>();
 
   constructor(
     private readonly options: AcpRuntimeOptions,
@@ -760,6 +762,7 @@ export class AcpRuntimeManager {
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
       onExitPlanMode: this.options.onExitPlanMode,
+      authCredentials: this.transientCredentials.get(record.acpxRecordId),
       verbose: this.options.verbose,
       timeoutMs: this.options.timeoutMs,
       resumePolicy: resumePolicyForSessionMode(sessionMode),
@@ -777,23 +780,41 @@ export class AcpRuntimeManager {
     cwd?: string;
     resumeSessionId?: string;
     sessionOptions?: SessionAgentOptions;
+    agentArgv?: string[];
+    authCredentials?: Record<string, string>;
   }): Promise<SessionRecord> {
     const cwd = path.resolve(input.cwd?.trim() || this.options.cwd);
     const { agentCommand, agentArgv } = normalizeAgentCommandInput(
-      this.options.agentRegistry.resolve(input.agent),
+      input.agentArgv?.length ? input.agentArgv : this.options.agentRegistry.resolve(input.agent),
     );
     const reused = await this.reuseExistingRecord(input, cwd, agentCommand);
     if (reused) {
+      this.rememberTransientCredentials(reused.acpxRecordId, input.authCredentials);
       return reused;
     }
 
+    return this.initializeFreshSession(input, cwd, agentCommand, agentArgv);
+  }
+
+  private async initializeFreshSession(
+    input: {
+      sessionKey: string;
+      agent: string;
+      mode: "persistent" | "oneshot";
+      cwd?: string;
+      resumeSessionId?: string;
+      sessionOptions?: SessionAgentOptions;
+      agentArgv?: string[];
+      authCredentials?: Record<string, string>;
+    },
+    cwd: string,
+    agentCommand: string,
+    agentArgv: string[],
+  ): Promise<SessionRecord> {
     const client = this.createClient({
       agentCommand,
       agentArgv,
       cwd,
-      // Per-session mcpServers (e.g. the AI Project Manager's project-locked
-      // task tools) are appended to the runtime-level servers for this new
-      // session's client.
       mcpServers: [...(this.options.mcpServers ?? []), ...(input.sessionOptions?.mcpServers ?? [])],
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
@@ -802,6 +823,7 @@ export class AcpRuntimeManager {
       onExitPlanMode: this.options.onExitPlanMode,
       verbose: this.options.verbose,
       sessionOptions: input.sessionOptions,
+      authCredentials: input.authCredentials,
     });
     let keepClientOpen = false;
 
@@ -821,6 +843,7 @@ export class AcpRuntimeManager {
         cwd,
         session,
       });
+      this.rememberTransientCredentials(record.acpxRecordId, input.authCredentials);
       keepClientOpen = await this.keepPersistentClient(input.mode, record.acpxRecordId, client);
       return record;
     } finally {
@@ -828,6 +851,17 @@ export class AcpRuntimeManager {
         await client.close();
       }
     }
+  }
+
+  private rememberTransientCredentials(
+    recordId: string,
+    credentials: Record<string, string> | undefined,
+  ): void {
+    if (!credentials || Object.keys(credentials).length === 0) {
+      this.transientCredentials.delete(recordId);
+      return;
+    }
+    this.transientCredentials.set(recordId, { ...credentials });
   }
 
   async adoptSession(input: {
@@ -1354,6 +1388,7 @@ export class AcpRuntimeManager {
       onExitPlanMode: this.options.onExitPlanMode,
       verbose: this.options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
+      authCredentials: this.transientCredentials.get(record.acpxRecordId),
     });
   }
 
@@ -1802,6 +1837,7 @@ export class AcpRuntimeManager {
     record.closed = true;
     record.closedAt = isoNow();
     await this.options.sessionStore.save(record);
+    this.transientCredentials.delete(record.acpxRecordId);
   }
 
   private async closeBackendSession(record: SessionRecord): Promise<void> {
@@ -1819,6 +1855,7 @@ export class AcpRuntimeManager {
         onPermissionRequest: this.options.onPermissionRequest,
         onAskUserQuestion: this.options.onAskUserQuestion,
         onExitPlanMode: this.options.onExitPlanMode,
+        authCredentials: this.transientCredentials.get(record.acpxRecordId),
         verbose: this.options.verbose,
       });
 

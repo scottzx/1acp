@@ -191,6 +191,8 @@ export class AcpxRuntime implements AcpxRuntimeLike {
       cwd: input.cwd ?? this.options.cwd,
       resumeSessionId: input.resumeSessionId,
       sessionOptions: input.sessionOptions,
+      agentArgv: input.agentArgv,
+      authCredentials: input.authCredentials,
     });
 
     const handle: AcpRuntimeHandle = {

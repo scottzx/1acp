@@ -88,7 +88,6 @@ import {
 import {
   applyClaudeSettingsEnvironment,
   buildAgentSpawnOptions,
-  readDeepSeekProviderApiKey,
   readEnvCredential,
   resolveConfiguredAuthCredential,
 } from "./auth-env.js";
@@ -220,7 +219,7 @@ function applyDeepSeekBuildEnvironment(
   }
   if (!apiKey) {
     throw new AuthPolicyError(
-      "deepseek-build requires a non-empty DEEPSEEK_API_KEY or deepseek-api key in ~/.1agents/providers.json",
+      "deepseek-build requires transient xai.api_key credentials or DEEPSEEK_API_KEY",
     );
   }
   env.DEEPSEEK_API_KEY = apiKey;
@@ -2023,11 +2022,15 @@ export class AcpClient {
   }
 
   private readDeepSeekApiKey(): string | undefined {
+    const transient = resolveConfiguredAuthCredential("xai.api_key", this.options.authCredentials);
+    if (transient !== undefined) {
+      return nonEmptyEnvironmentValue(transient);
+    }
     const sessionValue = this.options.sessionOptions?.env?.DEEPSEEK_API_KEY;
     if (sessionValue !== undefined) {
       return nonEmptyEnvironmentValue(sessionValue);
     }
-    return nonEmptyEnvironmentValue(process.env.DEEPSEEK_API_KEY) ?? readDeepSeekProviderApiKey();
+    return nonEmptyEnvironmentValue(process.env.DEEPSEEK_API_KEY);
   }
 
   private applyGrokPermissionModeCompatibility(

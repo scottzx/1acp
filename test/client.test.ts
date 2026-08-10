@@ -445,7 +445,7 @@ test("AcpClient requires DEEPSEEK_API_KEY instead of falling back to other provi
   });
 });
 
-test("AcpClient loads the DeepSeek key from ~/.1agents/providers.json", async () => {
+test("AcpClient uses transient DeepSeek credentials and ignores providers.json", async () => {
   await withTempHome(async (homeDir) => {
     const providersDir = path.join(homeDir, ".1agents");
     await fs.mkdir(providersDir, { recursive: true });
@@ -465,17 +465,18 @@ test("AcpClient loads the DeepSeek key from ~/.1agents/providers.json", async ()
       const client = makeClient({
         agentCommand: "grok agent --model deepseek-v4-flash stdio",
         agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
+        authCredentials: { "xai.api_key": "transient-auth-token" },
       });
       const internals = asInternals(client);
       const launch = await internals.resolveAgentLaunchPlan?.();
 
       assert.ok(launch);
-      assert.equal(launch.spawnOptions.env.DEEPSEEK_API_KEY, "test-auth-token");
-      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "test-auth-token");
+      assert.equal(launch.spawnOptions.env.DEEPSEEK_API_KEY, "transient-auth-token");
+      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "transient-auth-token");
       assert.deepEqual(internals.selectAuthMethod?.([{ id: "xai.api_key" }]), {
         methodId: "xai.api_key",
-        credential: "test-auth-token",
-        source: "env",
+        credential: "transient-auth-token",
+        source: "config",
       });
     });
   });

@@ -1150,6 +1150,7 @@ wss.on("connection", (ws) => {
             acpSessionId,
             permissionMode,
             env,
+            launch,
           } = payload;
 
           console.time(`ensure_session_${sessionId}`);
@@ -1202,6 +1203,82 @@ wss.on("connection", (ws) => {
               sessionOptions.env = safeEnv;
             }
           }
+          const launchArgv = Array.isArray(launch?.argv)
+            ? launch.argv.filter((value) => typeof value === "string" && value.length > 0)
+            : [];
+          if (launchArgv.length > 0) {
+            if (
+              launchArgv.length !== 5 ||
+              launchArgv[0] !== "grok" ||
+              launchArgv[1] !== "agent" ||
+              launchArgv[2] !== "--model" ||
+              launchArgv[3].startsWith("-") ||
+              launchArgv[4] !== "stdio" ||
+              launch?.model !== launchArgv[3]
+            ) {
+              sendError(
+                ws,
+                sessionId,
+                "INVALID_LAUNCH",
+                "Only the code-owned grok-build launch shape is accepted",
+              );
+              return;
+            }
+            if (launch.env && typeof launch.env === "object" && !Array.isArray(launch.env)) {
+              const allowedLaunchEnv = new Set([
+                "GROK_XAI_API_BASE_URL",
+                "GROK_MODELS_BASE_URL",
+                "GROK_MODELS_LIST_URL",
+                "GROK_DEFAULT_MODEL",
+              ]);
+              const launchEnvEntries = Object.entries(launch.env);
+              if (
+                launchEnvEntries.some(
+                  ([key, value]) => !allowedLaunchEnv.has(key) || typeof value !== "string",
+                ) ||
+                launch.env.GROK_DEFAULT_MODEL !== launchArgv[3]
+              ) {
+                sendError(ws, sessionId, "INVALID_LAUNCH", "Invalid grok-build environment");
+                return;
+              }
+              sessionOptions.env = {
+                ...sessionOptions.env,
+                ...Object.fromEntries(launchEnvEntries),
+              };
+            }
+            if (typeof launch.model === "string" && launch.model.trim()) {
+              sessionOptions.model = launch.model.trim();
+            }
+          }
+          const transientCredentials =
+            launch?.transientCredentials &&
+            typeof launch.transientCredentials === "object" &&
+            !Array.isArray(launch.transientCredentials)
+              ? Object.fromEntries(
+                  Object.entries(launch.transientCredentials).filter(
+                    ([key, value]) => typeof key === "string" && typeof value === "string",
+                  ),
+                )
+              : undefined;
+          if (
+            transientCredentials &&
+            Object.keys(transientCredentials).some((key) => key !== "xai.api_key")
+          ) {
+            sendError(ws, sessionId, "INVALID_LAUNCH", "Invalid grok-build credential type");
+            return;
+          }
+          const profileId = typeof launch?.profileId === "string" ? launch.profileId : "";
+          const profileRevision = Number.isInteger(launch?.profileRevision)
+            ? launch.profileRevision
+            : 0;
+          const previousProfileId =
+            typeof launch?.previousProfileId === "string" ? launch.previousProfileId : "";
+          const previousProfileRevision = Number.isInteger(launch?.previousProfileRevision)
+            ? launch.previousProfileRevision
+            : 0;
+          const runtimeSessionKey = profileId
+            ? `${sessionId}@${profileId}-r${profileRevision}`
+            : sessionId;
 
           // Prefer the explicit resumeSessionId (the agent-side UUID
           // recorded in the 1agents index); fall back to acpSessionId
@@ -1213,11 +1290,46 @@ wss.on("connection", (ws) => {
           // never accidentally widens permissions.
           const seededMode = isValidPermissionMode(permissionMode) ? permissionMode : null;
 
-          const existingSession = activeSessions.get(sessionId);
+          let existingSession = activeSessions.get(sessionId);
+          const profileChanged = Boolean(
+            profileId &&
+            ((existingSession &&
+              (existingSession.profileId !== profileId ||
+                existingSession.profileRevision !== profileRevision)) ||
+              (!existingSession &&
+                previousProfileRevision > 0 &&
+                (previousProfileId !== profileId || previousProfileRevision !== profileRevision))),
+          );
+          if (existingSession && profileChanged) {
+            unregisterAgentSessionMapping(existingSession.handle);
+            try {
+              if (existingSession.activeTurn) {
+                await existingSession.activeTurn.cancel({ reason: "Profile upgraded" });
+              }
+              await cancelSessionQueue(existingSession, sessionId);
+              await runtime.close({ handle: existingSession.handle, reason: "Profile upgraded" });
+            } catch (err) {
+              console.warn(`[acpx-server] Profile upgrade close failed for ${sessionId}:`, err);
+            }
+            activeSessions.delete(sessionId);
+            existingSession = null;
+          }
           if (existingSession) {
             console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
             notifySessionTakenOver(existingSession.ws, ws, sessionId);
             existingSession.ws = ws;
+            if (launchArgv.length > 0) {
+              await runtime.ensureSession({
+                sessionKey: runtimeSessionKey,
+                agent: agentType,
+                mode: "persistent",
+                cwd: normalizedPath,
+                resumeSessionId: resumeId || undefined,
+                sessionOptions,
+                agentArgv: launchArgv,
+                authCredentials: transientCredentials,
+              });
+            }
             // Only seed the in-memory mode from the store when nothing is
             // set yet. Never overwrite a live mode with a (possibly stale)
             // store value — that would let a PATCH that hasn't completed
@@ -1233,17 +1345,17 @@ wss.on("connection", (ws) => {
             // order here is Map insertion order (request arrival).
             for (const pending of pendingPermissions.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
+                sendRuntimeTurnEvent(ws, sessionId, existingSession.activeTurn, pending.payload);
               }
             }
             for (const pending of pendingAskUserQuestions.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
+                sendRuntimeTurnEvent(ws, sessionId, existingSession.activeTurn, pending.payload);
               }
             }
             for (const pending of pendingExitPlanModes.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
+                sendRuntimeTurnEvent(ws, sessionId, existingSession.activeTurn, pending.payload);
               }
             }
             registerAgentSessionMapping(sessionId, existingSession.handle);
@@ -1301,7 +1413,12 @@ wss.on("connection", (ws) => {
           }
 
           // Phase 2: Instant pre-warm hit for fresh grok-build sessions if CWD matches!
-          if (agentType === "grok-build" && !resumeId && prewarmedGrokHandle) {
+          if (
+            agentType === "grok-build" &&
+            launchArgv.length === 0 &&
+            !resumeId &&
+            prewarmedGrokHandle
+          ) {
             if (prewarmedGrokCwd === normalizedPath) {
               console.time(`ensure_session_${sessionId}`);
               console.log(
@@ -1358,14 +1475,26 @@ wss.on("connection", (ws) => {
           );
 
           console.time(`ensure_session_${sessionId}`);
-          const sessionPromise = runtime.ensureSession({
-            sessionKey: sessionId,
+          let profileResumeFallback = profileChanged && !resumeId;
+          const ensureInput = {
+            sessionKey: runtimeSessionKey,
             agent: agentType,
             mode: "persistent",
             cwd: normalizedPath,
             resumeSessionId: resumeId || undefined,
             sessionOptions,
-          });
+            agentArgv: launchArgv.length > 0 ? launchArgv : undefined,
+            authCredentials: transientCredentials,
+          };
+          const sessionPromise = (async () => {
+            try {
+              return await runtime.ensureSession(ensureInput);
+            } catch (err) {
+              if (!profileChanged || !resumeId) {throw err;}
+              profileResumeFallback = true;
+              return await runtime.ensureSession({ ...ensureInput, resumeSessionId: undefined });
+            }
+          })();
           initializingSessions.set(sessionId, sessionPromise);
 
           try {
@@ -1374,7 +1503,7 @@ wss.on("connection", (ws) => {
             console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);
 
             // Asynchronously trigger background pre-warm after a cold spawn using the new CWD
-            if (agentType === "grok-build") {
+            if (agentType === "grok-build" && launchArgv.length === 0) {
               setTimeout(() => prewarmGrokSession(normalizedPath), 500);
             }
 
@@ -1392,6 +1521,8 @@ wss.on("connection", (ws) => {
               // brand-new session) so the mode check at line ~925 never
               // has to special-case null/undefined.
               permissionMode: seededMode ?? "approve-reads",
+              profileId,
+              profileRevision,
             });
             registerAgentSessionMapping(sessionId, handle);
 
@@ -1405,6 +1536,17 @@ wss.on("connection", (ws) => {
               }),
             );
             void sendSessionMeta(ws, sessionId, handle);
+            if (profileChanged) {
+              ws.send(
+                JSON.stringify({
+                  event: "profile_upgraded",
+                  sessionId,
+                  profileId,
+                  profileRevision,
+                  resumed: !profileResumeFallback,
+                }),
+              );
+            }
           } finally {
             initializingSessions.delete(sessionId);
           }
