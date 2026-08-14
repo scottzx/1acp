@@ -160,6 +160,7 @@ export function createRuntimeOptions(params: {
   cwd: string;
   sessionStore: AcpSessionStore;
   agentRegistry?: AcpAgentRegistry;
+  permissionPolicy?: AcpRuntimeOptions["permissionPolicy"];
   timeoutMs?: number;
 }): AcpRuntimeOptions {
   return {
@@ -175,5 +176,6 @@ export function createRuntimeOptions(params: {
       },
     },
     permissionMode: "approve-reads",
+    permissionPolicy: params.permissionPolicy,
   };
 }

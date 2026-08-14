@@ -55,6 +55,7 @@ export type {
   AcpRuntimeDoctorReport,
   AcpRuntimeEnsureInput,
   AcpRuntimeEvent,
+  AcpTextDeltaOriginMeta,
   AcpRuntimeHandle,
   AcpRuntimeOptions,
   AcpRuntimePromptMode,
@@ -72,6 +73,7 @@ export type {
   AcpSessionRecord,
   AcpSessionStore,
   AcpSessionUpdateTag,
+  PermissionPolicy,
   SessionAgentOptions,
   SystemPromptOption,
 } from "./runtime/public/contract.js";
@@ -301,6 +303,9 @@ export class AcpxRuntime implements AcpxRuntimeLike {
     );
     return {
       requestId: input.requestId,
+      get promptStarted() {
+        return turnPromise.then((turn) => turn.promptStarted);
+      },
       events: {
         async *[Symbol.asyncIterator]() {
           const turn = await turnPromise;

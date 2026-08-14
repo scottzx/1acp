@@ -11,6 +11,7 @@ import type {
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
+  PermissionPolicy,
   SessionRecord,
   SessionResumePolicy,
 } from "../../types.js";
@@ -43,6 +44,7 @@ export type WithConnectedSessionOptions<T> = {
   mcpServers?: McpServer[];
   permissionMode?: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
   onPermissionRequest?: (
     req: AcpPermissionRequest,
     ctx: { signal: AbortSignal },
@@ -106,6 +108,7 @@ export async function withConnectedSession<T>(
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
       nonInteractivePermissions: options.nonInteractivePermissions,
+      permissionPolicy: options.permissionPolicy,
       onPermissionRequest: options.onPermissionRequest,
       onAskUserQuestion: options.onAskUserQuestion,
       onExitPlanMode: options.onExitPlanMode,
@@ -123,6 +126,7 @@ export async function withConnectedSession<T>(
       mcpServers: options.mcpServers,
       permissionMode: options.permissionMode ?? "approve-reads",
       nonInteractivePermissions: options.nonInteractivePermissions,
+      permissionPolicy: options.permissionPolicy,
       onPermissionRequest: options.onPermissionRequest,
       onAskUserQuestion: options.onAskUserQuestion,
       onExitPlanMode: options.onExitPlanMode,

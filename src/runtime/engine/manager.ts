@@ -106,6 +106,9 @@ type Deferred<T> = {
   reject: (error: unknown) => void;
 };
 
+type SettledAttempt<T> = { ok: true; value: T } | { ok: false; error: unknown };
+type FailedAttempt = Extract<SettledAttempt<unknown>, { ok: false }>;
+
 function createDeferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
@@ -114,6 +117,20 @@ function createDeferred<T>(): Deferred<T> {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+async function settleAttempt<T>(run: () => T | Promise<T>): Promise<SettledAttempt<T>> {
+  try {
+    return { ok: true, value: await run() };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+function firstFailedAttempt(
+  attempts: readonly SettledAttempt<unknown>[],
+): FailedAttempt | undefined {
+  return attempts.find((attempt): attempt is FailedAttempt => !attempt.ok);
 }
 
 class AsyncEventQueue {
@@ -493,6 +510,7 @@ type RuntimeTurnTask = {
   };
   promptInput: PromptInput | string;
   queue: AsyncEventQueue;
+  promptStarted: Deferred<void>;
   sessionReady: Deferred<void>;
   state: RuntimeTurnTaskState;
   settleResult: (next: AcpRuntimeTurnResult) => void;
@@ -759,6 +777,7 @@ export class AcpRuntimeManager {
       mcpServers: [...(this.options.mcpServers ?? [])],
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
+      permissionPolicy: this.options.permissionPolicy,
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
       onExitPlanMode: this.options.onExitPlanMode,
@@ -809,7 +828,7 @@ export class AcpRuntimeManager {
     },
     cwd: string,
     agentCommand: string,
-    agentArgv: string[],
+    agentArgv?: string[],
   ): Promise<SessionRecord> {
     const client = this.createClient({
       agentCommand,
@@ -818,6 +837,7 @@ export class AcpRuntimeManager {
       mcpServers: [...(this.options.mcpServers ?? []), ...(input.sessionOptions?.mcpServers ?? [])],
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
+      permissionPolicy: this.options.permissionPolicy,
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
       onExitPlanMode: this.options.onExitPlanMode,
@@ -1204,6 +1224,8 @@ export class AcpRuntimeManager {
     const promptInput = toPromptInput(input.text, input.attachments);
     const queue = new AsyncEventQueue();
     const result = createDeferred<AcpRuntimeTurnResult>();
+    const promptStarted = createDeferred<void>();
+    void promptStarted.promise.catch(() => {});
     const sessionReady = createDeferred<void>();
     void sessionReady.promise.catch(() => {});
     let resultSettled = false;
@@ -1247,6 +1269,7 @@ export class AcpRuntimeManager {
     };
     if (input.signal) {
       if (input.signal.aborted) {
+        promptStarted.reject(new Error("ACP turn cancelled before prompt submission."));
         closeStream();
         settleResult({
           status: "cancelled",
@@ -1256,6 +1279,7 @@ export class AcpRuntimeManager {
         });
         return {
           requestId: input.requestId,
+          promptStarted: promptStarted.promise,
           events: queue.iterate(),
           result: result.promise,
           cancel: async () => {},
@@ -1269,6 +1293,7 @@ export class AcpRuntimeManager {
       input,
       promptInput,
       queue,
+      promptStarted,
       sessionReady,
       state,
       settleResult,
@@ -1277,6 +1302,7 @@ export class AcpRuntimeManager {
 
     return {
       requestId: input.requestId,
+      promptStarted: promptStarted.promise,
       events: queue.iterate(),
       result: result.promise,
       cancel: async () => {
@@ -1290,41 +1316,61 @@ export class AcpRuntimeManager {
 
   private async runRuntimeTurnTask(task: RuntimeTurnTask): Promise<void> {
     let turn: RunningRuntimeTurn | undefined;
+    let terminalResult: AcpRuntimeTurnResult;
     try {
       turn = await this.prepareRuntimeTurn(task);
       const { sessionId, resumed, loadError } = await this.connectRuntimeTurn(task, turn);
       await this.resolveRuntimeTurnReady(task, turn, resumed, loadError);
-      if (await this.cancelRuntimeTurnBeforePrompt(task, turn)) {
-        return;
-      }
-      await this.applyPendingRuntimeTurnCancel(task, turn);
-      const response = await runPromptTurn({
-        client: turn.client,
-        sessionId,
-        prompt: task.promptInput,
-        timeoutMs: task.input.timeoutMs ?? this.options.timeoutMs,
-        conversation: turn.conversation,
-        promptMessageId: turn.promptMessageId,
-      });
-      const status = response.stopReason === "cancelled" ? "cancelled" : "completed";
-      await this.saveTerminalRuntimeTurn(turn, status, response.stopReason);
-      const promptMessageId = turn.promptMessageId ?? task.input.requestId;
-      task.settleResult({
-        status,
-        ...(response.stopReason ? { stopReason: response.stopReason } : {}),
-        ...(finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId)
-          ? {
-              finalAnswer: finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId),
-            }
-          : {}),
-        promptMessageId,
-        runtimeRequestId: task.input.requestId,
-      });
+      terminalResult = await this.executeRuntimeTurnPrompt(task, turn, sessionId);
     } catch (error) {
-      await this.failRuntimeTurn(task, turn, error);
-    } finally {
-      await this.finalizeRuntimeTurn(task, turn);
+      terminalResult = await this.failRuntimeTurn(task, turn, error);
     }
+    try {
+      await this.finalizeRuntimeTurn(task, turn);
+    } catch (error) {
+      terminalResult = await this.failRuntimeTurn(task, turn, error);
+    }
+    task.settleResult(terminalResult);
+  }
+
+  private async executeRuntimeTurnPrompt(
+    task: RuntimeTurnTask,
+    turn: RunningRuntimeTurn,
+    sessionId: string,
+  ): Promise<AcpRuntimeTurnResult> {
+    if (await this.cancelRuntimeTurnBeforePrompt(task, turn)) {
+      await this.saveTerminalRuntimeTurn(turn, "cancelled", "cancelled");
+      return {
+        status: "cancelled",
+        stopReason: "cancelled",
+        promptMessageId: turn.promptMessageId ?? task.input.requestId,
+        runtimeRequestId: task.input.requestId,
+      };
+    }
+    await this.applyPendingRuntimeTurnCancel(task, turn);
+    const response = await runPromptTurn({
+      client: turn.client,
+      sessionId,
+      prompt: task.promptInput,
+      timeoutMs: task.input.timeoutMs ?? this.options.timeoutMs,
+      conversation: turn.conversation,
+      promptMessageId: turn.promptMessageId,
+      onPromptRequestStarted: () => task.promptStarted.resolve(),
+    });
+    const status = response.stopReason === "cancelled" ? "cancelled" : "completed";
+    await this.saveTerminalRuntimeTurn(turn, status, response.stopReason);
+    const promptMessageId = turn.promptMessageId ?? task.input.requestId;
+    return {
+      status,
+      ...(response.stopReason ? { stopReason: response.stopReason } : {}),
+      ...(finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId)
+        ? {
+            finalAnswer: finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId),
+          }
+        : {}),
+      promptMessageId,
+      runtimeRequestId: task.input.requestId,
+    };
   }
 
   private async prepareRuntimeTurn(task: RuntimeTurnTask): Promise<RunningRuntimeTurn> {
@@ -1383,6 +1429,7 @@ export class AcpRuntimeManager {
       mcpServers: [...(this.options.mcpServers ?? [])],
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
+      permissionPolicy: this.options.permissionPolicy,
       onPermissionRequest: this.options.onPermissionRequest,
       onAskUserQuestion: this.options.onAskUserQuestion,
       onExitPlanMode: this.options.onExitPlanMode,
@@ -1608,19 +1655,13 @@ export class AcpRuntimeManager {
 
   private async cancelRuntimeTurnBeforePrompt(
     task: RuntimeTurnTask,
-    turn: RunningRuntimeTurn,
+    _turn: RunningRuntimeTurn,
   ): Promise<boolean> {
     if (!task.state.pendingCancel && !task.input.signal?.aborted) {
       return false;
     }
     task.state.pendingCancel = false;
-    await this.saveTerminalRuntimeTurn(turn, "cancelled", "cancelled");
-    task.settleResult({
-      status: "cancelled",
-      stopReason: "cancelled",
-      promptMessageId: turn.promptMessageId ?? task.input.requestId,
-      runtimeRequestId: task.input.requestId,
-    });
+    task.promptStarted.reject(new Error("ACP turn cancelled before prompt submission."));
     return true;
   }
 
@@ -1660,7 +1701,8 @@ export class AcpRuntimeManager {
     task: RuntimeTurnTask,
     turn: RunningRuntimeTurn | undefined,
     error: unknown,
-  ): Promise<void> {
+  ): Promise<AcpRuntimeTurnResult> {
+    task.promptStarted.reject(error);
     task.sessionReady.reject(error);
     const normalized = normalizeOutputError(error, { origin: "runtime" });
     if (turn) {
@@ -1671,7 +1713,7 @@ export class AcpRuntimeManager {
         normalized.code ?? normalized.detailCode,
       );
     }
-    task.settleResult({
+    return {
       status: "failed",
       error: {
         message: normalized.message,
@@ -1681,7 +1723,7 @@ export class AcpRuntimeManager {
       },
       ...(turn?.promptMessageId ? { promptMessageId: turn.promptMessageId } : {}),
       runtimeRequestId: task.input.requestId,
-    });
+    };
   }
 
   private async finalizeRuntimeTurn(
@@ -1689,12 +1731,46 @@ export class AcpRuntimeManager {
     turn: RunningRuntimeTurn | undefined,
   ): Promise<void> {
     task.state.turnActive = false;
-    task.input.signal?.removeEventListener("abort", task.abortHandler);
-    turn?.client.clearEventHandlers();
-    const pooled = turn ? await this.finalizeRuntimeTurnRecord(turn) : false;
-    if (!pooled) {
-      await turn?.client.close().catch(() => {});
+    const abortHandlerAttempt = await settleAttempt(() =>
+      task.input.signal?.removeEventListener("abort", task.abortHandler),
+    );
+    const clearHandlersAttempt = await settleAttempt(() => turn?.client.clearEventHandlers());
+    const recordAttempt = await settleAttempt(async () =>
+      turn ? await this.finalizeRuntimeTurnRecord(turn) : false,
+    );
+    const failure = firstFailedAttempt([abortHandlerAttempt, clearHandlersAttempt, recordAttempt]);
+    let pooled = recordAttempt.ok ? recordAttempt.value : false;
+    if (failure) {
+      this.discardRetainedRuntimeTurnClient(turn);
+      pooled = false;
     }
+    await this.closeRuntimeTurnClient(turn, pooled);
+    this.cleanupRuntimeTurn(task, turn);
+    if (failure) {
+      throw failure.error;
+    }
+  }
+
+  private discardRetainedRuntimeTurnClient(turn: RunningRuntimeTurn | undefined): void {
+    if (!turn || this.pendingPersistentClients.get(turn.record.acpxRecordId) !== turn.client) {
+      return;
+    }
+    this.pendingPersistentClients.delete(turn.record.acpxRecordId);
+  }
+
+  private async closeRuntimeTurnClient(
+    turn: RunningRuntimeTurn | undefined,
+    pooled: boolean,
+  ): Promise<void> {
+    if (!turn || pooled) {
+      return;
+    }
+    try {
+      await turn.client.close();
+    } catch {}
+  }
+
+  private cleanupRuntimeTurn(task: RuntimeTurnTask, turn: RunningRuntimeTurn | undefined): void {
     if (turn) {
       this.activeControllers.delete(turn.record.acpxRecordId);
       this.closingActiveRecords.delete(turn.record.acpxRecordId);
@@ -1852,6 +1928,7 @@ export class AcpRuntimeManager {
         mcpServers: [...(this.options.mcpServers ?? [])],
         permissionMode: this.options.permissionMode,
         nonInteractivePermissions: this.options.nonInteractivePermissions,
+        permissionPolicy: this.options.permissionPolicy,
         onPermissionRequest: this.options.onPermissionRequest,
         onAskUserQuestion: this.options.onAskUserQuestion,
         onExitPlanMode: this.options.onExitPlanMode,

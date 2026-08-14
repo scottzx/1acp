@@ -8,6 +8,7 @@ import type {
   AcpRuntimeUsageBreakdown,
   AcpRuntimeUsageCost,
   AcpSessionUpdateTag,
+  AcpTextDeltaOriginMeta,
 } from "./contract.js";
 import { asOptionalString, asString, asTrimmedString, isRecord } from "./shared.js";
 
@@ -146,12 +147,63 @@ function backgroundTaskStatusText(payload: Record<string, unknown>): string | nu
   return `background tasks: ${completed}/${total} (${running} running, ${failed} failed)`;
 }
 
+/**
+ * Documented allowlist for text_delta.meta origin fields.
+ * Only these keys may be copied from ACP update `_meta`.
+ * Unknown keys (including secret-like producer-controlled names) are dropped.
+ */
+const ORIGIN_META_KEYS = [
+  "origin",
+  "kind",
+  "source",
+] as const satisfies readonly (keyof AcpTextDeltaOriginMeta)[];
+
+/**
+ * Preserve a fail-closed subset of ACP update origin fields for text_delta
+ * consumers. Empty or unusable values are omitted rather than inferred.
+ */
+function extractTextDeltaOrigin(payload: Record<string, unknown>): {
+  messageId?: string;
+  meta?: AcpTextDeltaOriginMeta;
+} {
+  const messageId = asOptionalString(payload.messageId);
+  const meta = sanitizeOriginMeta(payload._meta);
+  return {
+    ...(messageId ? { messageId } : {}),
+    ...(meta ? { meta } : {}),
+  };
+}
+
+/**
+ * Copy only allowlisted string origin keys from wire `_meta`.
+ * Nested objects, arrays, non-strings, and unknown keys are dropped.
+ */
+function sanitizeOriginMeta(value: unknown): AcpTextDeltaOriginMeta | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const out: AcpTextDeltaOriginMeta = {};
+  for (const key of ORIGIN_META_KEYS) {
+    const entry = value[key];
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const trimmed = entry.trim();
+    if (!trimmed) {
+      continue;
+    }
+    out[key] = trimmed;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function resolveTextChunk(params: {
   payload: Record<string, unknown>;
   stream: "output" | "thought";
   tag: AcpSessionUpdateTag;
   meta?: Record<string, unknown>;
 }): AcpRuntimeEvent | null {
+  const origin = extractTextDeltaOrigin(params.payload);
   const contentRaw = params.payload.content;
   if (isRecord(contentRaw)) {
     const contentType = asTrimmedString(contentRaw.type);
@@ -166,6 +218,7 @@ function resolveTextChunk(params: {
         stream: params.stream,
         tag: params.tag,
         ...readAgentTurnId(params.meta),
+        ...origin,
       };
     }
   }
@@ -179,6 +232,7 @@ function resolveTextChunk(params: {
     stream: params.stream,
     tag: params.tag,
     ...readAgentTurnId(params.meta),
+    ...origin,
   };
 }
 

@@ -17,13 +17,14 @@ import type {
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
+  PermissionPolicy,
   SessionRecord,
 } from "../../types.js";
 import type { SessionAgentOptions } from "../engine/session-options.js";
 
 export type { SessionAgentOptions, SystemPromptOption } from "../engine/session-options.js";
 
-export type { AcpPermissionDecision, AcpPermissionRequest } from "../../types.js";
+export type { AcpPermissionDecision, AcpPermissionRequest, PermissionPolicy } from "../../types.js";
 export type {
   AcpRuntimeConfigOption,
   AcpRuntimeConfigOptionChoice,
@@ -239,6 +240,16 @@ export type AcpRuntimeDoctorReport = {
   details?: string[];
 };
 
+/**
+ * Fail-closed origin metadata on `text_delta` events.
+ * Only these optional string fields are preserved from ACP wire `_meta`.
+ */
+export type AcpTextDeltaOriginMeta = {
+  origin?: string;
+  kind?: string;
+  source?: string;
+};
+
 export type AcpRuntimeEvent =
   | {
       type: "text_delta";
@@ -251,6 +262,25 @@ export type AcpRuntimeEvent =
        * subagent text from the main feed.
        */
       agentTurnId?: string;
+      /**
+       * Present when the originating ACP session update carried a non-empty
+       * `messageId`. Absent when the wire payload had no id.
+       * Opaque producer-supplied routing hint only: ACPX does not authenticate
+       * this value. Do not treat it as proof of authorship or as an
+       * authorization boundary. Useful for correlating chunks from the same
+       * producer message when the adapter includes an id.
+       */
+      messageId?: string;
+      /**
+       * Allowlisted origin fields from the ACP update `_meta`.
+       * Only the documented string keys `origin`, `kind`, and `source` are
+       * preserved. All other keys (including nested objects and secret-like
+       * producer-controlled names) are dropped. Omitted when none remain.
+       * These values are opaque producer-supplied routing hints, not
+       * authenticated authorship or provenance. Consumers must not use them
+       * as an authorization boundary.
+       */
+      meta?: AcpTextDeltaOriginMeta;
     }
   | {
       type: "status";
@@ -365,7 +395,14 @@ export type AcpRuntimeTurnResult =
 
 export interface AcpRuntimeTurn {
   readonly requestId: string;
+  /** Resolves after `connection.prompt()` returns its request promise. */
+  readonly promptStarted: Promise<void>;
   readonly events: AsyncIterable<AcpRuntimeEvent>;
+  /**
+   * Canonical completion signal for the turn. Resolves only after final record
+   * checkpoint/persistence and runtime client pooling or close cleanup attempts
+   * have settled.
+   */
   readonly result: Promise<AcpRuntimeTurnResult>;
   cancel(input?: { reason?: string }): Promise<void>;
   closeStream(input?: { reason?: string }): Promise<void>;
@@ -436,6 +473,7 @@ export type AcpRuntimeOptions = {
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
   timeoutMs?: number;
   probeAgent?: string;
   verbose?: boolean;
