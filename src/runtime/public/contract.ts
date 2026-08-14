@@ -321,10 +321,6 @@ export type AcpRuntimeEvent =
       tasks?: AcpRuntimeBackgroundTask[];
     }
   | {
-      type: "background_task";
-      tasks?: AcpRuntimeBackgroundTask[];
-    }
-  | {
       type: "tool_call";
       text: string;
       tag?: AcpSessionUpdateTag;

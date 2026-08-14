@@ -9,6 +9,11 @@ import {
   createAgentRegistry,
   createTurnJournal,
 } from "./src/runtime.js";
+import {
+  historyToolInput,
+  resolveRuntimeTurnId,
+  stampHistoryTurnIds,
+} from "./src/session/history-turn-ids.js";
 
 // ----------------------------------------------------
 // Configurations
@@ -650,8 +655,10 @@ function extractFromRuntimeRecord(record) {
   let currentTurnId;
   for (const msg of record.messages) {
     if (msg.User && Array.isArray(msg.User.content)) {
-      currentTurnId =
-        typeof msg.User.id === "string" && turnResults[msg.User.id] ? msg.User.id : undefined;
+      currentTurnId = resolveRuntimeTurnId(
+        typeof msg.User.id === "string" ? msg.User.id : undefined,
+        turnResults,
+      );
       const parts = [];
       for (const c of msg.User.content) {
         if (c && c.Text !== undefined) {
@@ -689,8 +696,9 @@ function extractFromRuntimeRecord(record) {
           items.push({
             kind: "tool_use",
             toolName: c.ToolUse.name || c.ToolUse.tool_name || c.ToolUse.toolName || "tool",
-            input: c.ToolUse.input ?? c.ToolUse.raw_input ?? {},
+            input: historyToolInput(c.ToolUse),
             toolCallId: c.ToolUse.id,
+            ...(c.ToolUse.kind ? { toolKind: c.ToolUse.kind } : {}),
             ...(currentTurnId ? { turnId: currentTurnId } : {}),
           });
         }
@@ -786,23 +794,23 @@ async function loadSessionHistory(sessionId, payload = {}) {
   const prefersNativeHistory = agentType === "claude" || agentType === "claudecode";
 
   const runtimeItems = await loadRuntimeHistory(sessionId, session);
-  if (runtimeItems.some((item) => item.turnId)) {
-    return runtimeItems;
-  }
-  if (prefersNativeHistory) {
+  let items = runtimeItems;
+  if (!runtimeItems.some((item) => item.turnId) && prefersNativeHistory) {
     const nativeItems = await loadNativeHistory(historyContext);
     if (nativeItems.length > 0) {
-      return nativeItems;
+      items = nativeItems;
     }
-  }
-  if (runtimeItems.length > 0) {
-    return runtimeItems;
+  } else if (runtimeItems.length === 0) {
+    items = await loadNativeHistory(historyContext);
   }
 
-  if (!prefersNativeHistory) {
-    return await loadNativeHistory(historyContext);
+  let turns = [];
+  try {
+    turns = (await turnJournal.snapshot(sessionId)).turns;
+  } catch (err) {
+    console.warn(`[acpx-server] Turn journal snapshot failed for ${sessionId}:`, err.message);
   }
-  return [];
+  return stampHistoryTurnIds(items, turns);
 }
 
 function runtimeMessageText(content) {
@@ -1490,7 +1498,9 @@ wss.on("connection", (ws) => {
             try {
               return await runtime.ensureSession(ensureInput);
             } catch (err) {
-              if (!profileChanged || !resumeId) {throw err;}
+              if (!profileChanged || !resumeId) {
+                throw err;
+              }
               profileResumeFallback = true;
               return await runtime.ensureSession({ ...ensureInput, resumeSessionId: undefined });
             }

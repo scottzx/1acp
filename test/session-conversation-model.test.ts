@@ -13,6 +13,38 @@ import {
 } from "../src/session/conversation-model.js";
 import type { SessionAcpxState } from "../src/types.js";
 
+test("conversation model persists ACP kind and locations for Cursor-style file tools", () => {
+  const conversation = createSessionConversation("2026-08-14T00:00:00.000Z");
+  recordPromptSubmission(conversation, "edit the file", "2026-08-14T00:00:00.000Z");
+  recordSessionUpdate(
+    conversation,
+    undefined,
+    {
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call-edit",
+        title: "Edit File",
+        status: "completed",
+        kind: "edit",
+        locations: [{ path: "src/app.ts" }],
+        rawInput: {},
+      },
+    },
+    "2026-08-14T00:00:01.000Z",
+  );
+
+  const agent = conversation.messages.find((message) => "Agent" in message);
+  assert.ok(agent && "Agent" in agent);
+  const tool = agent.Agent.content.find(
+    (entry) => "ToolUse" in entry && entry.ToolUse.id === "call-edit",
+  );
+  assert.ok(tool && "ToolUse" in tool);
+  assert.equal(tool.ToolUse.name, "Edit File");
+  assert.equal(tool.ToolUse.kind, "edit");
+  assert.deepEqual(tool.ToolUse.locations, [{ path: "src/app.ts" }]);
+});
+
 test("conversation model captures prompt, chunks, tool calls, and metadata", () => {
   const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
   let acpxState = undefined;

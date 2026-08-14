@@ -298,6 +298,10 @@ export type SessionToolUse = {
   input: unknown;
   is_input_complete: boolean;
   thought_signature?: string | null;
+  /** ACP ToolKind when the adapter sent one (Cursor often titles tools "Edit File"). */
+  kind?: string;
+  /** ACP locations — Cursor file tools persist empty input and only put paths here. */
+  locations?: Array<{ path: string; line?: number }>;
 };
 
 export type SessionToolResultContent =
