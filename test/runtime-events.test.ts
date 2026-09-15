@@ -291,31 +291,14 @@ test("parsePromptEventLine handles runtime status-style updates", () => {
     parsePromptEventLine(
       JSON.stringify({
         sessionUpdate: "plan",
-        entries: [
-          { content: "first step", status: "completed", priority: "high" },
-          { content: "second step", status: "in_progress" },
-          { content: "third step", status: "bogus" },
-        ],
+        entries: [{ content: "first step" }],
       }),
     ),
     {
       type: "status",
-      text: "plan updated (3)",
+      text: "plan: first step",
       tag: "plan",
-      planEntries: [
-        { content: "first step", status: "completed", priority: "high" },
-        { content: "second step", status: "in_progress" },
-        // Unknown status falls back to "pending"; missing priority stays off.
-        { content: "third step", status: "pending" },
-      ],
     },
-  );
-
-  // A plan with no renderable entries falls back to the text-only status,
-  // which yields null (nothing to show) rather than a bogus checklist.
-  assert.equal(
-    parsePromptEventLine(JSON.stringify({ sessionUpdate: "plan", entries: [{}] })),
-    null,
   );
 
   assert.deepEqual(
@@ -375,7 +358,12 @@ test("parsePromptEventLine ignores unsupported structured payloads and treats ra
     type: "status",
     text: "operation",
   });
-  assert.equal(parsePromptEventLine(JSON.stringify({ type: "plan", entries: [] })), null);
+  assert.deepEqual(parsePromptEventLine(JSON.stringify({ type: "plan", entries: [] })), {
+    type: "status",
+    text: "plan updated",
+    tag: "plan",
+    entries: [],
+  });
   assert.deepEqual(parsePromptEventLine(JSON.stringify(["not", "an", "object"])), {
     type: "status",
     text: '["not","an","object"]',
@@ -877,6 +865,119 @@ test("parsePromptEventLine preserves origin on agent_thought_chunk", () => {
       tag: "agent_thought_chunk",
       messageId: "thought_1",
       meta: { origin: "assistant" },
+    },
+  );
+});
+
+test("parsePromptEventLine surfaces structured plan entries", () => {
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "plan",
+        entries: [
+          { content: "first step", status: "in_progress", priority: "high" },
+          { content: "second step", status: "pending" },
+        ],
+      }),
+    ),
+    {
+      type: "status",
+      text: "plan: first step",
+      tag: "plan",
+      entries: [
+        { content: "first step", status: "in_progress", priority: "high" },
+        { content: "second step", status: "pending" },
+      ],
+    },
+  );
+
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "plan",
+            entries: [{ content: "enveloped", status: "completed", priority: "low" }],
+          },
+        },
+      }),
+    ),
+    {
+      type: "status",
+      text: "plan: enveloped",
+      tag: "plan",
+      entries: [{ content: "enveloped", status: "completed", priority: "low" }],
+    },
+  );
+
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "plan",
+        entries: [
+          { content: "kept", status: "completed", priority: "urgent" },
+          null,
+          "skip",
+          { content: "  ", status: "pending" },
+          { content: "dropped", status: "bogus" },
+          { content: "also kept", status: "pending", priority: "low" },
+        ],
+      }),
+    ),
+    {
+      type: "status",
+      text: "plan: kept",
+      tag: "plan",
+      entries: [
+        { content: "kept", status: "completed" },
+        { content: "also kept", status: "pending", priority: "low" },
+      ],
+    },
+  );
+
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "plan",
+        entries: [{ content: "status-less still narrates" }],
+      }),
+    ),
+    {
+      type: "status",
+      text: "plan: status-less still narrates",
+      tag: "plan",
+    },
+  );
+});
+
+test("parsePromptEventLine preserves explicit empty plan replacements", () => {
+  assert.deepEqual(parsePromptEventLine(JSON.stringify({ sessionUpdate: "plan", entries: [] })), {
+    type: "status",
+    text: "plan updated",
+    tag: "plan",
+    entries: [],
+  });
+});
+
+test("parsePromptEventLine recovers plan snapshots with malformed leading entries", () => {
+  assert.deepEqual(
+    parsePromptEventLine(
+      JSON.stringify({
+        sessionUpdate: "plan",
+        entries: [
+          { content: "  ", status: "pending" },
+          { content: "usable step", status: "in_progress", priority: "high" },
+        ],
+      }),
+    ),
+    {
+      type: "status",
+      text: "plan: usable step",
+      tag: "plan",
+      entries: [{ content: "usable step", status: "in_progress", priority: "high" }],
     },
   );
 });

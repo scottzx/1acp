@@ -1,4 +1,9 @@
-import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientprotocol/sdk";
+import type {
+  SetSessionConfigOptionResponse,
+  ToolCallContent,
+  ToolCallLocation,
+  ToolKind,
+} from "@agentclientprotocol/sdk";
 import type { AcpRuntimeConfigOption } from "../../acp/config-option-support.js";
 import type {
   GrokAskUserAnswers,
@@ -12,8 +17,11 @@ import type {
 } from "../../acp/grok-exit-plan.js";
 import type { AcpRuntimeSessionModes } from "../../acp/mode-support.js";
 import type {
+  AcpElicitationHandler,
+  AcpElicitationMode,
   AcpPermissionDecision,
   AcpPermissionRequest,
+  AcpProcessLifecycle,
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
@@ -24,7 +32,22 @@ import type { SessionAgentOptions } from "../engine/session-options.js";
 
 export type { SessionAgentOptions, SystemPromptOption } from "../engine/session-options.js";
 
-export type { AcpPermissionDecision, AcpPermissionRequest, PermissionPolicy } from "../../types.js";
+export type {
+  AcpElicitationHandler,
+  AcpElicitationMode,
+  AcpElicitationContext,
+  AcpElicitationRequest,
+  AcpElicitationResponse,
+  AcpPermissionDecision,
+  AcpPermissionRequest,
+  AcpProcessExit,
+  AcpProcessLaunch,
+  AcpProcessLaunchScope,
+  AcpProcessLifecycle,
+  AcpProcessSpawnFailure,
+  AcpProcessStarted,
+  PermissionPolicy,
+} from "../../types.js";
 export type {
   AcpRuntimeConfigOption,
   AcpRuntimeConfigOptionChoice,
@@ -98,6 +121,8 @@ export type AcpRuntimeTurnInput = {
   requestId: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Handles ACP elicitation requests owned by this prompt turn. */
+  onElicitation?: AcpElicitationHandler;
 };
 
 export type AcpRuntimeCapabilities = {
@@ -310,10 +335,11 @@ export type AcpRuntimeEvent =
        */
       currentModeId?: string;
       /**
-       * Populated on `plan` events: the agent's full execution plan
-       * (TodoWrite / Codex plan). The complete list on every update — the
-       * host replaces its checklist wholesale.
+       * Normalized entries on `plan` events; malformed entries are skipped.
+       * Replace the displayed plan when present, including clearing it for [].
        */
+      entries?: AcpRuntimePlanEntry[];
+      /** Compatibility alias for entries */
       planEntries?: AcpRuntimePlanEntry[];
     }
   | {
@@ -347,6 +373,7 @@ export type AcpRuntimeEvent =
   | {
       type: "done";
       stopReason?: string;
+      _meta?: Record<string, unknown> | null;
     }
   /**
    * Compatibility failure event emitted by runTurn(...). startTurn(...).events
@@ -374,6 +401,7 @@ export type AcpRuntimeTurnResult =
       finalAnswer?: string;
       promptMessageId?: string;
       runtimeRequestId?: string;
+      _meta?: Record<string, unknown> | null;
     }
   | {
       status: "cancelled";
@@ -381,6 +409,7 @@ export type AcpRuntimeTurnResult =
       finalAnswer?: string;
       promptMessageId?: string;
       runtimeRequestId?: string;
+      _meta?: Record<string, unknown> | null;
     }
   | {
       status: "failed";
@@ -391,7 +420,7 @@ export type AcpRuntimeTurnResult =
 
 export interface AcpRuntimeTurn {
   readonly requestId: string;
-  /** Resolves after `connection.prompt()` returns its request promise. */
+  /** Resolves after the underlying writable transport accepts the prompt request. */
   readonly promptStarted: Promise<void>;
   readonly events: AsyncIterable<AcpRuntimeEvent>;
   /**
@@ -435,7 +464,11 @@ export interface AcpRuntime {
   }): Promise<AcpRuntimeCapabilities> | AcpRuntimeCapabilities;
   getStatus?(input: { handle: AcpRuntimeHandle; signal?: AbortSignal }): Promise<AcpRuntimeStatus>;
   setMode?(input: { handle: AcpRuntimeHandle; mode: string }): Promise<void>;
-  setConfigOption?(input: { handle: AcpRuntimeHandle; key: string; value: string }): Promise<void>;
+  setConfigOption?(input: {
+    handle: AcpRuntimeHandle;
+    key: string;
+    value: string;
+  }): Promise<SetSessionConfigOptionResponse | void>;
   doctor?(): Promise<AcpRuntimeDoctorReport>;
   cancel(input: { handle: AcpRuntimeHandle; reason?: string }): Promise<void>;
   close(input: {
@@ -464,6 +497,8 @@ export interface AcpAgentRegistry {
 
 export type AcpRuntimeOptions = {
   cwd: string;
+  /** Trusted child-only environment, snapshotted at construction and never persisted. */
+  agentProcessEnv?: Record<string, string>;
   sessionStore: AcpSessionStore;
   agentRegistry: AcpAgentRegistry;
   mcpServers?: McpServer[];
@@ -473,6 +508,10 @@ export type AcpRuntimeOptions = {
   timeoutMs?: number;
   probeAgent?: string;
   verbose?: boolean;
+  /** ACP elicitation modes the embedding host can render for prompt turns. */
+  elicitationModes?: readonly AcpElicitationMode[];
+  /** Optional lifecycle observer for ACP agent processes owned by this runtime. */
+  processLifecycle?: AcpProcessLifecycle;
   onPermissionRequest?: (
     req: AcpPermissionRequest,
     ctx: { signal: AbortSignal },

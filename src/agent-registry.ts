@@ -3,9 +3,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ACP_ADAPTER_PACKAGE_RANGES = {
-  pi: "^0.0.31",
+  pi: "^0.0.33",
   codex: "^1.1.5",
-  claude: "^0.60.0",
+  claude: "^0.76.0",
   mux: "^0.28.0",
   opencode: "^1.17.0",
 } as const;
@@ -56,6 +56,7 @@ export const AGENT_REGISTRY: Record<string, string> = {
   kilocode: "npx -y @kilocode/cli acp",
   kimi: "kimi acp",
   kiro: "kiro-cli-chat acp",
+  mcode: "mcode acp",
   mux: `npx -y mux@${ACP_ADAPTER_PACKAGE_RANGES.mux} acp`,
   opencode: "npx -y opencode-ai acp",
   pool: "pool acp",
@@ -85,6 +86,7 @@ export const AGENT_ARGV_REGISTRY: Record<string, string[]> = {
   kilocode: ["npx", "-y", "@kilocode/cli", "acp"],
   kimi: ["kimi", "acp"],
   kiro: ["kiro-cli-chat", "acp"],
+  mcode: ["mcode", "acp"],
   mux: ["npx", "-y", `mux@${ACP_ADAPTER_PACKAGE_RANGES.mux}`, "acp"],
   opencode: ["npx", "-y", "opencode-ai", "acp"],
   pool: ["pool", "acp"],

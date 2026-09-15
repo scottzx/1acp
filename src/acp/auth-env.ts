@@ -138,42 +138,49 @@ function baseAgentEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
-function applyAuthCredentials(
-  env: NodeJS.ProcessEnv,
-  authCredentials: Record<string, string> | undefined,
-): Set<string> {
-  const protectedKeys = promotePrefixedAuthEnvironment(env);
-  for (const [methodId, credential] of Object.entries(authCredentials ?? {})) {
-    addAuthCredentialEnvKeys(protectedKeys, methodId, credential);
-    assignAuthCredentialEnv(env, methodId, credential);
-  }
-  return protectedKeys;
-}
-
-function applySessionEnvironment(
-  env: NodeJS.ProcessEnv,
-  sessionEnv: Record<string, string> | undefined,
-  protectedKeys: Set<string>,
-): void {
-  for (const [key, value] of Object.entries(sessionEnv ?? {})) {
-    if (typeof value !== "string" || protectedKeys.has(protectedEnvKey(key))) {
-      continue;
+function validateAgentProcessEnv(agentProcessEnv: Record<string, string> | undefined): void {
+  for (const [key, value] of Object.entries(agentProcessEnv ?? {})) {
+    if (
+      typeof value !== "string" ||
+      key.includes("=") ||
+      key.includes("\u0000") ||
+      value.includes("\u0000")
+    ) {
+      throw new Error(
+        "Invalid agentProcessEnv: environment entries cannot contain NUL or names with '='",
+      );
     }
-    assignSessionEnv(env, key, value);
   }
 }
 
 function buildAgentEnvironment(
   authCredentials: Record<string, string> | undefined,
   sessionEnv: Record<string, string> | undefined,
-  includeClaudeSettings: boolean,
+  agentProcessEnv: Record<string, string> | undefined,
+  includeClaudeSettings = false,
 ): NodeJS.ProcessEnv {
-  const env = baseAgentEnvironment();
+  validateAgentProcessEnv(agentProcessEnv);
+  const env: NodeJS.ProcessEnv = baseAgentEnvironment();
   if (includeClaudeSettings) {
     applyClaudeSettingsEnvironment(env);
   }
-  const protectedKeys = applyAuthCredentials(env, authCredentials);
-  applySessionEnvironment(env, sessionEnv, protectedKeys);
+  const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
+  if (authCredentials) {
+    for (const [methodId, credential] of Object.entries(authCredentials)) {
+      addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
+      assignAuthCredentialEnv(env, methodId, credential);
+    }
+  }
+
+  for (const overlay of [sessionEnv, agentProcessEnv]) {
+    for (const [key, value] of Object.entries(overlay ?? {})) {
+      if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) {
+        continue;
+      }
+      assignSessionEnv(env, key, value);
+    }
+  }
+
   return env;
 }
 
@@ -245,6 +252,7 @@ export function buildAgentSpawnOptions(
   cwd: string,
   authCredentials: Record<string, string> | undefined,
   sessionEnv?: Record<string, string>,
+  agentProcessEnvOrClaudeSettings?: Record<string, string> | boolean,
   includeClaudeSettings = false,
 ): {
   cwd: string;
@@ -252,9 +260,16 @@ export function buildAgentSpawnOptions(
   stdio: ["pipe", "pipe", "pipe"];
   windowsHide: true;
 } {
+  let agentProcessEnv: Record<string, string> | undefined;
+  let claudeSettings = includeClaudeSettings;
+  if (typeof agentProcessEnvOrClaudeSettings === "boolean") {
+    claudeSettings = agentProcessEnvOrClaudeSettings;
+  } else if (agentProcessEnvOrClaudeSettings && typeof agentProcessEnvOrClaudeSettings === "object") {
+    agentProcessEnv = agentProcessEnvOrClaudeSettings;
+  }
   return {
     cwd,
-    env: buildAgentEnvironment(authCredentials, sessionEnv, includeClaudeSettings),
+    env: buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv, claudeSettings),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   };

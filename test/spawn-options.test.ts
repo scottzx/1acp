@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveClaudeCodeExecutable } from "../src/acp/agent-command.js";
-import { resolveAgentSessionCwd } from "../src/acp/client-process.js";
+import { resolveAgentSessionCwd, runTimedExecFile } from "../src/acp/client-process.js";
 import { buildAgentSpawnOptions, buildSpawnCommandOptions } from "../src/acp/client.js";
 import { buildTerminalSpawnOptions } from "../src/acp/terminal-manager.js";
 import { buildQueueOwnerSpawnOptions } from "../src/cli/session/queue-owner-process.js";
@@ -117,6 +117,53 @@ test("buildAgentSpawnOptions injects Claude settings only when requested", async
     }
     await fs.rm(home, { recursive: true, force: true });
   }
+});
+
+test("runtime environment overrides session values without changing protected credentials or parent", () => {
+  const options = buildAgentSpawnOptions(
+    os.tmpdir(),
+    { "runtime-token": "synthetic-credential" },
+    { ACPX_TEST_RUNTIME_OVERLAY: "session", RUNTIME_TOKEN: "session-credential" },
+    {
+      ACPX_TEST_RUNTIME_OVERLAY: "runtime",
+      RUNTIME_TOKEN: "runtime-credential",
+      ACPX_AUTH_RUNTIME_TOKEN: "runtime-prefixed",
+    },
+  );
+  assert.equal(options.env.ACPX_TEST_RUNTIME_OVERLAY, "runtime");
+  assert.equal(options.env.RUNTIME_TOKEN, "synthetic-credential");
+  assert.equal(options.env.ACPX_AUTH_RUNTIME_TOKEN, "synthetic-credential");
+  assert.equal(process.env.ACPX_TEST_RUNTIME_OVERLAY, undefined);
+});
+
+test("runtime environment uses Windows case collision and credential protection rules", () => {
+  withPlatform("win32", () => {
+    const options = buildAgentSpawnOptions(
+      os.tmpdir(),
+      { "runtime-token": "synthetic-credential" },
+      { ACPX_TEST_RUNTIME_OVERLAY: "session" },
+      { acpx_test_runtime_overlay: "runtime", runtime_token: "override" },
+    );
+    assert.equal(options.env.ACPX_TEST_RUNTIME_OVERLAY, undefined);
+    assert.equal(options.env.acpx_test_runtime_overlay, "runtime");
+    assert.equal(options.env.RUNTIME_TOKEN, "synthetic-credential");
+    assert.equal(options.env.runtime_token, undefined);
+  });
+});
+
+test("invalid runtime environment fails without echoing the supplied value", () => {
+  assert.throws(
+    () =>
+      buildAgentSpawnOptions(os.tmpdir(), undefined, undefined, {
+        VALID_NAME: "private-marker\u0000",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /Invalid agentProcessEnv/);
+      assert.equal(error.message.includes("private-marker"), false);
+      return true;
+    },
+  );
 });
 
 test("spawned agent child process receives session env with parent-override precedence", async () => {
@@ -541,6 +588,80 @@ test("resolveAgentSessionCwd rejects empty wslpath output", async () => {
     }),
     /wslpath returned an empty Windows path/,
   );
+});
+
+test("runTimedExecFile returns helper stdout", async () => {
+  const stdout = await runTimedExecFile(process.execPath, [
+    "-e",
+    "process.stdout.write('helper-ok')",
+  ]);
+  assert.equal(stdout, "helper-ok");
+});
+
+test("runTimedExecFile keeps stdout beyond execFile default maxBuffer", async () => {
+  const size = 1024 * 1024 + 64 * 1024;
+  const stdout = await runTimedExecFile(process.execPath, [
+    "-e",
+    `process.stdout.write("x".repeat(${size}))`,
+  ]);
+  assert.equal(stdout.length, size);
+});
+
+test("runTimedExecFile kills a hung helper instead of waiting forever", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-timed-exec-"));
+  const helperPidPath = path.join(tmp, "helper.pid");
+  const descendantPidPath = path.join(tmp, "descendant.pid");
+  try {
+    await assert.rejects(
+      runTimedExecFile(
+        process.execPath,
+        [
+          "-e",
+          [
+            `const fs = require("node:fs")`,
+            `const { spawn } = require("node:child_process")`,
+            `fs.writeFileSync(${JSON.stringify(helperPidPath)}, String(process.pid))`,
+            `const descendant = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 5000)"], { stdio: "inherit" })`,
+            `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid))`,
+            `setInterval(() => {}, 1000)`,
+          ].join(";"),
+        ],
+        { timeoutMs: 200 },
+      ),
+      (error: unknown) =>
+        error instanceof Error && (error as NodeJS.ErrnoException).code === "ETIMEDOUT",
+    );
+
+    const helperPid = Number(await fs.readFile(helperPidPath, "utf8"));
+    assert.ok(Number.isInteger(helperPid) && helperPid > 0);
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(helperPid, 0);
+      } catch {
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    }
+    try {
+      process.kill(helperPid, "SIGKILL");
+    } catch {
+      // best-effort cleanup
+    }
+    assert.fail(`hung helper process still alive: ${helperPid}`);
+  } finally {
+    try {
+      const descendantPid = Number(await fs.readFile(descendantPidPath, "utf8"));
+      if (Number.isInteger(descendantPid) && descendantPid > 0) {
+        process.kill(descendantPid, "SIGKILL");
+      }
+    } catch {
+      // best-effort cleanup of the helper's pipe-inheriting descendant
+    }
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });
 
 test("buildTerminalSpawnOptions enables shell for PATH-resolved .cmd wrappers on Windows", async () => {

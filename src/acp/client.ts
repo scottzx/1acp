@@ -2,21 +2,24 @@ import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_p
 import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import {
-  ClientSideConnection,
   PROTOCOL_VERSION,
-  RequestError,
+  client,
+  methods,
   type AnyMessage,
   type AuthMethod,
   type AuthenticateRequest,
-  type ClientCapabilities,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type InitializeResponse,
+  type JsonRpcId,
   type ListSessionsRequest,
   type ListSessionsResponse,
   type KillTerminalRequest,
   type KillTerminalResponse,
   type LoadSessionResponse,
+  type NewSessionResponse,
   type PromptResponse,
   type ReadTextFileRequest,
   type ReadTextFileResponse,
@@ -60,12 +63,16 @@ import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
+  AcpElicitationHandler,
+  AcpElicitationMode,
+  AcpProcessLaunch,
+  AcpProcessLaunchScope,
+  AcpProcessStarted,
   NonInteractivePermissionPolicy,
   PermissionMode,
   PermissionStats,
   PromptInput,
 } from "../types.js";
-import { getAcpxVersion } from "../version.js";
 import {
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
@@ -102,10 +109,16 @@ import {
   waitForSpawn,
 } from "./client-process.js";
 import { isCodexAcpCommand, resolveCodexExecutable } from "./codex-compat.js";
+import {
+  createAgentConnectionFacade,
+  resolveClientCapabilities,
+  resolveClientInfo,
+  type AcpAgentConnection,
+} from "./client-protocol.js";
 import { extractAcpError } from "./error-shapes.js";
 import {
   cancelledAskUserResponse,
-  isGrokAskUserQuestionMethod,
+  GROK_ASK_USER_QUESTION_METHOD,
   normalizeHostAskUserResponse,
   parseGrokAskUserQuestionRequest,
   promptGrokAskUserQuestion,
@@ -113,14 +126,13 @@ import {
 } from "./grok-ask-user.js";
 import {
   abandonedExitPlanResponse,
-  isGrokExitPlanModeMethod,
+  GROK_EXIT_PLAN_MODE_METHOD,
   normalizeHostExitPlanResponse,
   parseGrokExitPlanModeRequest,
   promptGrokExitPlanMode,
   type GrokExitPlanModeResponse,
   type GrokExitPlanOutcome,
 } from "./grok-exit-plan.js";
-import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
 import {
   modelStateFromConfigOptions,
   modelStateFromSessionResponse,
@@ -128,6 +140,12 @@ import {
   resolveRequestedModelId,
   type SessionModelState,
 } from "./model-support.js";
+import {
+  AcpMessageLimitError,
+  createNdJsonMessageStream,
+  readMaxAcpMessageBytes,
+} from "./ndjson-stream.js";
+import { observeAcpStream } from "./observed-stream.js";
 import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
@@ -142,6 +160,7 @@ export {
   resolveClaudeCodeSettingSources,
   shouldIgnoreNonJsonAgentOutputLine,
 };
+export { parseAcpJsonMessageLine } from "./ndjson-stream.js";
 
 const REPLAY_IDLE_MS = 80;
 const REPLAY_DRAIN_TIMEOUT_MS = 5_000;
@@ -152,12 +171,6 @@ const STARTUP_STDERR_MAX_CHARS = 8_192;
 const DEEPSEEK_BUILD_DEFAULT_MODEL = "deepseek-v4-flash";
 const DEEPSEEK_BUILD_API_BASE_URL = "https://api.deepseek.com";
 const DEEPSEEK_BUILD_MODELS_URL = `${DEEPSEEK_BUILD_API_BASE_URL}/models`;
-const DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META = Object.freeze({
-  "cognition.ai/requestDiagnostics": true,
-});
-const DEVIN_COMPATIBILITY_CLIENT_NAME = "windsurf";
-// This is the embedded Windsurf IDE version bundled with Devin Desktop 3.1.7, the first locally verified version that passes Devin's server-side ACP precondition.
-const DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION = "1.110.1";
 // Align with Grok CLI `--permission-mode` / config `defaultMode`:
 // default | acceptEdits | auto | dontAsk | bypassPermissions | plan
 const GROK_PERMISSION_MODE_IDS = [
@@ -294,45 +307,52 @@ function hasModeConfigOption(configOptions: SessionConfigOption[] | undefined): 
   );
 }
 
-function resolveClientInfo(devinAcp: boolean): { name: string; version: string } {
-  if (!devinAcp) {
-    return {
-      name: "acpx",
-      version: getAcpxVersion(),
-    };
-  }
+const ELICITATION_CANCEL_MESSAGES = {
+  inactive: "elicitation owner is no longer active",
+  unavailable: "elicitation handler is unavailable",
+  unsupported: "elicitation mode is not supported",
+  mismatchedSession: "elicitation session is not active",
+  cancelled: "elicitation request was cancelled",
+  requestScoped: "request-scoped elicitation has no owner",
+} as const;
 
-  return {
-    name: DEVIN_COMPATIBILITY_CLIENT_NAME,
-    version: process.env.ACPX_DEVIN_WINDSURF_VERSION ?? DEFAULT_DEVIN_COMPATIBILITY_CLIENT_VERSION,
-  };
+function normalizeElicitationModes(
+  modes: readonly AcpElicitationMode[] | undefined,
+): AcpElicitationMode[] {
+  return [...new Set((modes ?? []).filter((mode) => mode === "form" || mode === "url"))];
 }
 
-function resolveClientCapabilities(params: {
-  devinAcp: boolean;
-  fs: boolean;
-  terminal: boolean;
-}): ClientCapabilities {
-  const baseCapabilities: ClientCapabilities = {
-    fs: {
-      readTextFile: params.fs,
-      writeTextFile: params.fs,
-    },
-    terminal: params.terminal,
-  };
-
-  if (!params.devinAcp) {
-    return baseCapabilities;
-  }
-
-  return {
-    ...baseCapabilities,
-    _meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META,
-  };
+function cancelledElicitationResponse(message: string): CreateElicitationResponse {
+  return { action: "cancel", _meta: { message } };
 }
 
-function isDevinRequestDiagnosticsMethod(method: string): boolean {
-  return method === "_cognition.ai/request_diagnostics";
+function isKnownElicitationResponse(response: unknown): response is CreateElicitationResponse {
+  if (!response || typeof response !== "object") {
+    return false;
+  }
+  const action = (response as { action?: unknown }).action;
+  return action === "accept" || action === "decline" || action === "cancel";
+}
+
+function elicitationSessionId(request: CreateElicitationRequest): string | undefined {
+  const value = (request as { sessionId?: unknown }).sessionId;
+  return typeof value === "string" ? value : undefined;
+}
+
+function elicitationRequestScopeId(request: CreateElicitationRequest): JsonRpcId | undefined {
+  const value = (request as { requestId?: unknown }).requestId;
+  return value === null || typeof value === "string" || typeof value === "number"
+    ? value
+    : undefined;
+}
+
+function waitForAbort(signal: AbortSignal): Promise<{ kind: "aborted" }> {
+  if (signal.aborted) {
+    return Promise.resolve({ kind: "aborted" });
+  }
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve({ kind: "aborted" }), { once: true });
+  });
 }
 
 type LoadSessionOptions = {
@@ -395,6 +415,21 @@ type PendingConnectionRequest = {
   reject: (error: unknown) => void;
 };
 
+type ActivePromptState = {
+  sessionId: string;
+  requestId?: JsonRpcId;
+  promise?: Promise<PromptResponse>;
+  cancelPromise?: Promise<void>;
+  onRequestWritten?: () => Promise<void> | void;
+  elicitationHandler?: AcpElicitationHandler;
+  elicitationController: AbortController;
+};
+
+type ElicitationOwner = {
+  active: ActivePromptState;
+  handler: AcpElicitationHandler;
+};
+
 function snapshotPermissionPolicy(
   policy: AcpClientOptions["permissionPolicy"],
 ): AcpClientOptions["permissionPolicy"] {
@@ -407,6 +442,18 @@ function snapshotPermissionPolicy(
     ...(policy.escalate ? { escalate: [...policy.escalate] } : {}),
     ...(policy.defaultAction ? { defaultAction: policy.defaultAction } : {}),
   };
+}
+
+function snapshotProcessLaunchScope(
+  scope: AcpProcessLaunchScope | undefined,
+): AcpProcessLaunchScope {
+  if (!scope || scope.kind === "client") {
+    return Object.freeze({ kind: "client" });
+  }
+  if (scope.kind === "runtime-session") {
+    return Object.freeze({ kind: "runtime-session", sessionKey: scope.sessionKey });
+  }
+  return Object.freeze({ kind: "runtime-probe", agent: scope.agent });
 }
 
 type AuthSelection = {
@@ -431,6 +478,7 @@ type AgentLaunchPlan = {
 type StartupFailureWatcher = {
   promise: Promise<never>;
   dispose: () => void;
+  getError: () => AgentStartupError | undefined;
 };
 
 type SessionUpdateSuppressionState = {
@@ -496,94 +544,9 @@ function installSdkConsoleErrorSuppression(): () => void {
   };
 }
 
-function enqueueNdJsonLine(
-  agentCommand: string,
-  line: string,
-  controller: ReadableStreamDefaultController<AnyMessage>,
-): void {
-  const trimmedLine = line.trim();
-  if (!trimmedLine || shouldIgnoreNonJsonAgentOutputLine(agentCommand, trimmedLine)) {
-    return;
-  }
-  try {
-    const message = parseAcpJsonMessageLine(trimmedLine);
-    if (message) {
-      controller.enqueue(message);
-    }
-  } catch (err) {
-    console.error("Failed to parse JSON message:", trimmedLine, err);
-  }
-}
-
-export function parseAcpJsonMessageLine(line: string): AnyMessage | undefined {
-  const message: unknown = JSON.parse(line);
-  return isAcpMessageObject(message) ? message : undefined;
-}
-
-function enqueueNdJsonLines(
-  agentCommand: string,
-  lines: string[],
-  controller: ReadableStreamDefaultController<AnyMessage>,
-): void {
-  for (const line of lines) {
-    enqueueNdJsonLine(agentCommand, line, controller);
-  }
-}
-
-function createNdJsonMessageStream(
-  agentCommand: string,
-  output: WritableStream<Uint8Array>,
-  input: ReadableStream<Uint8Array>,
-): {
-  readable: ReadableStream<AnyMessage>;
-  writable: WritableStream<AnyMessage>;
-} {
-  const textEncoder = new TextEncoder();
-  const textDecoder = new TextDecoder();
-
-  const readable = new ReadableStream<AnyMessage>({
-    async start(controller) {
-      let content = "";
-      const reader = input.getReader();
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
-          }
-          if (!value) {
-            continue;
-          }
-          content += textDecoder.decode(value, { stream: true });
-          const lines = content.split("\n");
-          content = lines.pop() || "";
-          enqueueNdJsonLines(agentCommand, lines, controller);
-        }
-      } finally {
-        reader.releaseLock();
-        controller.close();
-      }
-    },
-  });
-
-  const writable = new WritableStream<AnyMessage>({
-    async write(message) {
-      const content = JSON.stringify(message) + "\n";
-      const writer = output.getWriter();
-      try {
-        await writer.write(textEncoder.encode(content));
-      } finally {
-        writer.releaseLock();
-      }
-    },
-  });
-
-  return { readable, writable };
-}
-
 export class AcpClient {
   private options: AcpClientOptions;
-  private connection?: ClientSideConnection;
+  private connection?: AcpAgentConnection;
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
@@ -615,10 +578,8 @@ export class AcpClient {
   private bufferedSessionUpdates: SessionNotification[] = [];
   private static readonly MAX_BUFFERED_SESSION_UPDATES = 64;
   private suppressReplaySessionUpdateMessages = false;
-  private activePrompt?: {
-    sessionId: string;
-    promise: Promise<PromptResponse>;
-  };
+  private activePrompt?: ActivePromptState;
+  private readonly pendingPromptOwners: ActivePromptState[] = [];
   private readonly cancellingSessionIds = new Set<string>();
   private readonly permissionAbortControllers = new Map<string, AbortController>();
   private closing = false;
@@ -636,8 +597,10 @@ export class AcpClient {
     this.options = {
       ...options,
       cwd: asAbsoluteCwd(options.cwd),
+      agentProcessEnv: options.agentProcessEnv ? { ...options.agentProcessEnv } : undefined,
       authPolicy: options.authPolicy ?? "skip",
       permissionPolicy: snapshotPermissionPolicy(options.permissionPolicy),
+      elicitationModes: normalizeElicitationModes(options.elicitationModes),
     };
     this.eventHandlers = {
       onAcpMessage: this.options.onAcpMessage,
@@ -848,6 +811,19 @@ export class AcpClient {
     return this.activePrompt.sessionId === sessionId;
   }
 
+  hasUnresolvedPrompt(): boolean {
+    return this.activePrompt !== undefined;
+  }
+
+  endPromptElicitation(sessionId: string): void {
+    const active = this.activePrompt;
+    if (!active || active.sessionId !== sessionId) {
+      return;
+    }
+    active.elicitationHandler = undefined;
+    active.elicitationController.abort();
+  }
+
   async start(): Promise<void> {
     if (this.connection && this.agent && isChildProcessRunning(this.agent)) {
       return;
@@ -856,15 +832,15 @@ export class AcpClient {
       await this.close();
     }
 
+    const maxMessageBytes = readMaxAcpMessageBytes();
     const launch = await this.resolveAgentLaunchPlan();
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
-    const child = await this.spawnAgentProcess(launch);
+    const { child, process: startedProcess } = await this.spawnAgentProcess(launch);
     this.closing = false;
-    this.agentStartedAt = isoNow();
+    this.agentStartedAt = startedProcess.startedAt;
     this.lastAgentExit = undefined;
-    this.lastKnownPid = child.pid ?? undefined;
-    this.attachAgentLifecycleObservers(child);
+    this.lastKnownPid = startedProcess.pid;
     const startupStderr: string[] = [];
 
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -874,14 +850,35 @@ export class AcpClient {
       }
       process.stderr.write(chunk);
     });
+    const startupFailure = this.createStartupFailureWatcher(child, startupStderr);
+    try {
+      await this.admitAndObserveSpawnedProcess(child, startedProcess);
+      const admissionExit = startupFailure.getError();
+      if (admissionExit) {
+        throw admissionExit;
+      }
+    } catch (error) {
+      startupFailure.dispose();
+      throw error;
+    }
 
     const input = Writable.toWeb(child.stdin);
     const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
+    let connection: AcpAgentConnection | undefined;
     const stream = this.createTappedStream(
-      createNdJsonMessageStream(this.options.agentCommand, input, output),
+      createNdJsonMessageStream(
+        this.options.agentCommand,
+        input,
+        output,
+        maxMessageBytes,
+        (error) => {
+          this.rejectPendingConnectionRequests(error);
+          connection?.close?.(error);
+        },
+      ),
     );
 
-    const connection = this.createConnection(stream, launch);
+    connection = this.createConnection(stream, launch);
     connection.signal.addEventListener(
       "abort",
       () => {
@@ -889,8 +886,6 @@ export class AcpClient {
       },
       { once: true },
     );
-    const startupFailure = this.createStartupFailureWatcher(child, startupStderr);
-
     await this.initializeAgentConnection({
       child,
       connection,
@@ -912,11 +907,14 @@ export class AcpClient {
     if (isQoderAcpCommand(spawnCommand, args)) {
       args = buildQoderAcpCommandArgs(args, this.options);
     }
+    const claudeAcp = isClaudeAcpCommand(spawnCommand, args);
+    const codexAcp = isCodexAcpCommand(spawnCommand, args);
     const spawnOptions = buildAgentSpawnOptions(
       this.options.cwd,
       this.options.authCredentials,
       this.options.sessionOptions?.env,
-      isClaudeAcpCommand(spawnCommand, args),
+      this.options.agentProcessEnv,
+      claudeAcp,
     );
     applyDeepSeekBuildEnvironment(
       spawnOptions.env,
@@ -930,8 +928,8 @@ export class AcpClient {
       devinAcp: isDevinAcpCommand(spawnCommand, args),
       geminiAcp: isGeminiAcpCommand(spawnCommand, args),
       copilotAcp: isCopilotAcpCommand(spawnCommand, args),
-      claudeAcp: isClaudeAcpCommand(spawnCommand, args),
-      codexAcp: isCodexAcpCommand(spawnCommand, args),
+      claudeAcp,
+      codexAcp,
       spawnOptions,
     };
   }
@@ -974,9 +972,10 @@ export class AcpClient {
     }
   }
 
-  private async spawnAgentProcess(
-    plan: AgentLaunchPlan,
-  ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
+  private async spawnAgentProcess(plan: AgentLaunchPlan): Promise<{
+    child: ChildProcessByStdio<Writable, Readable, Readable>;
+    process: AcpProcessStarted;
+  }> {
     if (plan.claudeAcp) {
       applyClaudeSettingsEnvironment(plan.spawnOptions.env);
     }
@@ -986,16 +985,66 @@ export class AcpClient {
       process.platform,
       plan.spawnOptions.env,
     );
-    const spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
-      ...plan.spawnOptions,
-      windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
-    }) as ChildProcessByStdio<Writable, Readable, Readable>;
+    const launch: AcpProcessLaunch = Object.freeze({
+      launchId: randomUUID(),
+      scope: snapshotProcessLaunchScope(this.options.processLaunchScope),
+      command: spawnCommand.command,
+      args: Object.freeze([...spawnCommand.args]),
+      cwd: this.options.cwd,
+    });
+    await this.options.processLifecycle?.onBeforeSpawn?.(launch);
+
+    let spawnedChild: ChildProcessByStdio<Writable, Readable, Readable>;
     try {
+      spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
+        ...plan.spawnOptions,
+        windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
+      });
       await waitForSpawn(spawnedChild);
     } catch (error) {
-      throw new AgentSpawnError(this.options.agentCommand, error);
+      const spawnError = new AgentSpawnError(this.options.agentCommand, error);
+      this.notifyProcessSpawnFailure(launch, spawnError);
+      throw spawnError;
     }
-    return requireAgentStdio(spawnedChild);
+
+    const child = requireAgentStdio(spawnedChild);
+    const pid = child.pid;
+    if (pid === undefined) {
+      const spawnError = new AgentSpawnError(
+        this.options.agentCommand,
+        new Error("spawned agent process did not expose a PID"),
+      );
+      this.notifyProcessSpawnFailure(launch, spawnError);
+      await this.terminateAgentProcess(child);
+      throw spawnError;
+    }
+    return {
+      child,
+      process: Object.freeze({
+        ...launch,
+        pid,
+        startedAt: isoNow(),
+      }),
+    };
+  }
+
+  private async admitAndObserveSpawnedProcess(
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    process: AcpProcessStarted,
+  ): Promise<void> {
+    let releaseExitNotification = () => {};
+    const exitNotificationBarrier = new Promise<void>((resolve) => {
+      releaseExitNotification = resolve;
+    });
+    this.attachAgentLifecycleObservers(child, process, exitNotificationBarrier);
+    try {
+      await this.options.processLifecycle?.onSpawned?.(process);
+    } catch (error) {
+      await this.terminateAgentProcess(child);
+      throw error;
+    } finally {
+      releaseExitNotification();
+    }
   }
 
   private createConnection(
@@ -1004,70 +1053,94 @@ export class AcpClient {
       writable: WritableStream<AnyMessage>;
     },
     launch: Pick<AgentLaunchPlan, "devinAcp">,
-  ): ClientSideConnection {
-    return new ClientSideConnection(
-      () => ({
-        sessionUpdate: async (params: SessionNotification) => {
-          await this.handleSessionUpdate(params);
+  ): AcpAgentConnection {
+    const app = client({ name: "acpx" })
+      .onNotification(methods.client.session.update, async ({ params }) => {
+        await this.handleSessionUpdate(params);
+      })
+      .onNotification(methods.client.elicitation.complete, async () => {})
+      .onRequest(methods.client.session.requestPermission, async ({ params }) => {
+        return await this.handlePermissionRequest(params);
+      })
+      .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
+        return await this.handleElicitationRequest(params, requestId, signal);
+      })
+      .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
+        return await this.handleReadTextFile(params);
+      })
+      .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
+        return await this.handleWriteTextFile(params);
+      })
+      .onRequest(methods.client.terminal.create, async ({ params }) => {
+        return await this.handleCreateTerminal(params);
+      })
+      .onRequest(methods.client.terminal.output, async ({ params }) => {
+        return await this.handleTerminalOutput(params);
+      })
+      .onRequest(methods.client.terminal.waitForExit, async ({ params }) => {
+        return await this.handleWaitForTerminalExit(params);
+      })
+      .onRequest(methods.client.terminal.kill, async ({ params }) => {
+        return await this.handleKillTerminal(params);
+      })
+      .onRequest(methods.client.terminal.release, async ({ params }) => {
+        return await this.handleReleaseTerminal(params);
+      });
+
+    if (launch.devinAcp) {
+      app.onRequest(
+        "_cognition.ai/request_diagnostics",
+        (params): Record<string, unknown> => {
+          return params && typeof params === "object" && !Array.isArray(params)
+            ? (params as Record<string, unknown>)
+            : {};
         },
-        requestPermission: async (
-          params: RequestPermissionRequest,
-        ): Promise<RequestPermissionResponse> => {
-          return this.handlePermissionRequest(params);
-        },
-        extMethod: async (
-          method: string,
-          params: Record<string, unknown>,
-        ): Promise<Record<string, unknown>> => {
-          if (isGrokAskUserQuestionMethod(method)) {
-            return await this.handleGrokAskUserQuestion(params);
-          }
-          if (isGrokExitPlanModeMethod(method)) {
-            return await this.handleGrokExitPlanMode(params);
-          }
-          if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
-            return {};
-          }
-          const error = RequestError.methodNotFound(method);
-          if (!this.options.suppressSdkConsoleErrors) {
-            console.error(error.message);
-          }
-          throw error;
-        },
-        readTextFile: async (params: ReadTextFileRequest): Promise<ReadTextFileResponse> => {
-          return this.handleReadTextFile(params);
-        },
-        writeTextFile: async (params: WriteTextFileRequest): Promise<WriteTextFileResponse> => {
-          return this.handleWriteTextFile(params);
-        },
-        createTerminal: async (params: CreateTerminalRequest): Promise<CreateTerminalResponse> => {
-          return this.handleCreateTerminal(params);
-        },
-        terminalOutput: async (params: TerminalOutputRequest): Promise<TerminalOutputResponse> => {
-          return this.handleTerminalOutput(params);
-        },
-        waitForTerminalExit: async (
-          params: WaitForTerminalExitRequest,
-        ): Promise<WaitForTerminalExitResponse> => {
-          return this.handleWaitForTerminalExit(params);
-        },
-        killTerminal: async (params: KillTerminalRequest): Promise<KillTerminalResponse> => {
-          return this.handleKillTerminal(params);
-        },
-        releaseTerminal: async (
-          params: ReleaseTerminalRequest,
-        ): Promise<ReleaseTerminalResponse> => {
-          return this.handleReleaseTerminal(params);
-        },
-        extNotification: async (): Promise<void> => {},
-      }),
-      stream,
+        async () => ({}),
+      );
+    }
+
+    const grokParamsParser = (params: unknown): Record<string, unknown> => {
+      return params && typeof params === "object" && !Array.isArray(params)
+        ? (params as Record<string, unknown>)
+        : {};
+    };
+
+    app.onRequest(
+      GROK_ASK_USER_QUESTION_METHOD,
+      grokParamsParser,
+      async ({ params }) => {
+        return (await this.handleGrokAskUserQuestion(params)) as unknown as Record<string, unknown>;
+      },
     );
+    app.onRequest(
+      "x.ai/ask_user_question",
+      grokParamsParser,
+      async ({ params }) => {
+        return (await this.handleGrokAskUserQuestion(params)) as unknown as Record<string, unknown>;
+      },
+    );
+
+    app.onRequest(
+      GROK_EXIT_PLAN_MODE_METHOD,
+      grokParamsParser,
+      async ({ params }) => {
+        return (await this.handleGrokExitPlanMode(params)) as unknown as Record<string, unknown>;
+      },
+    );
+    app.onRequest(
+      "x.ai/exit_plan_mode",
+      grokParamsParser,
+      async ({ params }) => {
+        return (await this.handleGrokExitPlanMode(params)) as unknown as Record<string, unknown>;
+      },
+    );
+
+    return createAgentConnectionFacade(app.connect(stream));
   }
 
   private async initializeAgentConnection(params: {
     child: ChildProcessByStdio<Writable, Readable, Readable>;
-    connection: ClientSideConnection;
+    connection: AcpAgentConnection;
     startupFailure: StartupFailureWatcher;
     startupStderr: string[];
     launch: AgentLaunchPlan;
@@ -1083,12 +1156,13 @@ export class AcpClient {
       this.initResult = initResult;
       this.log(`initialized protocol version ${initResult.protocolVersion}`);
     } catch (error) {
+      params.connection.close?.(error);
       await this.handleInitializeFailure(params, error);
     }
   }
 
   private async initializeProtocolConnection(
-    connection: ClientSideConnection,
+    connection: AcpAgentConnection,
     launch: Pick<AgentLaunchPlan, "devinAcp" | "geminiAcp">,
   ): Promise<InitializeResponse> {
     const initializePromise = connection.initialize({
@@ -1097,6 +1171,7 @@ export class AcpClient {
         devinAcp: launch.devinAcp,
         fs: this.options.fs !== false,
         terminal: this.options.terminal !== false,
+        elicitationModes: this.options.elicitationModes ?? [],
       }),
       clientInfo: resolveClientInfo(launch.devinAcp),
     });
@@ -1117,11 +1192,10 @@ export class AcpClient {
     error: unknown,
   ): Promise<never> {
     params.startupFailure.dispose();
-    const normalizedError = await this.normalizeInitializeError(
-      error,
-      params.child,
-      params.startupStderr,
-    );
+    const normalizedError =
+      error instanceof AcpMessageLimitError
+        ? error
+        : await this.normalizeInitializeError(error, params.child, params.startupStderr);
     try {
       params.child.kill();
     } catch {
@@ -1142,56 +1216,16 @@ export class AcpClient {
   private createTappedStream(base: {
     readable: ReadableStream<AnyMessage>;
     writable: WritableStream<AnyMessage>;
-  }): {
-    readable: ReadableStream<AnyMessage>;
-    writable: WritableStream<AnyMessage>;
-  } {
-    const onAcpMessage = () => this.eventHandlers.onAcpMessage;
-    const onAcpOutputMessage = () => this.eventHandlers.onAcpOutputMessage;
-
-    const shouldSuppressInboundReplaySessionUpdate = (message: AnyMessage): boolean => {
-      return this.suppressReplaySessionUpdateMessages && isSessionUpdateNotification(message);
-    };
-
-    const readable = new ReadableStream<AnyMessage>({
-      async start(controller) {
-        const reader = base.readable.getReader();
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) {
-              break;
-            }
-            if (!value) {
-              continue;
-            }
-            if (!shouldSuppressInboundReplaySessionUpdate(value)) {
-              onAcpOutputMessage()?.("inbound", value);
-              onAcpMessage()?.("inbound", value);
-            }
-            controller.enqueue(value);
-          }
-        } finally {
-          reader.releaseLock();
-          controller.close();
-        }
+  }): ReturnType<typeof observeAcpStream> {
+    return observeAcpStream(base, {
+      onMessage: (direction, message) => {
+        this.eventHandlers.onAcpOutputMessage?.(direction, message);
+        this.eventHandlers.onAcpMessage?.(direction, message);
       },
+      suppressReplaySessionUpdates: () => this.suppressReplaySessionUpdateMessages,
+      bindPromptOwner: (owner) => this.bindPromptOwner(owner),
+      onPromptRequestWritten: (active, owner) => this.onPromptRequestWritten(active, owner),
     });
-
-    const writable = new WritableStream<AnyMessage>({
-      async write(message) {
-        onAcpOutputMessage()?.("outbound", message);
-        onAcpMessage()?.("outbound", message);
-        const writer = base.writable.getWriter();
-        try {
-          await writer.write(message);
-        } finally {
-          writer.releaseLock();
-        }
-      },
-    });
-
-    return { readable, writable };
   }
 
   async createSession(cwd = this.options.cwd): Promise<SessionCreateResult> {
@@ -1203,7 +1237,7 @@ export class AcpClient {
     const claudeAcp = isClaudeAcpCommand(command, args);
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
 
-    let result: Awaited<ReturnType<typeof connection.newSession>>;
+    let result: NewSessionResponse;
     try {
       const createPromise = this.runConnectionRequest(() =>
         connection.newSession({
@@ -1331,7 +1365,8 @@ export class AcpClient {
   async prompt(
     sessionId: string,
     prompt: PromptInput | string,
-    onRequestStarted?: () => Promise<void> | void,
+    onRequestWritten?: () => Promise<void> | void,
+    onElicitation?: AcpElicitationHandler,
   ): Promise<PromptResponse> {
     const connection = this.getConnection();
     const normalizedPrompt = this.normalizePromptForAgent(prompt);
@@ -1339,41 +1374,103 @@ export class AcpClient {
       ? installSdkConsoleErrorSuppression()
       : undefined;
 
+    const previousActivePrompt = this.activePrompt;
+    const activePrompt = this.beginActivePrompt(sessionId, onRequestWritten, onElicitation);
+
     let promptPromise: Promise<PromptResponse>;
     try {
-      promptPromise = this.runConnectionRequest(
-        () =>
-          connection.prompt({
-            sessionId,
-            prompt: normalizedPrompt,
-          }),
-        onRequestStarted,
-        () => !connection.signal?.aborted,
+      promptPromise = this.runConnectionRequest(() =>
+        connection.prompt({
+          sessionId,
+          prompt: normalizedPrompt,
+        }),
       );
     } catch (error) {
+      this.clearActivePrompt(activePrompt);
       restoreConsoleError?.();
       throw error;
     }
 
-    this.activePrompt = {
-      sessionId,
-      promise: promptPromise,
-    };
+    activePrompt.promise = promptPromise;
 
     try {
+      // Queue this prompt before abort listeners can cancel its newly published owner.
+      previousActivePrompt?.elicitationController?.abort();
       return this.returnPromptResponseOrPermissionFailure(sessionId, await promptPromise);
     } catch (error) {
       this.throwPromptPermissionFailureIfPresent(sessionId);
       throw error;
     } finally {
       restoreConsoleError?.();
-      if (this.activePrompt?.promise === promptPromise) {
-        this.activePrompt = undefined;
-      }
-      this.cancellingSessionIds.delete(sessionId);
-      this.abortAndDropPermissionSignal(sessionId);
-      this.promptPermissionFailures.delete(sessionId);
+      this.clearActivePrompt(activePrompt);
     }
+  }
+
+  private beginActivePrompt(
+    sessionId: string,
+    onRequestWritten: (() => Promise<void> | void) | undefined,
+    elicitationHandler: AcpElicitationHandler | undefined,
+  ): ActivePromptState {
+    this.cancellingSessionIds.delete(sessionId);
+    const active: ActivePromptState = {
+      sessionId,
+      onRequestWritten,
+      elicitationHandler,
+      elicitationController: new AbortController(),
+    };
+    this.activePrompt = active;
+    this.pendingPromptOwners.push(active);
+    return active;
+  }
+
+  private bindPromptOwner(owner: {
+    requestId: JsonRpcId;
+    sessionId: string;
+  }): ActivePromptState | undefined {
+    const active = this.pendingPromptOwners.find((candidate) => {
+      return candidate.requestId === undefined && candidate.sessionId === owner.sessionId;
+    });
+    if (active) {
+      active.requestId = owner.requestId;
+    }
+    return active;
+  }
+
+  private onPromptRequestWritten(
+    active: ActivePromptState,
+    owner: { requestId: JsonRpcId; sessionId: string },
+  ): void {
+    if (active.requestId !== owner.requestId || active.sessionId !== owner.sessionId) {
+      return;
+    }
+    try {
+      void Promise.resolve(active.onRequestWritten?.()).catch(() => {});
+    } catch {
+      // Readiness observation must not own a request accepted by the transport.
+    }
+  }
+
+  private clearActivePrompt(active: ActivePromptState): void {
+    // Other sessions may be globally active while a newer same-session prompt still owns state.
+    const pendingIndex = this.pendingPromptOwners.indexOf(active);
+    const clearSession = !this.pendingPromptOwners.some(
+      (candidate, index) => index > pendingIndex && candidate.sessionId === active.sessionId,
+    );
+    if (this.activePrompt === active) {
+      this.activePrompt = undefined;
+    }
+    if (pendingIndex >= 0) {
+      this.pendingPromptOwners.splice(pendingIndex, 1);
+    }
+    let permissionController: AbortController | undefined;
+    if (clearSession) {
+      this.cancellingSessionIds.delete(active.sessionId);
+      permissionController = this.takePermissionAbortController(active.sessionId);
+      this.promptPermissionFailures.delete(active.sessionId);
+    }
+    // Finish bookkeeping before callbacks can admit another prompt or permission request.
+    active.elicitationController.abort();
+    permissionController?.abort();
   }
 
   private normalizePromptForAgent(prompt: PromptInput | string): PromptInput {
@@ -1595,17 +1692,34 @@ export class AcpClient {
 
   async cancel(sessionId: string): Promise<void> {
     const connection = this.getConnection();
-    this.cancellingSessionIds.add(sessionId);
-    this.abortAndDropPermissionSignal(sessionId);
-    await this.runConnectionRequest(() =>
-      connection.cancel({
-        sessionId,
-      }),
-    );
+    const active = this.activePrompt?.sessionId === sessionId ? this.activePrompt : undefined;
+    // Queue and latch before abort listeners can reenter cancellation or start another prompt.
+    const cancellation: Promise<void> =
+      active?.cancelPromise ??
+      this.runConnectionRequest(() => connection.cancel({ sessionId })).catch((error: unknown) => {
+        if (active?.cancelPromise === cancellation) {
+          active.cancelPromise = undefined;
+        }
+        throw error;
+      });
+    const permissionController = this.takePermissionAbortController(sessionId);
+    if (active) {
+      active.cancelPromise = cancellation;
+      this.cancellingSessionIds.add(sessionId);
+      active.elicitationController?.abort();
+    } else {
+      this.cancellingSessionIds.delete(sessionId);
+    }
+    permissionController?.abort();
+    await cancellation;
   }
 
   async closeSession(sessionId: string): Promise<void> {
     const connection = this.getConnection();
+    this.cancellingSessionIds.add(sessionId);
+    if (this.activePrompt?.sessionId === sessionId) {
+      this.activePrompt.elicitationController?.abort();
+    }
     await this.runConnectionRequest(() =>
       connection.closeSession({
         sessionId,
@@ -1711,6 +1825,10 @@ export class AcpClient {
     if (waitMs <= 0) {
       return undefined;
     }
+    const activePromise = active.promise;
+    if (!activePromise) {
+      return undefined;
+    }
 
     let timer: NodeJS.Timeout | number | undefined;
     const timeoutPromise = new Promise<undefined>((resolve) => {
@@ -1719,7 +1837,7 @@ export class AcpClient {
 
     try {
       return await Promise.race([
-        active.promise.then(
+        activePromise.then(
           (response) => response,
           () => undefined,
         ),
@@ -1734,6 +1852,7 @@ export class AcpClient {
 
   async close(): Promise<void> {
     this.closing = true;
+    this.abortActiveElicitation();
 
     await this.terminalManager.shutdown();
 
@@ -1741,6 +1860,7 @@ export class AcpClient {
     if (agent) {
       await this.terminateAgentProcess(agent);
     }
+    this.closeConnection();
     if (this.pendingConnectionRequests.size > 0) {
       this.rejectPendingConnectionRequests(
         this.lastAgentExit
@@ -1764,6 +1884,7 @@ export class AcpClient {
     this.suppressSessionUpdates = false;
     this.suppressReplaySessionUpdateMessages = false;
     this.activePrompt = undefined;
+    this.pendingPromptOwners.length = 0;
     this.cancellingSessionIds.clear();
     for (const controller of this.permissionAbortControllers.values()) {
       controller.abort();
@@ -1778,6 +1899,14 @@ export class AcpClient {
     this.initResult = undefined;
     this.connection = undefined;
     this.agent = undefined;
+  }
+
+  private abortActiveElicitation(): void {
+    this.activePrompt?.elicitationController?.abort();
+  }
+
+  private closeConnection(): void {
+    this.connection?.close?.();
   }
 
   private async terminateAgentProcess(
@@ -1843,7 +1972,7 @@ export class AcpClient {
     }
   }
 
-  private getConnection(): ClientSideConnection {
+  private getConnection(): AcpAgentConnection {
     if (!this.connection) {
       throw new Error("ACP client not started");
     }
@@ -1885,6 +2014,7 @@ export class AcpClient {
     startupStderr: string[],
   ): StartupFailureWatcher {
     let settled = false;
+    let failure: AgentStartupError | undefined;
     let rejectPromise: (error: unknown) => void;
 
     const cleanup = () => {
@@ -1893,13 +2023,14 @@ export class AcpClient {
       child.off("close", onClose);
     };
 
-    const finish = (error?: unknown) => {
+    const finish = (error?: AgentStartupError) => {
       if (settled) {
         return;
       }
       settled = true;
       cleanup();
       if (error) {
+        failure = error;
         rejectPromise(error);
       }
     };
@@ -1934,11 +2065,16 @@ export class AcpClient {
       child.once("error", onError);
       child.once("exit", onExit);
       child.once("close", onClose);
+      if (child.exitCode !== null || child.signalCode !== null) {
+        onExit(child.exitCode, child.signalCode);
+      }
     });
+    void promise.catch(() => {});
 
     return {
       promise,
       dispose: () => finish(),
+      getError: () => failure,
     };
   }
 
@@ -2113,23 +2249,23 @@ export class AcpClient {
   }
 
   private async authenticateIfRequired(
-    connection: ClientSideConnection,
-    methods: AuthMethod[],
+    connection: AcpAgentConnection,
+    authMethods: AuthMethod[],
   ): Promise<void> {
-    if (methods.length === 0) {
+    if (authMethods.length === 0) {
       return;
     }
 
-    const selected = this.selectAuthMethod(methods);
+    const selected = this.selectAuthMethod(authMethods);
     if (!selected) {
       if (this.options.authPolicy === "fail") {
         throw new AuthPolicyError(
-          `agent advertised auth methods [${methods.map((m) => m.id).join(", ")}] but no matching credentials found`,
+          `agent advertised auth methods [${authMethods.map((m) => m.id).join(", ")}] but no matching credentials found`,
         );
       }
 
       this.log(
-        `agent advertised auth methods [${methods.map((m) => m.id).join(", ")}] but no matching credentials found — skipping (agent may handle auth internally)`,
+        `agent advertised auth methods [${authMethods.map((m) => m.id).join(", ")}] but no matching credentials found — skipping (agent may handle auth internally)`,
       );
       return;
     }
@@ -2286,6 +2422,86 @@ export class AcpClient {
     return response;
   }
 
+  private async handleElicitationRequest(
+    request: CreateElicitationRequest,
+    requestId: JsonRpcId,
+    requestSignal: AbortSignal,
+  ): Promise<CreateElicitationResponse> {
+    const resolved = this.resolveElicitationOwner(request);
+    if ("response" in resolved) {
+      return resolved.response;
+    }
+    const { active, handler } = resolved.owner;
+
+    const signal = AbortSignal.any([requestSignal, active.elicitationController.signal]);
+    const handlerAttempt = Promise.resolve()
+      .then(async () => await handler(request, { requestId, signal }))
+      .then(
+        (response) => ({ kind: "response" as const, response }),
+        (error: unknown) => ({ kind: "error" as const, error }),
+      );
+    const outcome = await Promise.race([handlerAttempt, waitForAbort(signal)]);
+
+    if (this.activePrompt !== active) {
+      return cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.inactive);
+    }
+    if (outcome.kind === "aborted" || signal.aborted) {
+      return cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.cancelled);
+    }
+    if (outcome.kind === "error" || !isKnownElicitationResponse(outcome.response)) {
+      return cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.unavailable);
+    }
+    return outcome.response;
+  }
+
+  private resolveElicitationOwner(
+    request: CreateElicitationRequest,
+  ): { owner: ElicitationOwner } | { response: CreateElicitationResponse } {
+    if (!this.options.elicitationModes?.includes(request.mode as AcpElicitationMode)) {
+      return { response: cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.unsupported) };
+    }
+    const active = this.activePrompt;
+    if (!active) {
+      return { response: cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.inactive) };
+    }
+    const scope = this.resolveElicitationScope(request, active);
+    if ("response" in scope) {
+      return scope;
+    }
+    if (this.isElicitationSessionCancelling(scope.sessionId)) {
+      return { response: cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.cancelled) };
+    }
+    if (!active.elicitationHandler) {
+      return { response: cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.unavailable) };
+    }
+    return { owner: { active, handler: active.elicitationHandler } };
+  }
+
+  private resolveElicitationScope(
+    request: CreateElicitationRequest,
+    active: ActivePromptState,
+  ): { sessionId: string } | { response: CreateElicitationResponse } {
+    const sessionId = elicitationSessionId(request);
+    if (sessionId) {
+      return sessionId === active.sessionId
+        ? { sessionId }
+        : {
+            response: cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.mismatchedSession),
+          };
+    }
+    const requestScopeId = elicitationRequestScopeId(request);
+    if (requestScopeId === undefined || requestScopeId !== active.requestId) {
+      return {
+        response: cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.requestScoped),
+      };
+    }
+    return { sessionId: active.sessionId };
+  }
+
+  private isElicitationSessionCancelling(sessionId: string): boolean {
+    return this.closing || this.cancellingSessionIds.has(sessionId);
+  }
+
   private async tryHandlePermissionRequestWithHost(
     params: RequestPermissionRequest,
   ): Promise<RequestPermissionResponse | undefined> {
@@ -2383,10 +2599,24 @@ export class AcpClient {
 
   private attachAgentLifecycleObservers(
     child: ChildProcessByStdio<Writable, Readable, Readable>,
+    startedProcess: AcpProcessStarted,
+    exitNotificationBarrier: Promise<void>,
   ): void {
-    child.once("exit", (exitCode, signal) => {
+    const onExit = (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      const exitedAt = isoNow();
       this.recordAgentExit("process_exit", exitCode, signal);
-    });
+      void exitNotificationBarrier.then(() => {
+        this.notifyProcessExit(startedProcess, exitCode, signal, exitedAt);
+      });
+    };
+    child.once("exit", onExit);
+
+    // A child can exit between spawn completion and observer attachment.
+    // Replay Node's recorded state so host process ownership cannot remain stale.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      child.off("exit", onExit);
+      onExit(child.exitCode, child.signalCode);
+    }
 
     child.once("close", (exitCode, signal) => {
       this.recordAgentExit("process_close", exitCode, signal);
@@ -2395,6 +2625,55 @@ export class AcpClient {
     child.stdout.once("close", () => {
       this.recordAgentExit("pipe_close", child.exitCode ?? null, child.signalCode ?? null);
     });
+  }
+
+  private notifyProcessSpawnFailure(launch: AcpProcessLaunch, error: unknown): void {
+    const handler = this.options.processLifecycle?.onSpawnFailed;
+    if (!handler) {
+      return;
+    }
+    const event = Object.freeze({
+      ...launch,
+      error,
+      failedAt: isoNow(),
+    });
+    try {
+      void Promise.resolve(handler(event)).catch((observerError: unknown) => {
+        this.logProcessLifecycleError("onSpawnFailed", observerError);
+      });
+    } catch (observerError) {
+      this.logProcessLifecycleError("onSpawnFailed", observerError);
+    }
+  }
+
+  private notifyProcessExit(
+    startedProcess: AcpProcessStarted,
+    exitCode: number | null,
+    signal: NodeJS.Signals | null,
+    exitedAt: string,
+  ): void {
+    const handler = this.options.processLifecycle?.onExit;
+    if (!handler) {
+      return;
+    }
+    const event = Object.freeze({
+      ...startedProcess,
+      exitCode,
+      signal,
+      exitedAt,
+    });
+    try {
+      void Promise.resolve(handler(event)).catch((error: unknown) => {
+        this.logProcessLifecycleError("onExit", error);
+      });
+    } catch (error) {
+      this.logProcessLifecycleError("onExit", error);
+    }
+  }
+
+  private logProcessLifecycleError(hook: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.log(`process lifecycle ${hook} hook failed: ${message}`);
   }
 
   private recordAgentExit(
@@ -2439,11 +2718,7 @@ export class AcpClient {
     return error;
   }
 
-  private async runConnectionRequest<T>(
-    run: () => Promise<T>,
-    onRequestStarted?: () => Promise<void> | void,
-    canStartRequest: () => boolean = () => true,
-  ): Promise<T> {
+  private async runConnectionRequest<T>(run: () => Promise<T>): Promise<T> {
     return await new Promise<T>((resolve, reject) => {
       const pending: PendingConnectionRequest = {
         settled: false,
@@ -2465,16 +2740,7 @@ export class AcpClient {
           if (pending.settled) {
             return { started: false as const };
           }
-          const requestCanStart = canStartRequest();
-          const request = run();
-          if (requestCanStart) {
-            try {
-              void Promise.resolve(onRequestStarted?.()).catch(() => {});
-            } catch {
-              // Readiness observation must not own a request that was already submitted.
-            }
-          }
-          return { started: true as const, value: await request };
+          return { started: true as const, value: await run() };
         })
         .then(
           (outcome) => {
@@ -2559,12 +2825,10 @@ export class AcpClient {
     return controller.signal;
   }
 
-  private abortAndDropPermissionSignal(sessionId: string): void {
+  private takePermissionAbortController(sessionId: string): AbortController | undefined {
     const controller = this.permissionAbortControllers.get(sessionId);
-    if (controller) {
-      controller.abort();
-      this.permissionAbortControllers.delete(sessionId);
-    }
+    this.permissionAbortControllers.delete(sessionId);
+    return controller;
   }
 
   private recordPermissionDecision(decision: "approved" | "denied" | "cancelled"): void {

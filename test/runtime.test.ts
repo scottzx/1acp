@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   AcpRuntimeError,
   AcpxRuntime,
@@ -25,6 +26,8 @@ function assertTurnResult(
   assert.equal(result.status, status);
   assert.equal(result.stopReason, stopReason);
 }
+
+const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
 function createSessionRecord(overrides: Partial<AcpSessionRecord> = {}): AcpSessionRecord {
   return {
@@ -143,7 +146,7 @@ test("AcpxRuntime delegates session lifecycle to the runtime manager", async () 
       acpxRecordId: record.acpxRecordId,
     }),
     setMode: async () => {},
-    setConfigOption: async () => {},
+    setConfigOption: async () => ({ configOptions: [] }),
     cancel: async () => {
       managerCancelCalls += 1;
     },
@@ -221,7 +224,9 @@ test("AcpxRuntime delegates session lifecycle to the runtime manager", async () 
 
   await runtime.getStatus({ handle });
   await runtime.setMode({ handle, mode: "architect" });
-  await runtime.setConfigOption({ handle, key: "approval", value: "manual" });
+  assert.deepEqual(await runtime.setConfigOption({ handle, key: "approval", value: "manual" }), {
+    configOptions: [],
+  });
   await runtime.cancel({ handle, reason: "legacy cancel" });
   await turn.closeStream({ reason: "observer closed stream" });
   await turn.cancel();
@@ -294,6 +299,112 @@ test("AcpxRuntime adopts a pre-warmed handle under the real host session id", as
     agentSessionId: "agent-prewarmed",
   });
 });
+
+test("AcpxRuntime keeps session ownership from initialization through idle updates and oneshot cleanup", async (t) => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-owner-"));
+  const stateDir = path.join(rootDir, "state");
+  const persistentPidFile = path.join(rootDir, "persistent.pid");
+  const oneshotPidFile = path.join(rootDir, "oneshot.pid");
+  t.after(async () => {
+    await fs.rm(rootDir, { recursive: true, force: true });
+  });
+
+  const runtime = createAcpRuntime({
+    cwd: rootDir,
+    sessionStore: createFileSessionStore({ stateDir }),
+    agentRegistry: createAgentRegistry({
+      overrides: {
+        fixture: [
+          process.execPath,
+          MOCK_AGENT_PATH,
+          "--advertise-commands-after-new",
+          "--pid-file",
+          persistentPidFile,
+        ],
+        "fixture-oneshot": [process.execPath, MOCK_AGENT_PATH, "--pid-file", oneshotPidFile],
+      },
+    }),
+    permissionMode: "approve-reads",
+  });
+
+  const persistentHandle = await runtime.ensureSession({
+    sessionKey: "owned-persistent",
+    agent: "fixture",
+    mode: "persistent",
+  });
+  const status = await waitForRuntimeStatus(
+    async () => await runtime.getStatus({ handle: persistentHandle }),
+    (value) => value.availableCommands?.[0]?.name === "fixture-command",
+  );
+  assert.deepEqual(status.availableCommands, [
+    {
+      name: "fixture-command",
+      description: "Advertised after session creation",
+      hasInput: false,
+    },
+  ]);
+  await runtime.close({ handle: persistentHandle, reason: "test complete" });
+
+  const firstHandle = await runtime.ensureSession({
+    sessionKey: "owned-oneshot",
+    agent: "fixture-oneshot",
+    mode: "oneshot",
+  });
+  const secondHandle = await runtime.ensureSession({
+    sessionKey: "owned-oneshot",
+    agent: "fixture-oneshot",
+    mode: "oneshot",
+  });
+  assert.equal(firstHandle.acpxRecordId, secondHandle.acpxRecordId);
+  assert.equal(firstHandle.backendSessionId, secondHandle.backendSessionId);
+
+  const turn = runtime.startTurn({
+    handle: secondHandle,
+    text: "echo owner cleanup",
+    mode: "prompt",
+    requestId: "req-owner-cleanup",
+  });
+  for await (const event of turn.events) {
+    // Drain the public event stream before observing terminal cleanup.
+    void event;
+  }
+  assert.deepEqual(await turn.result, {
+    status: "completed",
+    stopReason: "end_turn",
+    finalAnswer: "owner cleanup",
+    promptMessageId: "req-owner-cleanup",
+    runtimeRequestId: "req-owner-cleanup",
+  });
+
+  const oneshotPid = Number((await fs.readFile(oneshotPidFile, "utf8")).trim());
+  await waitForRuntimeStatus(
+    () => isProcessRunning(oneshotPid),
+    (running) => !running,
+  );
+});
+
+async function waitForRuntimeStatus<T>(
+  read: () => Promise<T> | T,
+  matches: (value: T) => boolean,
+): Promise<T> {
+  const deadline = Date.now() + 5_000;
+  let value = await read();
+  while (!matches(value) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    value = await read();
+  }
+  assert.equal(matches(value), true);
+  return value;
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 test("createFileSessionStore persists records inside the provided state directory", async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-"));
@@ -406,6 +517,20 @@ test("createFileSessionStore rebind refuses to overwrite an existing target", as
   );
   assert.equal((await store.load(sourceId))?.acpSessionId, "sid-source");
   assert.equal((await store.load(targetId))?.acpSessionId, "sid-target");
+});
+
+test("createFileSessionStore preserves environment name casing across reloads", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-env-store-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+  const env = { INITIAL_AGENT_MODE: "read-only", CustomMixedCase: "synthetic" };
+  const record = createSessionRecord({ acpx: { session_options: { env } } });
+
+  await createFileSessionStore({ stateDir }).save(record);
+
+  const restored = await createFileSessionStore({ stateDir }).load(record.acpxRecordId);
+  assert.deepEqual(restored?.acpx?.session_options?.env, env);
 });
 
 test("createFileSessionStore supports concurrent saves in the same millisecond", async (t) => {
@@ -752,4 +877,30 @@ test("createRuntimeStore is an alias for the file-backed session store", async (
   const loaded = await store.load("alias-record");
 
   assert.equal(loaded?.acpSessionId, "alias-sid");
+});
+
+test("AcpxRuntime snapshots transient child environment for manager and probes", async () => {
+  const agentProcessEnv = { ACPX_TEST_RUNTIME_OVERLAY: "construction-value" };
+  const observed: unknown[] = [];
+  const runtime = new AcpxRuntime(
+    {
+      cwd: process.cwd(),
+      sessionStore: createFileSessionStore({
+        stateDir: path.join(os.tmpdir(), "unused-env-store"),
+      }),
+      agentRegistry: createAgentRegistry(),
+      permissionMode: "deny-all",
+      agentProcessEnv,
+    },
+    {
+      probeRunner: async (options) => {
+        observed.push(options.agentProcessEnv);
+        return { ok: true, message: "synthetic probe" };
+      },
+    },
+  );
+  agentProcessEnv.ACPX_TEST_RUNTIME_OVERLAY = "mutated-value";
+  await runtime.doctor();
+  assert.deepEqual(observed, [{ ACPX_TEST_RUNTIME_OVERLAY: "construction-value" }]);
+  assert.equal(process.env.ACPX_TEST_RUNTIME_OVERLAY, undefined);
 });

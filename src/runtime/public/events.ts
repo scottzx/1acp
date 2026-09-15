@@ -4,7 +4,6 @@ import type {
   AcpRuntimeBackgroundTask,
   AcpRuntimeEvent,
   AcpRuntimePlanEntry,
-  AcpRuntimePlanEntryStatus,
   AcpRuntimeUsageBreakdown,
   AcpRuntimeUsageCost,
   AcpSessionUpdateTag,
@@ -145,6 +144,66 @@ function backgroundTaskStatusText(payload: Record<string, unknown>): string | nu
     return null;
   }
   return `background tasks: ${completed}/${total} (${running} running, ${failed} failed)`;
+}
+
+function isPlanEntryStatus(value: string): value is AcpRuntimePlanEntry["status"] {
+  return value === "pending" || value === "in_progress" || value === "completed";
+}
+
+function isPlanEntryPriority(value: string): value is NonNullable<AcpRuntimePlanEntry["priority"]> {
+  return value === "high" || value === "medium" || value === "low";
+}
+
+function planUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
+  const raw = payload.entries;
+  const entries = normalizePlanEntries(raw);
+  if (Array.isArray(raw) && raw.length === 0) {
+    // An explicit empty snapshot clears the host's previous plan.
+    return { type: "status", text: "plan updated", tag: "plan", entries: [] };
+  }
+  // Preserve legacy summaries, including entries without a valid status.
+  const text =
+    planStatusText(payload) ?? (entries.length > 0 ? `plan: ${entries[0]?.content}` : null);
+  if (!text) {
+    return null;
+  }
+  return {
+    type: "status",
+    text,
+    tag: "plan",
+    ...(entries.length > 0 ? { entries } : {}),
+  };
+}
+
+function normalizePlanEntries(value: unknown): AcpRuntimePlanEntry[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const entries: AcpRuntimePlanEntry[] = [];
+  for (const entry of value) {
+    const normalized = normalizePlanEntry(entry);
+    if (normalized) {
+      entries.push(normalized);
+    }
+  }
+  return entries;
+}
+
+function normalizePlanEntry(value: unknown): AcpRuntimePlanEntry | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const content = asTrimmedString(value.content);
+  const status = asTrimmedString(value.status);
+  if (!content || !isPlanEntryStatus(status)) {
+    return undefined;
+  }
+  const priority = asTrimmedString(value.priority);
+  return {
+    content,
+    status,
+    ...(isPlanEntryPriority(priority) ? { priority } : {}),
+  };
 }
 
 /**
@@ -665,22 +724,6 @@ function currentModeUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEve
   };
 }
 
-// Structured variant of the plan status: keeps the full entry list on the
-// event so hosts can render a live checklist instead of a one-line summary.
-// Falls back to the text-only status when no renderable entries are present.
-function planUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
-  const planEntries = normalizePlanEntries(payload.entries);
-  if (!planEntries) {
-    return statusUpdateEvent("plan", payload);
-  }
-  return {
-    type: "status",
-    text: `plan updated (${planEntries.length})`,
-    tag: "plan",
-    planEntries,
-  };
-}
-
 function backgroundTaskUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {
   const tasks = normalizeBackgroundTasks(payload.tasks);
   if (!tasks) {
@@ -739,54 +782,6 @@ function normalizeBackgroundTasks(value: unknown): AcpRuntimeBackgroundTask[] | 
     }
   }
   return tasks.length > 0 ? tasks : undefined;
-}
-
-const PLAN_ENTRY_STATUSES: ReadonlySet<AcpRuntimePlanEntryStatus> = new Set([
-  "pending",
-  "in_progress",
-  "completed",
-]);
-
-const PLAN_ENTRY_PRIORITIES: ReadonlySet<"high" | "medium" | "low"> = new Set([
-  "high",
-  "medium",
-  "low",
-]);
-
-function normalizePlanStatus(value: unknown): AcpRuntimePlanEntryStatus {
-  const raw = asTrimmedString(value) as AcpRuntimePlanEntryStatus;
-  return PLAN_ENTRY_STATUSES.has(raw) ? raw : "pending";
-}
-
-function normalizePlanPriority(value: unknown): "high" | "medium" | "low" | undefined {
-  const raw = asTrimmedString(value) as "high" | "medium" | "low";
-  return PLAN_ENTRY_PRIORITIES.has(raw) ? raw : undefined;
-}
-
-function normalizePlanEntry(entry: unknown): AcpRuntimePlanEntry | undefined {
-  if (!isRecord(entry)) {
-    return undefined;
-  }
-  const content = asTrimmedString(entry.content);
-  if (!content) {
-    return undefined;
-  }
-  const priority = normalizePlanPriority(entry.priority);
-  return { content, status: normalizePlanStatus(entry.status), ...(priority ? { priority } : {}) };
-}
-
-function normalizePlanEntries(value: unknown): AcpRuntimePlanEntry[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const entries: AcpRuntimePlanEntry[] = [];
-  for (const entry of value) {
-    const normalized = normalizePlanEntry(entry);
-    if (normalized) {
-      entries.push(normalized);
-    }
-  }
-  return entries.length > 0 ? entries : undefined;
 }
 
 function availableCommandsUpdateEvent(payload: Record<string, unknown>): AcpRuntimeEvent | null {

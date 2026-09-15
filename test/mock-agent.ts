@@ -6,6 +6,7 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
+  type AnyMessage,
   type CloseSessionRequest,
   type CloseSessionResponse,
   PROTOCOL_VERSION,
@@ -14,7 +15,11 @@ import {
   type Agent,
   type AgentSideConnection as AgentConnection,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type InitializeRequest,
   type InitializeResponse,
+  type JsonRpcId,
   type ListSessionsRequest,
   type ListSessionsResponse,
   type LoadSessionRequest,
@@ -26,17 +31,21 @@ import {
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionId,
+  type SessionConfigOption,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type SessionInfo,
+  methods,
 } from "@agentclientprotocol/sdk";
 
 type ParsedCommand = {
   command: string;
   args: string[];
 };
+
+let activePromptRequestId: JsonRpcId | undefined;
 
 type MockAgentOptions = {
   hangOnNewSession: boolean;
@@ -59,7 +68,9 @@ type MockAgentOptions = {
   setSessionModelInvalidParams: boolean;
   advertiseConfigOptions: boolean;
   advertiseModels: boolean;
+  advertiseModelProvider: boolean;
   advertiseLegacyModels: boolean;
+  advertiseCommandsAfterNew: boolean;
   modelConfigId: string;
   omitReconnectConfigOptions: boolean;
   omitReconnectModelId?: string;
@@ -68,6 +79,7 @@ type MockAgentOptions = {
   loadReplayText: string;
   ignoreSigterm: boolean;
   cancelDelayMs: number;
+  elicitOnNewSession: boolean;
   /** If set, the agent writes its PID to this path at startup (before ACP handshake). */
   pidFile?: string;
 };
@@ -79,6 +91,7 @@ type SessionState = {
   configValues: Record<string, string | boolean>;
   transientPromptAttempts: Record<string, number>;
   modelId: string;
+  lastElicitationResponse?: CreateElicitationResponse;
 };
 
 class CancelledError extends Error {
@@ -128,6 +141,16 @@ function getPromptText(prompt: ContentBlock[]): string {
   }
 
   return parts.join("").trim();
+}
+
+function formSchema() {
+  return {
+    type: "object" as const,
+    properties: {
+      answer: { type: "string" as const },
+    },
+    required: ["answer"],
+  };
 }
 
 function describePromptBlocks(prompt: ContentBlock[]): string {
@@ -369,7 +392,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let setSessionModelInvalidParams = false;
   let advertiseConfigOptions = false;
   let advertiseModels = false;
+  let advertiseModelProvider = false;
   let advertiseLegacyModels = false;
+  let advertiseCommandsAfterNew = false;
   let modelConfigId = "model";
   let omitReconnectConfigOptions = false;
   let omitReconnectModelId: string | undefined;
@@ -379,6 +404,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let cancelDelayMs = 0;
   let hangOnNewSession = false;
+  let elicitOnNewSession = false;
   let pidFile: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -444,8 +470,19 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--advertise-model-provider") {
+      advertiseModels = true;
+      advertiseModelProvider = true;
+      continue;
+    }
+
     if (token === "--advertise-legacy-models") {
       advertiseLegacyModels = true;
+      continue;
+    }
+
+    if (token === "--advertise-commands-after-new") {
+      advertiseCommandsAfterNew = true;
       continue;
     }
 
@@ -524,6 +561,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--elicit-on-new-session") {
+      elicitOnNewSession = true;
+      continue;
+    }
+
     if (token === "--pid-file") {
       pidFile = parseOptionValue(argv, index + 1, token);
       index += 1;
@@ -587,7 +629,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     setSessionModelInvalidParams,
     advertiseConfigOptions,
     advertiseModels,
+    advertiseModelProvider,
     advertiseLegacyModels,
+    advertiseCommandsAfterNew,
     modelConfigId,
     omitReconnectConfigOptions,
     omitReconnectModelId,
@@ -596,6 +640,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadReplayText,
     ignoreSigterm,
     cancelDelayMs,
+    elicitOnNewSession,
     pidFile,
   };
 }
@@ -684,6 +729,7 @@ function buildConfigOptions(
   modelConfigId: string,
   omitModelId?: string,
   currentModelId = state.modelId,
+  includeProvider = false,
 ): SetSessionConfigOptionResponse["configOptions"] {
   const reasoningEffort =
     typeof state.configValues.reasoning_effort === "string"
@@ -699,6 +745,18 @@ function buildConfigOptions(
   ].filter((option) => option.value !== omitModelId);
 
   return [
+    ...(includeProvider
+      ? [
+          {
+            id: "provider",
+            name: "Provider",
+            type: "select",
+            category: "model",
+            currentValue: "fixture-provider",
+            options: [{ value: "fixture-provider", name: "Fixture Provider" }],
+          } satisfies SessionConfigOption,
+        ]
+      : []),
     {
       id: "mode",
       name: "Session Mode",
@@ -741,13 +799,15 @@ class MockAgent implements Agent {
   private readonly connection: AgentConnection;
   private readonly sessions = new Map<SessionId, SessionState>();
   private readonly options: MockAgentOptions;
+  private clientCapabilities?: InitializeRequest["clientCapabilities"];
 
   constructor(connection: AgentConnection, options: MockAgentOptions) {
     this.connection = connection;
     this.options = options;
   }
 
-  async initialize(): Promise<InitializeResponse> {
+  async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    this.clientCapabilities = structuredClone(params.clientCapabilities);
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
       ...(this.options.supportsListSessions ? { list: {} } : {}),
@@ -780,6 +840,16 @@ class MockAgent implements Agent {
     const sessionId = randomUUID();
     this.sessions.set(sessionId, createSessionState(false));
 
+    if (this.options.elicitOnNewSession) {
+      const response = await this.connection.request(methods.client.elicitation.create, {
+        mode: "form",
+        requestId: "session-new",
+        message: "Configure the session",
+        requestedSchema: formSchema(),
+      });
+      this.ensureSession(sessionId).lastElicitationResponse = response;
+    }
+
     const response: NewSessionResponse = { sessionId };
 
     if (this.options.newSessionMeta) {
@@ -791,14 +861,22 @@ class MockAgent implements Agent {
         this.sessions.get(sessionId) ?? createSessionState(false),
         this.options.modelConfigId,
         this.options.omitReconnectModelId,
+        undefined,
+        this.options.advertiseModelProvider,
       );
     }
 
-    return attachLegacyModels(
+    const result = attachLegacyModels(
       response,
       this.ensureSession(sessionId),
       this.options.advertiseLegacyModels,
     );
+    if (this.options.advertiseCommandsAfterNew) {
+      setImmediate(() => {
+        void this.sendAvailableCommands(sessionId);
+      });
+    }
+    return result;
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -866,6 +944,9 @@ class MockAgent implements Agent {
       response.configOptions = buildConfigOptions(
         this.sessions.get(sessionId) ?? createSessionState(false),
         this.options.modelConfigId,
+        undefined,
+        undefined,
+        this.options.advertiseModelProvider,
       );
     }
 
@@ -1057,6 +1138,7 @@ class MockAgent implements Agent {
         this.options.modelConfigId,
         this.options.omitReconnectModelId,
         this.options.reportModelAs,
+        this.options.advertiseModelProvider,
       ),
     };
   }
@@ -1099,6 +1181,21 @@ class MockAgent implements Agent {
           type: "text",
           text,
         },
+      },
+    });
+  }
+
+  private async sendAvailableCommands(sessionId: SessionId): Promise<void> {
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "available_commands_update",
+        availableCommands: [
+          {
+            name: "fixture-command",
+            description: "Advertised after session creation",
+          },
+        ],
       },
     });
   }
@@ -1173,6 +1270,14 @@ class MockAgent implements Agent {
     }
     if (text === "retryable-error-once") {
       return "recovered after retry";
+    }
+
+    if (text === "client-capabilities") {
+      return JSON.stringify(this.clientCapabilities);
+    }
+
+    if (text.startsWith("elicitation ")) {
+      return await this.handleElicitation(sessionId, text.slice("elicitation ".length), signal);
     }
 
     if (text.startsWith("extension-notification ")) {
@@ -1407,6 +1512,100 @@ class MockAgent implements Agent {
     return `unrecognized prompt: ${text}`;
   }
 
+  private async handleElicitation(
+    sessionId: SessionId,
+    command: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    if (command === "complete") {
+      const conn = this.connection as unknown as {
+        unstable_completeElicitation?: (p: unknown) => Promise<void>;
+        completeElicitation?: (p: unknown) => Promise<void>;
+      };
+      if (typeof conn.unstable_completeElicitation === "function") {
+        await conn.unstable_completeElicitation({ elicitationId: "elicitation-123" });
+      } else if (typeof conn.completeElicitation === "function") {
+        await conn.completeElicitation({ elicitationId: "elicitation-123" });
+      }
+      return "elicitation complete accepted";
+    }
+
+    if (command === "last-response") {
+      return JSON.stringify(this.ensureSession(sessionId).lastElicitationResponse ?? null);
+    }
+
+    const request: CreateElicitationRequest =
+      command === "request-scoped"
+        ? {
+            mode: "form",
+            requestId: activePromptRequestId ?? "missing-prompt-request",
+            message: "Choose a value",
+            requestedSchema: formSchema(),
+          }
+        : command === "mismatched-session"
+          ? {
+              mode: "form",
+              sessionId: "wrong-session",
+              toolCallId: "tool-123",
+              message: "Choose a value",
+              requestedSchema: formSchema(),
+            }
+          : command === "custom-mode"
+            ? {
+                mode: "future-mode",
+                sessionId,
+                message: "Choose a value",
+              }
+            : {
+                mode: command === "url" ? "url" : "form",
+                sessionId,
+                toolCallId: "tool-123",
+                message: "Choose a value",
+                ...(command === "url"
+                  ? { elicitationId: "elicitation-123", url: "https://example.invalid/input" }
+                  : { requestedSchema: formSchema() }),
+              };
+
+    if (command === "late") {
+      void this.connection.request(methods.client.elicitation.create, request).then((response) => {
+        this.ensureSession(sessionId).lastElicitationResponse = response;
+      });
+      return "elicitation dispatched";
+    }
+
+    if (command === "timeout-late") {
+      void this.connection.request(methods.client.elicitation.create, request).then((response) => {
+        this.ensureSession(sessionId).lastElicitationResponse = response;
+      });
+      await sleepWithCancel(5_000, signal);
+      return "elicitation timeout completed";
+    }
+
+    if (command === "request-cancel") {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30);
+      try {
+        const response = await this.connection.request(methods.client.elicitation.create, request, {
+          cancellationSignal: controller.signal,
+        });
+        return `elicitation request completed:${JSON.stringify(response)}:aborted:${controller.signal.aborted}`;
+      } catch {
+        return `elicitation request cancelled:${controller.signal.aborted}`;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    const response = await this.connection.request(methods.client.elicitation.create, request, {
+      cancellationSignal: signal,
+    });
+    this.ensureSession(sessionId).lastElicitationResponse = response;
+    if (command === "form-no-echo") {
+      return `elicitation ${response.action}`;
+    }
+    return JSON.stringify(response);
+  }
+
   private async runTerminalCommand(
     sessionId: SessionId,
     rawCommand: string,
@@ -1478,7 +1677,30 @@ class MockAgent implements Agent {
 
 const output = Writable.toWeb(process.stdout);
 const input = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
-const stream = ndJsonStream(output, input);
+const baseStream = ndJsonStream(output, input);
+const stream = {
+  readable: new ReadableStream<AnyMessage>({
+    async start(controller) {
+      const reader = baseStream.readable.getReader();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          if ("method" in value && value.method === methods.agent.session.prompt && "id" in value) {
+            activePromptRequestId = value.id;
+          }
+          controller.enqueue(value);
+        }
+      } finally {
+        reader.releaseLock();
+        controller.close();
+      }
+    },
+  }),
+  writable: baseStream.writable,
+};
 const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
 
 // Write PID to a file before doing anything else so that the parent can track

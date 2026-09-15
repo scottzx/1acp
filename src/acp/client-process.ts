@@ -2,9 +2,67 @@ import { execFile, type ChildProcess, type ChildProcessByStdio } from "node:chil
 import fs from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
-import { promisify } from "node:util";
 
-const execFileAsync = promisify(execFile);
+export const PROCESS_HELPER_TIMEOUT_MS = 8_000;
+export const PROCESS_HELPER_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+
+export async function runTimedExecFile(
+  command: string,
+  args: readonly string[],
+  options: {
+    timeoutMs?: number;
+    maxBufferBytes?: number;
+    windowsHide?: boolean;
+  } = {},
+): Promise<string> {
+  const timeoutMs = Math.max(1, Math.round(options.timeoutMs ?? PROCESS_HELPER_TIMEOUT_MS));
+  return await new Promise<string>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const child = execFile(
+      command,
+      [...args],
+      {
+        encoding: "utf8",
+        maxBuffer: options.maxBufferBytes ?? PROCESS_HELPER_MAX_BUFFER_BYTES,
+        killSignal: "SIGKILL",
+        windowsHide: options.windowsHide,
+      },
+      (error, stdout) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout);
+      },
+    );
+
+    timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const killed = child.kill("SIGKILL");
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      reject(
+        Object.assign(new Error(`${command} timed out after ${timeoutMs}ms`), {
+          code: "ETIMEDOUT",
+          killed,
+          signal: "SIGKILL" as const,
+        }),
+      );
+    }, timeoutMs);
+  });
+}
 
 export type CommandParts = {
   command: string;
@@ -319,10 +377,7 @@ function isWindowsExecutableCommand(command: string): boolean {
 }
 
 async function runWslpath(cwd: string): Promise<string> {
-  const { stdout } = await execFileAsync("wslpath", ["-w", cwd], {
-    encoding: "utf8",
-  });
-  return stdout;
+  return await runTimedExecFile("wslpath", ["-w", cwd]);
 }
 
 export function basenameToken(value: string): string {

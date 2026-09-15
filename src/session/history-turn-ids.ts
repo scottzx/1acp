@@ -109,7 +109,7 @@ export function resolveRuntimeTurnId(
 export function stampHistoryTurnIds<T extends HistoryItem>(
   items: T[],
   turns: HistoryTurnRef[],
-): T[] {
+): Array<T & { turnId?: string }> {
   if (items.length === 0) {return items;}
 
   const unused = turns.filter((turn) => resolvableTurnId(turn));

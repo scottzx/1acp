@@ -7,6 +7,7 @@ import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
+  AcpElicitationMode,
   AuthPolicy,
   McpServer,
   NonInteractivePermissionPolicy,
@@ -16,7 +17,11 @@ import type {
   SessionResumePolicy,
 } from "../../types.js";
 import { applyLifecycleSnapshotToRecord } from "./lifecycle.js";
-import { connectAndLoadSession, type ConnectedSessionController } from "./reconnect.js";
+import {
+  connectAndLoadSession,
+  type ConnectAndLoadSessionOptions,
+  type ConnectedSessionController,
+} from "./reconnect.js";
 import { sessionOptionsFromRecord } from "./session-options.js";
 
 export type FullConnectedSessionController = ConnectedSessionController & {
@@ -55,7 +60,9 @@ export type WithConnectedSessionOptions<T> = {
   authPolicy?: AuthPolicy;
   fs?: boolean;
   terminal?: boolean;
+  elicitationModes?: readonly AcpElicitationMode[];
   resumePolicy?: SessionResumePolicy;
+  replacingConfigOption?: ConnectAndLoadSessionOptions["replacingConfigOption"];
   timeoutMs?: number;
   verbose?: boolean;
   onClientAvailable?: (controller: FullConnectedSessionController) => void;
@@ -100,43 +107,26 @@ export async function withConnectedSession<T>(
   options: WithConnectedSessionOptions<T>,
 ): Promise<WithConnectedSessionResult<T>> {
   const record = await options.loadRecord(options.sessionRecordId);
-  const client =
-    options.createClient?.({
-      agentCommand: record.agentCommand,
-      agentArgv: record.agentArgv,
-      cwd: absolutePath(record.cwd),
-      mcpServers: options.mcpServers,
-      permissionMode: options.permissionMode ?? "approve-reads",
-      nonInteractivePermissions: options.nonInteractivePermissions,
-      permissionPolicy: options.permissionPolicy,
-      onPermissionRequest: options.onPermissionRequest,
-      onAskUserQuestion: options.onAskUserQuestion,
-      onExitPlanMode: options.onExitPlanMode,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      fs: options.fs,
-      terminal: options.terminal,
-      verbose: options.verbose,
-      sessionOptions: sessionOptionsFromRecord(record),
-    }) ??
-    new AcpClient({
-      agentCommand: record.agentCommand,
-      agentArgv: record.agentArgv,
-      cwd: absolutePath(record.cwd),
-      mcpServers: options.mcpServers,
-      permissionMode: options.permissionMode ?? "approve-reads",
-      nonInteractivePermissions: options.nonInteractivePermissions,
-      permissionPolicy: options.permissionPolicy,
-      onPermissionRequest: options.onPermissionRequest,
-      onAskUserQuestion: options.onAskUserQuestion,
-      onExitPlanMode: options.onExitPlanMode,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      fs: options.fs,
-      terminal: options.terminal,
-      verbose: options.verbose,
-      sessionOptions: sessionOptionsFromRecord(record),
-    });
+  const clientOptions: ConstructorParameters<typeof AcpClient>[0] = {
+    agentCommand: record.agentCommand,
+    agentArgv: record.agentArgv,
+    cwd: absolutePath(record.cwd),
+    mcpServers: options.mcpServers,
+    permissionMode: options.permissionMode ?? "approve-reads",
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    permissionPolicy: options.permissionPolicy,
+    onPermissionRequest: options.onPermissionRequest,
+    onAskUserQuestion: options.onAskUserQuestion,
+    onExitPlanMode: options.onExitPlanMode,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    fs: options.fs,
+    terminal: options.terminal,
+    elicitationModes: options.elicitationModes,
+    verbose: options.verbose,
+    sessionOptions: sessionOptionsFromRecord(record),
+  };
+  const client = options.createClient?.(clientOptions) ?? new AcpClient(clientOptions);
   let activeSessionIdForControl = record.acpSessionId;
   let notifiedClientAvailable = false;
   const activeController = createActiveSessionController({
@@ -152,6 +142,7 @@ export async function withConnectedSession<T>(
           client,
           record,
           resumePolicy: options.resumePolicy,
+          replacingConfigOption: options.replacingConfigOption,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
           activeController,

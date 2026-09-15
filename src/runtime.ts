@@ -1,3 +1,4 @@
+import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   DEFAULT_AGENT_NAME,
   listBuiltInAgents,
@@ -46,9 +47,20 @@ export {
 } from "./runtime/public/handle-state.js";
 export type {
   AcpAgentRegistry,
+  AcpElicitationContext,
+  AcpElicitationHandler,
+  AcpElicitationMode,
+  AcpElicitationRequest,
+  AcpElicitationResponse,
   AcpFileSessionStoreOptions,
   AcpPermissionDecision,
   AcpPermissionRequest,
+  AcpProcessExit,
+  AcpProcessLaunch,
+  AcpProcessLaunchScope,
+  AcpProcessLifecycle,
+  AcpProcessSpawnFailure,
+  AcpProcessStarted,
   AcpRuntime,
   AcpRuntimeAvailableCommand,
   AcpRuntimeCapabilities,
@@ -58,6 +70,7 @@ export type {
   AcpTextDeltaOriginMeta,
   AcpRuntimeHandle,
   AcpRuntimeOptions,
+  AcpRuntimePlanEntry,
   AcpRuntimePromptMode,
   AcpRuntimeSessionMode,
   AcpRuntimeSessionModels,
@@ -153,7 +166,11 @@ export class AcpxRuntime implements AcpxRuntimeLike {
         details?: unknown[];
       }>;
     },
-  ) {}
+  ) {
+    if (options.agentProcessEnv) {
+      this.options = { ...options, agentProcessEnv: { ...options.agentProcessEnv } };
+    }
+  }
 
   isHealthy(): boolean {
     return this.healthy;
@@ -299,6 +316,7 @@ export class AcpxRuntime implements AcpxRuntimeLike {
         requestId: input.requestId,
         timeoutMs: input.timeoutMs,
         signal: input.signal,
+        onElicitation: input.onElicitation,
       }),
     );
     return {
@@ -336,6 +354,7 @@ export class AcpxRuntime implements AcpxRuntimeLike {
       requestId: input.requestId,
       timeoutMs: input.timeoutMs,
       signal: input.signal,
+      onElicitation: input.onElicitation,
     });
   }
 
@@ -383,10 +402,10 @@ export class AcpxRuntime implements AcpxRuntimeLike {
     handle: AcpRuntimeHandle;
     key: string;
     value: string;
-  }): Promise<void> {
+  }): Promise<SetSessionConfigOptionResponse> {
     const { handle, state } = this.resolveManagerHandle(input.handle);
     const manager = await this.getManager();
-    await manager.setConfigOption(handle, input.key, input.value, state.mode);
+    return await manager.setConfigOption(handle, input.key, input.value, state.mode);
   }
 
   async cancel(input: { handle: AcpRuntimeHandle; reason?: string }): Promise<void> {
