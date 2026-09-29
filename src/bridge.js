@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { WebSocketServer } from "ws";
+import { attachAcpConnection } from "./acp-connection.js";
 import {
   createAcpRuntime,
   createRuntimeStore,
@@ -19,7 +20,7 @@ import {
 // Configurations
 // ----------------------------------------------------
 const PORT = process.env.ACPX_PORT ? Number.parseInt(process.env.ACPX_PORT, 10) : 36812;
-const DEFAULT_STATE_DIR = path.join(os.homedir(), ".1agents", "acpx-state");
+const DEFAULT_STATE_DIR = process.env.ACP_STATE_DIR || path.join(os.homedir(), ".1agents", "acpx-state");
 // "总是允许" allowlists are project-level: one file per workspace, stored inside
 // the project folder (see allowRulesFile). Shared by every session in that
 // project and living on disk means a recorded rule survives idle-reap, resume
@@ -1165,6 +1166,7 @@ async function flushSessionHistoryPush(sessionId, state) {
 // ----------------------------------------------------
 // WebSocket Server Setup
 // ----------------------------------------------------
+/** @type {import("ws").WebSocketServer | null} */
 export let wss = null;
 
 export function attachBridgeServer(serverOrOptions = {}) {
@@ -1190,7 +1192,8 @@ export function attachBridgeServer(serverOrOptions = {}) {
     console.error("[acpx-server] WebSocketServer error:", err);
   });
 
-  wss.on("connection", (ws, req) => setupConnection(ws, req));
+  wss.on("connection", (ws, req) => attachAcpConnection(ws, req));
+  wss.on("close", () => { wss = null; });
 
   return {
     wss,
@@ -1200,22 +1203,8 @@ export function attachBridgeServer(serverOrOptions = {}) {
   };
 }
 
-export function setupConnection(ws, req) {
-  if (req) {
-    const hostHeader = req.headers?.host;
-    ws._acpxReqHost = hostHeader ? hostHeader.split(":")[0] : undefined;
-  }
-  console.log("[acpx-server] Client connected to ACP bridge.");
-
-  ws.on("message", async (messageData) => {
-    let payload;
-    try {
-      payload = JSON.parse(messageData.toString());
-    } catch {
-      sendError(ws, null, "INVALID_JSON", "Failed to parse JSON payload");
-      return;
-    }
-
+/** Internal runtime command dispatch; the network entry point is ACP JSON-RPC. */
+export async function dispatchCommand(ws, payload) {
     const { action, sessionId } = payload;
     if (!action) {
       sendError(ws, sessionId, "MISSING_ACTION", "Action field is required");
@@ -1237,6 +1226,7 @@ export function setupConnection(ws, req) {
             permissionMode,
             responsePolicy,
             env,
+            launch,
           } = payload;
           const normalizedResponsePolicy = responsePolicy === "summary" ? "summary" : "stream";
 
@@ -1291,6 +1281,83 @@ export function setupConnection(ws, req) {
             }
           }
 
+          const launchArgv = Array.isArray(launch?.argv)
+            ? launch.argv.filter((value) => typeof value === "string" && value.length > 0)
+            : [];
+          if (launchArgv.length > 0) {
+            if (
+              launchArgv.length !== 5 ||
+              launchArgv[0] !== "grok" ||
+              launchArgv[1] !== "agent" ||
+              launchArgv[2] !== "--model" ||
+              launchArgv[3].startsWith("-") ||
+              launchArgv[4] !== "stdio" ||
+              launch?.model !== launchArgv[3]
+            ) {
+              sendError(
+                ws,
+                sessionId,
+                "INVALID_LAUNCH",
+                "Only the code-owned grok-build launch shape is accepted",
+              );
+              return;
+            }
+            if (launch.env && typeof launch.env === "object" && !Array.isArray(launch.env)) {
+              const allowedLaunchEnv = new Set([
+                "GROK_XAI_API_BASE_URL",
+                "GROK_MODELS_BASE_URL",
+                "GROK_MODELS_LIST_URL",
+                "GROK_DEFAULT_MODEL",
+              ]);
+              const launchEnvEntries = Object.entries(launch.env);
+              if (
+                launchEnvEntries.some(
+                  ([key, value]) => !allowedLaunchEnv.has(key) || typeof value !== "string",
+                ) ||
+                launch.env.GROK_DEFAULT_MODEL !== launchArgv[3]
+              ) {
+                sendError(ws, sessionId, "INVALID_LAUNCH", "Invalid grok-build environment");
+                return;
+              }
+              sessionOptions.env = {
+                ...sessionOptions.env,
+                ...Object.fromEntries(launchEnvEntries),
+              };
+            }
+            if (typeof launch.model === "string" && launch.model.trim()) {
+              sessionOptions.model = launch.model.trim();
+            }
+          }
+          const transientCredentials =
+            launch?.transientCredentials &&
+            typeof launch.transientCredentials === "object" &&
+            !Array.isArray(launch.transientCredentials)
+              ? Object.fromEntries(
+                  Object.entries(launch.transientCredentials).filter(
+                    ([key, value]) => typeof key === "string" && typeof value === "string",
+                  ),
+                )
+              : undefined;
+          if (
+            transientCredentials &&
+            Object.keys(transientCredentials).some((key) => key !== "xai.api_key")
+          ) {
+            sendError(ws, sessionId, "INVALID_LAUNCH", "Invalid grok-build credential type");
+            return;
+          }
+          const profileId = typeof launch?.profileId === "string" ? launch.profileId : "";
+          const profileRevision = Number.isInteger(launch?.profileRevision)
+            ? launch.profileRevision
+            : 0;
+          const previousProfileId =
+            typeof launch?.previousProfileId === "string" ? launch.previousProfileId : "";
+          const previousProfileRevision = Number.isInteger(launch?.previousProfileRevision)
+            ? launch.previousProfileRevision
+            : 0;
+          const runtimeSessionKey = profileId
+            ? `${sessionId}@${profileId}-r${profileRevision}`
+            : (payload.runtimeSessionKey || sessionId);
+
           // Prefer the explicit resumeSessionId (the agent-side UUID
           // recorded in the 1agents index); fall back to acpSessionId
           // for older clients. Empty string means "start a fresh session".
@@ -1301,11 +1368,46 @@ export function setupConnection(ws, req) {
           // never accidentally widens permissions.
           const seededMode = isValidPermissionMode(permissionMode) ? permissionMode : null;
 
-          const existingSession = activeSessions.get(sessionId);
+          let existingSession = activeSessions.get(sessionId);
+          const profileChanged = Boolean(
+            profileId &&
+            ((existingSession &&
+              (existingSession.profileId !== profileId ||
+                existingSession.profileRevision !== profileRevision)) ||
+              (!existingSession &&
+                previousProfileRevision > 0 &&
+                (previousProfileId !== profileId || previousProfileRevision !== profileRevision))),
+          );
+          if (existingSession && profileChanged) {
+            unregisterAgentSessionMapping(existingSession.handle);
+            try {
+              if (existingSession.activeTurn) {
+                await existingSession.activeTurn.cancel({ reason: "Profile upgraded" });
+              }
+              await cancelSessionQueue(existingSession, sessionId);
+              await runtime.close({ handle: existingSession.handle, reason: "Profile upgraded" });
+            } catch (err) {
+              console.warn(`[acpx-server] Profile upgrade close failed for ${sessionId}:`, err);
+            }
+            activeSessions.delete(sessionId);
+            existingSession = null;
+          }
           if (existingSession) {
             console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
             notifySessionTakenOver(existingSession.ws, ws, sessionId);
             existingSession.ws = ws;
+            if (launchArgv.length > 0) {
+              await runtime.ensureSession({
+                sessionKey: runtimeSessionKey,
+                agent: agentType,
+                mode: "persistent",
+                cwd: normalizedPath,
+                resumeSessionId: resumeId || undefined,
+                sessionOptions,
+                agentArgv: launchArgv,
+                authCredentials: transientCredentials,
+              });
+            }
             // Only seed the in-memory mode from the store when nothing is
             // set yet. Never overwrite a live mode with a (possibly stale)
             // store value — that would let a PATCH that hasn't completed
@@ -1327,17 +1429,17 @@ export function setupConnection(ws, req) {
             // order here is Map insertion order (request arrival).
             for (const pending of pendingPermissions.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
+                sendRuntimeTurnEvent(ws, sessionId, existingSession.activeTurn, pending.payload);
               }
             }
             for (const pending of pendingAskUserQuestions.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
+                sendRuntimeTurnEvent(ws, sessionId, existingSession.activeTurn, pending.payload);
               }
             }
             for (const pending of pendingExitPlanModes.values()) {
               if (pending.sessionId === sessionId && pending.payload) {
-                sendRuntimeTurnEvent(ws, sessionId, existing.activeTurn, pending.payload);
+                sendRuntimeTurnEvent(ws, sessionId, existingSession.activeTurn, pending.payload);
               }
             }
             registerAgentSessionMapping(sessionId, existingSession.handle);
@@ -1398,7 +1500,7 @@ export function setupConnection(ws, req) {
           }
 
           // Phase 2: Instant pre-warm hit for fresh grok-build sessions if CWD matches!
-          if (agentType === "grok-build" && !resumeId && prewarmedGrokHandle) {
+          if (agentType === "grok-build" && launchArgv.length === 0 && !resumeId && prewarmedGrokHandle) {
             if (prewarmedGrokCwd === normalizedPath) {
               console.time(`ensure_session_${sessionId}`);
               console.log(
@@ -1460,14 +1562,28 @@ export function setupConnection(ws, req) {
           );
 
           console.time(`ensure_session_${sessionId}`);
-          const sessionPromise = runtime.ensureSession({
-            sessionKey: sessionId,
+          let profileResumeFallback = profileChanged && !resumeId;
+          const ensureInput = {
+            sessionKey: runtimeSessionKey,
             agent: agentType,
             mode: "persistent",
             cwd: normalizedPath,
             resumeSessionId: resumeId || undefined,
             sessionOptions,
-          });
+            agentArgv: launchArgv.length > 0 ? launchArgv : undefined,
+            authCredentials: transientCredentials,
+          };
+          const sessionPromise = (async () => {
+            try {
+              return await runtime.ensureSession(ensureInput);
+            } catch (err) {
+              if (!profileChanged || !resumeId) {
+                throw err;
+              }
+              profileResumeFallback = true;
+              return await runtime.ensureSession({ ...ensureInput, resumeSessionId: undefined });
+            }
+          })();
           initializingSessions.set(sessionId, sessionPromise);
 
           try {
@@ -1476,7 +1592,7 @@ export function setupConnection(ws, req) {
             console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);
 
             // Asynchronously trigger background pre-warm after a cold spawn using the new CWD
-            if (agentType === "grok-build") {
+            if (agentType === "grok-build" && launchArgv.length === 0) {
               setTimeout(() => prewarmGrokSession(normalizedPath), 500);
             }
 
@@ -1494,6 +1610,8 @@ export function setupConnection(ws, req) {
               // brand-new session) so the mode check never has to
               // special-case null/undefined.
               permissionMode: seededMode ?? "approve-reads",
+              profileId,
+              profileRevision,
               responsePolicy: normalizedResponsePolicy,
               reqHost: ws._acpxReqHost,
             });
@@ -1512,6 +1630,17 @@ export function setupConnection(ws, req) {
               }),
             );
             void sendSessionMeta(ws, sessionId, handle);
+            if (profileChanged) {
+              ws.send(
+                JSON.stringify({
+                  event: "profile_upgraded",
+                  sessionId,
+                  profileId,
+                  profileRevision,
+                  resumed: !profileResumeFallback,
+                }),
+              );
+            }
           } finally {
             initializingSessions.delete(sessionId);
           }
@@ -1673,7 +1802,7 @@ export function setupConnection(ws, req) {
           }
 
           const pending = pendingPermissions.get(requestId);
-          if (!pending) {
+          if (!pending || pending.sessionId !== sessionId || activeSessions.get(sessionId)?.ws !== ws) {
             // Common when the UI double-clicks, or still shows a prompt after
             // timeout/abort (especially Grok client-side confirms that used to
             // stay unresolved in the frontend pending pool). Log for diagnosis;
@@ -1729,7 +1858,7 @@ export function setupConnection(ws, req) {
           }
 
           const pending = pendingAskUserQuestions.get(requestId);
-          if (!pending) {
+          if (!pending || pending.sessionId !== sessionId || activeSessions.get(sessionId)?.ws !== ws) {
             sendError(
               ws,
               sessionId,
@@ -1785,7 +1914,7 @@ export function setupConnection(ws, req) {
           }
 
           const pending = pendingExitPlanModes.get(requestId);
-          if (!pending) {
+          if (!pending || pending.sessionId !== sessionId || activeSessions.get(sessionId)?.ws !== ws) {
             sendError(
               ws,
               sessionId,
@@ -2098,6 +2227,7 @@ export function setupConnection(ws, req) {
               await runtime.close({ handle: session.handle, reason: "Session closed by request" });
             } catch (err) {
               console.error(`[acpx-server] Error closing runtime handle:`, err);
+              throw err;
             }
             activeSessions.delete(sessionId);
             sessionBackgroundTasks.delete(sessionId);
@@ -2300,7 +2430,7 @@ export function setupConnection(ws, req) {
                 });
             } else {
               try {
-                const record = await runtime.options.sessionStore.load(sessionId);
+                const record = await runtime.options.sessionStore.load(payload.runtimeRecordId || sessionId);
                 if (record) {
                   record.closed = true;
                   record.closedAt = new Date().toISOString();
@@ -2415,11 +2545,6 @@ export function setupConnection(ws, req) {
         sendError(ws, sessionId, "ACTION_FAILED", describeActionError(err));
       }
     }
-  });
-
-  ws.on("close", () => {
-    console.log("[acpx-server] Go backend client disconnected.");
-  });
 }
 
 // Send the session's advertised capability snapshot (native modes, models,
@@ -2442,7 +2567,7 @@ async function sendSessionMeta(ws, sessionId, handle) {
       payload.availableCommands = status.availableCommands;
     }
     if (status.configOptions) {
-      payload.configOptions = status.configOptions;
+      payload.configOptions = status.details?.configOptions ?? status.configOptions;
     }
     if (typeof status.forkSupported === "boolean") {
       payload.forkSupported = status.forkSupported;
@@ -2768,6 +2893,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
           const toolStatus = rawStatus === "success" ? "completed" : rawStatus || undefined;
           sendRuntimeTurnEvent(targetWs, sessionId, turn, {
             event: "tool_call",
+            content: event.content,
             toolName: resolveToolDisplayName(event),
             toolCallId: event.toolCallId,
             ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
@@ -2935,6 +3061,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
           targetWs.send(
             JSON.stringify({
               event: "error",
+              scope: "turn",
               sessionId,
               message: result.error?.message || "Turn execution failed",
             }),
@@ -2960,6 +3087,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             JSON.stringify({
               event: "done",
               sessionId,
+              stopReason: result.stopReason,
               summary,
               ...(stopped ? { stopped: true } : {}),
             }),
@@ -3041,6 +3169,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
         targetWs.send(
           JSON.stringify({
             event: "error",
+            scope: "turn",
             sessionId,
             message: err.message,
           }),
@@ -3349,6 +3478,8 @@ async function handlePermissionRequestCallback(req, ctx) {
         requestId,
         toolCallId: req.raw.toolCall.toolCallId,
         toolName: resolveToolDisplayName(req.raw.toolCall),
+        toolCall: req.raw.toolCall,
+        options: req.raw.options,
         arguments: req.raw.toolCall.rawInput || {},
       },
     });
@@ -3386,6 +3517,8 @@ async function handlePermissionRequestCallback(req, ctx) {
       requestId,
       toolCallId: req.raw.toolCall.toolCallId,
       toolName: resolveToolDisplayName(req.raw.toolCall),
+        toolCall: req.raw.toolCall,
+        options: req.raw.options,
       arguments: req.raw.toolCall.rawInput || {},
     });
   });
@@ -3480,3 +3613,7 @@ export {
   gracefulExit,
 };
 
+
+export { pendingPermissions, pendingAskUserQuestions, pendingExitPlanModes, loadSessionHistory };
+
+export async function readRuntimeRecord(id) { return runtime.options.sessionStore.load(id); }

@@ -135,6 +135,11 @@ export async function serveAcpService(options: ServerOptions = {}): Promise<{
   }
 
   const close = async (): Promise<void> => {
+    const sockets = bridge.wss;
+    if (sockets) {
+      for (const client of sockets.clients) client.terminate();
+      await new Promise<void>((resolve) => sockets.close(() => resolve()));
+    }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     try {
       await killAllManagedAgents();

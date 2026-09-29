@@ -58,9 +58,9 @@ test('serveAcpService serves HTTP endpoints and WebSocket', async () => {
     });
     ws.send('invalid json');
     const responseText = await messagePromise;
-    const response = JSON.parse(responseText) as { event: string; code: string };
-    assert.equal(response.event, 'error');
-    assert.equal(response.code, 'INVALID_JSON');
+    const response = JSON.parse(responseText) as { jsonrpc: string; error: { code: number } };
+    assert.equal(response.jsonrpc, '2.0');
+    assert.equal(response.error.code, -32700);
 
     ws.close();
   } finally {

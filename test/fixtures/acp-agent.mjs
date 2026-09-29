@@ -1,0 +1,25 @@
+// Deterministic external ACP Agent used by the runtime integration test.
+import readline from 'node:readline';
+const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
+let turn;
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const m = JSON.parse(line);
+  const p = m.params;
+  const reply = result => send({ id: m.id, result });
+  switch (m.method) {
+    case 'initialize': reply({ protocolVersion: 1, agentInfo: { name: 'fixture', version: '1' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } }, authMethods: [] }); break;
+    case 'session/new': reply({ sessionId: 'native-fixture' }); break;
+    case 'session/load': case 'session/resume': reply({}); break;
+    case 'session/prompt':
+      turn = m;
+      send({ method: 'session/update', params: { sessionId: p.sessionId, update: { sessionUpdate: 'tool_call', toolCallId: 'write-1', title: 'Write', kind: 'edit', status: 'pending', rawInput: { path: '/tmp/example' } } } });
+      send({ id: 'approval', method: 'session/request_permission', params: { sessionId: p.sessionId, toolCall: { toolCallId: 'write-1', title: 'Write', kind: 'edit', rawInput: { path: '/tmp/example' } }, options: [{ optionId: 'yes', kind: 'allow_once', name: 'Allow' }, { optionId: 'no', kind: 'reject_once', name: 'Reject' }] } });
+      break;
+    default:
+      if (m.id === 'approval') {
+        send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', status: 'completed', rawOutput: 'saved' } } });
+        send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fixture complete' } } } });
+        send({ id: turn.id, result: { stopReason: 'end_turn' } });
+      } else if (m.id !== undefined) send({ id: m.id, error: { code: -32601, message: 'Method not found' } });
+  }
+});

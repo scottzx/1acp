@@ -4,6 +4,7 @@
  * 节点身份来自 `@1agents/dreammate-node`（优先 tailnet，回退本地），
  * 保证整台机器上的所有服务共享同一个 node_id 与 name。
  */
+import { createAgentRegistry } from '@scottzx/1acp/runtime';
 import { nodeIdentity, type NodeIdentity } from '@1agents/dreammate-node';
 import {
   PROTOCOL_VERSION,
@@ -67,6 +68,9 @@ export async function buildManifest(baseUrl: string): Promise<NodeManifest> {
       protocol_version: PROTOCOL_VERSION,
       identity_source: identity.source,
       service_type: 'agent_runtime',
+      acp_protocol_version: 1,
+      acp_transport: 'websocket',
+      acp_agent_endpoints: Object.fromEntries(createAgentRegistry().list().map(name => [name, `/agents/${encodeURIComponent(name)}`])),
     },
     services: [
       {
