@@ -45,5 +45,10 @@
     "@types/ws": "^8.5.14",
     "esbuild": "^0.28.2",
     "typescript": "^5.7.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scottzx/1acp.git",
+    "directory": "packages/dsh-plugin"
   }
 }

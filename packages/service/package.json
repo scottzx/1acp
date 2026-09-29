@@ -13,7 +13,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/scottzx/acp-service.git"
+    "url": "git+https://github.com/scottzx/1acp.git",
+    "directory": "packages/service"
   },
   "publishConfig": {
     "access": "public",
@@ -50,7 +51,7 @@
     "@1agents/dreammate-network": "^0.3.1",
     "@1agents/dreammate-node": "^0.4.0",
     "@agentclientprotocol/sdk": "1.4.0",
-    "@scottzx/1acp": "^0.15.1",
+    "@scottzx/1acp": "workspace:^",
     "ws": "^8.18.0"
   },
   "devDependencies": {

@@ -105,7 +105,7 @@ Nonstandard metadata is namespaced; standard `session/update` content is still a
 
 Upgrade the service and 1agents Go client together. Old `action/event` WebSocket clients are not supported by 0.2. The Go `internal/acpwire` client converts existing chat view messages to standard ACP and negotiated extensions; frontend view state can remain unchanged. It stores the returned service session ID for future reconnects and explicitly imports older native IDs when needed.
 
-The npm `@1agents/acp-bridge` package is now a small launcher depending on `@1agents/acp-service ^0.2.0`. Release in order: `@scottzx/1acp 0.15.1`, `@1agents/acp-service 0.2.0`, then the dependent launcher. After the runtime release, run `npm install --package-lock-only` to record its registry resolution/integrity, and verify a clean `npm ci` before publishing the service. The current lock records the locally verified runtime version without a machine-local tarball URL. Development supervision locates `services/acp-service`; package filling must not overwrite the launcher with the former server implementation.
+The npm `@1agents/acp-bridge` package is now a small launcher depending on `@1agents/acp-service ^0.2.0`. Release in order: `@scottzx/1acp 0.15.1`, `@1agents/acp-service 0.2.0`, then the dependent launcher. Install from the monorepo root with `pnpm install --frozen-lockfile`; the service uses `workspace:^` for the runtime, and pnpm converts it to a version range during packing. Development supervision locates `services/1acp/packages/service`; package filling must not overwrite the launcher with the former server implementation.
 
 ## Verify
 

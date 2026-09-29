@@ -1,0 +1,43 @@
+name: ACP workspace
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  runtime-service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @scottzx/1acp check
+      - run: pnpm --filter @scottzx/1acp check:docs
+      - run: pnpm --filter @1agents/acp-service typecheck
+      - run: pnpm --filter @1agents/acp-service test
+  dsh-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 21638c5631
+          path: .dsh-checkout
+      - run: corepack pnpm install --frozen-lockfile
+        working-directory: .dsh-checkout
+      - run: corepack pnpm run build
+        working-directory: .dsh-checkout
+      - run: pnpm link:dsh "$GITHUB_WORKSPACE/.dsh-checkout"
+      - run: pnpm --filter @1agents/dsh-acp test

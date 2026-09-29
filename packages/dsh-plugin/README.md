@@ -4,7 +4,7 @@ An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent session
 
 ## Use
 
-Install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/dsh-acp-plugin` from your DSH checkout, then restart `pnpm dsh web`. Start acp-service separately on `127.0.0.1:36812`.
+Install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin` from your DSH checkout, then restart `pnpm dsh web`. Start acp-service separately on `127.0.0.1:36812`.
 
 Choose **ACP · Codex** or **ACP · Grok** in the new-session Agent preset picker, choose a workspace, then send a message. ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. An active session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
 
@@ -32,17 +32,17 @@ The bundle's `oneagents-acp` row accepts `serviceUrl`, `agents`, `stateDirectory
 
 ## Development and removal
 
-Build from this plugin directory:
+Install dependencies from the repository root, then build from this plugin directory:
 
 ```sh
-npm ci
+pnpm -w install --frozen-lockfile
 node scripts/link-dsh-types.mjs /absolute/path/DSH
-npm test
+pnpm test
 ```
 
 The DSH checkout must already have its dependencies installed and declaration outputs built. Development type checking links its matching packages into `node_modules/@deepseek-ai`; generated JavaScript has no runtime imports of those packages and uses the Host's provided services. Tests cover real-WebSocket streaming, permissions, questions, cancellation, reconnection and saved bindings.
 
-On this machine, start the service from `../acp-service` with:
+On this machine, start the service from `../service` with:
 
 ```sh
 CODEX_PATH=/Applications/ChatGPT.app/Contents/Resources/codex \

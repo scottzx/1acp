@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-test/
+coverage/
+*.tgz
+.DS_Store
+.dsh-checkout/

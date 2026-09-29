@@ -1,0 +1,16 @@
+{
+  "name": "@1agents/acp-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter @scottzx/1acp build && pnpm --filter @1agents/acp-service build && pnpm --filter @1agents/dsh-acp build",
+    "test": "pnpm -r test",
+    "test:integration": "pnpm --filter @1agents/acp-service test && pnpm --filter @1agents/dsh-acp test",
+    "link:dsh": "node packages/dsh-plugin/scripts/link-dsh-types.mjs",
+    "start:service": "pnpm --filter @1agents/acp-service start"
+  }
+}
