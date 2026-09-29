@@ -17,7 +17,7 @@ async function publishPackages() {
   for (const directory of packages) {
     if (selection !== 'all' && selection !== directory) continue;
     const { name, version } = JSON.parse(readFileSync(`packages/${directory}/package.json`, 'utf8'));
-    const archive = `release/${name.replace('@', '').replace('/', '-')}-${version}.tgz`;
+    const archive = resolve(`release/${name.replace('@', '').replace('/', '-')}-${version}.tgz`);
     const packed = JSON.parse(execFileSync('tar', ['-xOf', archive, 'package/package.json'], { encoding: 'utf8' }));
     if (packed.name !== name || packed.version !== version || packed.private) throw new Error(`Invalid release archive: ${archive}`);
     const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`);
