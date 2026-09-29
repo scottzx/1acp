@@ -4,12 +4,15 @@ ACP Agent Runtime Service for Codex, Grok Build, Claude Code and other Agents su
 
 ## Run
 
-Requires Node.js 22.13 or later and `@scottzx/1acp ^0.15.1`. The runtime's per-session launch argv and transient credentials APIs are required by Provider Profiles. The npm registry currently contains only 0.14.0; publish 0.15.1 before a clean registry installation of this service. For local development before that release, build and pack `1agents_app/modules/1acp`, then run `npm install --no-save --package-lock=false /absolute/path/scottzx-1acp-0.15.1.tgz` in this service directory. This installs the actual package artifact without replacing the declared registry dependency with a machine-local path.
+Requires Node.js 22.13 or later and `@scottzx/1acp ^0.15.1`. The runtime's per-session launch argv and transient credentials APIs are required by Provider Profiles. Local development uses the runtime workspace package directly; no manual tarball installation is needed. Published service installations require the matching runtime version to be available in the registry.
+
+Run from the monorepo root:
 
 ```sh
-npm install
-npm run build
-node dist/bin/acp-service.js serve --host 127.0.0.1 --port 36812 --no-report
+pnpm install --frozen-lockfile
+pnpm --filter @scottzx/1acp build
+pnpm --filter @1agents/acp-service build
+pnpm start:service serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
 The default port is 36812. Without `--no-report`, the service reports to the local DreamMate node. Agent executables and their authentication must be available to the service process. `ACP_STATE_DIR` overrides the default `~/.1agents/acpx-state` directory for runtime records, turn journals and ACP replay data.
