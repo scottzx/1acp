@@ -172,7 +172,17 @@ function buildAgentEnvironment(
     }
   }
 
-  for (const overlay of [sessionEnv, agentProcessEnv]) {
+  applySessionEnvironment(env, protectedAuthEnvKeys, [sessionEnv, agentProcessEnv]);
+
+  return env;
+}
+
+function applySessionEnvironment(
+  env: NodeJS.ProcessEnv,
+  protectedAuthEnvKeys: Set<string>,
+  overlays: (Record<string, string> | undefined)[],
+): void {
+  for (const overlay of overlays) {
     for (const [key, value] of Object.entries(overlay ?? {})) {
       if (typeof value !== "string" || protectedAuthEnvKeys.has(protectedEnvKey(key))) {
         continue;
@@ -180,8 +190,6 @@ function buildAgentEnvironment(
       assignSessionEnv(env, key, value);
     }
   }
-
-  return env;
 }
 
 function assignSessionEnv(env: NodeJS.ProcessEnv, key: string, value: string): void {
@@ -264,7 +272,10 @@ export function buildAgentSpawnOptions(
   let claudeSettings = includeClaudeSettings;
   if (typeof agentProcessEnvOrClaudeSettings === "boolean") {
     claudeSettings = agentProcessEnvOrClaudeSettings;
-  } else if (agentProcessEnvOrClaudeSettings && typeof agentProcessEnvOrClaudeSettings === "object") {
+  } else if (
+    agentProcessEnvOrClaudeSettings &&
+    typeof agentProcessEnvOrClaudeSettings === "object"
+  ) {
     agentProcessEnv = agentProcessEnvOrClaudeSettings;
   }
   return {

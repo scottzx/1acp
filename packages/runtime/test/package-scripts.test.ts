@@ -25,7 +25,7 @@ test("lint script covers conformance runner sources", () => {
 });
 
 test("lockfile keeps project dependencies visible to single-document consumers", () => {
-  const lockfile = readFileSync(path.join(process.cwd(), "pnpm-lock.yaml"), "utf8");
+  const lockfile = readFileSync(path.resolve(process.cwd(), "../..", "pnpm-lock.yaml"), "utf8");
   const documents = lockfile.split(/^---\s*$/m).filter((document) => document.trim());
 
   // Dependabot currently reads only the first document (dependabot-core#15904).

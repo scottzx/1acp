@@ -42,7 +42,9 @@ function hasStructuredPath(input: Record<string, unknown>): boolean {
 }
 
 function parseRawInput(raw?: string): Record<string, unknown> | undefined {
-  if (typeof raw !== "string" || !raw.trim() || raw === "{}") {return undefined;}
+  if (typeof raw !== "string" || !raw.trim() || raw === "{}") {
+    return undefined;
+  }
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -71,11 +73,16 @@ function extractLocations(tool: HistoryToolUse): string[] {
 export function historyToolInput(tool: HistoryToolUse): unknown {
   const input = parseObjectInput(tool);
   const paths = extractLocations(tool);
-  if (paths.length === 0) {return input ?? tool.input ?? {};}
+  if (paths.length === 0) {
+    return input ?? tool.input ?? {};
+  }
   const next = input ?? {};
   if (!hasStructuredPath(next)) {
-    if (paths.length === 1) {next.path = paths[0];}
-    else {next.paths = paths;}
+    if (paths.length === 1) {
+      next.path = paths[0];
+    } else {
+      next.paths = paths;
+    }
   }
   return next;
 }
@@ -93,10 +100,16 @@ export function resolveRuntimeTurnId(
   userId: string | undefined,
   turnResults: Record<string, RuntimeTurnResult | undefined>,
 ): string | undefined {
-  if (!userId) {return undefined;}
-  if (turnResults[userId]) {return userId;}
+  if (!userId) {
+    return undefined;
+  }
+  if (turnResults[userId]) {
+    return userId;
+  }
   for (const [requestId, result] of Object.entries(turnResults)) {
-    if (result?.prompt_message_id === userId) {return requestId;}
+    if (result?.prompt_message_id === userId) {
+      return requestId;
+    }
   }
   return undefined;
 }
@@ -110,7 +123,9 @@ export function stampHistoryTurnIds<T extends HistoryItem>(
   items: T[],
   turns: HistoryTurnRef[],
 ): Array<T & { turnId?: string }> {
-  if (items.length === 0) {return items;}
+  if (items.length === 0) {
+    return items;
+  }
 
   const unused = turns.filter((turn) => resolvableTurnId(turn));
   let currentTurnId: string | undefined;
@@ -120,7 +135,9 @@ export function stampHistoryTurnIds<T extends HistoryItem>(
       if (item.turnId) {
         currentTurnId = item.turnId;
         const index = unused.findIndex((turn) => turnOwnsHistoryId(turn, item.turnId));
-        if (index >= 0) {unused.splice(index, 1);}
+        if (index >= 0) {
+          unused.splice(index, 1);
+        }
       } else {
         const byPrompt = unused.findIndex(
           (turn) => !!turn.promptText && turn.promptText === item.text,
@@ -129,7 +146,9 @@ export function stampHistoryTurnIds<T extends HistoryItem>(
         currentTurnId = turn ? resolvableTurnId(turn) : undefined;
       }
     }
-    if (!currentTurnId || item.turnId) {return item;}
+    if (!currentTurnId || item.turnId) {
+      return item;
+    }
     changed = true;
     return { ...item, turnId: currentTurnId };
   });
@@ -137,7 +156,9 @@ export function stampHistoryTurnIds<T extends HistoryItem>(
 }
 
 function turnOwnsHistoryId(turn: HistoryTurnRef, historyTurnId?: string): boolean {
-  if (!historyTurnId) {return false;}
+  if (!historyTurnId) {
+    return false;
+  }
   return (
     turn.turnId === historyTurnId ||
     turn.clientRequestId === historyTurnId ||

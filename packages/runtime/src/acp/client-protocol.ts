@@ -3,6 +3,8 @@ import {
   type AuthenticateRequest,
   type ClientCapabilities,
   type ClientConnection,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
@@ -47,15 +49,7 @@ export type AcpAgentConnection = {
   cancel: (params: { sessionId: string }) => Promise<void>;
   closeSession: (params: { sessionId: string }) => Promise<void>;
   deleteSession: (params: { sessionId: string }) => Promise<void>;
-  unstable_forkSession: (params: {
-    sessionId: string;
-    cwd?: string;
-    mcpServers?: unknown[];
-  }) => Promise<{
-    sessionId: string;
-    _meta?: Record<string, unknown>;
-    configOptions?: unknown[];
-  }>;
+  unstable_forkSession: (params: ForkSessionRequest) => Promise<ForkSessionResponse>;
   logout: (params: Record<string, unknown>) => Promise<void>;
   listSessions: (params: ListSessionsRequest) => Promise<ListSessionsResponse>;
 };
@@ -99,13 +93,7 @@ export function createAgentConnectionFacade(connection: ClientConnection): AcpAg
     deleteSession: async (params) => {
       await agent.request(methods.agent.session.delete, params);
     },
-    unstable_forkSession: async (params) => {
-      return (await agent.request(methods.agent.session.fork, params)) as {
-        sessionId: string;
-        _meta?: Record<string, unknown>;
-        configOptions?: unknown[];
-      };
-    },
+    unstable_forkSession: async (params) => await agent.request(methods.agent.session.fork, params),
     logout: async (params) => {
       await agent.request(methods.agent.logout, params);
     },

@@ -388,26 +388,38 @@ function applyToolCallUpdate(agent: SessionAgentMessage, update: ToolCall | Tool
 }
 
 function applyToolKind(tool: SessionToolUse, update: ToolCall | ToolCallUpdate): void {
-  if (!hasOwn(update, "kind")) {return;}
+  if (!hasOwn(update, "kind")) {
+    return;
+  }
   const kind = typeof update.kind === "string" ? update.kind.trim() : "";
-  if (kind) {tool.kind = kind;}
+  if (kind) {
+    tool.kind = kind;
+  }
 }
 
 function parseLocation(loc: unknown): { path: string; line?: number } | null {
-  if (!loc || typeof loc !== "object") {return null;}
+  if (!loc || typeof loc !== "object") {
+    return null;
+  }
   const rawPath = (loc as { path?: unknown }).path;
   const path = typeof rawPath === "string" ? rawPath.trim() : "";
-  if (!path) {return null;}
+  if (!path) {
+    return null;
+  }
   const line = (loc as { line?: unknown }).line;
   return typeof line === "number" ? { path, line } : { path };
 }
 
 function applyToolLocations(tool: SessionToolUse, update: ToolCall | ToolCallUpdate): void {
-  if (!hasOwn(update, "locations") || !Array.isArray(update.locations)) {return;}
+  if (!hasOwn(update, "locations") || !Array.isArray(update.locations)) {
+    return;
+  }
   const locations: NonNullable<SessionToolUse["locations"]> = [];
   for (const item of update.locations) {
     const parsed = parseLocation(item);
-    if (parsed) {locations.push(parsed);}
+    if (parsed) {
+      locations.push(parsed);
+    }
   }
   tool.locations = locations;
 }

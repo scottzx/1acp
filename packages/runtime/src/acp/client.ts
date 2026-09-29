@@ -108,13 +108,13 @@ import {
   waitForChildExit,
   waitForSpawn,
 } from "./client-process.js";
-import { isCodexAcpCommand, resolveCodexExecutable } from "./codex-compat.js";
 import {
   createAgentConnectionFacade,
   resolveClientCapabilities,
   resolveClientInfo,
   type AcpAgentConnection,
 } from "./client-protocol.js";
+import { isCodexAcpCommand, resolveCodexExecutable } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
 import {
   cancelledAskUserResponse,
@@ -1105,35 +1105,19 @@ export class AcpClient {
         : {};
     };
 
-    app.onRequest(
-      GROK_ASK_USER_QUESTION_METHOD,
-      grokParamsParser,
-      async ({ params }) => {
-        return (await this.handleGrokAskUserQuestion(params)) as unknown as Record<string, unknown>;
-      },
-    );
-    app.onRequest(
-      "x.ai/ask_user_question",
-      grokParamsParser,
-      async ({ params }) => {
-        return (await this.handleGrokAskUserQuestion(params)) as unknown as Record<string, unknown>;
-      },
-    );
+    app.onRequest(GROK_ASK_USER_QUESTION_METHOD, grokParamsParser, async ({ params }) => {
+      return await this.handleGrokAskUserQuestion(params);
+    });
+    app.onRequest("x.ai/ask_user_question", grokParamsParser, async ({ params }) => {
+      return await this.handleGrokAskUserQuestion(params);
+    });
 
-    app.onRequest(
-      GROK_EXIT_PLAN_MODE_METHOD,
-      grokParamsParser,
-      async ({ params }) => {
-        return (await this.handleGrokExitPlanMode(params)) as unknown as Record<string, unknown>;
-      },
-    );
-    app.onRequest(
-      "x.ai/exit_plan_mode",
-      grokParamsParser,
-      async ({ params }) => {
-        return (await this.handleGrokExitPlanMode(params)) as unknown as Record<string, unknown>;
-      },
-    );
+    app.onRequest(GROK_EXIT_PLAN_MODE_METHOD, grokParamsParser, async ({ params }) => {
+      return await this.handleGrokExitPlanMode(params);
+    });
+    app.onRequest("x.ai/exit_plan_mode", grokParamsParser, async ({ params }) => {
+      return await this.handleGrokExitPlanMode(params);
+    });
 
     return createAgentConnectionFacade(app.connect(stream));
   }

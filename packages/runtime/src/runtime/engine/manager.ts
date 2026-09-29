@@ -47,7 +47,6 @@ import type {
   AcpRuntimeTurnAttachment,
   AcpRuntimeTurn,
   AcpRuntimeTurnResult,
-  AcpSessionUpdateTag,
 } from "../public/contract.js";
 import { AcpRuntimeError } from "../public/errors.js";
 import { parsePromptEventLine } from "../public/events.js";
@@ -475,10 +474,7 @@ export class AcpRuntimeManager {
     private readonly deps: AcpRuntimeManagerDeps = {},
   ) {}
 
-  private setTransientCredentials(
-    recordId: string,
-    credentials?: Record<string, string>,
-  ): void {
+  private setTransientCredentials(recordId: string, credentials?: Record<string, string>): void {
     if (!credentials || Object.keys(credentials).length === 0) {
       this.transientCredentials.delete(recordId);
       return;
@@ -562,8 +558,7 @@ export class AcpRuntimeManager {
       notification,
     );
     trimConversationForRuntime(projection.conversation);
-    const updateTag = ((notification.update as { sessionUpdate?: string })?.sessionUpdate ??
-      "") as AcpSessionUpdateTag;
+    const updateTag = notification.update.sessionUpdate;
     // Persist first so hosts that refresh history on this callback observe
     // the newly applied update. Failures are metadata-only.
     void projection.checkpoint
@@ -572,7 +567,7 @@ export class AcpRuntimeManager {
         this.options.onOutOfTurnSessionUpdate?.(
           owner.recordId ?? owner.sessionKey,
           updateTag,
-          notification as unknown as Record<string, unknown>,
+          notification,
         );
       })
       .catch(() => {});
@@ -1194,19 +1189,7 @@ export class AcpRuntimeManager {
         const response = await this.runRuntimePrompt(task, turn, sessionId);
         const status = response.stopReason === "cancelled" ? "cancelled" : "completed";
         await this.saveTerminalRuntimeTurn(turn, status, response.stopReason);
-        const promptMessageId = turn.promptMessageId ?? task.input.requestId;
-        terminalResult = {
-          status,
-          ...(response.stopReason ? { stopReason: response.stopReason } : {}),
-          ...(response._meta === undefined ? {} : { _meta: response._meta }),
-          ...(finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId)
-            ? {
-                finalAnswer: finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId),
-              }
-            : {}),
-          promptMessageId,
-          runtimeRequestId: task.input.requestId,
-        };
+        terminalResult = this.completedRuntimeTurnResult(task, turn, response, status);
       }
     } catch (error) {
       terminalResult = await this.failRuntimeTurn(task, turn, error);
@@ -1217,6 +1200,27 @@ export class AcpRuntimeManager {
       terminalResult = await this.failRuntimeTurn(task, turn, error);
     }
     task.settleResult(terminalResult);
+  }
+
+  private completedRuntimeTurnResult(
+    task: RuntimeTurnTask,
+    turn: RunningRuntimeTurn,
+    response: Awaited<ReturnType<typeof runPromptTurn>>,
+    status: "cancelled" | "completed",
+  ): AcpRuntimeTurnResult {
+    const promptMessageId = turn.promptMessageId ?? task.input.requestId;
+    return {
+      status,
+      ...(response.stopReason ? { stopReason: response.stopReason } : {}),
+      ...(response._meta === undefined ? {} : { _meta: response._meta }),
+      ...(finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId)
+        ? {
+            finalAnswer: finalVisibleAnswerAfterPrompt(turn.conversation, promptMessageId),
+          }
+        : {}),
+      promptMessageId,
+      runtimeRequestId: task.input.requestId,
+    };
   }
 
   private async runRuntimePrompt(
