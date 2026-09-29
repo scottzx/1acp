@@ -10,6 +10,8 @@ Install the published bundles from your DSH checkout:
 pnpm dsh plugin --profile web add @1agents/dsh-acp @1agents/session-reader
 ```
 
+If pnpm pauses the first install for the transitive `esbuild` build script, set `allowBuilds: { esbuild: false }` in that profile's `pnpm-workspace.yaml` and repeat the install. Automatic ACP startup uses published JavaScript and works without running that install script.
+
 The package declares `dsh.bundle.patch` and its browser entry, so installation selects the bundle automatically. Restart `pnpm dsh web` after updating packages. If you use an installed `dsh` executable, omit the leading `pnpm`. Replace `web` with `desktop` for the desktop profile.
 
 The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
