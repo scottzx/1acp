@@ -47,6 +47,7 @@ jobs:
       - run: corepack pnpm run build
         working-directory: .dsh-checkout
       - run: pnpm link:dsh "$GITHUB_WORKSPACE/.dsh-checkout"
+      - run: pnpm --filter @1agents/acp-service... build
       - run: pnpm --filter @1agents/dsh-acp test
       - run: mkdir -p release && pnpm --filter @1agents/dsh-acp pack --pack-destination "$GITHUB_WORKSPACE/release"
       - uses: actions/upload-artifact@v4

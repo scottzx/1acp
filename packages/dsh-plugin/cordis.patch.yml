@@ -4,6 +4,7 @@
     - id: oneagents-acp
       name: '@1agents/dsh-acp'
       config:
+        serviceMode: auto
         serviceUrl: http://127.0.0.1:36812
         reconnectAttempts: 5
         reconnectDelayMs: 1000

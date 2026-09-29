@@ -1,6 +1,6 @@
 # @1agents/dsh-acp
 
-An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and acp-service 0.2. No DSH source files are modified.
+An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and installs acp-service 0.2 as a dependency. No DSH source files are modified.
 
 ## Use
 
@@ -12,13 +12,13 @@ pnpm dsh plugin --profile web add @1agents/dsh-acp @1agents/session-reader
 
 The package declares `dsh.bundle.patch` and its browser entry, so installation selects the bundle automatically. Restart `pnpm dsh web` after updating packages. If you use an installed `dsh` executable, omit the leading `pnpm`. Replace `web` with `desktop` for the desktop profile.
 
-Start acp-service separately on `127.0.0.1:36812`:
+The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
 
 ```sh
 npx --yes @1agents/acp-service@^0.2.0 serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
-The service requires each native Agent’s CLI and credentials. It is not launched by plugin installation. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin`.
+The service requires each native Agent’s CLI and credentials. Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin`.
 
 Choose a discovered **ACP · Agent** in the new-session Agent preset picker, choose a workspace, then send a message. ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. Before the first turn, switching the Agent preset replaces the discovery connection and its native commands. Once a turn starts, the session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
 
@@ -59,7 +59,17 @@ This plugin supports **text prompts**. Attachments and specialized external-tool
 
 ## Configuration
 
-The bundle's `oneagents-acp` row accepts `serviceUrl`, `agents`, `stateDirectory`, `reconnectAttempts` and `reconnectDelayMs`. Change it through the profile's `cordis.patch.yml`, not the DSH repository. Use a new session after changing endpoint or workspace. When `agents` is omitted, plugin startup fetches `GET /agents` from acp-service and registers presets for entries with `chat_ready: true`, using their service-provided names. Discovery runs on the service host. Restart the plugin after installing or removing a harness. An explicit `agents` list bypasses discovery and preserves manual registry selection; `[]` registers no presets. Start the updated service before loading the plugin: connection errors and invalid inventory responses fail plugin initialization instead of selecting fallback agents.
+The bundle's `oneagents-acp` row accepts `serviceUrl`, `serviceMode`, `serviceStartupTimeoutMs`, `serviceShutdownTimeoutMs`, `agents`, `stateDirectory`, `reconnectAttempts` and `reconnectDelayMs`. Change it through the profile's `cordis.patch.yml`, not the DSH repository. Use a new session after changing endpoint or workspace. When `agents` is omitted, plugin startup fetches `GET /agents` from acp-service and registers presets for entries with `chat_ready: true`, using their service-provided names. Discovery runs on the service host. Restart the plugin after installing or removing a harness. An explicit `agents` list bypasses discovery and preserves manual registry selection; `[]` registers no presets. Service startup, connection errors and invalid inventory responses fail plugin initialization instead of selecting fallback agents.
+
+### Local service lifecycle
+
+`serviceMode` defaults to `auto`. Only plain HTTP root URLs on `127.0.0.1`, `localhost` or `[::1]` can start a process. Remote URLs, HTTPS and URLs with a path or credentials remain external connections. `external` disables process management for every address. Use a stable nonzero port: native session bindings include the endpoint.
+
+Before spawning, the plugin validates `/health`. Connection refusal permits startup; HTTP errors, authentication failures, timeouts and another application occupying the port fail explicitly. Startup waits for the child to listen and pass its health check before discovering Agent presets. `serviceStartupTimeoutMs` defaults to 15000 for each startup/health phase; `serviceShutdownTimeoutMs` defaults to 5000 before forced process exit.
+
+Plugin disposal closes ACP connections before shutting down its owned service and awaiting process exit. Concurrent plugin instances in the same DSH process share an owned service until the last instance disposes. An existing service is never stopped. A worker also exits if its DSH parent crashes or is killed. If the worker itself crashes, requests fail through the normal ACP connection errors; restart the plugin to start a replacement. A service shared by separate DSH processes should be managed externally so stopping its owning DSH instance does not interrupt the others.
+
+The child inherits DSH's environment, including native Agent configuration and credentials, and uses the service's existing state directory (`ACP_STATE_DIR` or `~/.1agents/acpx-state`). It starts with node reporting disabled. The plugin neither downloads executables at startup nor launches native Agents until a session needs one.
 
 ## Development and removal
 
@@ -68,12 +78,13 @@ Install dependencies from the repository root, then build from this plugin direc
 ```sh
 pnpm -w install --frozen-lockfile
 node scripts/link-dsh-types.mjs /absolute/path/DSH
+pnpm --filter @1agents/acp-service... build
 pnpm test
 ```
 
 The DSH checkout must already have its dependencies installed and declaration outputs built. Development type checking links its matching packages into `node_modules/@deepseek-ai`; generated JavaScript has no runtime imports of those packages and uses the Host's provided services. Tests cover real-WebSocket streaming, permissions, questions, cancellation, reconnection and saved bindings.
 
-On this machine, start the service from `../service` with:
+For manual service debugging on this machine, start it from `../service` with:
 
 ```sh
 CODEX_PATH=/Applications/ChatGPT.app/Contents/Resources/codex \
@@ -81,6 +92,6 @@ npm_config_cache="$HOME/.dsh/plugins/1agents-acp/npm-cache" \
 node dist/bin/acp-service.js serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
-`CODEX_PATH` selects the installed app's newer Codex runtime; the global CLI on this machine rejects its configured `gpt-6-astra` model. The separate npm cache avoids a broken pre-existing npx cache. Neither setting changes the global Codex configuration.
+For automatic startup, set these environment variables on the DSH process instead. `CODEX_PATH` selects the installed app's newer Codex runtime; the global CLI on this machine rejects its configured `gpt-6-astra` model. The separate npm cache avoids a broken pre-existing npx cache. Neither setting changes the global Codex configuration.
 
 Remove using `pnpm dsh plugin --profile web remove @1agents/dsh-acp`, then restart DSH; removing the bundle also restores the stock model-selection row. The preset registrations are removed with the bundle. Keep binding files if sessions may be reattached later.

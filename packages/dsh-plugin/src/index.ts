@@ -8,14 +8,15 @@ import type { SessionId } from '@deepseek-ai/dsh-session';
 import { AcpAdapter, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
+import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
 export const name = 'oneagents-acp';
 export const inject = ['llm', 'agents', 'approval', 'userQuestions', 'commands', 'sessionProjections', 'webServer', 'sessionController', 'agentPresets', 'sessions', 'sessionPersistence', 'workspaceRegistry'];
-export async function apply(ctx: Context, input: Partial<Config> = {}): Promise<void> {
+export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> = {}): Promise<void> {
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
-  const serviceUrl = input.serviceUrl ?? 'http://127.0.0.1:36812';
-  const url = new URL(serviceUrl);
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('serviceUrl must use http or https');
+  const service = resolveServiceOptions(input);
+  const { serviceUrl } = service;
+  await ctx.effect(async () => acquireService(service));
   const presets = input.agents === undefined
     ? await discoverPresets(serviceUrl)
     : [...new Set(input.agents)].map(id => ({ id, label: id }));

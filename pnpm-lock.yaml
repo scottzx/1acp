@@ -18,6 +18,9 @@ importers:
 
   packages/dsh-plugin:
     dependencies:
+      '@1agents/acp-service':
+        specifier: workspace:^
+        version: link:../service
       '@agentclientprotocol/sdk':
         specifier: 1.4.0
         version: 1.4.0(zod@4.6.2)
