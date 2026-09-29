@@ -12,7 +12,7 @@ import type {} from '@deepseek-ai/dsh-session-projection';
 import type {} from '@deepseek-ai/dsh-agent-preset-registry';
 import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
-import { State } from './state.js';
+import { State, type Binding } from './state.js';
 export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number }
 export interface Capabilities {
   agent: string;
@@ -43,6 +43,7 @@ export class AcpAdapter implements LlmAdapter {
   private controllers = new Map<string, AbortController>();
   private jobs = new Set<Promise<void>>();
   private links = new Map<string, Promise<Link>>();
+  private connections = new Map<string, Promise<Link>>();
   private capabilities = new Map<string, Capabilities>();
   private commandScopes = new Map<string, () => Promise<unknown>>();
   private commandContexts = new Map<string, Context>();
@@ -100,6 +101,36 @@ export class AcpAdapter implements LlmAdapter {
     }
     return capabilities;
   }
+  /** Import native history without prompting; callers persist the returned service identity before creating DSH history.
+   * @param name Configured ACP registry identifier.
+   * @param cwd Existing original working directory.
+   * @param nativeSessionId Original Agent session identifier.
+   * @returns Binding using the service’s new identity and resume restoration mode.
+   */
+  async importNative(name: string, cwd: string, nativeSessionId: string): Promise<Binding> {
+    if (!this.config.agents.includes(name)) throw new Error(`ACP Agent is not configured: ${name}`);
+    const endpoint = new URL(`/agents/${encodeURIComponent(name)}`, this.config.serviceUrl);
+    endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+    const task = (async () => {
+      const link = await connect(endpoint.href, {
+        update: () => {},
+        permission: async () => ({ outcome: { outcome: 'cancelled' } }),
+        question: async () => ({ outcome: 'cancelled' }),
+        plan: async () => ({ outcome: 'abandoned' }),
+      }, this.lifetime.signal);
+      try {
+        const result = object(await link.rpc.request('_1agents/session/import', {
+          sessionId: nativeSessionId, cwd, mcpServers: [],
+          _meta: { '1agents': { permissionMode: 'approve-reads' } },
+        }, { cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]) }));
+        if (typeof result.sessionId !== 'string' || !result.sessionId) throw new Error('ACP import returned no service session ID');
+        return { agent: name, cwd, endpoint: endpoint.href, sessionId: result.sessionId, restoreMethod: 'session/resume' as const };
+      } finally { link.close(); await link.closed; }
+    })();
+    const settled = task.then(() => {}, () => {});
+    this.jobs.add(settled);
+    try { return await task; } finally { this.jobs.delete(settled); }
+  }
   private publishCommands(agent: Agent, commands: AvailableCommand[]): void {
     const scope = this.commandContexts.get(agent.id);
     if (!scope) return; // A final transport notification may follow Agent disposal.
@@ -120,14 +151,37 @@ export class AcpAdapter implements LlmAdapter {
     }
   }
   private async connection(agent: Agent): Promise<Link> {
+    const operation = (this.connections.get(agent.id) ?? Promise.resolve())
+      .catch(() => undefined).then(() => this.openConnection(agent));
+    this.connections.set(agent.id, operation);
+    try { return await operation; }
+    finally { if (this.connections.get(agent.id) === operation) this.connections.delete(agent.id); }
+  }
+  private async openConnection(agent: Agent): Promise<Link> {
     const name = this.agentName(agent);
     if (!name) throw new Error('ACP is available only in an ACP Agent preset; start a new ACP session');
     const cwd = agent.session.header.cwd;
     if (!cwd) throw new Error('Create the ACP session in a workspace first');
     const endpoint = new URL(`/agents/${encodeURIComponent(name)}`, this.config.serviceUrl);
     endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
-    const binding = this.state.get(agent.id);
-    if (binding && (binding.agent !== name || binding.cwd !== cwd || binding.endpoint !== endpoint.href)) throw new Error('This session is bound to another ACP Agent or endpoint; start a new session');
+    let binding = this.state.get(agent.id);
+    if (binding && (binding.agent !== name || binding.cwd !== cwd || binding.endpoint !== endpoint.href)) {
+      const boundary = this.ctx.sessionProjections.stateOf(agent.session, 'turnBoundary');
+      const previousEndpoint = new URL(`/agents/${encodeURIComponent(binding.agent)}`, this.config.serviceUrl);
+      previousEndpoint.protocol = endpoint.protocol;
+      if (binding.imported || !boundary || boundary.openTurnStartSeq !== null || boundary.lastTurn > 0
+        || binding.agent === name || binding.cwd !== cwd || binding.endpoint !== previousEndpoint.href) {
+        throw new Error('This session is bound to another ACP Agent or endpoint; start a new session');
+      }
+      // Capability discovery may bind a draft before its first turn.
+      // Retire its transport and commands before initializing the selected Agent.
+      (await this.links.get(agent.id))?.close();
+      this.links.delete(agent.id);
+      this.capabilities.delete(agent.id);
+      for (const dispose of this.commandDisposers.get(agent.id) ?? []) dispose();
+      this.commandDisposers.delete(agent.id);
+      binding = undefined;
+    }
     const existing = this.links.get(agent.id);
     if (existing) return existing;
     const operation = (async () => {
@@ -151,6 +205,7 @@ export class AcpAdapter implements LlmAdapter {
       const interactionSignal = (signal: AbortSignal) => AbortSignal.any([signal, this.lifetime.signal, ...(this.controllers.has(agent.id) ? [this.controllers.get(agent.id)!.signal] : [])]);
       const link = await connect(endpoint.href, {
         update: update => {
+          if (this.capabilities.get(agent.id) !== capabilities) return;
           if (update.sessionUpdate === 'available_commands_update') {
             capabilities.commands = update.availableCommands;
             this.publishCommands(agent, update.availableCommands);
@@ -166,7 +221,7 @@ export class AcpAdapter implements LlmAdapter {
         const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': { permissionMode: 'approve-reads' } } };
         const cancellationSignal = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]);
         const result = binding
-          ? await link.rpc.request('session/load', { ...params, sessionId: binding.sessionId }, { cancellationSignal })
+          ? await link.rpc.request(binding.restoreMethod ?? 'session/load', { ...params, sessionId: binding.sessionId }, { cancellationSignal })
           : await link.rpc.request('session/new', params, { cancellationSignal });
         if (!binding) this.state.save(agent.id, { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId });
         capabilities.configOptions = result.configOptions ?? capabilities.configOptions;
@@ -228,7 +283,8 @@ export class AcpAdapter implements LlmAdapter {
     let start = options.messages.length - 1;
     while (start >= 0 && options.messages[start].role !== 'assistant') start--;
     if (this.agentName(agent) !== options.model) throw new Error('ACP is available only in its matching Agent preset; start a new ACP session');
-    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && m.source?.kind === 'user');
+    const importedIds = new Set(this.state.get(agent.id)?.imported?.messageIds ?? []);
+    const input = options.messages.slice(start + 1).filter(m => m.role === 'user' && m.source?.kind === 'user' && (m.id === undefined || !importedIds.has(m.id)));
     const blocks = input.flatMap(m => m.content);
     if (!blocks.length || blocks.some(b => b.type !== 'text')) throw new Error('This ACP plugin currently accepts text prompts only');
     const text = blocks.map(b => (b as { text: string }).text).join('\n\n');

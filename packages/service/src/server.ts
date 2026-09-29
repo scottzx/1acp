@@ -3,10 +3,12 @@
  *
  * 单端口复用：
  *  - GET /health: 供 dreammate-node 与探活方检查运行状态
+ *  - GET /agents: 返回本机 harness 安装状态与 ACP 可用性
  *  - GET /manifest: 返回符合 DreamMate Network 规范的节点能力清单
  *  - WebSocket: 处理与客户端（Web Chat、IM 机器人等）的全双工 ACP 会话
  */
 import http from 'node:http';
+import { discoverAgents } from './catalog.js';
 import type { AddressInfo } from 'node:net';
 import { nodeIdentity } from '@1agents/dreammate-node';
 import { reportAndHoldRegistration } from '@1agents/dreammate-node/client';
@@ -37,6 +39,10 @@ export function createAcpServer(): {
       try {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
         const { pathname } = url;
+        if (req.method === 'GET' && pathname === '/agents') {
+          res.setHeader('Cache-Control', 'no-store');
+          return json(res, 200, { agents: discoverAgents().map(({ path: _path, ...agent }) => agent) });
+        }
         const identity = await nodeIdentity();
 
         if (req.method === 'GET' && pathname === '/health') {

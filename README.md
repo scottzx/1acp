@@ -5,7 +5,7 @@ Three independently versioned packages share one repository and one pnpm lockfil
 | Directory | npm package | Responsibility |
 | --- | --- | --- |
 | `packages/runtime` | `@scottzx/1acp` | Agent runtime and CLI |
-| `packages/service` | `@1agents/acp-service` | ACP JSON-RPC WebSocket service and session recovery |
+| `packages/service` | `@1agents/acp-service` | Local harness discovery, ACP JSON-RPC WebSocket service and session recovery |
 | `packages/dsh-plugin` | `@1agents/dsh-acp` | DSH session presets, native commands, model selection and interactions |
 
 ## Development
@@ -35,9 +35,9 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 ## Package releases
 
-Package names and versions remain independent. Use `pnpm --filter <package-name> pack` or `pnpm --filter <package-name> publish`; pnpm converts the service's `workspace:^` dependency into the runtime's version range. Publish a required runtime version before the service that depends on it. The DSH plugin remains private until its distribution is explicitly enabled.
+Package names and versions remain independent. Use `pnpm --filter <package-name> pack` or `pnpm --filter <package-name> publish`; pnpm converts the service's `workspace:^` dependency into the runtime's version range. Publish a required runtime version before the service that depends on it. The DSH plugin is public and declares the DSH bundle installation metadata.
 
-The former single-package workflows are retained inside their package directories as historical references and are not active GitHub workflows. Root CI validates the runtime, service and DSH plugin. The former package-local Husky hook is not installed at the workspace root; run the documented checks before committing. Automatic publishing is not enabled by this migration; the service's npm trusted-publisher repository must be updated before publishing from this repository.
+The former single-package workflows are retained inside their package directories as historical references and are not active GitHub workflows. Root CI validates the runtime, service and DSH plugin. The former package-local Husky hook is not installed at the workspace root; run the documented checks before committing. The root Release workflow publishes the validated tarballs using the repository’s `NPM_TOKEN` secret; it accepts one package or the complete dependency chain. Versions come from each package manifest. A retry skips an already published version only when its tarball integrity matches; changed contents require a version bump.
 
 ## Repository migration
 

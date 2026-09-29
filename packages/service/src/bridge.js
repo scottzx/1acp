@@ -4,10 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { WebSocketServer } from "ws";
 import { attachAcpConnection } from "./acp-connection.js";
+import { createServiceAgentRegistry } from "./catalog.js";
 import {
   createAcpRuntime,
   createRuntimeStore,
-  createAgentRegistry,
   createTurnJournal,
 } from "@scottzx/1acp/runtime";
 import {
@@ -100,7 +100,7 @@ const sessionBackgroundTasks = new Map();
 const runtime = createAcpRuntime({
   cwd: process.cwd(),
   sessionStore: createRuntimeStore({ stateDir: DEFAULT_STATE_DIR }),
-  agentRegistry: createAgentRegistry(),
+  agentRegistry: createServiceAgentRegistry(),
   permissionMode: "approve-reads", // default, will be overridden by session or client options
   onPermissionRequest: handlePermissionRequestCallback,
   onAskUserQuestion: handleAskUserQuestionCallback,

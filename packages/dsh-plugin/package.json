@@ -1,19 +1,30 @@
 {
   "name": "@1agents/dsh-acp",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "External ACP Agent sessions for DeepSeek Harness",
   "exports": {
-    ".": "./dist/index.js",
-    "./preset": "./dist/preset.js",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./preset": {
+      "types": "./dist/preset.d.ts",
+      "import": "./dist/preset.js"
+    },
     "./package.json": "./package.json",
-    "./client": "./dist/client.js"
+    "./client": "./dist/client.js",
+    "./imports": {
+      "types": "./dist/imports.d.ts",
+      "import": "./dist/imports.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "dist",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -31,7 +42,8 @@
   },
   "scripts": {
     "build": "tsc && node scripts/bundle-client.mjs",
-    "test": "npm run build && node --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=22.13.0"
@@ -50,5 +62,11 @@
     "type": "git",
     "url": "git+https://github.com/scottzx/1acp.git",
     "directory": "packages/dsh-plugin"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org",
+    "provenance": true
   }
 }

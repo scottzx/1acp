@@ -8,3 +8,5 @@ export type { AccessDescriptor, NetworkService, NodeIdentity, NodeManifest, Reac
 export { createAcpServer, serveAcpService } from './server.js';
 export type { ServerOptions } from './server.js';
 export { attachBridgeServer, activeSessions, sessionBackgroundTasks, killAllManagedAgents } from './bridge.js';
+export { discoverAgents } from './catalog.js';
+export type { AgentStatus, DiscoveryOptions } from './catalog.js';

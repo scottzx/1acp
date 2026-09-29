@@ -6,23 +6,31 @@ import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 import { AcpAdapter, type Config } from './adapter.js';
+import { discoverPresets } from './discovery.js';
+import { NativeSessions } from './imports.js';
 export const name = 'oneagents-acp';
-export const inject = ['llm', 'agents', 'approval', 'userQuestions', 'commands', 'sessionProjections', 'webServer', 'sessionController', 'agentPresets'];
+export const inject = ['llm', 'agents', 'approval', 'userQuestions', 'commands', 'sessionProjections', 'webServer', 'sessionController', 'agentPresets', 'sessions', 'sessionPersistence', 'workspaceRegistry'];
 export async function apply(ctx: Context, input: Partial<Config> = {}): Promise<void> {
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
+  const serviceUrl = input.serviceUrl ?? 'http://127.0.0.1:36812';
+  const url = new URL(serviceUrl);
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('serviceUrl must use http or https');
+  const presets = input.agents === undefined
+    ? await discoverPresets(serviceUrl)
+    : [...new Set(input.agents)].map(id => ({ id, label: id }));
   const config: Config = {
-    serviceUrl: input.serviceUrl ?? 'http://127.0.0.1:36812', agents: input.agents ?? ['codex', 'grok-build'],
+    serviceUrl, agents: presets.map(preset => preset.id),
     stateDirectory: input.stateDirectory ?? join(home, 'plugins', '1agents-acp', 'sessions'),
     reconnectAttempts: input.reconnectAttempts ?? 5, reconnectDelayMs: input.reconnectDelayMs ?? 1000,
   };
-  const url = new URL(config.serviceUrl);
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('serviceUrl must use http or https');
-  if (!config.agents.length || config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
+  if (config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
   if (!Number.isSafeInteger(config.reconnectAttempts) || config.reconnectAttempts < 0 || !Number.isSafeInteger(config.reconnectDelayMs) || config.reconnectDelayMs < 1) throw new Error('Invalid ACP reconnect policy');
   const adapter = new AcpAdapter(ctx, config);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
-  ctx.effect(() => () => adapter.dispose());
+  const nativeSessions = new NativeSessions(ctx, adapter, config);
+  ctx.provide('oneagentsAcpSessions', nativeSessions);
+  ctx.effect(() => async () => { await Promise.all([nativeSessions.dispose(), adapter.dispose()]); });
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/api/1agents-acp', handler: async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
@@ -43,10 +51,10 @@ export async function apply(ctx: Context, input: Partial<Config> = {}): Promise<
       res.end(JSON.stringify(await adapter.configure(agent, value.configId, value.value)));
     } catch (error) { res.statusCode = 400; res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); }
   } }));
-  for (const agent of config.agents) {
+  for (const { id: agent, label } of presets) {
     const dispose = await ctx.agentPresets.register({
       id: `oneagents-acp-${agent}`,
-      name: `ACP · ${agent === 'grok-build' ? 'Grok' : agent === 'codex' ? 'Codex' : agent}`,
+      name: `ACP · ${label}`,
       description: `当前会话直接连接 ${agent}；切换 Agent 请新建会话。`,
       order: 20,
       plugins: [

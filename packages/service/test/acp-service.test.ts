@@ -15,6 +15,7 @@ test('buildManifest produces valid DreamMate Network Manifest', async () => {
   const svc = manifest.services[0];
   assert.equal(svc.id, 'acp-service');
   assert.equal(svc.kind, 'agent_runtime');
+  assert.ok(svc.capabilities);
   assert.ok(svc.capabilities.includes('agent.prompt'));
   assert.ok(svc.capabilities.includes('agent.response_policy'));
   assert.ok(svc.capabilities.includes('runtime.claude'));
@@ -44,6 +45,13 @@ test('serveAcpService serves HTTP endpoints and WebSocket', async () => {
     assert.equal(manifestRes.status, 200);
     const manifest = await manifestRes.json() as { services: Array<{ id: string }> };
     assert.equal(manifest.services[0].id, 'acp-service');
+
+    const catalogRes = await fetch(`http://127.0.0.1:${port}/agents`);
+    assert.equal(catalogRes.status, 200);
+    const catalog = await catalogRes.json() as { agents: Array<{ id: string; chat_ready: boolean }> };
+    assert.ok(catalog.agents.some(agent => agent.id === 'claude'));
+    assert.ok(catalog.agents.every(agent => typeof agent.chat_ready === 'boolean'));
+    assert.ok(catalog.agents.every(agent => !('path' in agent)));
 
     // 3. Test WebSocket connection
     const ws = new WebSocket(`ws://127.0.0.1:${port}/`);

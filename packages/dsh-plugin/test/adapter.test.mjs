@@ -9,7 +9,7 @@ import { AcpAdapter } from '../dist/adapter.js';
 import { stream } from '../dist/transport.js';
 import { State } from '../dist/state.js';
 
-async function fixture(t, disconnect = false, interaction = 'permission') {
+async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-test-'));
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise(r => wss.once('listening', r));
@@ -28,6 +28,7 @@ async function fixture(t, disconnect = false, interaction = 'permission') {
     const app = acpAgent()
       .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true, _meta: { '1agents': { version: 1 } } } }))
       .onRequest('session/new', async () => {
+        await beforeNew();
         const sessionId = 'remote-' + (++creations);
         await connection.client.notify('session/update', { sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'review', description: 'Native review', input: { hint: 'Scope' } }, { name: 'model', description: 'Native model' }] } });
         return { sessionId, configOptions: configOptions(), modes: { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] } };
@@ -67,12 +68,12 @@ async function fixture(t, disconnect = false, interaction = 'permission') {
       });
     connection = app.connect(stream(ws));
   });
-  const local = { id: 'dsh-session', session: { header: { cwd: directory, agentPreset: 'oneagents-acp-codex' } }, ctx: { commands: { register: definition => { commands.set(definition.name, definition); return () => commands.delete(definition.name); } } } };
+  const local = { id: 'dsh-session', session: { header: { cwd: directory, agentPreset: 'oneagents-acp-codex' }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: { commands: { register: definition => { commands.set(definition.name, definition); return () => commands.delete(definition.name); } } } };
   const scopedCommands = local.ctx.commands;
   delete local.ctx.commands;
   local.ctx.inject = async (deps, apply) => { assert.deepEqual(deps, ['commands']); apply({ commands: scopedCommands, effect: () => {} }); return { dispose: async () => {} }; };
   const sent = []; local.followup = m => sent.push(m);
-  const ctx = { sessionProjections: { stateOf: session => session.header.agentPreset }, agents: { get: id => id === local.id ? local : undefined }, approval: { request: async request => {
+  const ctx = { sessionProjections: { stateOf: (session, key) => key === 'turnBoundary' ? session.boundary : session.header.agentPreset }, agents: { get: id => id === local.id ? local : undefined }, approval: { request: async request => {
     permissions++; assert.equal(request.agent, local);
     if (interaction === 'pending') {
       waiting.resolve();
@@ -193,4 +194,57 @@ test('native commands, models and modes are discovered before prompting and stay
   await collect(f.adapter, f.options('message-1'));
   assert.equal(f.counts().creations, 1);
   assert.deepEqual(f.changes.map(c => c.sessionId), ['remote-1', 'remote-1']);
+});
+
+test('unstarted sessions switch ACP agents and replace native commands', async t => {
+  const f = await fixture(t);
+  f.local.session.header.agentPreset = 'oneagents-acp-grok-build';
+  await f.adapter.describe(f.local);
+  await f.adapter.configure(f.local, 'native-model', 'native-b');
+  assert.ok(f.commands.has('status'));
+  f.local.session.header.agentPreset = 'oneagents-acp-codex';
+  assert.equal((await f.adapter.describe(f.local)).agent, 'codex');
+  assert.ok(!f.commands.has('status'));
+  assert.ok(f.commands.has('review'));
+  await collect(f.adapter, f.options('first-message'));
+  assert.deepEqual(f.counts(), { creations: 2, executions: 1, permissions: 1 });
+  assert.equal(new State(f.config.stateDirectory).get(f.local.id).agent, 'codex');
+});
+
+test('started sessions reject a different ACP binding', async t => {
+  const f = await fixture(t);
+  await collect(f.adapter, f.options('first-message'));
+  f.local.session.boundary.lastTurn = 1;
+  f.local.session.header.agentPreset = 'oneagents-acp-grok-build';
+  await assert.rejects(f.adapter.describe(f.local), /bound to another ACP/);
+  assert.equal(f.counts().creations, 1);
+});
+
+test('switching while discovery is pending serializes the replacement connection', { timeout: 5000 }, async t => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const f = await fixture(t, false, 'permission', async () => { entered.resolve(); await release.promise; });
+  f.local.session.header.agentPreset = 'oneagents-acp-grok-build';
+  const first = f.adapter.describe(f.local);
+  await entered.promise;
+  f.local.session.header.agentPreset = 'oneagents-acp-codex';
+  const second = f.adapter.describe(f.local);
+  release.resolve();
+  await first;
+  assert.equal((await second).agent, 'codex');
+  await collect(f.adapter, f.options('first-message'));
+  assert.deepEqual(f.counts(), { creations: 2, executions: 1, permissions: 1 });
+});
+
+test('draft switching preserves endpoint protection and requires known turn state', async t => {
+  const f = await fixture(t);
+  await f.adapter.describe(f.local);
+  f.local.session.header.agentPreset = 'oneagents-acp-grok-build';
+  f.local.session.boundary = undefined;
+  await assert.rejects(f.adapter.describe(f.local), /bound to another ACP/);
+  f.local.session.boundary = { openTurnStartSeq: null, lastTurn: 0 };
+  const state = new State(f.config.stateDirectory);
+  state.save(f.local.id, { ...state.get(f.local.id), endpoint: 'ws://other.example/agents/codex' });
+  await assert.rejects(f.adapter.describe(f.local), /bound to another ACP/);
+  assert.equal(f.counts().creations, 1);
 });

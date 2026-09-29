@@ -5,8 +5,5 @@
       name: '@1agents/dsh-acp'
       config:
         serviceUrl: http://127.0.0.1:36812
-        agents:
-          - codex
-          - grok-build
         reconnectAttempts: 5
         reconnectDelayMs: 1000

@@ -4,11 +4,42 @@ An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent session
 
 ## Use
 
-Install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin` from your DSH checkout, then restart `pnpm dsh web`. Start acp-service separately on `127.0.0.1:36812`.
+Install the published bundles from your DSH checkout:
 
-Choose **ACP · Codex** or **ACP · Grok** in the new-session Agent preset picker, choose a workspace, then send a message. ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. An active session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
+```sh
+pnpm dsh plugin --profile web add @1agents/dsh-acp @1agents/session-reader
+```
+
+The package declares `dsh.bundle.patch` and its browser entry, so installation selects the bundle automatically. Restart `pnpm dsh web` after updating packages. If you use an installed `dsh` executable, omit the leading `pnpm`. Replace `web` with `desktop` for the desktop profile.
+
+Start acp-service separately on `127.0.0.1:36812`:
+
+```sh
+npx --yes @1agents/acp-service@^0.2.0 serve --host 127.0.0.1 --port 36812 --no-report
+```
+
+The service requires each native Agent’s CLI and credentials. It is not launched by plugin installation. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin`.
+
+Choose a discovered **ACP · Agent** in the new-session Agent preset picker, choose a workspace, then send a message. ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. Before the first turn, switching the Agent preset replaces the discovery connection and its native commands. Once a turn starts, the session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
 
 The bundle registers an ACP adapter through DSH's public streaming extension and routes the ACP presets to it. It sends newly admitted messages whose source is `user` to `session/prompt`, not to `subagent-acp`; there is no coordinating DeepSeek model call. DSH-generated workspace instructions and runtime-context messages are excluded. The external Agent owns its model, prompt, tools and native history, including any project instructions it discovers itself. DSH owns its UI and local user/assistant transcript. External tool progress appears in the thinking stream; it is never dispatched as a DSH tool call.
+
+## Continue imported native sessions
+
+With `@1agents/session-reader` installed, choose **在 DSH 中继续原会话** on a Claude, Codex or Grok history. The original workspace must still exist. The plugin restores the native session through acp-service's `_1agents/session/import`, creates DSH history under the matching ACP preset, and attaches it to that workspace. Importing sends no prompt. Subsequent messages go to the original Agent; imported messages are never resent, including an unfinished trailing user message. Unsupported sources stay readable in session-reader.
+
+Imported bindings use `session/resume` because the service does not own a complete ACP replay of earlier native history. Existing ordinary ACP bindings continue using `session/load`. Endpoint, source provider and native ID identify an import; repeated admission reuses its DSH session without refreshing or replacing history. Old history-only DSH copies are not adopted. Original Agent history can continue changing outside DSH; the imported DSH history is a snapshot.
+
+The service ID is saved before DSH creation. A failed local creation or workspace attachment can be retried after restart without importing again. Native restoration and authentication failures are reported, never replaced by a new empty session. If the transport is lost before the import response reaches the plugin, the plugin cannot know the service ID and does not automatically retry that RPC.
+
+### Plugin service API
+
+`ctx.oneagentsAcpSessions` is a Cordis service owned by this plugin; consumers may declare it optional so history browsing works without ACP. Its TypeScript declarations are exported from `@1agents/dsh-acp/imports`. Consumers call the service from the Host and must not instantiate it or write its binding files.
+
+- `availability(provider)` returns `{ available, agent?, reason? }` without restoring a session. It checks configuration and the service inventory; successful native restoration remains the final capability/authentication check.
+- `importSession({ provider, nativeSessionId, cwd, events })` accepts current DSH events starting at sequence zero. It returns `{ success: true, dshSessionId, workspace, workspaceId, agent, continuation: 'native' }` only after restoration, DSH creation and workspace attachment succeed.
+
+Provider mapping is `claude → claude`, `codex → codex`, `grok → grok-build`. The service validates history through DSH before restoring a new native binding. No DSH Session format changes are required.
 
 ## Native commands and configuration
 
@@ -28,7 +59,7 @@ This plugin supports **text prompts**. Attachments and specialized external-tool
 
 ## Configuration
 
-The bundle's `oneagents-acp` row accepts `serviceUrl`, `agents`, `stateDirectory`, `reconnectAttempts` and `reconnectDelayMs`. Change it through the profile's `cordis.patch.yml`, not the DSH repository. Use a new session after changing endpoint or workspace. The default bundle offers Codex and Grok Build; other registry names can be added explicitly.
+The bundle's `oneagents-acp` row accepts `serviceUrl`, `agents`, `stateDirectory`, `reconnectAttempts` and `reconnectDelayMs`. Change it through the profile's `cordis.patch.yml`, not the DSH repository. Use a new session after changing endpoint or workspace. When `agents` is omitted, plugin startup fetches `GET /agents` from acp-service and registers presets for entries with `chat_ready: true`, using their service-provided names. Discovery runs on the service host. Restart the plugin after installing or removing a harness. An explicit `agents` list bypasses discovery and preserves manual registry selection; `[]` registers no presets. Start the updated service before loading the plugin: connection errors and invalid inventory responses fail plugin initialization instead of selecting fallback agents.
 
 ## Development and removal
 

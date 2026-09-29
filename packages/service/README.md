@@ -120,3 +120,11 @@ npm test
 ```
 
 Tests use the official ACP SDK over real WebSockets, cover session lifecycle and permission reconnects, and drive the installed 1acp runtime through a deterministic external stdio Agent. They require no model API key. Existing real-provider smoke tests in the 1agents backend remain opt-in.
+
+## Local harness discovery
+
+`GET /agents` returns `{ "agents": [...] }`, a fresh local filesystem inventory shared by DSH and 1agents_app. Each entry includes the canonical ACP registry `id`, display `label`, native CLI `installed`, and `chat_ready`. Legacy app fields (`type`, capabilities, cc-connect transport, integration status and install guidance) remain available; `claude` uses the legacy app type `claudecode`.
+
+Discovery checks PATH, `~/.local/bin`, `~/.grok/bin`, and installed adapter package launch files. A registered native ACP command is ready when its executable exists. Adapter-backed harnesses are ready when the adapter is installed, or when their native CLI and `npx` are installed; the latter uses the runtime's existing adapter download behavior when a session launches. Having `npx` or `uvx` alone does not expose uninstalled harnesses. Scanning neither executes agents nor downloads packages, and readiness does not verify credentials or model access. Detection-only frameworks remain in the inventory with `chat_ready: false`.
+
+The service launcher uses the same local command resolution, including absolute paths to user-local binaries. The catalog originates from 1agents_app's former Go detector; consumers no longer probe their own host or maintain separate detection tables. `discoverAgents()` is also exported for embedded service consumers and includes local executable paths; the HTTP response omits these paths.
