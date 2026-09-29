@@ -3558,13 +3558,7 @@ async function gracefulExit(source) {
   }
   isShuttingDown = true;
 
-  // 1. Immediately pause and destroy stdin to prevent libuv busy polling on EOF
-  try {
-    process.stdin.pause();
-    process.stdin.destroy();
-  } catch {}
-
-  // 2. Failsafe timeout: force exit after 3 seconds even if cleanup hangs
+  // Force exit after 3 seconds if agent cleanup hangs.
   const forceExitTimer = setTimeout(() => {
     console.error(`[acpx-server] Shutdown timed out (3s, source: ${source}). Force exiting...`);
     process.exit(0);
@@ -3580,20 +3574,8 @@ async function gracefulExit(source) {
   }
 }
 
+/** The standalone HTTP/WebSocket service stops on signals, independently of stdin. */
 export function attachProcessSignalHandlers() {
-  try {
-    process.stdin.resume();
-    process.stdin.on("end", () => {
-      console.error("[acpx-server] Parent process standard input closed. Shutting down...");
-      void gracefulExit("stdin-end");
-    });
-
-    process.stdin.on("close", () => {
-      console.error("[acpx-server] Parent process standard input closed. Shutting down...");
-      void gracefulExit("stdin-close");
-    });
-  } catch {}
-
   process.on("SIGINT", () => {
     console.log("[acpx-server] Received SIGINT. Terminating...");
     void gracefulExit("SIGINT");

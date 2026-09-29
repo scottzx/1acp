@@ -17,6 +17,8 @@ pnpm start:service serve --host 127.0.0.1 --port 36812 --no-report
 
 The default port is 36812. Without `--no-report`, the service reports to the local DreamMate node. Agent executables and their authentication must be available to the service process. `ACP_STATE_DIR` overrides the default `~/.1agents/acpx-state` directory for runtime records, turn journals and ACP replay data.
 
+The standalone HTTP/WebSocket service does not read standard input and keeps running when it is closed or redirected from `/dev/null`. Stop the service with `SIGINT` or `SIGTERM`; both clean up managed Agent sessions before exiting.
+
 ```ts
 import { serveAcpService } from '@1agents/acp-service';
 const service = await serveAcpService({ host: '127.0.0.1', port: 36812, report: false });
