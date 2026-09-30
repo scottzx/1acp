@@ -103,6 +103,7 @@
 - 版本节奏参考：上游架构同步 = runtime minor（0.16.0），适配方 minor（0.3.0），纯依赖范围更新 patch（0.2.1）。
 - 发布门禁：`.github/workflows/ci.yml` 打 tarball + **manifest 断言**（pack 出来的 package.json 里 name/version/依赖范围逐项核对）→ `release.yml`（workflow_dispatch）顺序发布，幂等（已发布版本做 integrity 比对后跳过），发布后 `npm view` 验证注册表依赖范围。
 - dsh-plugin 构建依赖 DSH 平台类型：本地 `pnpm link:dsh /path/to/DSH`；CI checkout 固定 ref 的 DSH 仓库自建。注意 **`pnpm install` 会清掉 node_modules 里的类型 symlink，每次 install 后要重新 link**。
+- CI 装 autoreview 的 Python 依赖时**不要用 `pip install --user`**：`test:autoreview` 以 `python -I` 运行，隔离模式排除 user site-packages，Pillow 装进 `~/.local` 后测试看不见（症状：`ModuleNotFoundError: PIL` × N + 走 "requires Pillow" 兜底路径的断言失败）。照上游写法 `python -m pip install -r requirements-autoreview.txt` 即可。
 - 发布前本地演练：三包 pack → `tar -xOf <tgz> package/package.json` 核对依赖 → 临时目录 npm install tarball 验证 bin/exports/依赖链全解析。
 
 ## 六、快速参考

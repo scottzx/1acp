@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install autoreview Python dependencies
-        run: python -m pip install --user -r packages/runtime/requirements-autoreview.txt
+        run: python -m pip install -r packages/runtime/requirements-autoreview.txt
       - run: pnpm install --frozen-lockfile
       - run: node --test scripts/*.test.mjs
       - run: pnpm --filter @scottzx/1acp check
