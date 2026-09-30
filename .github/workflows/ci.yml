@@ -16,13 +16,36 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install autoreview Python dependencies
+        run: python -m pip install --user -r packages/runtime/requirements-autoreview.txt
       - run: pnpm install --frozen-lockfile
       - run: node --test scripts/*.test.mjs
       - run: pnpm --filter @scottzx/1acp check
       - run: pnpm --filter @scottzx/1acp check:docs
       - run: pnpm --filter @1agents/acp-service typecheck
       - run: pnpm --filter @1agents/acp-service test
-      - run: mkdir -p release && pnpm --filter @scottzx/1acp pack --pack-destination "$GITHUB_WORKSPACE/release" && pnpm --filter @1agents/acp-service pack --pack-destination "$GITHUB_WORKSPACE/release"
+      - name: Pack runtime and service tarballs
+        run: |
+          mkdir -p release
+          pnpm --filter @scottzx/1acp pack --pack-destination "$GITHUB_WORKSPACE/release"
+          pnpm --filter @1agents/acp-service pack --pack-destination "$GITHUB_WORKSPACE/release"
+      - name: Verify packed manifests publish correctly
+        run: |
+          set -eu
+          check() {
+            local archive="$1" name="$2" version="$3" dep="$4" want="$5"
+            local got
+            got=$(tar -xOf "release/$archive" package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s);console.log(p.name+'|'+p.version+'|'+(p.dependencies?.[\"$dep\"]??'missing'))})")
+            case "$got" in
+              "$name|$version|$want") echo "ok $name@$version -> $dep@$want" ;;
+              *) echo "::error::packed manifest mismatch for $archive: got [$got], want $name|$version|$want"; exit 1 ;;
+            esac
+          }
+          check scottzx-1acp-0.16.0.tgz @scottzx/1acp 0.16.0 @openclaw/fs-safe '^0.20.0'
+          check 1agents-acp-service-0.3.0.tgz @1agents/acp-service 0.3.0 @scottzx/1acp '^0.16.0'
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-service-packages
@@ -49,7 +72,16 @@ jobs:
       - run: pnpm link:dsh "$GITHUB_WORKSPACE/.dsh-checkout"
       - run: pnpm --filter @1agents/acp-service... build
       - run: pnpm --filter @1agents/dsh-acp test
-      - run: mkdir -p release && pnpm --filter @1agents/dsh-acp pack --pack-destination "$GITHUB_WORKSPACE/release"
+      - name: Pack plugin tarball and verify its dependency range
+        run: |
+          set -eu
+          mkdir -p release
+          pnpm --filter @1agents/dsh-acp pack --pack-destination "$GITHUB_WORKSPACE/release"
+          got=$(tar -xOf release/1agents-dsh-acp-0.2.1.tgz package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s);console.log(p.name+'|'+p.version+'|'+p.dependencies?.['@1agents/acp-service']??'missing')})")
+          case "$got" in
+            "@1agents/dsh-acp|0.2.1|^0.3.0") echo "ok plugin manifest" ;;
+            *) echo "::error::packed manifest mismatch: got [$got]"; exit 1 ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-plugin-package

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { modelStateFromConfigOptions } from "../src/acp/model-support.js";
 import { applyConfigOptionsToState } from "../src/session/config-options.js";
-import { createConversation, reduceSessionUpdate } from "../src/session/conversation-reducer.js";
 import {
   cloneSessionAcpxState,
   createSessionConversation,
@@ -11,6 +10,7 @@ import {
   recordPromptSubmission,
   recordSessionUpdate,
 } from "../src/session/conversation-model.js";
+import { createConversation, reduceSessionUpdate } from "../src/session/conversation-reducer.js";
 import type { SessionAcpxState } from "../src/types.js";
 
 test("conversation model persists ACP kind and locations for Cursor-style file tools", () => {

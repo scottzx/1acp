@@ -5493,9 +5493,7 @@ test("AcpRuntimeManager adopts a pooled pre-warm record and moves idle updates t
   // the unref'd debounce timer does not need to keep the event loop alive.
   let persisted = false;
   for (let attempt = 0; attempt < 200 && !persisted; attempt += 1) {
-    persisted = JSON.stringify((await store.load(targetId))?.messages).includes(
-      "after adoption",
-    );
+    persisted = JSON.stringify((await store.load(targetId))?.messages).includes("after adoption");
     if (!persisted) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }

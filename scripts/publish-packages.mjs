@@ -10,6 +10,22 @@ export function verifyPublishedArchive(archive, dist) {
   if (dist?.integrity !== integrity) throw new Error('Published version has different contents; bump the package version');
 }
 
+/** After publishing, confirm the registry copy resolves the declared dependency. */
+export function verifyRegistryState(name, version, dependency, range, runView = (args) => execFileSync('npm', args, { encoding: 'utf8' })) {
+  const view = JSON.parse(runView(['view', `${name}@${version}`, 'dependencies', '--json']));
+  const resolved = view?.[dependency];
+  if (resolved !== range) {
+    throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved ?? 'missing'}; expected ${range}`);
+  }
+  console.log(`registry ok: ${name}@${version} -> ${dependency}@${resolved}`);
+}
+
+const EXPECTED_DEPENDENCIES = {
+  runtime: ['@openclaw/fs-safe', '^0.20.0'],
+  service: ['@scottzx/1acp', '^0.16.0'],
+  'dsh-plugin': ['@1agents/acp-service', '^0.3.0'],
+};
+
 async function publishPackages() {
   const selection = process.env.RELEASE_PACKAGE;
   const packages = ['runtime', 'service', 'dsh-plugin'];
@@ -30,6 +46,8 @@ async function publishPackages() {
     } else {
       throw new Error(`Registry check failed for ${name}: HTTP ${response.status}`);
     }
+    const [dependency, range] = EXPECTED_DEPENDENCIES[directory];
+    verifyRegistryState(name, version, dependency, range);
     const tag = `${name.split('/').at(-1)}-v${version}`;
     const remote = execFileSync('git', ['ls-remote', '--tags', 'origin', `refs/tags/${tag}`], { encoding: 'utf8' }).trim();
     if (!remote) {
