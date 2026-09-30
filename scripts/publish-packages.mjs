@@ -10,26 +10,37 @@ export function verifyPublishedArchive(archive, dist) {
   if (dist?.integrity !== integrity) throw new Error('Published version has different contents; bump the package version');
 }
 
-/** After publishing, confirm the registry copy resolves the declared dependency. */
-export async function verifyRegistryState(name, version, dependency, range, runView = (args) => execFileSync('npm', args, { encoding: 'utf8' }), { attempts = 30, delayMs = 10_000 } = {}) {
+/** After publishing, confirm the registry copy resolves the declared dependency.
+ * Talks to https://registry.npmjs.org directly so a local .npmrc mirror does not
+ * delay the publish pipeline; the official write appears immediately, but
+ * any mirror cache may lag the write for minutes. */
+export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 60, delayMs = 15_000 } = {}) {
   let resolved;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const view = JSON.parse(runView(['view', `${name}@${version}`, 'dependencies', '--json']));
-      resolved = view?.[dependency];
+      resolved = await fetcher(name, version, dependency);
       if (resolved === range) {
         console.log(`registry ok: ${name}@${version} -> ${dependency}@${resolved}`);
         return;
       }
-      if (resolved === undefined) throw new Error(`Registry ${name}@${version} does not list ${dependency} (missing); expected ${range}`);
-      throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved}; expected ${range}`);
+      throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved ?? 'missing'}; expected ${range}`);
     } catch (error) {
-      // npm registry reads lag writes by a couple of minutes right after publish.
-      if (attempt === attempts || !/E404|No match found/i.test(String(error.message))) throw error;
+      // Only E404 from the official registry is treated as a propagation delay;
+      // mismatched ranges or network errors short-circuit immediately.
+      if (attempt === attempts || !/E404|404|Not Found/i.test(String(error.message))) throw error;
       console.log(`registry read for ${name}@${version} not propagated yet (attempt ${attempt}/${attempts}); retrying in ${delayMs / 1000}s`);
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
+}
+
+async function fetchRegistry(name, version, dependency) {
+  const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`;
+  const response = await fetch(url, { headers: { 'content-type': 'application/json' } });
+  if (response.status === 404) throw new Error(`E404 from registry for ${url}`);
+  if (!response.ok) throw new Error(`Registry check for ${name}@${version} failed: HTTP ${response.status}`);
+  const doc = await response.json();
+  return doc?.dependencies?.[dependency];
 }
 
 const EXPECTED_DEPENDENCIES = {
