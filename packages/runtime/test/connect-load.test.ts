@@ -883,6 +883,47 @@ test("connectAndLoadSession fails when desired mode replay cannot be restored on
   });
 });
 
+test("a generic mode config replacement still replays the saved legacy mode", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "generic-mode-replacement",
+    acpSessionId: "previous-session",
+    agentSessionId: "previous-native",
+    agentCommand: "unused-agent",
+    cwd: process.cwd(),
+    acpx: { desired_mode_id: "plan" },
+  });
+  const calls: string[] = [];
+  const client: FakeClient = {
+    hasReusableSession: () => false,
+    start: async () => {},
+    getAgentLifecycleSnapshot: () => ({ running: false }),
+    supportsLoadSession: () => false,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => assert.fail("load is not advertised"),
+    createSession: async () => ({ sessionId: "fresh-session", agentSessionId: "fresh-native" }),
+    setSessionMode: async (sessionId, modeId) => {
+      calls.push(`${sessionId}:${modeId}`);
+      throw new Error("retired legacy mode");
+    },
+    setSessionModel: async () => assert.fail("model must not dispatch after replay rejection"),
+    setSessionConfigOption: async () =>
+      assert.fail("generic control must not dispatch after replay rejection"),
+  };
+  await assert.rejects(
+    connectAndLoadSession({
+      client: client as never,
+      record,
+      replacingConfigOption: { key: "mode" },
+      activeController: ACTIVE_CONTROLLER,
+    }),
+    { name: "SessionModeReplayError" },
+  );
+  assert.deepEqual(calls, ["fresh-session:plan"]);
+  assert.equal(record.acpSessionId, "previous-session");
+  assert.equal(record.agentSessionId, "previous-native");
+  assert.equal(record.acpx?.desired_mode_id, "plan");
+});
+
 test("connectAndLoadSession replays desired model on a fresh session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1211,7 +1252,9 @@ for (const [connection, modelMetadata, replacingConfig, savedEffort, siblingChan
           sessionId: "fresh-session",
           agentSessionId: "fresh-runtime",
           configOptions: configOptions("low", "ask", "default-model"),
+          configOptionsPresent: true,
           models: buildModelsState("default-model"),
+          legacyModelMetadataPresent: false,
         }),
         setSessionMode: async (sessionId, value) => {
           assert.equal(connection, "fresh", "legacy mode must remain fresh-only");

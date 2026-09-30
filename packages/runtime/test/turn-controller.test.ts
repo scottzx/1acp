@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   QueueOwnerTurnController,
   type QueueOwnerActiveSessionController,
-} from "../src/cli/queue/owner-turn-controller.js";
+} from "../src/session/queue/owner-turn-controller.js";
 
 test("QueueOwnerTurnController tracks explicit lifecycle states", async () => {
   const controller = createQueueOwnerTurnController();
@@ -47,6 +46,82 @@ test("QueueOwnerTurnController cancels immediately for active prompts", async ()
   assert.equal(controller.hasPendingCancel, false);
 });
 
+test("QueueOwnerTurnController revokes retry admission while cooperative cancellation waits", async () => {
+  const controller = createQueueOwnerTurnController();
+  const signal = controller.beginTurn();
+  let finishCancel!: (cancelled: boolean) => void;
+  const cancellation = new Promise<boolean>((resolve) => {
+    finishCancel = resolve;
+  });
+  let calls = 0;
+  controller.setActiveController(
+    makeActiveController({
+      hasActivePrompt: () => true,
+      requestCancelActivePrompt: () => {
+        calls += 1;
+        assert.equal(
+          signal.aborted,
+          false,
+          "cooperative cancellation starts before abort listeners",
+        );
+        return cancellation;
+      },
+    }),
+  );
+  controller.markPromptActive();
+  const accepted = controller.requestCancel();
+  try {
+    assert.equal(calls, 1);
+    assert.equal(signal.aborted, true, "retry admission stops before cancellation settles");
+    finishCancel(true);
+    assert.equal(await accepted, true);
+    controller.endTurn();
+    assert.equal(controller.beginTurn().aborted, false, "the successor owns a fresh signal");
+  } finally {
+    finishCancel(false);
+    await accepted;
+  }
+});
+
+for (const kind of ["active", "deferred"]) {
+  test(`QueueOwnerTurnController keeps successor cancellation after an old ${kind} acknowledgement`, async () => {
+    const controller = createQueueOwnerTurnController();
+    controller.beginTurn();
+    let active = kind === "active";
+    let finishCancel!: (cancelled: boolean) => void;
+    const cancellation = new Promise<boolean>((resolve) => {
+      finishCancel = resolve;
+    });
+    controller.setActiveController(
+      makeActiveController({
+        hasActivePrompt: () => active,
+        requestCancelActivePrompt: () => cancellation,
+      }),
+    );
+    if (kind === "deferred") {
+      assert.equal(await controller.requestCancel(), true);
+      active = true;
+    }
+    const oldCancel =
+      kind === "active" ? controller.requestCancel() : controller.applyPendingCancel();
+    try {
+      controller.clearActiveController();
+      controller.endTurn();
+      const nextSignal = controller.beginTurn();
+      assert.equal(nextSignal.aborted, false);
+      assert.equal(await controller.requestCancel(), true);
+      const nextReason: unknown = nextSignal.reason;
+      finishCancel(true);
+      assert.equal(await oldCancel, true);
+      assert.equal(controller.hasPendingCancel, true);
+      assert.equal(nextSignal.reason, nextReason);
+    } finally {
+      finishCancel(false);
+      await oldCancel;
+    }
+  });
+}
+
 test("QueueOwnerTurnController defers cancel while turn is starting", async () => {
   const controller = createQueueOwnerTurnController();
   let promptActive = false;
@@ -81,179 +156,8 @@ test("QueueOwnerTurnController defers cancel while turn is starting", async () =
   assert.equal(controller.hasPendingCancel, false);
 });
 
-test("QueueOwnerTurnController routes setSessionMode through active controller", async () => {
-  let activeCalls = 0;
-  let fallbackCalls = 0;
-  const observedTimeouts: Array<number | undefined> = [];
-  const fallbackTimeouts: Array<number | undefined> = [];
-
-  const controller = createQueueOwnerTurnController({
-    withTimeout: async (run, timeoutMs) => {
-      observedTimeouts.push(timeoutMs);
-      return await run();
-    },
-    setSessionModeFallback: async (_modeId, timeoutMs) => {
-      fallbackCalls += 1;
-      fallbackTimeouts.push(timeoutMs);
-    },
-  });
-
-  controller.setActiveController(
-    makeActiveController({
-      setSessionMode: async () => {
-        activeCalls += 1;
-      },
-    }),
-  );
-
-  await controller.setSessionMode("plan", 1250);
-  assert.equal(activeCalls, 1);
-  assert.equal(fallbackCalls, 0);
-  assert.deepEqual(observedTimeouts, [1250]);
-  assert.deepEqual(fallbackTimeouts, []);
-});
-
-test("QueueOwnerTurnController routes setSessionModel through active controller", async () => {
-  let activeCalls = 0;
-  let fallbackCalls = 0;
-  const observedTimeouts: Array<number | undefined> = [];
-  const fallbackTimeouts: Array<number | undefined> = [];
-
-  const controller = createQueueOwnerTurnController({
-    withTimeout: async (run, timeoutMs) => {
-      observedTimeouts.push(timeoutMs);
-      return await run();
-    },
-    setSessionModelFallback: async (_modelId, timeoutMs) => {
-      fallbackCalls += 1;
-      fallbackTimeouts.push(timeoutMs);
-      return { configOptions: [] };
-    },
-  });
-
-  const reportedResponse: SetSessionConfigOptionResponse = {
-    configOptions: [
-      {
-        id: "model",
-        name: "Model",
-        type: "select",
-        options: [{ value: "fast-model", name: "Fast" }],
-        currentValue: "fast-model",
-      },
-    ],
-  };
-  controller.setActiveController(
-    makeActiveController({
-      setSessionModel: async () => {
-        activeCalls += 1;
-        return reportedResponse;
-      },
-    }),
-  );
-
-  const response = await controller.setSessionModel("gpt-5.4", 1500);
-  assert.equal(activeCalls, 1);
-  assert.equal(fallbackCalls, 0);
-  assert.deepEqual(observedTimeouts, [1500]);
-  assert.deepEqual(fallbackTimeouts, []);
-  assert.equal(response, reportedResponse);
-});
-
-test("QueueOwnerTurnController routes setSessionConfigOption through fallback when inactive", async () => {
-  let fallbackCalls = 0;
-  const fallbackTimeouts: Array<number | undefined> = [];
-
-  const controller = createQueueOwnerTurnController({
-    setSessionConfigOptionFallback: async (_configId, _value, timeoutMs) => {
-      fallbackCalls += 1;
-      fallbackTimeouts.push(timeoutMs);
-      return { configOptions: [] };
-    },
-  });
-
-  const response = await controller.setSessionConfigOption("approval_policy", "strict", 2300);
-  assert.equal(fallbackCalls, 1);
-  assert.deepEqual(fallbackTimeouts, [2300]);
-  assert.deepEqual(response, { configOptions: [] });
-});
-
-test("QueueOwnerTurnController rejects control requests while closing", async () => {
-  let setModeFallbackCalls = 0;
-  let setModelFallbackCalls = 0;
-  let setConfigFallbackCalls = 0;
-  const controller = createQueueOwnerTurnController({
-    setSessionModeFallback: async () => {
-      setModeFallbackCalls += 1;
-    },
-    setSessionModelFallback: async () => {
-      setModelFallbackCalls += 1;
-    },
-    setSessionConfigOptionFallback: async () => {
-      setConfigFallbackCalls += 1;
-      return { configOptions: [] };
-    },
-  });
-
-  controller.beginClosing();
-
-  await assert.rejects(
-    async () => await controller.setSessionMode("plan"),
-    /Queue owner is closing/,
-  );
-  await assert.rejects(
-    async () => await controller.setSessionModel("gpt-5.4"),
-    /Queue owner is closing/,
-  );
-  await assert.rejects(
-    async () => await controller.setSessionConfigOption("k", "v"),
-    /Queue owner is closing/,
-  );
-  assert.equal(setModeFallbackCalls, 0);
-  assert.equal(setModelFallbackCalls, 0);
-  assert.equal(setConfigFallbackCalls, 0);
-});
-
-type QueueOwnerTurnControllerOverrides = Partial<{
-  withTimeout: <T>(run: () => Promise<T>, timeoutMs?: number) => Promise<T>;
-  setSessionModeFallback: (modeId: string, timeoutMs?: number) => Promise<void>;
-  setSessionModelFallback: (
-    modelId: string,
-    timeoutMs?: number,
-  ) => Promise<SetSessionConfigOptionResponse | undefined>;
-  setSessionConfigOptionFallback: (
-    configId: string,
-    value: string,
-    timeoutMs?: number,
-  ) => Promise<SetSessionConfigOptionResponse>;
-}>;
-
-function createQueueOwnerTurnController(
-  overrides: QueueOwnerTurnControllerOverrides = {},
-): QueueOwnerTurnController {
-  const withTimeout =
-    overrides.withTimeout ?? (async <T>(run: () => Promise<T>): Promise<T> => await run());
-  const setSessionModeFallback =
-    overrides.setSessionModeFallback ??
-    (async (): Promise<void> => {
-      // no-op
-    });
-  const setSessionModelFallback =
-    overrides.setSessionModelFallback ??
-    (async () => ({
-      configOptions: [],
-    }));
-  const setSessionConfigOptionFallback =
-    overrides.setSessionConfigOptionFallback ??
-    (async () => ({
-      configOptions: [],
-    }));
-
-  return new QueueOwnerTurnController({
-    withTimeout,
-    setSessionModeFallback,
-    setSessionModelFallback,
-    setSessionConfigOptionFallback,
-  });
+function createQueueOwnerTurnController(): QueueOwnerTurnController {
+  return new QueueOwnerTurnController();
 }
 
 type ActiveControllerOverrides = Partial<QueueOwnerActiveSessionController>;

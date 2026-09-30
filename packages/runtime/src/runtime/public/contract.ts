@@ -1,3 +1,6 @@
+import type { AcpAgentRegistry } from "../../agent-registry.js";
+import type { AcpControlAuthority } from "../../async-control.js";
+export type { AcpAgentRegistry } from "../../agent-registry.js";
 import type {
   SetSessionConfigOptionResponse,
   ToolCallContent,
@@ -16,11 +19,11 @@ import type {
   GrokExitPlanOutcome,
 } from "../../acp/grok-exit-plan.js";
 import type { AcpRuntimeSessionModes } from "../../acp/mode-support.js";
+import type { SessionWatchEvent } from "../../session/journal.js";
 import type {
   AcpElicitationHandler,
   AcpElicitationMode,
-  AcpPermissionDecision,
-  AcpPermissionRequest,
+  AcpPermissionHandler,
   AcpProcessLifecycle,
   McpServer,
   NonInteractivePermissionPolicy,
@@ -39,6 +42,7 @@ export type {
   AcpElicitationRequest,
   AcpElicitationResponse,
   AcpPermissionDecision,
+  AcpPermissionHandler,
   AcpPermissionRequest,
   AcpProcessExit,
   AcpProcessLaunch,
@@ -54,6 +58,11 @@ export type {
 } from "../../acp/config-option-support.js";
 export type { AcpRuntimeSessionModeInfo, AcpRuntimeSessionModes } from "../../acp/mode-support.js";
 
+/**
+ * ACP has no mid-turn steering request. In-process runtimes admit a "steer"
+ * turn like "prompt": it waits behind any active turn on the same session and
+ * does not change that turn. Shared runtimes reject "steer".
+ */
 export type AcpRuntimePromptMode = "prompt" | "steer";
 
 export type AcpRuntimeSessionMode = "persistent" | "oneshot";
@@ -71,7 +80,11 @@ export type AcpSessionUpdateTag =
   | "plan"
   | (string & {});
 
-export type AcpRuntimeControl = "session/set_mode" | "session/set_config_option" | "session/status";
+export type AcpRuntimeControl =
+  | "session/set_mode"
+  | "session/set_model"
+  | "session/set_config_option"
+  | "session/status";
 
 export type AcpRuntimeHandle = {
   sessionKey: string;
@@ -95,7 +108,7 @@ export type AcpRuntimeEnsureInput = {
    * on the underlying `session/new` request, and persisted onto the new
    * record. Ignored when an existing persistent session is reused — system
    * prompts are fixed at `newSession` time, so changing them requires a
-   * different sessionKey or closing the prior record first.
+   * different sessionKey or prepareFreshSession on the prior record first.
    */
   sessionOptions?: SessionAgentOptions;
   /** Host-resolved argv. Never sourced from a persisted user profile. */
@@ -113,18 +126,28 @@ export type AcpRuntimeTurnAttachment = {
   data: string;
 };
 
-export type AcpRuntimeTurnInput = {
+/**
+ * In-process turns check synchronous host authority before prompt dispatch.
+ * A throwing assertActive rejects admission without aborting the signal.
+ */
+export type AcpRuntimeTurnInput = AcpControlAuthority & {
   handle: AcpRuntimeHandle;
   text: string;
   attachments?: AcpRuntimeTurnAttachment[];
   mode: AcpRuntimePromptMode;
   requestId: string;
   timeoutMs?: number;
-  signal?: AbortSignal;
+  /**
+   * Overrides the client's default callback for this prompt turn. Throwing or
+   * returning undefined falls through to configured permission policy, not the
+   * default callback.
+   */
+  onPermissionRequest?: AcpPermissionHandler;
   /** Handles ACP elicitation requests owned by this prompt turn. */
   onElicitation?: AcpElicitationHandler;
 };
 
+/** Caller-owned snapshot; local mutations do not change runtime capabilities. */
 export type AcpRuntimeCapabilities = {
   controls: AcpRuntimeControl[];
   configOptionKeys?: string[];
@@ -133,6 +156,8 @@ export type AcpRuntimeCapabilities = {
 export type AcpRuntimeSessionModels = {
   currentModelId?: string;
   availableModelIds: string[];
+  /** Native display names, when retained by the session snapshot. */
+  availableModels?: Array<{ modelId: string; name: string }>;
 };
 
 /**
@@ -228,6 +253,8 @@ export type AcpRuntimeSessionUsage = {
 export type AcpRuntimeStatus = {
   /** Whether the connected agent advertised ACP session fork support. */
   forkSupported?: boolean;
+  /** Most recent host request id admitted for a prompt on this session. */
+  lastRequestId?: string;
   summary?: string;
   acpxRecordId?: string;
   backendSessionId?: string;
@@ -434,13 +461,23 @@ export interface AcpRuntimeTurn {
 }
 
 export interface AcpRuntime {
+  /** Passively replays and follows recorded turns when the backend supports a shared journal. */
+  watchSession?(input: {
+    handle: AcpRuntimeHandle;
+    cursor?: string;
+    signal?: AbortSignal;
+  }): AsyncIterable<SessionWatchEvent>;
+  /** Stops owned connections and joins admitted work; stored sessions remain resumable. */
+  shutdown?(): Promise<void>;
+  /** Finds a persistent session handle without starting or reconnecting an agent. */
+  findSession?(input: { sessionKey: string; agent: string }): Promise<AcpRuntimeHandle | undefined>;
   ensureSession(input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle>;
   /**
    * Rebind a persistent runtime session to its final host-owned session key.
    * Intended for sessions created under a temporary pre-warm key before the
    * host session id exists.
    */
-  adoptSession(input: { handle: AcpRuntimeHandle; sessionKey: string }): Promise<AcpRuntimeHandle>;
+  adoptSession?(input: { handle: AcpRuntimeHandle; sessionKey: string }): Promise<AcpRuntimeHandle>;
   logoutSession?(input: { handle: AcpRuntimeHandle }): Promise<void>;
   authenticateSession?(input: {
     handle: AcpRuntimeHandle;
@@ -463,14 +500,22 @@ export interface AcpRuntime {
     handle?: AcpRuntimeHandle;
   }): Promise<AcpRuntimeCapabilities> | AcpRuntimeCapabilities;
   getStatus?(input: { handle: AcpRuntimeHandle; signal?: AbortSignal }): Promise<AcpRuntimeStatus>;
-  setMode?(input: { handle: AcpRuntimeHandle; mode: string }): Promise<void>;
-  setConfigOption?(input: {
-    handle: AcpRuntimeHandle;
-    key: string;
-    value: string;
-  }): Promise<SetSessionConfigOptionResponse | void>;
+  /** Authority gates dispatch; an issued control still settles its response and saved state. */
+  setMode?(input: AcpControlAuthority & { handle: AcpRuntimeHandle; mode: string }): Promise<void>;
+  setModel?(
+    input: AcpControlAuthority & { handle: AcpRuntimeHandle; model: string },
+  ): Promise<void>;
+  setConfigOption?(
+    input: AcpControlAuthority & {
+      handle: AcpRuntimeHandle;
+      key: string;
+      value: string;
+    },
+  ): Promise<SetSessionConfigOptionResponse | void>;
   doctor?(): Promise<AcpRuntimeDoctorReport>;
   cancel(input: { handle: AcpRuntimeHandle; reason?: string }): Promise<void>;
+  /** Locally closes the session and persists fresh creation on the next ensure without resumeSessionId. */
+  prepareFreshSession?(input: { handle: AcpRuntimeHandle }): Promise<void>;
   close(input: {
     handle: AcpRuntimeHandle;
     reason: string;
@@ -490,10 +535,19 @@ export interface AcpSessionStore {
   rebind?(sourceSessionId: string, record: AcpSessionRecord): Promise<void>;
 }
 
-export interface AcpAgentRegistry {
-  resolve(agentName: string): string | string[];
-  list(): string[];
-}
+export type AcpRuntimeSessionContext = {
+  sessionKey: string;
+  cwd: string;
+  agentCommand: string;
+  agentArgv?: string[];
+};
+
+export type AcpRuntimeSessionPermissions = Partial<
+  Pick<
+    AcpRuntimeOptions,
+    "permissionMode" | "nonInteractivePermissions" | "permissionPolicy" | "onPermissionRequest"
+  >
+>;
 
 export type AcpRuntimeOptions = {
   cwd: string;
@@ -501,7 +555,22 @@ export type AcpRuntimeOptions = {
   agentProcessEnv?: Record<string, string>;
   sessionStore: AcpSessionStore;
   agentRegistry: AcpAgentRegistry;
-  mcpServers?: McpServer[];
+  /**
+   * Servers for new and reconnected session clients. A resolver runs at connection
+   * creation with the session's stored identity; its result is never persisted.
+   * Retained connections keep their original servers. Initialization-only health
+   * probes do not call the resolver.
+   */
+  mcpServers?: McpServer[] | ((session: AcpRuntimeSessionContext) => McpServer[]);
+  /**
+   * Client permissions for new and reconnected sessions, resolved from stored
+   * identity. Unspecified fields inherit runtime defaults. Retained clients keep
+   * their original policy; health probes do not call this resolver. Neither the
+   * policy nor its callback is persisted.
+   */
+  sessionPermissions?: (
+    session: AcpRuntimeSessionContext,
+  ) => AcpRuntimeSessionPermissions | undefined;
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
@@ -512,10 +581,7 @@ export type AcpRuntimeOptions = {
   elicitationModes?: readonly AcpElicitationMode[];
   /** Optional lifecycle observer for ACP agent processes owned by this runtime. */
   processLifecycle?: AcpProcessLifecycle;
-  onPermissionRequest?: (
-    req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
-  ) => Promise<AcpPermissionDecision | undefined>;
+  onPermissionRequest?: AcpPermissionHandler;
   /**
    * Host-driven handler for Grok Build's `_x.ai/ask_user_question` extension.
    * Used by bridge-server to surface the questionnaire over WebSocket.
@@ -546,6 +612,22 @@ export type AcpRuntimeOptions = {
     updateTag: AcpSessionUpdateTag,
     update?: Record<string, unknown>,
   ) => void;
+  /**
+   * ACP filesystem callback capability for new and reconnected session clients.
+   * Omitted defaults to enabled, matching `AcpClientOptions`. Retained clients
+   * keep their original capability. Health probes disable filesystem callbacks
+   * and ignore this option. Disabling is a protocol callback policy, not an OS
+   * sandbox for the agent's own filesystem access. The setting is not persisted.
+   */
+  fs?: boolean;
+  /**
+   * ACP terminal callback capability for new and reconnected session clients.
+   * Omitted defaults to enabled, matching `AcpClientOptions`. Retained clients
+   * keep their original capability. Health probes disable terminal callbacks
+   * and ignore this option. Disabling is a protocol callback policy, not an OS
+   * sandbox for the agent's own process access. The setting is not persisted.
+   */
+  terminal?: boolean;
 };
 
 export type AcpFileSessionStoreOptions = {

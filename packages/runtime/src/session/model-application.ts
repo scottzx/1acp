@@ -3,8 +3,9 @@ import type { AcpClient, SessionCreateResult } from "../acp/client.js";
 import {
   assertRequestedModelSupported,
   modelStateFromConfigOptions,
+  resolveRequestedModelId,
 } from "../acp/model-support.js";
-import { withTimeout } from "../async-control.js";
+import { withTimeout, type AcpControlAuthority } from "../async-control.js";
 
 export function currentModelIdFromSetModelResponse(
   response: SetSessionConfigOptionResponse | undefined,
@@ -20,11 +21,17 @@ export async function applyRequestedModelIfAdvertised(params: {
   models: SessionCreateResult["models"];
   agentCommand?: string;
   timeoutMs?: number;
+  authority?: AcpControlAuthority;
   onWarning?: (message: string) => void;
-}): Promise<{
-  applied: boolean;
-  response?: SetSessionConfigOptionResponse;
-}> {
+}): Promise<
+  | { applied: false; response?: undefined }
+  | {
+      applied: true;
+      modelId: string;
+      resolvedModelId: string;
+      response?: SetSessionConfigOptionResponse;
+    }
+> {
   const requestedModel =
     typeof params.requestedModel === "string" ? params.requestedModel.trim() : "";
   if (!requestedModel) {
@@ -42,13 +49,19 @@ export async function applyRequestedModelIfAdvertised(params: {
   if (!params.models) {
     return { applied: false };
   }
-  if (params.models.currentModelId === requestedModel) {
-    return { applied: true };
+  const resolvedModelId = resolveRequestedModelId({ ...params, requestedModel });
+  if (params.models.currentModelId === resolvedModelId) {
+    return { applied: true, modelId: requestedModel, resolvedModelId };
   }
 
   const response = await withTimeout(
-    params.client.setSessionModel(params.sessionId, requestedModel, params.models),
+    params.client.setSessionModel(
+      params.sessionId,
+      requestedModel,
+      params.models,
+      params.authority,
+    ),
     params.timeoutMs,
   );
-  return { applied: true, response };
+  return { applied: true, modelId: requestedModel, resolvedModelId, response };
 }

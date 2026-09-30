@@ -41,6 +41,16 @@ export function mergeSessionOptions(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+export function normalizeSessionOptionShape(
+  options: SessionAgentOptions | undefined,
+): SessionAgentOptions | undefined {
+  const normalized = mergeSessionOptions(options, undefined);
+  if (normalized?.env !== undefined && Object.keys(normalized.env).length === 0) {
+    delete normalized.env;
+  }
+  return normalized && Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
 function mergeEnvRecords(
   fallback: Record<string, string> | undefined,
   preferred: Record<string, string> | undefined,
@@ -88,15 +98,15 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
   }
 
   const sessionOptions: SessionAgentOptions = {};
-  assignStoredOption(sessionOptions, "model", nonEmptyString(stored.model));
-  assignStoredOption(sessionOptions, "allowedTools", storedAllowedTools(stored.allowed_tools));
-  assignStoredOption(sessionOptions, "maxTurns", storedMaxTurns(stored.max_turns));
-  assignStoredOption(
+  assignDefinedOption(sessionOptions, "model", nonEmptyString(stored.model));
+  assignDefinedOption(sessionOptions, "allowedTools", storedAllowedTools(stored.allowed_tools));
+  assignDefinedOption(sessionOptions, "maxTurns", storedMaxTurns(stored.max_turns));
+  assignDefinedOption(
     sessionOptions,
     "systemPrompt",
-    storedSystemPromptOption(stored.system_prompt),
+    normalizeSystemPromptOption(stored.system_prompt),
   );
-  assignStoredOption(sessionOptions, "env", storedEnvRecord(stored.env));
+  assignDefinedOption(sessionOptions, "env", storedEnvRecord(stored.env));
 
   return Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined;
 }
@@ -136,13 +146,18 @@ function storedEnvRecord(value: unknown): Record<string, string> | undefined {
     if (typeof raw !== "string") {
       continue;
     }
-    result[key] = raw;
+    Object.defineProperty(result, key, {
+      value: raw,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
 function normalizeSystemPromptOption(value: unknown): SystemPromptOption | undefined {
-  const prompt = nonEmptyString(value);
+  const prompt = nonEmptyPromptText(value);
   if (prompt !== undefined) {
     return prompt;
   }
@@ -154,15 +169,11 @@ function appendedSystemPrompt(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return undefined;
   }
-  return nonEmptyString((value as { append?: unknown }).append);
+  return nonEmptyPromptText((value as { append?: unknown }).append);
 }
 
-function assignStoredOption<Key extends keyof SessionAgentOptions>(
-  target: SessionAgentOptions,
-  key: Key,
-  value: SessionAgentOptions[Key] | undefined,
-): void {
-  assignDefinedOption(target, key, value);
+function nonEmptyPromptText(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function storedAllowedTools(value: unknown): string[] | undefined {
@@ -173,10 +184,6 @@ function storedAllowedTools(value: unknown): string[] | undefined {
 
 function storedMaxTurns(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
-}
-
-function storedSystemPromptOption(value: unknown): SystemPromptOption | undefined {
-  return normalizeSystemPromptOption(value);
 }
 
 function nonEmptyString(value: unknown): string | undefined {

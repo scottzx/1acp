@@ -10,15 +10,24 @@ import type {
   SessionRecord,
 } from "../types.js";
 import type { BundleReader } from "./bundle-reader.js";
+import { isPathMismatchError } from "./read-errors.js";
+import { projectRunBundle } from "./run-projection.js";
 import { mergeLiveRunState } from "./run-state.js";
 
 export async function loadRunBundle(reader: BundleReader): Promise<LoadedRunBundle> {
-  const manifest = await reader.readJson<FlowRunManifest>("manifest.json");
+  const manifest = await readJson<FlowRunManifest>(reader, "manifest.json");
   const [flow, run, live, steps, trace] = await Promise.all([
-    reader.readJson<FlowDefinitionSnapshot>(manifest.paths.flow),
-    reader.readJson<FlowRunState>(manifest.paths.runProjection),
-    reader.readJson<Partial<FlowRunState>>(manifest.paths.liveProjection).catch(() => null),
-    reader.readJson<FlowStepRecord[]>(manifest.paths.stepsProjection),
+    readJson<FlowDefinitionSnapshot>(reader, manifest.paths.flow),
+    readJson<FlowRunState>(reader, manifest.paths.runProjection),
+    readJson<Partial<FlowRunState>>(reader, manifest.paths.liveProjection).catch(
+      (error: unknown) => {
+        if (isPathMismatchError(error)) {
+          throw error;
+        }
+        return null;
+      },
+    ),
+    readJson<FlowStepRecord[]>(reader, manifest.paths.stepsProjection),
     readNdjson<FlowTraceEvent>(reader, manifest.paths.trace),
   ]);
 
@@ -26,8 +35,8 @@ export async function loadRunBundle(reader: BundleReader): Promise<LoadedRunBund
     await Promise.all(
       manifest.sessions.map(async (sessionEntry) => {
         const [binding, record, events] = await Promise.all([
-          reader.readJson<FlowSessionBinding>(sessionEntry.bindingPath),
-          reader.readJson<SessionRecord>(sessionEntry.recordPath),
+          readJson<FlowSessionBinding>(reader, sessionEntry.bindingPath),
+          readJson<SessionRecord>(reader, sessionEntry.recordPath),
           readNdjson<FlowBundledSessionEvent>(reader, sessionEntry.eventsPath),
         ]);
 
@@ -44,17 +53,21 @@ export async function loadRunBundle(reader: BundleReader): Promise<LoadedRunBund
     ),
   );
 
-  return {
+  return projectRunBundle({
     sourceType: reader.sourceType,
     sourceLabel: reader.label,
     manifest,
     flow,
     run: mergeLiveRunState(run, live),
     live,
-    steps: steps.slice().toSorted(compareByAttemptStart),
-    trace: trace.slice().toSorted((left, right) => left.seq - right.seq),
+    steps,
+    trace: trace.toSorted((left, right) => left.seq - right.seq),
     sessions,
-  };
+  });
+}
+
+async function readJson<T>(reader: BundleReader, relativePath: string): Promise<T> {
+  return JSON.parse(await reader.readText(relativePath)) as T;
 }
 
 async function readNdjson<T>(reader: BundleReader, relativePath: string): Promise<T[]> {
@@ -64,12 +77,4 @@ async function readNdjson<T>(reader: BundleReader, relativePath: string): Promis
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => JSON.parse(line) as T);
-}
-
-function compareByAttemptStart(left: FlowStepRecord, right: FlowStepRecord): number {
-  const started = Date.parse(left.startedAt) - Date.parse(right.startedAt);
-  if (started !== 0) {
-    return started;
-  }
-  return left.attemptId.localeCompare(right.attemptId);
 }

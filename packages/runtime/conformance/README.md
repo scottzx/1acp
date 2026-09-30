@@ -13,7 +13,10 @@ session lifecycle flows.
 - `session/prompt`
 - `session/update`
 - `session/cancel`
-- baseline error semantics (`Invalid params`, permission denied, unknown session)
+- baseline error semantics (`Invalid params`, unknown session)
+
+Deterministic permission checks, cancellable delays, and late updates use the
+bundled mock adapter's command semantics in a separate mock profile.
 
 ## Non-goals (v1)
 
@@ -37,14 +40,22 @@ Case files are prefixed numerically to preserve stable execution ordering.
 
 Draft contract and seed case corpus.
 
-Current profile (`acp-core-v1`) includes 21 required cases.
+The default profile (`acp-core-v1`) includes 14 adapter-independent required cases.
+The explicit `acpx-mock-v1` profile includes those cases and seven mock-specific
+regressions, for 21 required cases in total.
 
 ## Run
 
-Run against the default mock ACP adapter:
+Run the core profile against the default mock ACP adapter:
 
 ```bash
 pnpm run conformance:run
+```
+
+Run all deterministic regressions with the bundled mock adapter:
+
+```bash
+pnpm run conformance:run -- --profile conformance/profiles/acpx-mock-v1.json
 ```
 
 Run a single case:
@@ -71,10 +82,40 @@ pnpm run conformance:run -- \
 ## Notes
 
 - The draft runner currently executes required case ids from the selected
-  profile and prints a pass/fail matrix.
+  profile and prints a pass/fail matrix. `--case` narrows that selected profile's
+  required cases; use the mock profile to select its permission or active-cancel
+  cases.
 - Case/profile parsing is pure Node JSON parsing (no Python dependency).
 - The runner is data-driven: it executes structured case `steps` and `checks`
   from JSON instead of hard-coded `case id -> logic` switches.
+- Core structured prompts use baseline `text` and `resource_link` content. Their
+  synthetic URI identifies a content block; the case does not require a real
+  file or prove a file read. Embedded `resource` transport and exact mock reply
+  assertions are retained in runner tests against the bundled mock, which
+  advertises `embeddedContext` support.
+- Use `acpx-mock-v1` with the bundled mock adapter: its permission prompts,
+  cancellable delays, and post-success updates depend on known mock commands.
+- Filesystem callbacks resolve paths within the session cwd, including symlinks
+  that stay inside it. Links that escape the cwd and writes to hardlinked files
+  are rejected. Relative paths use the session cwd without changing the adapter
+  command's working directory.
+- Read callbacks honor the optional one-based `line` and maximum-line `limit`
+  selectors, matching the production client. Even a zero-line read must pass
+  permission and filesystem checks.
+- Run write cases in a disposable workspace: existing files can be overwritten.
+  Newly created files receive best-effort cleanup within the same filesystem
+  root. These callback checks do not sandbox the adapter process itself.
+- Each case retires its adapter, witnessed descendants, and transport before
+  reporting its result. Cleanup has an eight-second budget and escalates from
+  stdin EOF to TERM and KILL. If retirement cannot be verified, the case fails
+  with a cleanup diagnostic and later cases are not launched; an original case
+  error remains in the report too.
+- SIGINT, SIGTERM, and SIGHUP stop new work and interrupt pending requests,
+  sleeps, and settle waits. The runner completes owned cleanup and writes the
+  partial report before exiting with the first signal (or its conventional
+  numeric exit status on Windows). Repeated signals do not skip cleanup.
+  Descendants that escape observation and abrupt, uncatchable termination are
+  outside this cleanup guarantee.
 
 ## Data-Driven Model
 
@@ -96,12 +137,70 @@ Each case file can define:
   - `updates_count_at_least`
   - `updates_all_session`
   - `updates_text_includes`
+  - `updates_session_update_includes`
+  - `filesystem_operation`
+
+`updates_count_at_least` accepts an optional literal `from` name, for example
+`{ "type": "updates_count_at_least", "from": "turn2", "min": 1 }`.
+It selects the prompt named by `prompt.save_as` or `prompt_background.save_as`.
+An `await_background.save_as` name aliases the same original prompt; awaiting it
+does not restart its observation. Names are literal, without saved-value
+interpolation. Reusing a name selects its latest naming operation; saving a
+`new_session` result there removes the old prompt link. Existing aliases retain
+their original prompt.
+
+A scoped count includes matching-session, SDK-normalized callbacks from the
+prompt's handoff to the SDK message writable until the immediately registered
+observer of its original request Promise runs, on success or rejection. This
+measures callback delivery, not raw frame timing, completed byte delivery or
+causal origin. A delayed earlier-turn callback arriving inside a later scope can
+still count because notifications have no prompt-origin ID.
+
+The source must have an observed handoff and completion and must be unambiguous,
+even when `min` is zero. Overlapping dispatched prompts in the same session make
+their scopes ambiguous, including prompts without a saved name. Different
+sessions are counted independently. Checks do not wait for unfinished background
+requests. Without `from`, counts and the other update checks stay case-wide,
+including intentional post-success drain checks.
+
+`filesystem_operation` requires a completed local filesystem callback somewhere
+in the case, before checks run after the optional settle wait. It matches
+`method` (`read_text_file` or `write_text_file`), `session` (a literal ID or saved
+reference), and the exact literal request `path`. Writes also require exact
+`content`, including an empty string when that is the intended write.
+`outcome` is either `{ "type": "success" }` or
+`{ "type": "error", "code": -32001 }` with the expected numeric error code.
+Successful reads may add `content_includes` inside `outcome` to match a
+case-insensitive substring of the actual returned file content.
+
+This check proves local callback completion, not prompt attribution, response
+delivery or peer receipt. A completed callback during session creation or an
+earlier prompt can satisfy it; an unfinished callback cannot. The mock
+permission/read/write cases require these operation checks in addition to their
+prompt completion expectations. Agent prose and a separate permission request
+cannot substitute for the actual filesystem operation.
+
+When a step declares `expect_error`, its operation must fail. Optional `codes`
+and `message_any` fields filter the failure; `{}` accepts any operation error.
+Runner interruption is never an expected operation error. A successful operation
+always fails the case.
+
+The runner validates the profile and every JSON file in the cases directory
+before launching an adapter, including files outside a `--case` selection.
+Unknown fields, actions or checks, malformed control values, duplicate case IDs
+and duplicate required IDs are startup errors. Known descriptive metadata remains
+optional; minimal cases and empty step/check arrays are supported.
+
+Validation applies to runner instructions. Session cwd and session-ID payloads,
+and the contents of prompt blocks, remain unchanged so negative protocol cases
+can deliberately send invalid ACP inputs. Saved keys are literal names; inherited
+JavaScript properties cannot satisfy a saved-value assertion.
 
 ## Nightly Workflow
 
 - Workflow file: `.github/workflows/conformance-nightly.yml`
-- `Conformance (Mock Full)` always runs the full profile on the local mock
-  adapter and uploads a JSON report artifact.
+- `Conformance (Mock Full)` always runs the explicit `acpx-mock-v1` profile on the
+  local mock adapter and uploads a JSON report artifact.
 - `Conformance (Real Adapter Smoke)` runs only when repository variable
   `ACPX_CONFORMANCE_REAL=1`, using handshake smoke checks for selected
   real adapters.

@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { synthesizeLiveRunState } from "../examples/flows/replay-viewer/server/live-run-state.js";
+import { projectRunBundle } from "../examples/flows/replay-viewer/src/lib/run-projection.js";
+import { resolveSessionRenderState } from "../examples/flows/replay-viewer/src/lib/session-render-state.js";
+import {
+  listSessionViews,
+  selectAttemptView,
+} from "../examples/flows/replay-viewer/src/lib/view-model-conversation.js";
 import type {
   FlowBundledSessionEvent,
   FlowDefinitionSnapshot,
@@ -11,9 +16,9 @@ import type {
   ViewerRunLiveState,
 } from "../examples/flows/replay-viewer/src/types.js";
 
-test("synthesizeLiveRunState replays bundled ACP events into a live current ACP attempt", () => {
+test("projectRunBundle replays bundled ACP events into a live current ACP attempt", () => {
   const sessionId = "main-bundle";
-  const state = synthesizeLiveRunState(
+  const state = projectRunBundle(
     makeLiveBundle({
       sessionId,
       record: {
@@ -63,9 +68,9 @@ test("synthesizeLiveRunState replays bundled ACP events into a live current ACP 
   assert.equal(agent.Agent?.content?.[0]?.Text, "hel");
 });
 
-test("synthesizeLiveRunState replays only new session events beyond record.lastSeq", () => {
+test("projectRunBundle does not duplicate content represented by a checkpoint", () => {
   const sessionId = "main-bundle";
-  const state = synthesizeLiveRunState(
+  const state = projectRunBundle(
     makeLiveBundle({
       sessionId,
       record: {
@@ -244,6 +249,53 @@ function makeFlow(): FlowDefinitionSnapshot {
   };
 }
 
+for (const checkpointed of [false, true]) {
+  test(`logical prompt precedes captured setup content (checkpoint: ${checkpointed})`, () => {
+    const sessionId = "main-bundle";
+    const record = liveToolBaseRecord();
+    const user = {
+      User: {
+        id: checkpointed ? "saved-setup-user" : `replay:${sessionId}:2`,
+        content: [{ Text: "hello" }],
+      },
+    };
+    if (checkpointed) {
+      record.lastSeq = 3;
+      record.messages = [
+        user,
+        { Agent: { content: [{ Text: "setup answer" }], tool_results: {} } },
+      ];
+    }
+    const input = makeLiveBundle({
+      sessionId,
+      record,
+      events: [
+        // Runtime normalization admits the captured client stream, including
+        // notifications whose session ID differs from the current binding.
+        makeChunkEvent("another-session", 1, "setup "),
+        makePromptEvent("agent-session", 2, "hello"),
+        makeChunkEvent("agent-session", 3, "answer"),
+        makeChunkEvent("agent-session", 4, " tail"),
+      ],
+    });
+    const before = structuredClone(input);
+    const projected = projectRunBundle(input);
+    assert.deepEqual(projected.sessions[sessionId].record.messages, [
+      user,
+      { Agent: { content: [{ Text: "setup answer tail" }], tool_results: {} } },
+    ]);
+    assert.deepEqual(projected.steps[0].trace?.conversation, {
+      sessionId,
+      messageStart: 0,
+      messageEnd: 1,
+      eventStartSeq: 1,
+      eventEndSeq: 4,
+    });
+    assert.equal(projected.steps[0].promptText, "hello");
+    assert.deepEqual(input, before);
+  });
+}
+
 function makePromptEvent(sessionId: string, seq: number, text: string): FlowBundledSessionEvent {
   return {
     seq,
@@ -278,4 +330,129 @@ function makeChunkEvent(sessionId: string, seq: number, text: string): FlowBundl
       },
     },
   };
+}
+
+function liveToolBaseRecord(): SessionRecord {
+  const at = "2026-04-01T10:00:00.000Z";
+  return {
+    schema: "acpx.session.v1",
+    acpxRecordId: "tool-status-record",
+    acpSessionId: "agent-session",
+    agentCommand: "codex",
+    cwd: "/tmp/replay-live",
+    createdAt: at,
+    lastUsedAt: at,
+    lastSeq: 0,
+    eventLog: {
+      active_path: "sessions/main-bundle/events.ndjson",
+      segment_count: 1,
+      max_segment_bytes: 67_108_864,
+      max_segments: 1,
+    },
+    messages: [],
+    updated_at: at,
+    cumulative_token_usage: {},
+    request_token_usage: {},
+  };
+}
+
+function liveToolEvent(
+  seq: number,
+  toolCallId: string,
+  patch: { status?: "pending" | "in_progress" | "completed" | "failed"; title?: string },
+): FlowBundledSessionEvent {
+  return {
+    seq,
+    at: new Date(Date.parse("2026-04-01T10:00:00.000Z") + seq * 1_000).toISOString(),
+    direction: "inbound",
+    message: {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "agent-session",
+        update: {
+          sessionUpdate: seq === 2 ? "tool_call" : "tool_call_update",
+          toolCallId,
+          ...(seq === 2 ? { kind: "execute", rawInput: { command: ["synthetic-check"] } } : {}),
+          ...patch,
+        },
+      },
+    },
+  };
+}
+
+for (const terminal of ["completed", "failed"] as const) {
+  for (const toolCallId of ["live-tool", "__proto__"]) {
+    test(`live ${toolCallId} stays running through status-only updates until ${terminal}`, () => {
+      const sessionId = "main-bundle";
+      let record = liveToolBaseRecord();
+      const events = [makePromptEvent("agent-session", 1, "Inspect this synthetic tool.")];
+      const stages = [
+        {
+          patch: { status: "pending" as const, title: "Synthetic tool" },
+          complete: false,
+          status: "running",
+        },
+        { patch: { title: "Synthetic tool still pending" }, complete: false, status: "running" },
+        { patch: { status: "in_progress" as const }, complete: false, status: "running" },
+        {
+          patch: { status: terminal },
+          complete: true,
+          status: terminal === "failed" ? "error" : "completed",
+        },
+      ];
+      for (const [index, stage] of stages.entries()) {
+        events.push(liveToolEvent(index + 2, toolCallId, stage.patch));
+        // Reuse the actual previous reconstructed record as the checkpoint. The
+        // event log still contains its prefix; only events beyond lastSeq apply.
+        const input = makeLiveBundle({ sessionId, record, events });
+        const original = structuredClone(input);
+        const live = projectRunBundle(input);
+        assert.deepEqual(input, original, "live synthesis must preserve its input");
+        const selected = selectAttemptView(live, 0);
+        assert.ok(selected);
+        const session = listSessionViews(live, selected).find((value) => value.id === sessionId);
+        assert.ok(session);
+        assert.equal(session.isStreamingSource, true);
+        const rendering = resolveSessionRenderState({
+          sessionSlice: session.sessionSlice,
+          isStreamingSource: session.isStreamingSource,
+          sessionRevealProgress: 0.1,
+          liveStreaming: true,
+        });
+        assert.equal(rendering.animateConversation, false);
+        assert.equal(rendering.renderedSessionSlice, session.sessionSlice);
+        const message = rendering.renderedSessionSlice.find((value) =>
+          value.toolUses.some((tool) => tool.id === toolCallId),
+        );
+        assert.ok(message);
+        const use = message.toolUses.find((tool) => tool.id === toolCallId);
+        const result = message.toolResults.find((tool) => tool.id === toolCallId);
+        assert.ok(use);
+        assert.ok(result);
+        assert.equal(
+          (use.raw as { is_input_complete?: unknown }).is_input_complete,
+          stage.complete,
+        );
+        assert.equal((result.raw as { output?: { status?: unknown } }).output?.status, undefined);
+        assert.equal(result.status, stage.status);
+        assert.equal(result.isError, terminal === "failed" && stage.complete);
+        assert.deepEqual(
+          message.parts.map((part) => part.type),
+          ["tool_use", "tool_result"],
+        );
+        record = live.sessions[sessionId].record;
+        if (stage.complete) {
+          const paused = resolveSessionRenderState({
+            sessionSlice: session.sessionSlice,
+            isStreamingSource: session.isStreamingSource,
+            sessionRevealProgress: null,
+            liveStreaming: false,
+          });
+          assert.deepEqual(paused.renderedSessionSlice, session.sessionSlice);
+          assert.equal(paused.animateConversation, false);
+        }
+      }
+    });
+  }
 }

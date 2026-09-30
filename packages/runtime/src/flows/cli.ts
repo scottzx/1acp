@@ -12,21 +12,22 @@ import {
   resolvePermissionMode,
   type GlobalFlags,
 } from "../cli/flags.js";
+import {
+  resolvePermissionPolicyFromFlags,
+  sessionOptionsFromGlobalFlags,
+} from "../cli/invocation-options.js";
 import { type FlowDefinition, FlowRunner } from "../flows.js";
-import { loadPermissionPolicySpec } from "../permission-policy.js";
 import { permissionModeSatisfies } from "../permissions.js";
 import type { PermissionMode } from "../types.js";
 import { isDefinedFlow } from "./authoring.js";
 import { validateFlowDefinition } from "./graph.js";
+import { installFlowRuntimeResolution } from "./module-resolution.js";
 
 type FlowRunFlags = {
   inputJson?: string;
   inputFile?: string;
   defaultAgent?: string;
 };
-
-const FLOW_RUNTIME_SPECIFIER = "acpx/flows";
-const TEXT_MODULE_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
 
 export async function handleFlowRun(
   flowFile: string,
@@ -36,7 +37,7 @@ export async function handleFlowRun(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
-  const permissionPolicy = await resolveFlowPermissionPolicy(globalFlags);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const outputPolicy = resolveOutputPolicy(globalFlags.format, globalFlags.jsonStrict === true);
   const input = await readFlowInput(flags);
   const flowPath = path.resolve(flowFile);
@@ -58,11 +59,7 @@ export async function handleFlowRun(
     ttlMs: globalFlags.ttl,
     verbose: globalFlags.verbose,
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-    },
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
   });
 
   const result = await runner.run(flow, input, {
@@ -70,15 +67,6 @@ export async function handleFlowRun(
   });
 
   printFlowRunResult(result, globalFlags);
-}
-
-async function resolveFlowPermissionPolicy(globalFlags: GlobalFlags) {
-  try {
-    return await loadPermissionPolicySpec(globalFlags.permissionPolicy, globalFlags.cwd);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new InvalidArgumentError(`Invalid permission policy: ${message}`);
-  }
 }
 
 function assertFlowPermissionRequirements(
@@ -139,57 +127,16 @@ async function readFlowInput(flags: FlowRunFlags): Promise<unknown> {
 
 async function loadFlowModule(flowPath: string): Promise<FlowDefinition> {
   const extension = path.extname(flowPath).toLowerCase();
-  const prepared = await prepareFlowModuleImport(flowPath, extension);
-  try {
-    const module = await loadFlowRuntimeModule(prepared.flowUrl, extension);
-
-    const candidate = findFlowDefinition(module);
-    if (!candidate) {
-      throw new Error(
-        `Flow module must export default defineFlow({...}) from "acpx/flows": ${flowPath}`,
-      );
-    }
-    validateFlowDefinition(candidate);
-    return candidate;
-  } finally {
-    await prepared.cleanup?.();
+  installFlowRuntimeResolution(pathToFileURL(resolveFlowRuntimeImportSpecifier()).href);
+  const module = await loadFlowRuntimeModule(pathToFileURL(flowPath).href, extension);
+  const candidate = findFlowDefinition(module);
+  if (!candidate) {
+    throw new Error(
+      `Flow module must export default defineFlow({...}) from "acpx/flows" (or "@scottzx/1acp/flows"): ${flowPath}`,
+    );
   }
-}
-
-async function prepareFlowModuleImport(
-  flowPath: string,
-  extension: string,
-): Promise<{
-  flowUrl: string;
-  cleanup?: () => Promise<void>;
-}> {
-  const flowUrl = pathToFileURL(flowPath).href;
-  if (!TEXT_MODULE_EXTENSIONS.has(extension)) {
-    return { flowUrl };
-  }
-
-  const source = await fs.readFile(flowPath, "utf8");
-  if (!source.includes(FLOW_RUNTIME_SPECIFIER)) {
-    return { flowUrl };
-  }
-
-  const runtimeSpecifier = resolveFlowRuntimeImportSpecifier();
-  const rewritten = source.replaceAll(
-    /(["'])acpx\/flows\1/g,
-    (_match, quote: string) => `${quote}${runtimeSpecifier}${quote}`,
-  );
-  if (rewritten === source) {
-    return { flowUrl };
-  }
-
-  const tempPath = path.join(path.dirname(flowPath), `.acpx-flow-load-${randomUUID()}${extension}`);
-  await fs.writeFile(tempPath, rewritten, "utf8");
-  return {
-    flowUrl: pathToFileURL(tempPath).href,
-    cleanup: async () => {
-      await fs.rm(tempPath, { force: true });
-    },
-  };
+  validateFlowDefinition(candidate);
+  return candidate;
 }
 
 function resolveFlowRuntimeImportSpecifier(): string {
@@ -206,66 +153,38 @@ function resolveFlowRuntimeImportSpecifier(): string {
   return runtimePath.replaceAll(path.sep, "/");
 }
 
-async function loadFlowRuntimeModule(
-  flowUrl: string,
-  extension: string,
-): Promise<{
+type FlowModule = {
   default?: unknown;
   "module.exports"?: unknown;
-}> {
+};
+
+async function loadFlowRuntimeModule(flowUrl: string, extension: string): Promise<FlowModule> {
   if (extension === ".ts" || extension === ".tsx" || extension === ".cts") {
-    const { register } = (await import("tsx/cjs/api")) as {
-      register: (options: { namespace: string }) => {
-        require: (
-          specifier: string,
-          parentURL: string,
-        ) => {
-          default?: unknown;
-          "module.exports"?: unknown;
-        };
-        unregister: () => void;
-      };
-    };
+    const { register } = await import("tsx/cjs/api");
     const loader = register({ namespace: randomUUID() });
     try {
-      return loader.require(flowUrl, import.meta.url);
+      return loader.require(flowUrl, import.meta.url) as FlowModule;
     } finally {
       loader.unregister();
     }
   }
 
   if (extension === ".mts") {
-    const { register } = (await import("tsx/esm/api")) as {
-      register: (options: { namespace: string }) => {
-        import: (
-          specifier: string,
-          parentURL: string,
-        ) => Promise<{
-          default?: unknown;
-          "module.exports"?: unknown;
-        }>;
-        unregister: () => Promise<void>;
-      };
-    };
+    const { register } = await import("tsx/esm/api");
     const loader = register({ namespace: randomUUID() });
     try {
-      return await loader.import(flowUrl, import.meta.url);
+      return (await loader.import(flowUrl, import.meta.url)) as FlowModule;
     } finally {
       await loader.unregister();
     }
   }
 
-  return (await import(flowUrl)) as {
-    default?: unknown;
-    "module.exports"?: unknown;
-  };
+  return (await import(flowUrl)) as FlowModule;
 }
 
-function findFlowDefinition(module: {
-  default?: unknown;
-  "module.exports"?: unknown;
-}): FlowDefinition | null {
+function findFlowDefinition(module: FlowModule): FlowDefinition | null {
   const candidates = [
+    module,
     module.default,
     module["module.exports"],
     getNestedDefault(module.default),

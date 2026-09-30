@@ -31,16 +31,6 @@ export const catalogDescriptors = [
     "install_command": "curl -fsSL https://x.ai/cli/install.sh | bash"
   },
   {
-    "type": "deepseek-build",
-    "label": "DeepSeek",
-    "binary": "grok",
-    "acp_capable": true,
-    "cli_capable": true,
-    "cc_transport": "acp",
-    "integrated": true,
-    "install_command": "curl -fsSL https://x.ai/cli/install.sh | bash"
-  },
-  {
     "type": "cursor",
     "label": "Cursor Agent",
     "binary": "agent",

@@ -1,6 +1,6 @@
 ---
 name: acpx
-description: Use acpx as a headless ACP CLI for agent-to-agent communication, including prompt/exec/sessions workflows, session scoping, queueing, permissions, output formats, system-prompt overrides, and multi-agent flows authored with defineFlow/decision/decisionEdge.
+description: Use acpx as a headless ACP CLI for agent-to-agent communication, including installed-agent inspection, prompt/exec/sessions workflows, session scoping, queueing, permissions, output formats, system-prompt overrides, and multi-agent flows authored with defineFlow/decision/decisionEdge.
 ---
 
 # acpx
@@ -29,8 +29,9 @@ Core capabilities:
 - Prompt input via stdin or `--file`
 - Config files with global+project merge and `config show|init`
 - Session metadata/history inspection (`sessions show`, `sessions history`)
+- Passive replay and live observation (`sessions watch -s <name> --cursor <cursor>`; omit the cursor for retained history)
 - Local agent process checks via `status`
-- Stable ACP client methods for filesystem and terminal requests
+- Stable ACP client methods for filesystem and terminal requests; filesystem paths preserve symlink/parent traversal order within the working directory
 - Stable ACP `authenticate` handshake via env/config credentials
 - Structured streaming output (`text`, `json`, `quiet`) with optional `--suppress-reads`
 - Prompt-response `_meta` preservation across direct, queued, compare, and embedded-runtime results
@@ -62,7 +63,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
+acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | watch [-s <name>] [--cursor <cursor>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
@@ -73,7 +74,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | watch [-s <name>] [--cursor <cursor>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
@@ -83,18 +84,20 @@ If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdi
 Friendly agent names resolve to commands:
 
 - `pi` -> `npx pi-acp` (ACPX-owned package range; see `agents/Pi.md`)
-- `openclaw` -> `openclaw acp`
+- `openclaw` -> `openclaw acp` (see the [OpenClaw guide](https://github.com/openclaw/acpx/blob/main/agents/OpenClaw.md))
 - `codex` -> `npx -y @agentclientprotocol/codex-acp` (ACPX-owned package range)
 - `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range; see `agents/Claude.md`)
 - `gemini` -> `gemini --acp`
 - `cursor` -> `cursor-agent acp`
 - `copilot` -> `copilot --acp --stdio`
-- `deepseek-build` -> `grok agent --model deepseek-v4-flash stdio`
-  Resolves its key from session `DEEPSEEK_API_KEY`, parent `DEEPSEEK_API_KEY`, then the exact `deepseek-api` entry in `~/.1agents/providers.json`. Defaults to `deepseek-v4-flash` and supports `deepseek-v4-pro` through the existing `--model` option.
+- `antigravity` -> `agy_acp_server.par` (`--uid=` on Linux; `agy_acp_server.exe` on Windows). Install the official runtime/helper pair and configure its own sign-in first; see [Antigravity](https://github.com/openclaw/acpx/blob/main/agents/Antigravity.md). Fixed-choice interaction questions are cancelled, including with `--approve-all`, host permission callbacks, and existing custom launchers; acpx cannot supply user answers through permission approval.
+- `devin` -> `devin acp`
 - `droid` -> `droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
 - `fast-agent` -> `uvx fast-agent-mcp acp`
+- `fx` -> `fx acp` (install and authenticate a provider first; see the [fx guide](https://github.com/openclaw/acpx/blob/main/agents/Fx.md))
 - `grok-build` -> `grok agent stdio`
 - `iflow` -> `iflow --experimental-acp`
+- `junie` -> `junie --acp=true` (install and authenticate Junie first; see the [Junie guide](https://github.com/openclaw/acpx/blob/main/agents/Junie.md))
 - `kilocode` -> `npx -y @kilocode/cli acp`
 - `kimi` -> `kimi acp`
 - `kiro` -> `kiro-cli-chat acp`
@@ -114,6 +117,24 @@ Rules:
 - Unknown positional agent tokens are treated as raw agent commands.
 - `--agent <command>` explicitly sets a raw ACP adapter command.
 - Do not combine a positional agent and `--agent` in the same command.
+- Gemini version checks, Copilot ACP support checks, and their startup diagnostics use the selected agent's working directory and child environment, including session environment and embedded runtime overrides.
+- Embedded host lifecycle admission also covers compatibility and diagnostic invocations. Correlate their events by `launchId`; one session can produce several adapter processes. Checks retire their owned processes and output pipes before settling.
+
+## Embedded hosts
+
+When embedding ACPX, import `createAgentRegistry` from `acpx/agent-registry` and use `inspect(agentId)` to obtain installed launch facts without starting an agent. Treat `undefined` as uninspectable. Check the returned missing command/package requirements before acquiring a session; recheck when launching because installed files can change. Authentication and native model discovery belong to session acquisition.
+
+Custom registry names such as `constructor` and `__proto__` work with resolution, listing, and inspection. Without an explicit registry entry, unknown names remain raw commands.
+
+Use `getStatus({ handle }).models.availableModels` when present for native display names, and pass the selected opaque model ID, including any slashes, unchanged to `setModel`. Model changes validate against the connected session's advertised models, including after reconnect. `setConfigOption` applies the same validation when `key` names the advertised model option and returns that operation's native ACP response with the accepted `configOptions`. Use the response to update model and reasoning controls together. Embedded callers can identify unknown or ambiguous model failures with `isRequestedModelUnsupportedError(error)` and `error.reason === "unadvertised-model"`. When a Cursor alias matches multiple advertised variants, the error also has `ambiguous: true`; a selector with no advertised match omits that flag. Claude ACP retains its forwarding exception for selectors absent from its advertised list.
+
+Use `prepareFreshSession({ handle })` to persist a fresh-session request across restart, then ensure without `resumeSessionId`. Ordinary `close` retains session continuity; explicit remote discard requires the adapter’s optional close capability.
+
+Embedded controls save accepted settings with the current conversation. Turn finalization and one-shot cleanup wait for admitted controls, preserving final output, usage, and selections in the saved session. Ordinary `close` can return before active prompt cancellation finishes; the later save preserves its close/reset markers.
+
+For persistent sessions, compatible `ensureSession` calls may reuse an active record, including from permission callbacks during control reconnects. Changing its working directory, adapter invocation, or resume identity while turns or controls remain unfinished rejects with `ACP_SESSION_INIT_FAILED`; await that work or use a different key. After an active close, await its turn result before reopening. Idle replacement retires the old owner before initializing the successor; other records and distinct one-shot sessions remain independent.
+
+For installed entrypoints and prerequisites, read the matching [agent guide](https://github.com/openclaw/acpx/tree/main/agents). For resolver callbacks, custom command overrides, and lifecycle details, read [embedded agent discovery](https://github.com/openclaw/acpx/blob/main/docs/session-control.md#embedded-agent-discovery).
 
 ## Commands
 
@@ -192,15 +213,20 @@ Behavior:
 - `cancel`: sends cooperative `session/cancel` through queue-owner IPC.
 - `set-mode`: calls ACP `session/set_mode`.
 - `set-mode` mode ids are adapter-defined; unsupported values are rejected by the adapter (often `Invalid params`).
+- On allowed fresh fallback, `set-mode` replaces the old saved mode without replaying it. Other saved settings restore first; the new mode preference is saved only after acceptance.
+- Prompt reconnect uses model metadata received while restoring a saved mode before replaying the selected model, and retains changed or removed model support in the final session metadata.
 - `set`: calls ACP `session/set_config_option`.
+- A config key named `mode` keeps config-option transport; explicit `set-mode` uses the separate `session/set_mode` control.
 - Current codex-acp releases expose `model` and `reasoning_effort` as separate config options.
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.
-- `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
-- Model switches can change or remove reasoning-effort controls. ACPX reconciles saved non-mode selections with the accepted response; select a supported effort again if needed.
+- `set model <id>`: validates against the connected session's advertised models, uses `session/set_config_option` for model config options, and preserves `session/set_model` for explicitly advertised legacy models. Claude Code still accepts or rejects selectors absent from its advertised list.
+- Model switches can change or remove reasoning-effort controls. ACPX reconciles saved config selections with the accepted response; select a supported effort again if needed.
 - After reconnect, ACPX restores the saved model when advertised and replays saved config selections before prompting. A replay failure is reported instead of silently using defaults.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
 
 ### Sessions
+
+Use `acpx --format json pi sessions watch -s reviewer` to observe another client's work. Resume with `--cursor` using the last event's opaque cursor. Watchers do not cancel turns when stopped; use `turn_result` for the settled outcome, and treat owner-loss errors as unknown outcomes rather than retry instructions. See [Watching sessions](https://github.com/openclaw/acpx/blob/main/docs/session-watch.md).
 
 ```bash
 acpx sessions
@@ -263,28 +289,33 @@ Behavior:
 
 - `--agent <command>`: raw ACP agent command (escape hatch)
 - `--cwd <dir>`: working directory for session scope (default: current directory)
-- `--approve-all`: auto-approve all permission requests
-- `--approve-reads`: auto-approve reads/searches, prompt for writes (default mode)
-- `--deny-all`: deny all permission requests
-- `--non-interactive-permissions <policy>`: when prompting is unavailable, choose `deny` or `fail`
-- `--permission-policy <json-or-file>` / `--policy`: per-tool ACP permission rules (`autoApprove`, `autoDeny`, `escalate`, `defaultAction`)
+- `--approve-all`: approve tool permission requests not resolved by a per-tool policy
+- `--approve-reads`: approve remaining read/search requests and prompt for other tools (default mode)
+- `--deny-all`: deny tool permission requests not resolved by a per-tool policy
+- `--non-interactive-permissions <policy>`: choose `deny` or `fail` when the permission mode requires a prompt but stdin or stderr is not a TTY
+- `--permission-policy <json-or-file>` / `--policy`: per-tool ACP permission rules that take precedence over the permission mode
 - `--format <fmt>`: output format (`text`, `json`, `quiet`)
 - `--json-strict`: strict JSON mode; requires `--format json` and suppresses non-JSON stderr output
 - `--suppress-reads`: suppress raw read-file contents while preserving the selected format
-- `--timeout <seconds>`: max wait time (positive number)
+- `--timeout <seconds>`: response deadline (positive number); partial text is not completion. A final response during the bounded drain keeps its actual outcome. Queued prompts wait for cancellation and retirement of unfinished connections before reconnecting to the saved session; cleanup can extend elapsed time beyond the deadline.
 - `--ttl <seconds>`: queue owner idle TTL before shutdown (default `300`, `0` disables TTL)
 - `--model <id>`: request an agent model during session creation; non-Claude agents must advertise a model config option or legacy `models` metadata
 - `--system-prompt <text>`: replace the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt`; persisted in `session_options.system_prompt` so reuse keeps the override. Other agents ignore the field.
-- `--append-system-prompt <text>`: append text to the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt.append`; same persistence rules as `--system-prompt`.
+- `--append-system-prompt <text>`: append text to the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt.append`; same persistence rules as `--system-prompt`. Both system-prompt flags also apply to persistent and isolated ACP nodes in `flow run`.
 - `--allowed-tools <list>`: comma-separated tool whitelist (use `""` for no tools)
 - `--max-turns <count>`: cap session turn count
-- `--prompt-retries <count>`: retry failed prompt turns on transient errors (default `0`)
-- `--no-fs`: advertise both ACP filesystem capabilities as disabled so compatible agents use their native file operations
-- `--no-terminal`: do not advertise the ACP terminal capability — useful for review-only or sandboxed agent invocations
+- `--prompt-retries <count>`: retry failed prompt turns on transient errors (default `0`); cancelling a queued turn stops remaining attempts, while already-received final responses keep their outcome
+- `--no-fs`: disable ACP filesystem callbacks so compatible agents use their native file operations. This is a protocol callback policy, not an OS sandbox for the agent's own filesystem access.
+- `--no-terminal`: disable the ACP terminal callback. This is a protocol callback policy, not an OS sandbox for the agent's own process access.
 - `--verbose`: verbose ACP/debug logs to stderr
 
-Cursor may advertise bracketed model ids such as `composer-2.5[fast=false]`. A bare Cursor
-model name is normalized only when exactly one advertised bracketed variant matches it.
+Cursor may advertise bracketed model IDs such as `composer-2.5[fast=false]`. An exact
+advertised ID always wins. Only Cursor accepts a bare model name through a unique
+advertised bracketed variant; unknown or ambiguous names are rejected before the
+model change. This rule uses the current connected catalog for `set model`, embedded
+`setModel`, and model selections through `setConfigOption`, including after reconnect.
+
+An acknowledged model alias is saved as the resolved current model ID; its original spelling remains the preference replayed on reconnect. Non-list config catalogs are treated as acknowledgements, while an explicit empty list withdraws the catalog.
 
 Permission flags are mutually exclusive.
 
@@ -293,24 +324,37 @@ Permission flags are mutually exclusive.
 `--system-prompt` and `--append-system-prompt` let you specialize a Claude session without leaving lingering one-off state, while still benefiting from persistent session reuse.
 
 ```bash
-# Replace the system prompt for a named session, persisted across reuse
-acpx --system-prompt "You are a code reviewer who challenges every implicit assumption." claude -s review
+# Create a named session with a replacement system prompt.
+acpx --system-prompt "You are a code reviewer who challenges every implicit assumption." \
+  claude sessions new --name review
+acpx claude -s review 'review the current diff'
 
-# Append a guideline on top of the default system prompt
-acpx --append-system-prompt "Always explain trade-offs before recommending a fix." claude -s impl
+# Create a named session with an appended guideline.
+acpx --append-system-prompt "Always explain trade-offs before recommending a fix." \
+  claude sessions new --name impl
+acpx claude -s impl 'implement the requested change'
 ```
 
-The override is forwarded via ACP `_meta.systemPrompt` (or `_meta.systemPrompt.append`) on `session/new` and stored in `session_options.system_prompt`. Subsequent `prompt`/`ensure` calls in the same scope keep the override unless you explicitly create a new session. Non-Claude adapters ignore the field, so the same flag is safe inside cross-agent scripts.
+Run the creation command once, then select the session with `-s` for later prompts. Running `sessions new` again in the same scope closes the prior local record and creates a fresh session.
+
+The override is forwarded via ACP `_meta.systemPrompt` (or `_meta.systemPrompt.append`) on `session/new`, `session/load`, and `session/resume` and stored in `session_options.system_prompt`. Subsequent `prompt`/`ensure` calls in the same scope keep the override unless you explicitly create a new session. Non-Claude adapters ignore the field, so the same flag is safe inside cross-agent scripts.
+
+Embedded `SessionAgentOptions.systemPrompt` preserves raw nonempty replacement or append text through saving and reconnecting, including whitespace-only text. CLI prompt flags trim surrounding whitespace and reject whitespace-only values.
 
 ## Claude settings isolation
 
 Built-in `acpx claude` sessions load Claude project and local settings, but not
-user settings. This prevents globally enabled channel and daemon plugins from
+user settings. The same isolation and saved session options apply on creation,
+load, and resume. This prevents globally enabled channel and daemon plugins from
 claiming singleton external resources in an ACP-spawned session.
 
 Set `ACPX_CLAUDE_INCLUDE_USER_SETTINGS=1` only when the spawned session needs
 the user's global Claude settings and no such plugin conflict exists. Ambient
 credentials and other environment variables are still inherited normally.
+
+On Windows, native Claude executable discovery resolves relative `PATH` entries
+from the selected session cwd. An explicit `CLAUDE_CODE_EXECUTABLE` still takes
+precedence.
 
 ## Sessions cleanup
 
@@ -356,24 +400,13 @@ child agents, but they do not trigger ACP auth-method selection on their own.
 
 ## Devin ACP compatibility
 
-Devin is not a built-in agent shortcut. Use the raw command escape hatch:
+The `devin` shortcut runs the installed Devin CLI. Authenticate with Devin before starting sessions:
 
 ```bash
-acpx --agent 'devin acp' exec 'summarize this repo'
+acpx devin exec 'summarize this repo'
 ```
 
-Pass Devin global flags such as `--model <model>` before `acp` when needed.
-
-When `acpx` detects a Devin ACP launch (`devin ... acp`, `devin ... --acp`, or `devin ... --experimental-acp`), it advertises the minimum Windsurf-compatible metadata needed for Devin's ACP gate:
-
-- `clientInfo.name`: `windsurf` instead of `acpx`
-- `clientInfo.version`: `ACPX_DEVIN_WINDSURF_VERSION` env var, default `1.110.1`
-- `clientCapabilities`: standard `fs` and `terminal` support, plus `_meta["cognition.ai/requestDiagnostics"] = true`
-- Extension handling: returns `{}` for Devin `_cognition.ai/request_diagnostics` requests and accepts extension notifications without method-not-found noise
-
-This compatibility shim is scoped to Devin ACP launches only. Other agents continue to receive standard `acpx` identity and capabilities.
-
-See the repository [`agents/Devin.md`](https://github.com/openclaw/acpx/blob/main/agents/Devin.md) for the full Devin compatibility contract.
+`acpx --model <id> devin` uses the advertised ACP model config option. Raw `--agent` overrides remain available for launch flags. Devin launches retain their scoped Windsurf-compatible identity; see [`agents/Devin.md`](https://github.com/openclaw/acpx/blob/main/agents/Devin.md) for detection, version overrides, capabilities, and extension handling.
 
 ## Session behavior
 
@@ -386,8 +419,9 @@ Persistent prompt sessions are scoped by:
 Persistence:
 
 - Session records are stored in `~/.acpx/sessions/*.json`.
-- `-s/--session` creates parallel named conversations in the same repo.
+- `-s/--session` selects a named conversation; create it with `sessions new --name <name>` or `sessions ensure --name <name>` before prompting.
 - Changing `--cwd` changes scope and therefore session lookup.
+- Records saved under an earlier default command of a built-in agent, such as a previous ACPX-owned adapter range, are read as that agent's current command, so they stay in scope after an ACPX upgrade. Records with a custom launcher keep it. When both an upgraded and a current record match a scope, the most recently used one wins.
 - closed sessions are retained on disk with `closed: true` and `closedAt` until pruned.
 - auto-resume by scope skips closed sessions.
 
@@ -405,10 +439,12 @@ Queueing is per persistent session.
 
 - The active `acpx` process for a running prompt becomes the queue owner.
 - Other invocations submit prompts over local IPC.
-- On Unix-like systems, queue IPC uses a Unix socket under `~/.acpx/queues/<hash>.sock`.
-- Ownership is coordinated with a lock file under `~/.acpx/queues/<hash>.lock`.
+- On Unix-like systems, queue IPC uses `/tmp/acpx-<home-hash>/<session-hash>.sock`.
+- Ownership is coordinated with a lease file at `~/.acpx/queues/<session-hash>.lock`.
+- Persistent turns retain a separate filesystem guard through checkpoint and cleanup. Waiting can be cancelled; admitted ownership ends only after cleanup. Live guards never expire by age, and ambiguous guard state is preserved. See [session ownership](../../docs/sessions.md#queue-ownership).
 - On Windows, named pipes are used instead of Unix sockets.
 - after the queue drains, owner shutdown is governed by TTL (default 300s, configurable with `--ttl`).
+- Session controls use the retained adapter while active or idle, and the owner saves accepted settings before success. Idle controls keep the owner alive; prompt completion and close drain admitted controls. Treat timed-out settings as uncertain and do not repeat them automatically. Older callers or retained owners keep their previous persistence behavior.
 
 Submission behavior:
 
@@ -438,13 +474,27 @@ acpx --format json codex exec 'review changed files' \
 
 ## Permission modes
 
-- `--approve-all`: no interactive permission prompts
-- `--approve-reads` (default): approve reads/searches, prompt for writes
-- `--deny-all`: deny all permission requests
-- `--non-interactive-permissions <deny|fail>`: chosen behavior when no TTY is available to prompt
-- `--policy <json-or-file>`: match ACP permission requests by tool kind/title; non-interactive escalations add ACP response metadata
+For ACP tool permission requests, per-tool policy takes precedence over the permission mode. Rules are evaluated in this order: `autoDeny`, `autoApprove`, `escalate`, then `defaultAction`. The selected mode applies only when the policy does not resolve the request.
+
+- `--approve-all`: approve remaining tool permission requests without prompting
+- `--approve-reads` (default): approve remaining read/search requests and prompt for other tools
+- `--deny-all`: deny remaining tool permission requests
+- `--non-interactive-permissions <deny|fail>`: choose what happens when the mode requires a prompt but stdin or stderr is not a TTY
+- `--policy <json-or-file>`: match ACP tool permission requests by kind, title, title head, or raw input tool name
+
+An `autoApprove` rule can approve a tool request under `--deny-all`. An `escalate` rule can prompt under `--approve-all` when stdin and stderr are TTYs. Without both TTYs, escalation denies or cancels the current request and adds `_meta.acpx.permissionEscalation` to the ACP response, even when `--non-interactive-permissions fail` is selected.
+
+Per-tool policies govern `session/request_permission`. ACP filesystem and terminal operations use the client's permission mode separately; a tool approval does not bypass those operation checks.
 
 If every permission request is denied/cancelled and none approved, `acpx` exits with permission-denied status.
+
+Interactive tool, file-write, and terminal questions are serialized within each acpx process. Each question needs a separate answer; EOF denies active and waiting questions.
+
+Pending permissions, file operations, and terminal creation retain their admitting prompt's lifetime. Cancelled, completed, timed-out, superseded, or closed prompts cannot gain new mutation/spawn authority from late answers. Individual ACP request cancellation stays local to that request. Already-dispatched OS work is not rolled back.
+
+When a tool kind is absent, read/search approval is inferred only from complete leading action words. Filenames or substrings in other action titles do not grant approval; ambiguous titles still require the normal permission decision.
+
+Codex refusals prefer an offered non-cancelling one-time rejection. If safe refusal uses cancellation, acpx explains the possible turn termination in text output, quiet stderr, JSON response `_meta.acpx.permissionNotice`, and embedded status events. Permission denial never grants the requested operation. See [Codex](https://github.com/openclaw/acpx/blob/main/agents/Codex.md#permission-refusals).
 
 ## Flows (multi-agent workflows)
 
@@ -461,6 +511,8 @@ acpx flow run ./my-flow.flow.ts --default-agent claude
 ```
 
 Run artifacts persist under `~/.acpx/flows/runs/<runId>/`. Default per-step timeout is 15 minutes when `--timeout` is unset; flows that declare permission requirements fail fast before starting.
+
+Each attempt has one deadline across preparation, execution, and parsing. Callbacks receive `context.signal`; function actions also receive `context.runShell` to run commands whose processes and output streams the runner owns. A command's own timeout returns partial output with `timedOut: true`; enclosing node cancellation rejects after cleanup and prevents later managed commands. Admitted runtime writes finish before routing or final publication. Check the signal around custom asynchronous side effects: arbitrary JavaScript cannot be forcibly stopped, and completed effects are not rolled back. Persistent reconnects must load the same backend session or fail. See `docs/flows.md` for the command result and cancellation contracts.
 
 ### Authoring a flow
 
@@ -557,6 +609,8 @@ See `examples/flows/` in the repo for working samples (`branch.flow.ts`, `pr-tri
 
 ## Practical workflows
 
+For explicit `prompt` and `exec`, an agent-level `--file` is inherited unless the subcommand supplies its own file. Agent-level `--no-wait` also applies to `prompt`. Session-list options work on `sessions` or `list`, with explicit child values taking precedence. Watch inherits the agent's session selector unless `watch --name`/`-s` overrides it; its `--cursor` stays local to watch and never inherits the list pagination cursor.
+
 Persistent repo assistant:
 
 ```bash
@@ -574,7 +628,8 @@ acpx codex -s docs 'draft changelog entry for release'
 Specialized Claude reviewer that survives session reuse:
 
 ```bash
-acpx --system-prompt "You are a reviewer who refuses to approve untested changes." claude -s reviewer
+acpx --system-prompt "You are a reviewer who refuses to approve untested changes." \
+  claude sessions new --name reviewer
 acpx claude -s reviewer 'review the diff in src/auth/'
 ```
 

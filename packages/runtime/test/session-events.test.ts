@@ -1,29 +1,17 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { defaultSessionEventLog } from "../src/session/event-log.js";
 import { SessionEventWriter, listSessionEvents } from "../src/session/events.js";
 import { resolveSessionRecord, writeSessionRecord } from "../src/session/persistence.js";
+import { acquireSessionTurn } from "../src/session/turn-ownership.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome as withTempHomeFixture } from "./runtime-test-helpers.js";
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-events-home-"));
-  const originalHome = process.env.HOME;
-  process.env.HOME = homeDir;
-
-  try {
-    await run(homeDir);
-  } finally {
-    if (originalHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
+  await withTempHomeFixture("acpx-events-home-", run);
 }
 
 function makeSessionRecord(sessionId: string, cwd: string, maxSegments: number): SessionRecord {
@@ -52,7 +40,9 @@ function makeSessionRecord(sessionId: string, cwd: string, maxSegments: number):
   };
 }
 
-test("listSessionEvents reads all configured stream segments", async () => {
+test("listSessionEvents reads all configured stream segments", async (t) => {
+  const previousUmask = process.umask(0o002);
+  t.after(() => process.umask(previousUmask));
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -83,6 +73,12 @@ test("listSessionEvents reads all configured stream segments", async () => {
 
     const events = await listSessionEvents(sessionId);
     assert.equal(events.length, 8);
+    if (process.platform !== "win32") {
+      const directory = path.dirname(record.eventLog.active_path);
+      for (const file of (await fs.readdir(directory)).filter((name) => name.endsWith(".ndjson"))) {
+        assert.equal((await fs.stat(path.join(directory, file))).mode & 0o777, 0o600);
+      }
+    }
     assert.equal(
       events.every((event) => event.jsonrpc === "2.0"),
       true,
@@ -189,7 +185,7 @@ test("listSessionEvents skips malformed NDJSON lines", async () => {
   });
 });
 
-test("SessionEventWriter recovers stale stream lock files", async () => {
+test("session turn ownership recovers stale stream lock files", async (t) => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -213,6 +209,8 @@ test("SessionEventWriter recovers stale stream lock files", async () => {
       "utf8",
     );
 
+    const ownership = await acquireSessionTurn(sessionId);
+    t.after(() => ownership[Symbol.asyncDispose]());
     const writer = await SessionEventWriter.open(record);
     await writer.appendMessage({
       jsonrpc: "2.0",

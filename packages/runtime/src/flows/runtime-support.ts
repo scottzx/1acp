@@ -173,19 +173,26 @@ export function summarizePrompt(promptText: string, explicitDetail?: string): st
 export function createQuietCaptureOutput(): {
   formatter: ReturnType<typeof createOutputFormatter>;
   read: () => string;
+  sessionId: () => string | undefined;
 } {
   const chunks: string[] = [];
+  let sessionId: string | undefined;
   const stdout: MemoryWritable = {
     write(chunk: string) {
       chunks.push(chunk);
     },
   };
 
+  const formatter = createOutputFormatter("quiet", { stdout });
+  const setContext = formatter.setContext.bind(formatter);
+  formatter.setContext = (context) => {
+    sessionId = context.sessionId ?? sessionId;
+    setContext(context);
+  };
   return {
-    formatter: createOutputFormatter("quiet", {
-      stdout,
-    }),
+    formatter,
     read: () => chunks.join("").trim(),
+    sessionId: () => sessionId,
   };
 }
 
@@ -218,8 +225,13 @@ export function createRunId(flowName: string): string {
   return `${stamp}-${slug}-${randomUUID().slice(0, 8)}`;
 }
 
-export function createSessionBindingKey(agentCommand: string, cwd: string, handle: string): string {
-  return `${agentCommand}::${cwd}::${handle}`;
+export function createSessionBindingKey(
+  agentCommand: string,
+  cwd: string,
+  handle: string,
+  agentArgv?: readonly string[],
+): string {
+  return JSON.stringify([agentCommand, agentArgv ?? null, cwd, handle]);
 }
 
 export function createSessionName(

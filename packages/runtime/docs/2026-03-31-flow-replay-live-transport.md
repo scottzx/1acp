@@ -64,6 +64,16 @@ re-decided during coding:
 - The server computes patches from **semantic viewer state**, not by patching
   storage files directly.
 - The on-disk bundle format stays unchanged in this work.
+- Direct bundle loading and live snapshots share one conversation projection.
+  Display ranges come from the attempt's captured event interval; the original
+  event bounds and raw trace remain unchanged.
+- The projection retains recoverable event history independently of the bounded
+  runtime checkpoint. Saved message identities require demonstrated checkpoint
+  correspondence. Missing or contradictory history keeps known checkpoint data
+  and raw events without inventing message ownership.
+- A viewer-local range with `messageEnd < messageStart` highlights no message.
+  This covers metadata-only intervals and prepared steps without captured
+  conversation; it does not fall back to a previous turn's highlight.
 - Replaying an unchanged bundle preserves message identities. Projected user
   messages derive their identity from the session bundle and event sequence;
   message identities already present in a persisted checkpoint stay unchanged.
@@ -118,6 +128,16 @@ semantic view from storage-level fragments.
 
 The browser should instead hold one semantic viewer state object and patch that
 object directly.
+
+The Vite middleware watches viewer assets separately from run-bundle observation.
+On macOS it polls assets, avoiding native watcher stalls while continuing to
+observe files after editors replace them atomically. Asset edits still invalidate
+Vite's cached transforms; run subscriptions and their polling intervals are
+unchanged.
+
+Closing the viewer also settles pending dependency warmups, including immediately
+after the first entry-module request. Callers do not need to wait for optimization
+or request every dependency before closing the server.
 
 ## State model
 
@@ -267,6 +287,10 @@ The rule is:
 - the active live ACP turn should render directly from live session events
 - reconstructed session records remain the fallback once the turn is settled
 
+A tool result without an explicit adapter status stays running while its paired tool
+call is known to be incomplete. Older results without completion metadata keep
+their completed fallback.
+
 ## Message schema
 
 ### Client to server
@@ -320,6 +344,9 @@ That means:
 - all standard RFC 6902 JSON Patch operations remain valid
 - the transport also allows `append`
 - patch application failure triggers a resync
+
+Patch application uses a private working document. A failed batch leaves the
+previously published state and the received operations intact.
 
 There are no extra transport-specific patch operations beyond JSON Patch+.
 
@@ -501,6 +528,13 @@ That sidebar state should come from the live `runs` stream, not from a static
 load-time snapshot.
 
 ## Reconnections and resync
+
+Recoverable reads of a selected run keep the last good state, version, and
+subscription. The server retries on its normal polling interval and sends a
+snapshot when reading succeeds again, even if the state is unchanged. Repeated
+identical warnings are suppressed until recovery, and an accepted update clears
+only the matching run's read warning. A missing required file in an existing run
+can recover; confirmed missing run directories and denied paths remain unavailable.
 
 On reconnect:
 

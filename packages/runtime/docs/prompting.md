@@ -30,6 +30,15 @@ acpx codex prompt -f ./brief.md
 git diff | acpx codex --file - 'and call out anything risky'
 ```
 
+Unicode text is preserved across piped input chunks, including structured prompts,
+`--file -`, and `compare`.
+
+Structured JSON prompts can include ACP `resource_link` blocks with a string
+`name` and non-empty `uri`. Their optional `title` may be a string or `null`;
+both are preserved through file input, stdin, and queued prompts. Embedded
+`resource` blocks require a string `resource.text` or `resource.blob`, plus the
+agent's `embeddedContext` capability. Empty strings are valid names and payloads.
+
 The `--file -` form is particularly handy for piping a long prompt from another tool while still tacking on a short instruction at the end.
 
 ## Persistent vs. one-shot
@@ -74,6 +83,8 @@ Available on `prompt`, the bare implicit form, and `exec`:
 
 `--no-wait` is per-prompt; the next call without `--no-wait` will block normally.
 
+After an agent name, `--file` and `--no-wait` can appear before the explicit `prompt` subcommand or on it. `exec` accepts `--file` in either position as well. When both levels supply a file, the subcommand's explicit file wins. File input still combines with positional text, including when `--file -` reads stdin; text after `--` remains literal prompt content.
+
 ## Queue submission
 
 When a turn is already in flight for the target session, `acpx` does not spawn a second adapter. It submits to the running queue owner over local IPC. The submitter then either:
@@ -100,6 +111,55 @@ For applications using `acpx/runtime`, `AcpRuntimeTurn.promptStarted` resolves o
 
 Readiness does not mean the agent has finished processing the prompt. Await `turn.result` for the turn outcome after persistence and cleanup have settled.
 
+You may hold the object returned by `startTurn()` before reading its promises or events. Early startup or admission errors remain observable when you later consume that turn.
+
+### Host prompt authority
+
+In-process `createAcpRuntime()` turns accept an optional synchronous `assertActive`
+callback on both `startTurn()` and `runTurn()`. Throw when the host no longer
+permits the prompt, even if its `AbortSignal` has not been aborted:
+
+```typescript
+const turn = runtime.startTurn({
+  handle,
+  requestId: crypto.randomUUID(),
+  mode: "prompt",
+  text: "Review the repository",
+  signal: abortController.signal,
+  assertActive() {
+    if (!admission.active) {
+      throw new Error("Prompt admission revoked");
+    }
+  },
+});
+```
+
+The callback may run more than once. Keep it synchronous and safe to repeat.
+ACPX checks authority after turn preparation and again immediately before the
+native prompt transport write, including after SDK write-queue waits. A rejected
+prompt is not written: `promptStarted` rejects with the original callback error,
+and `result` reports a failed turn after normal persistence and cleanup.
+`runTurn()` reports that failure as its terminal error event. An aborted turn
+signal still produces a cancelled result.
+
+This guards prompt admission, not session creation, reconnect, or local
+checkpoint writes that preparation may already have performed. A rejection at
+the transport boundary closes that connection; a persistent session reconnects
+on the next turn. After the write is admitted, changing host authority does not
+cancel the prompt or discard its result. Use `turn.cancel()` or abort the signal
+to request cancellation. Callers without `assertActive` retain their existing
+behavior. [Shared runtimes](shared-sessions.md) reject this in-process callback.
+
+### Steer turns
+
+ACP has no request that adds input to a prompt that is already running, so
+`mode: "steer"` does not interrupt or extend the active turn. In-process
+`createAcpRuntime()` admits a steer turn like a prompt turn: it waits behind any
+active turn on the same session, its `promptStarted` resolves only after that
+turn settles, and it runs as the next prompt. To redirect work in progress,
+cancel the active turn first, then start the new one.
+[Shared runtimes](shared-sessions.md) reject steer turns.
+
 ## Timeouts
 
 `--timeout <seconds>` caps how long `acpx` will wait for an agent response. It applies to:
@@ -113,7 +173,9 @@ acpx --timeout 90 codex 'investigate the intermittent test timeout'
 
 Decimal seconds are allowed. Negative or zero is rejected as a usage error.
 
-If the timeout fires, `acpx` exits with code `3` and the agent process is cancelled cooperatively first.
+If no final ACP response arrives by the end of the bounded update drain, `acpx` exits with code `3`. Partial assistant text does not count as completion. A final response received during that drain retains its actual stop reason, usage, and metadata.
+
+Before the next queued prompt starts, acpx attempts cooperative cancellation of unfinished work and closes its connection. Cancellation and process cleanup can add time beyond the response deadline. The next turn reconnects using the saved provider session; shared sessions require that exact session to resume successfully.
 
 ## Models
 

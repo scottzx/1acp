@@ -9,11 +9,14 @@ Built-in agents:
 - `gemini -> gemini --acp`
 - `cursor -> cursor-agent acp`
 - `copilot -> copilot --acp --stdio`
-- `deepseek-build -> grok agent --model deepseek-v4-flash stdio`
+- `antigravity -> agy_acp_server.par` (`--uid=` on Linux; `.exe` on Windows)
+- `devin -> devin acp`
 - `droid -> droid exec --output-format acp` (`factory-droid` and `factorydroid` also resolve to `droid`)
 - `fast-agent -> uvx fast-agent-mcp acp`
+- `fx -> fx acp`
 - `grok-build -> grok agent stdio`
 - `iflow -> iflow --experimental-acp`
+- `junie -> junie --acp=true`
 - `kilocode -> npx -y @kilocode/cli acp`
 - `kimi -> kimi acp`
 - `kiro -> kiro-cli-chat acp`
@@ -28,16 +31,21 @@ Built-in agents:
 
 Harness-specific docs in this directory:
 
+- [Pi](Pi.md): built-in `pi -> npx pi-acp`
+- [OpenClaw](OpenClaw.md): built-in `openclaw -> openclaw acp`
 - [Codex](Codex.md): built-in `codex -> npx -y @agentclientprotocol/codex-acp`
 - [Claude](Claude.md): built-in `claude -> npx -y @agentclientprotocol/claude-agent-acp`
 - [Gemini](Gemini.md): built-in `gemini -> gemini --acp`
 - [Cursor](Cursor.md): built-in `cursor -> cursor-agent acp`
 - [Copilot](Copilot.md): built-in `copilot -> copilot --acp --stdio`
-- [DeepSeek Build](DeepSeekBuild.md): built-in `deepseek-build -> grok agent --model deepseek-v4-flash stdio`
+- [Antigravity](Antigravity.md): Google's official ACP runtime, setup and limitations
+- [Devin](Devin.md): built-in `devin -> devin acp`
 - [Droid](Droid.md): built-in `droid -> droid exec --output-format acp` with `factory-droid` and `factorydroid` aliases
 - [fast-agent](FastAgent.md): built-in `fast-agent -> uvx fast-agent-mcp acp`
+- [fx](Fx.md): built-in `fx -> fx acp`
 - [Grok Build](GrokBuild.md): built-in `grok-build -> grok agent stdio`
 - [iFlow](Iflow.md): built-in `iflow -> iflow --experimental-acp`
+- [Junie](Junie.md): built-in `junie -> junie --acp=true`
 - [Kilocode](Kilocode.md): built-in `kilocode -> npx -y @kilocode/cli acp`
 - [Kimi](Kimi.md): built-in `kimi -> kimi acp`
 - [Kiro](Kiro.md): built-in `kiro -> kiro-cli-chat acp`

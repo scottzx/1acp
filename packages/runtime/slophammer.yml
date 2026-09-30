@@ -31,8 +31,8 @@ typescript:
         - src/filesystem
         - src/permission-prompt
         - src/permissions
+        - src/process-identity
         - src/prompt-content
-        - src/session/runtime-session-id
         - src/spawn-command-options
         - src/types
         - src/version
@@ -51,6 +51,7 @@ typescript:
         - src/prompt-content
         - src/runtime
         - src/session
+        - src/state-files
         - src/types
     - from: src/flows
       allow:
@@ -61,6 +62,7 @@ typescript:
         - src/permission-policy
         - src/prompt-content
         - src/session
+        - src/state-files
         - src/types
     - from: src/runtime
       allow:
@@ -70,17 +72,23 @@ typescript:
         - src/errors
         - src/perf-metrics
         - src/persisted-key-policy
+        - src/process-liveness
         - src/prompt-content
         - src/session
+        - src/state-files
         - src/types
     - from: src/session
       allow:
         - src/acp
         - src/async-control
-        - src/cli/session
         - src/errors
+        - src/mcp-servers
         - src/perf-metrics
+        - src/perf-metrics-capture
         - src/process-liveness
+        - src/process-identity
         - src/persisted-key-policy
         - src/prompt-content
+        - src/runtime
+        - src/state-files
         - src/types

@@ -9,7 +9,7 @@ There are three ways to use a custom agent.
 
 ## 1. Unknown positional name
 
-If you type a positional agent token that is not a built-in friendly name, `acpx` treats it as a raw command:
+On Unix-like systems, a positional agent name that is neither built in nor configured is treated as a raw command:
 
 ```bash
 acpx my-agent 'review this patch'
@@ -18,11 +18,13 @@ acpx my-agent exec 'one-shot ask'
 acpx my-agent sessions
 ```
 
+For custom launches on Windows, define a named agent with `argv` as shown below. See [Config](config.md#the-agents-map) for structured argv and interpreter requirements.
+
 The literal string `my-agent` becomes the spawn command. This is useful when you have an ACP server already on `PATH` under a name that is not a built-in.
 
 ## 2. `--agent <command>` escape hatch
 
-For ad-hoc commands or paths with arguments and quoting, use `--agent`:
+On Unix-like systems, use `--agent` for ad-hoc raw commands or paths with arguments and quoting:
 
 ```bash
 acpx --agent ./bin/my-custom-acp-server 'do something'
@@ -43,8 +45,7 @@ For commands you use repeatedly, define them in [`~/.acpx/config.json`](config.m
 {
   "agents": {
     "ci-bot": {
-      "command": "node ./scripts/ci-acp-bridge.mjs",
-      "args": ["--profile", "internal"]
+      "argv": ["node", "./scripts/ci-acp-bridge.mjs", "--profile", "internal"]
     }
   }
 }
@@ -53,6 +54,7 @@ For commands you use repeatedly, define them in [`~/.acpx/config.json`](config.m
 Then call by friendly name:
 
 ```bash
+acpx ci-bot sessions new
 acpx ci-bot 'run validation checks'
 ```
 
@@ -66,7 +68,7 @@ The agent command — whether built-in, unknown positional, `--agent`, or config
 (agentCommand, absoluteCwd, optional name)
 ```
 
-Practical implication: switching from `acpx --agent ./bin/v1` to `acpx --agent ./bin/v2` in the same repo gives you two independent session histories, not one shared session. Use a config entry with a stable friendly name to keep history continuous across binary upgrades.
+Switching from `acpx --agent ./bin/v1` to `acpx --agent ./bin/v2` changes the session scope. A friendly config name is a shortcut, not the stored session identity: changing its configured executable or arguments can select a different scope. Keep the resolved command unchanged during an upgrade—for example, update the binary behind a stable executable path—to retain the same local scope. Resuming its conversation still depends on the adapter supporting the saved session.
 
 ## ACP requirements for custom agents
 
@@ -76,7 +78,10 @@ A custom agent must:
 - Implement the standard ACP methods (`initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/resume` or `session/load`, `session/close`).
 - Advertise `agentCapabilities` and model controls honestly. Prefer a categorized model config option for ACP 0.25; existing adapters may continue to return legacy `models` metadata and implement `session/set_model`.
 
-`fs/*` and `terminal/*` client methods are stable on the `acpx` side and respect cwd sandboxing — your adapter can request file reads, writes, and terminal calls and they will be routed through `acpx`'s permission policy.
+`fs/*` and `terminal/*` client methods are routed through acpx's permission
+policy. File operations apply cwd containment checks; terminal commands are not
+an OS sandbox. See [Permissions](permissions.md#working-directory-and-filesystem-guardrails) for the
+filesystem guarantees and limitations.
 
 ### Troubleshooting `session/new`
 

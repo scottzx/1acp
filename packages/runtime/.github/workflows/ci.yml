@@ -53,8 +53,6 @@ jobs:
 
           docs_changed=false
           docs_only=true
-          changelog_present=false
-          changelog_scope_only=true
 
           if [ "${#changed_files[@]}" -eq 0 ]; then
             docs_only=false
@@ -64,26 +62,12 @@ jobs:
             case "$file" in
               docs/**|README.md|CONTRIBUTING.md|CHANGELOG.md)
                 docs_changed=true
-                if [ "$file" = "CHANGELOG.md" ]; then
-                  changelog_present=true
-                else
-                  changelog_scope_only=false
-                fi
-                ;;
-              .github/workflows/ci.yml)
-                docs_only=false
-                changelog_scope_only=false
                 ;;
               *)
                 docs_only=false
-                changelog_scope_only=false
                 ;;
             esac
           done
-
-          if [ "$docs_only" != "true" ] && [ "$changelog_present" = "true" ] && [ "$changelog_scope_only" = "true" ]; then
-            docs_only=true
-          fi
 
           echo "docs_only=${docs_only}" >> "$GITHUB_OUTPUT"
           echo "docs_changed=${docs_changed}" >> "$GITHUB_OUTPUT"
@@ -122,6 +106,8 @@ jobs:
           - name: Mutation
             node_version: 22
             command: pnpm run mutate
+          - name: Autoreview
+            command: pnpm run test:autoreview
           - name: Slophammer
             command: |
               pnpm dlx slophammer-ts@latest rules --format text
@@ -148,6 +134,18 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Setup Python for Autoreview tests
+        if: matrix.name == 'Autoreview'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-autoreview.txt
+
+      - name: Install Autoreview test dependencies
+        if: matrix.name == 'Autoreview'
+        run: python -m pip install -r requirements-autoreview.txt
 
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}

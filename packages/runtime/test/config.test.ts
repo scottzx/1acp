@@ -6,6 +6,34 @@ import test from "node:test";
 import { resolveAgentCommandParts, splitCommandLine } from "../src/acp/client-process.js";
 import { initGlobalConfigFile, loadResolvedConfig, toConfigDisplay } from "../src/cli/config.js";
 
+test("config preserves prototype property names through loading and display", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      '{"agents":{"__proto__":{"argv":["global-agent"]},"constructor":{"command":"custom-constructor"}}}',
+    );
+    await fs.writeFile(
+      path.join(cwd, ".acpxrc.json"),
+      '{"agents":{" __proto__ ":{"argv":["project-agent","literal argument"]}}}',
+    );
+    const config = await loadResolvedConfig(cwd);
+    assert.equal(Object.hasOwn(config.agents, "__proto__"), true);
+    assert.equal(Object.getPrototypeOf(config.agents), Object.prototype);
+    // This is a configured agent name, not the legacy prototype accessor.
+    // eslint-disable-next-line no-proto
+    assert.deepEqual(config.agents["__proto__"].argv, ["project-agent", "literal argument"]);
+    const displayed = toConfigDisplay(config);
+    assert.equal(Object.getPrototypeOf(displayed.agents), Object.prototype);
+    assert.deepEqual(JSON.parse(JSON.stringify(displayed.agents)), {
+      ["__proto__"]: { argv: ["project-agent", "literal argument"] },
+      constructor: { command: "custom-constructor" },
+    });
+  });
+});
+
 test("loadResolvedConfig merges global and project config with project priority", async () => {
   await withTempEnv(async ({ homeDir }) => {
     const cwd = path.join(homeDir, "workspace");
@@ -107,6 +135,37 @@ test("loadResolvedConfig merges global and project config with project priority"
     ]);
     assert.equal(config.hasGlobalConfig, true);
     assert.equal(config.hasProjectConfig, true);
+  });
+});
+
+test("project scalar values skip invalid shadowed global values", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    const globalPath = path.join(homeDir, ".acpx", "config.json");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.dirname(globalPath), { recursive: true });
+    const project = {
+      defaultAgent: "custom",
+      defaultPermissions: "deny-all",
+      nonInteractivePermissions: "fail",
+      authPolicy: "fail",
+      ttl: 2,
+      queueMaxDepth: 3,
+      format: "quiet",
+      disableExec: false,
+    };
+    await fs.writeFile(
+      globalPath,
+      JSON.stringify(Object.fromEntries(Object.keys(project).map((key) => [key, {}]))),
+    );
+    await fs.writeFile(path.join(cwd, ".acpxrc.json"), JSON.stringify(project));
+    const resolved = await loadResolvedConfig(cwd);
+    assert.deepEqual(toConfigDisplay(resolved), {
+      ...project,
+      timeout: null,
+      agents: {},
+      authMethods: [],
+    });
   });
 });
 
@@ -220,11 +279,17 @@ test("loadResolvedConfig rejects a missing explicit MCP config path", async () =
   });
 });
 
-test("initGlobalConfigFile creates the config once and then reports existing file", async () => {
+test("initGlobalConfigFile creates the config once and then reports existing file", async (t) => {
+  const previousUmask = process.umask(0o002);
+  t.after(() => process.umask(previousUmask));
   await withTempEnv(async ({ homeDir }) => {
     const first = await initGlobalConfigFile();
     assert.equal(first.created, true);
     assert.equal(first.path, path.join(homeDir, ".acpx", "config.json"));
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(first.path)).mode & 0o777, 0o600);
+      assert.equal((await fs.stat(path.dirname(first.path))).mode & 0o777, 0o700);
+    }
 
     const second = await initGlobalConfigFile();
     assert.equal(second.created, false);

@@ -90,6 +90,38 @@ export function isSessionUpdateNotification(message: AnyMessage): boolean {
   );
 }
 
+function sessionUpdateHasRequiredFields(update: Record<string, unknown>): boolean {
+  const kind = update.sessionUpdate;
+  if (typeof kind !== "string") {
+    return false;
+  }
+  if (
+    kind === "agent_message_chunk" ||
+    kind === "agent_thought_chunk" ||
+    kind === "user_message_chunk"
+  ) {
+    return isChunkContent(update.content);
+  }
+  if (kind === "plan") {
+    return Array.isArray(update.entries) && update.entries.every(isPlanEntry);
+  }
+  return true;
+}
+
+function isChunkContent(value: unknown): boolean {
+  const content = asRecord(value);
+  return (
+    content !== null &&
+    typeof content.type === "string" &&
+    (content.type !== "text" || typeof content.text === "string")
+  );
+}
+
+function isPlanEntry(value: unknown): boolean {
+  const entry = asRecord(value);
+  return entry !== null && typeof entry.status === "string" && typeof entry.content === "string";
+}
+
 export function extractSessionUpdateNotification(
   message: AnyMessage,
 ): SessionNotification | undefined {
@@ -108,7 +140,7 @@ export function extractSessionUpdateNotification(
   }
 
   const update = asRecord(params.update);
-  if (!update || typeof update.sessionUpdate !== "string") {
+  if (!update || !sessionUpdateHasRequiredFields(update)) {
     return undefined;
   }
 
@@ -127,6 +159,15 @@ export function parsePromptStopReason(message: AnyMessage): string | undefined {
     return undefined;
   }
   return typeof record.stopReason === "string" ? record.stopReason : undefined;
+}
+
+export function parsePermissionNotice(message: AnyMessage): string | undefined {
+  if (!Object.hasOwn(message, "id") || !Object.hasOwn(message, "result")) {
+    return undefined;
+  }
+  const result = asRecord((message as { result?: unknown }).result);
+  const notice = asRecord(asRecord(result?._meta)?.acpx)?.permissionNotice;
+  return typeof notice === "string" ? notice : undefined;
 }
 
 export function parseJsonRpcErrorMessage(message: AnyMessage): string | undefined {

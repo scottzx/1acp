@@ -3,7 +3,6 @@ export { parseSessionRecord } from "./persistence/parse.js";
 export {
   DEFAULT_HISTORY_LIMIT,
   absolutePath,
-  closeSession,
   findGitRepositoryRoot,
   findSession,
   findSessionByDirectoryWalk,
@@ -12,6 +11,7 @@ export {
   listSessionsForAgent,
   normalizeName,
   pruneSessions,
+  readSessionRecord,
   resolveSessionRecord,
   writeSessionRecord,
 } from "./persistence/repository.js";

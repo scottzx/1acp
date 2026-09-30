@@ -12,6 +12,7 @@ import { InterruptedError } from "./async-control.js";
 import { configurePublicCli } from "./cli-public.js";
 import { handlePrompt } from "./cli/command-handlers.js";
 import { registerAgentCommand, registerDefaultCommands } from "./cli/command-registration.js";
+import { scanCompareArgs } from "./cli/compare-args.js";
 import { loadResolvedConfig } from "./cli/config.js";
 import {
   addGlobalFlags,
@@ -21,8 +22,8 @@ import {
   resolveOutputPolicy,
 } from "./cli/flags.js";
 import { createOutputFormatter, getTextErrorRemediationHints } from "./cli/output/output.js";
-import { runQueueOwnerFromEnv } from "./cli/queue/owner-env.js";
 import { flushPerfMetricsCapture, installPerfMetricsCapture } from "./perf-metrics-capture.js";
+import { runQueueOwnerFromStdin } from "./session/queue/owner-input.js";
 import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from "./types.js";
 import { getAcpxVersion } from "./version.js";
 
@@ -101,6 +102,7 @@ function shouldMaybeHandleSkillflag(argv: string[]): boolean {
 
 type AgentTokenScan = {
   token?: string;
+  index?: number;
   hasAgentOverride: boolean;
 };
 
@@ -166,7 +168,7 @@ function detectAgentToken(argv: string[]): AgentTokenScan {
     const token = argv[index];
     const step = scanAgentTokenStep(token, hasAgentOverride);
     if (step.result) {
-      return step.result;
+      return { ...step.result, index };
     }
     if (step.hasAgentOverride) {
       hasAgentOverride = true;
@@ -177,81 +179,44 @@ function detectAgentToken(argv: string[]): AgentTokenScan {
   return { hasAgentOverride };
 }
 
-function detectInitialCwd(argv: string[]): string {
+function lastTopLevelFlagValue(argv: string[], flag: string): string | undefined {
+  let value: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
-
     const scan = classifyTopLevelFlagScan(token);
     if (scan.stop) {
       break;
     }
-
-    const cwd = readCwdFlagValue(token, argv[index + 1]);
-    if (cwd) {
-      return path.resolve(cwd);
-    }
-    if (isCwdFlagToken(token)) {
-      break;
-    }
-
-    if (scan.skipNext) {
-      index += 1;
-    }
-  }
-
-  return process.cwd();
-}
-
-function detectMcpConfigPath(argv: string[], cwd: string): string | undefined {
-  for (let index = 0; index < argv.length; index += 1) {
-    const scan = scanMcpConfigToken(argv[index], argv[index + 1], cwd);
-    if (scan.stop) {
-      return scan.path;
+    if (token === flag) {
+      value = argv[index + 1];
+    } else if (token.startsWith(`${flag}=`)) {
+      value = token.slice(flag.length + 1);
     }
     if (scan.skipNext) {
       index += 1;
     }
-  }
-  return undefined;
-}
-
-function scanMcpConfigToken(
-  token: string,
-  nextToken: string | undefined,
-  cwd: string,
-): { path?: string; skipNext?: boolean; stop?: boolean } {
-  if (token === "--" || !token.startsWith("-") || token === "-") {
-    return { stop: true };
-  }
-  if (token === "--mcp-config") {
-    return { path: resolveMcpConfigPath(nextToken, cwd), stop: true };
-  }
-  if (token.startsWith("--mcp-config=")) {
-    return { path: resolveMcpConfigPath(token.slice("--mcp-config=".length), cwd), stop: true };
-  }
-  return { skipNext: TOP_LEVEL_VERSION_VALUE_FLAGS.has(token) };
-}
-
-function resolveMcpConfigPath(value: string | undefined, cwd: string): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed && trimmed !== "--" ? path.resolve(cwd, trimmed) : undefined;
-}
-
-function isCwdFlagToken(token: string): boolean {
-  return token === "--cwd" || token.startsWith("--cwd=");
-}
-
-function readCwdFlagValue(token: string, nextToken: string | undefined): string | undefined {
-  const raw = token === "--cwd" ? nextToken : readInlineFlagValue(token, "--cwd");
-  const value = raw?.trim();
-  if (!value || value === "--") {
-    return undefined;
   }
   return value;
 }
 
+function detectInitialCwd(argv: string[]): string {
+  const command = detectAgentToken(argv);
+  if (command.token === "compare" && command.index !== undefined) {
+    const { cwd } = scanCompareArgs(argv.slice(command.index + 1));
+    if (cwd !== undefined) {
+      return path.resolve(cwd);
+    }
+  }
+  return path.resolve(lastTopLevelFlagValue(argv, "--cwd") ?? process.cwd());
+}
+
+function detectMcpConfigPath(argv: string[], cwd: string): string | undefined {
+  const value = lastTopLevelFlagValue(argv, "--mcp-config");
+  return value ? path.resolve(cwd, value) : undefined;
+}
+
 function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): OutputFormat {
-  let detectedFormat = fallback;
+  let detectedFormat: OutputFormat | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -275,7 +240,22 @@ function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): Ou
     }
   }
 
-  return detectedFormat;
+  return detectCompareOutputFormat(argv, detectedFormat, fallback);
+}
+
+function detectCompareOutputFormat(
+  argv: string[],
+  rootFormat: OutputFormat | undefined,
+  fallback: OutputFormat,
+): OutputFormat {
+  const command = detectAgentToken(argv);
+  if (command.token !== "compare" || command.index === undefined) {
+    return rootFormat ?? fallback;
+  }
+  const local = scanCompareArgs(argv.slice(command.index + 1));
+  const localFormat = isOutputFormat(local.format) ? local.format : undefined;
+  // Match parsed options: the alias wins, otherwise globals overwrite locals.
+  return local.json ? "json" : (rootFormat ?? localFormat ?? fallback);
 }
 
 function classifyTopLevelFlagScan(token: string): TopLevelFlagStep {
@@ -427,13 +407,6 @@ async function emitRequestedError(
   }
 }
 
-async function runWithOutputPolicy<T>(
-  _outputPolicy: OutputPolicy,
-  run: () => Promise<T>,
-): Promise<T> {
-  return await run();
-}
-
 async function handleQueueOwnerCommand(argv: string[]): Promise<boolean> {
   installPerfMetricsCapture({
     argv: argv.slice(2),
@@ -445,7 +418,7 @@ async function handleQueueOwnerCommand(argv: string[]): Promise<boolean> {
   }
 
   try {
-    await runQueueOwnerFromEnv(process.env);
+    await runQueueOwnerFromStdin();
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -495,7 +468,11 @@ async function handleProgramParseError(
   requestedOutputPolicy: OutputPolicy,
 ): Promise<never> {
   if (error instanceof CommanderError) {
-    if (error.code === "commander.helpDisplayed" || error.code === "commander.version") {
+    if (
+      error.code === "commander.helpDisplayed" ||
+      error.code === "commander.version" ||
+      (error.code === "commander.help" && error.exitCode === 0)
+    ) {
       process.exit(EXIT_CODES.SUCCESS);
     }
 
@@ -533,48 +510,50 @@ export async function main(argv: string[] = process.argv): Promise<void> {
 
   await maybeHandleSkillflag(normalizedArgv);
 
-  const initialCwd = detectInitialCwd(rawArgs);
-  const config = await loadResolvedConfig(initialCwd, {
-    mcpConfigPath: detectMcpConfigPath(rawArgs, initialCwd),
-  });
   const requestedJsonStrict = detectJsonStrict(rawArgs);
-  const requestedOutputFormat = detectRequestedOutputFormat(rawArgs, config.format);
-  const requestedOutputPolicy = {
-    ...resolveOutputPolicy(requestedOutputFormat, requestedJsonStrict),
+  let requestedOutputPolicy = {
+    ...resolveOutputPolicy(detectRequestedOutputFormat(rawArgs, "text"), requestedJsonStrict),
     suppressReads: rawArgs.some((token) => token === "--suppress-reads"),
   };
 
-  const program = createProgram(requestedJsonStrict);
-
-  addGlobalFlags(program);
-
-  configurePublicCli({
-    program,
-    argv: rawArgs,
-    config,
-    requestedJsonStrict,
-    topLevelVerbs: TOP_LEVEL_VERBS,
-    listBuiltInAgents,
-    detectAgentToken,
-    registerAgentCommand,
-    registerDefaultCommands,
-    handlePromptAction: async (command, promptParts) => {
-      await handlePrompt(undefined, promptParts, {}, command, config);
-    },
-  });
-
-  program.exitOverride((error) => {
-    throw error;
-  });
-
   try {
-    await runWithOutputPolicy(requestedOutputPolicy, async () => {
-      try {
-        await program.parseAsync(normalizedArgv);
-      } catch (error) {
-        await handleProgramParseError(error, requestedOutputPolicy);
-      }
+    const initialCwd = detectInitialCwd(rawArgs);
+    const config = await loadResolvedConfig(initialCwd, {
+      mcpConfigPath: detectMcpConfigPath(rawArgs, initialCwd),
     });
+    requestedOutputPolicy = {
+      ...resolveOutputPolicy(
+        detectRequestedOutputFormat(rawArgs, config.format),
+        requestedJsonStrict,
+      ),
+      suppressReads: requestedOutputPolicy.suppressReads,
+    };
+    const program = createProgram(requestedJsonStrict);
+
+    addGlobalFlags(program);
+
+    configurePublicCli({
+      program,
+      argv: rawArgs,
+      config,
+      requestedJsonStrict,
+      topLevelVerbs: TOP_LEVEL_VERBS,
+      listBuiltInAgents,
+      detectAgentToken,
+      registerAgentCommand,
+      registerDefaultCommands,
+      handlePromptAction: async (command, promptParts) => {
+        await handlePrompt(undefined, promptParts, {}, command, config);
+      },
+    });
+
+    program.exitOverride((error) => {
+      throw error;
+    });
+
+    await program.parseAsync(normalizedArgv);
+  } catch (error) {
+    await handleProgramParseError(error, requestedOutputPolicy);
   } finally {
     flushPerfMetricsCapture();
   }

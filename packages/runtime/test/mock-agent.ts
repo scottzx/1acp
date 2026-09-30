@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -24,6 +24,7 @@ import {
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
@@ -45,6 +46,40 @@ type ParsedCommand = {
   args: string[];
 };
 
+type QueueLifecycleControl = {
+  nonce: string;
+  stopPath: string;
+  cancelReceiptPath: string;
+  leasePath: string;
+};
+
+function readQueueLifecycleControl(filePath: string): QueueLifecycleControl {
+  const value: unknown = JSON.parse(readFileSync(filePath, "utf8"));
+  assertQueueLifecycleControl(value);
+  return value;
+}
+
+function assertQueueLifecycleControl(value: unknown): asserts value is QueueLifecycleControl {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !("nonce" in value) ||
+    typeof value.nonce !== "string" ||
+    !value.nonce ||
+    !("stopPath" in value) ||
+    typeof value.stopPath !== "string" ||
+    !value.stopPath ||
+    !("cancelReceiptPath" in value) ||
+    typeof value.cancelReceiptPath !== "string" ||
+    !value.cancelReceiptPath ||
+    !("leasePath" in value) ||
+    typeof value.leasePath !== "string" ||
+    !value.leasePath
+  ) {
+    throw new Error("Invalid queue lifecycle control");
+  }
+}
+
 let activePromptRequestId: JsonRpcId | undefined;
 
 type MockAgentOptions = {
@@ -61,9 +96,13 @@ type MockAgentOptions = {
   loadSessionNotFound: boolean;
   resumeSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
+  loadSessionAction?: string;
+  newSessionAction?: string;
+  initializeAction?: string;
   setSessionModeFails: boolean;
   setSessionModeInvalidParams: boolean;
   setSessionConfigInvalidParams: boolean;
+  omitSetConfigOptions: boolean;
   setSessionModelFails: boolean;
   setSessionModelInvalidParams: boolean;
   advertiseConfigOptions: boolean;
@@ -79,6 +118,7 @@ type MockAgentOptions = {
   loadReplayText: string;
   ignoreSigterm: boolean;
   cancelDelayMs: number;
+  queueLifecycleControl?: QueueLifecycleControl;
   elicitOnNewSession: boolean;
   /** If set, the agent writes its PID to this path at startup (before ACP handshake). */
   pidFile?: string;
@@ -92,6 +132,7 @@ type SessionState = {
   transientPromptAttempts: Record<string, number>;
   modelId: string;
   lastElicitationResponse?: CreateElicitationResponse;
+  mcpServers?: NewSessionRequest["mcpServers"];
 };
 
 class CancelledError extends Error {
@@ -385,6 +426,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let loadSessionNotFound = false;
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
+  let loadSessionAction: string | undefined;
+  let newSessionAction: string | undefined;
+  let initializeAction: string | undefined;
   let setSessionModeFails = false;
   let setSessionModeInvalidParams = false;
   let setSessionConfigInvalidParams = false;
@@ -403,6 +447,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let loadReplayText = "replayed load session update";
   let ignoreSigterm = false;
   let cancelDelayMs = 0;
+  let queueLifecycleControl: QueueLifecycleControl | undefined;
   let hangOnNewSession = false;
   let elicitOnNewSession = false;
   let pidFile: string | undefined;
@@ -412,6 +457,25 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--supports-load-session") {
       supportsLoadSession = true;
+      continue;
+    }
+
+    if (token === "--load-session-action") {
+      supportsLoadSession = true;
+      loadSessionAction = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--new-session-action") {
+      newSessionAction = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
+    if (token === "--initialize-action") {
+      initializeAction = parseOptionValue(argv, index + 1, token);
+      index += 1;
       continue;
     }
 
@@ -448,6 +512,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--omit-set-config-options") {
+      continue;
+    }
     if (token === "--set-session-config-invalid-params") {
       setSessionConfigInvalidParams = true;
       continue;
@@ -455,13 +522,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--set-session-model-fails") {
       setSessionModelFails = true;
-      advertiseModels = true;
       continue;
     }
 
     if (token === "--set-session-model-invalid-params") {
       setSessionModelInvalidParams = true;
-      advertiseModels = true;
       continue;
     }
 
@@ -556,6 +621,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--queue-lifecycle-control") {
+      queueLifecycleControl = readQueueLifecycleControl(parseOptionValue(argv, index + 1, token));
+      index += 1;
+      continue;
+    }
+
     if (token === "--hang-on-new-session") {
       hangOnNewSession = true;
       continue;
@@ -622,13 +693,19 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadSessionNotFound,
     resumeSessionNotFound,
     loadSessionFailsOnEmpty,
+    loadSessionAction,
+    newSessionAction,
+    initializeAction,
     setSessionModeFails,
     setSessionModeInvalidParams,
     setSessionConfigInvalidParams,
+    omitSetConfigOptions: argv.includes("--omit-set-config-options"),
     setSessionModelFails,
     setSessionModelInvalidParams,
     advertiseConfigOptions,
-    advertiseModels,
+    advertiseModels:
+      advertiseModels ||
+      ((setSessionModelFails || setSessionModelInvalidParams) && !advertiseLegacyModels),
     advertiseModelProvider,
     advertiseLegacyModels,
     advertiseCommandsAfterNew,
@@ -640,6 +717,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadReplayText,
     ignoreSigterm,
     cancelDelayMs,
+    queueLifecycleControl,
     elicitOnNewSession,
     pidFile,
   };
@@ -799,6 +877,7 @@ class MockAgent implements Agent {
   private readonly connection: AgentConnection;
   private readonly sessions = new Map<SessionId, SessionState>();
   private readonly options: MockAgentOptions;
+  private readonly queueCancellationPhases = new Set<"entry" | "before-result">();
   private clientCapabilities?: InitializeRequest["clientCapabilities"];
 
   constructor(connection: AgentConnection, options: MockAgentOptions) {
@@ -813,6 +892,7 @@ class MockAgent implements Agent {
       ...(this.options.supportsListSessions ? { list: {} } : {}),
       ...(this.options.supportsResumeSession ? { resume: {} } : {}),
     };
+    await this.runOptionalAction("initialize", this.options.initializeAction);
     return {
       protocolVersion: PROTOCOL_VERSION,
       authMethods: [],
@@ -832,13 +912,15 @@ class MockAgent implements Agent {
     return;
   }
 
-  async newSession(): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (this.options.hangOnNewSession) {
       return await new Promise<NewSessionResponse>(() => {});
     }
 
     const sessionId = randomUUID();
-    this.sessions.set(sessionId, createSessionState(false));
+    this.sessions.set(sessionId, { ...createSessionState(false), mcpServers: params.mcpServers });
+
+    await this.runOptionalAction(sessionId, this.options.newSessionAction);
 
     if (this.options.elicitOnNewSession) {
       const response = await this.connection.request(methods.client.elicitation.create, {
@@ -903,7 +985,18 @@ class MockAgent implements Agent {
       throw error;
     }
 
-    this.sessions.set(params.sessionId, existing ?? createSessionState(false));
+    this.sessions.set(params.sessionId, {
+      ...(existing ?? createSessionState(false)),
+      mcpServers: params.mcpServers,
+    });
+
+    if (this.options.loadSessionAction) {
+      await this.handlePrompt(
+        params.sessionId,
+        this.options.loadSessionAction,
+        new AbortController().signal,
+      );
+    }
 
     if (this.options.replayLoadSessionUpdates) {
       await this.sendAssistantMessage(params.sessionId, this.options.loadReplayText);
@@ -944,7 +1037,7 @@ class MockAgent implements Agent {
       response.configOptions = buildConfigOptions(
         this.sessions.get(sessionId) ?? createSessionState(false),
         this.options.modelConfigId,
-        undefined,
+        this.options.omitReconnectModelId,
         undefined,
         this.options.advertiseModelProvider,
       );
@@ -999,9 +1092,15 @@ class MockAgent implements Agent {
     session.pendingPrompt = promptAbort;
     const text = getPromptText(params.prompt);
 
-    if (text === "partial-retryable-error") {
+    if (text === "partial-retryable-error" || text === "late-retryable-error") {
       try {
-        await this.sendAssistantMessage(params.sessionId, "partial update");
+        if (text === "late-retryable-error") {
+          setTimeout(() => {
+            void this.sendAssistantMessage(params.sessionId, "partial update").catch(() => {});
+          }, 50);
+        } else {
+          await this.sendAssistantMessage(params.sessionId, "partial update");
+        }
         const error = new Error("Internal error") as Error & {
           code: number;
           data: {
@@ -1054,6 +1153,7 @@ class MockAgent implements Agent {
       return { stopReason: "end_turn" };
     } catch (error) {
       if (promptAbort.signal.aborted || error instanceof CancelledError) {
+        this.recordQueueCancellation(params.sessionId, "before-result");
         return { stopReason: "cancelled" };
       }
 
@@ -1066,7 +1166,38 @@ class MockAgent implements Agent {
     }
   }
 
+  private recordQueueCancellation(sessionId: SessionId, phase: "entry" | "before-result"): void {
+    const control = this.options.queueLifecycleControl;
+    if (!control || this.queueCancellationPhases.has(phase)) {
+      return;
+    }
+    let lease: { pid: unknown; ownerGeneration: unknown } | null = null;
+    try {
+      const value: unknown = JSON.parse(readFileSync(control.leasePath, "utf8"));
+      if (value && typeof value === "object" && "pid" in value && "ownerGeneration" in value) {
+        lease = { pid: value.pid, ownerGeneration: value.ownerGeneration };
+      }
+    } catch {
+      // Missing or unreadable lease evidence must fail the test without holding cancellation.
+    }
+    const pending = this.sessions.get(sessionId)?.pendingPrompt;
+    writeFileSync(
+      control.cancelReceiptPath,
+      `${JSON.stringify({
+        nonce: control.nonce,
+        pid: process.pid,
+        phase,
+        lease,
+        promptPending: pending !== undefined,
+        promptAborted: pending?.signal.aborted ?? false,
+      })}\n`,
+      { flag: "a" },
+    );
+    this.queueCancellationPhases.add(phase);
+  }
+
   async cancel(params: { sessionId: SessionId }): Promise<void> {
+    this.recordQueueCancellation(params.sessionId, "entry");
     if (this.options.cancelDelayMs > 0) {
       await new Promise<void>((resolve) => setTimeout(resolve, this.options.cancelDelayMs));
     }
@@ -1130,6 +1261,11 @@ class MockAgent implements Agent {
       session.modelId = params.value;
     } else {
       session.configValues[params.configId] = params.value;
+    }
+
+    if (this.options.omitSetConfigOptions) {
+      // Exercise a nonconforming acknowledgement without an option catalog.
+      return {} as SetSessionConfigOptionResponse;
     }
 
     return {
@@ -1255,6 +1391,17 @@ class MockAgent implements Agent {
     return session;
   }
 
+  private async runOptionalAction(sessionId: SessionId, action: string | undefined): Promise<void> {
+    if (!action) {
+      return;
+    }
+    try {
+      await this.handlePrompt(sessionId, action, new AbortController().signal);
+    } catch {
+      // Keep the handshake going after a rejected or failed callback.
+    }
+  }
+
   private async handlePrompt(
     sessionId: SessionId,
     text: string,
@@ -1270,6 +1417,10 @@ class MockAgent implements Agent {
     }
     if (text === "retryable-error-once") {
       return "recovered after retry";
+    }
+
+    if (text === "session-mcp-servers") {
+      return JSON.stringify(this.ensureSession(sessionId).mcpServers);
     }
 
     if (text === "client-capabilities") {
@@ -1392,6 +1543,18 @@ class MockAgent implements Agent {
       return `read complete: ${filePath}`;
     }
 
+    if (text.startsWith("permission-write ")) {
+      const write = text.slice("permission-write ".length);
+      const permission = await this.handlePrompt(sessionId, `permission edit ${write}`, signal);
+      return permission === "permission selected:allow"
+        ? await this.handlePrompt(
+            sessionId,
+            `write ${path.resolve(write.slice(0, write.indexOf(" ")))} ${write.slice(write.indexOf(" ") + 1)}`,
+            signal,
+          )
+        : permission;
+    }
+
     if (text.startsWith("write ")) {
       const rest = text.slice("write ".length).trim();
       const firstSpace = rest.search(/\s/);
@@ -1466,6 +1629,18 @@ class MockAgent implements Agent {
       return `slept ${Math.round(ms)}ms`;
     }
 
+    if (text.startsWith("stream-wait-file ")) {
+      const releaseFile = text.slice("stream-wait-file ".length).trim();
+      if (!releaseFile) {
+        throw new Error("Usage: stream-wait-file <release-file>");
+      }
+      await this.sendAssistantMessage(sessionId, "flow-held");
+      while (!existsSync(releaseFile)) {
+        await sleepWithCancel(10, signal);
+      }
+      return "stream-wait-file done: flow-held";
+    }
+
     if (text.startsWith("stream-sleep ")) {
       const rest = text.slice("stream-sleep ".length).trim();
       const firstSpace = rest.search(/\s/);
@@ -1485,6 +1660,11 @@ class MockAgent implements Agent {
       return `stream-sleep done: ${liveText}`;
     }
 
+    if (text === "disconnect-after-output") {
+      await this.sendAssistantMessage(sessionId, "partial ");
+      process.exit(91);
+    }
+
     if (text.startsWith("disconnect ")) {
       const rawMs = text.slice("disconnect ".length).trim();
       if (!rawMs) {
@@ -1496,7 +1676,18 @@ class MockAgent implements Agent {
         throw new Error("Usage: disconnect <milliseconds>");
       }
 
+      if (disconnectGateDirectory) {
+        writeFileSync(path.join(disconnectGateDirectory, "ready"), "ready\n", { flag: "wx" });
+        while (!existsSync(path.join(disconnectGateDirectory, "release"))) {
+          await sleepWithCancel(10, signal);
+        }
+      }
       await sleepWithCancel(Math.round(ms), signal);
+      if (disconnectGateDirectory) {
+        writeFileSync(path.join(disconnectGateDirectory, "disconnect-exit"), "91\n", {
+          flag: "wx",
+        });
+      }
       process.exit(91);
     }
 
@@ -1703,8 +1894,31 @@ const stream = {
 };
 const mockAgentOptions = parseMockAgentOptions(process.argv.slice(2));
 
-// Write PID to a file before doing anything else so that the parent can track
-// this bridge process and verify it is dead after queue-owner shutdown.
+const queueLifecycleControl = mockAgentOptions.queueLifecycleControl;
+if (queueLifecycleControl) {
+  const retireIfRequested = () => {
+    let request: string;
+    try {
+      request = readFileSync(queueLifecycleControl.stopPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+    if (request === queueLifecycleControl.nonce) {
+      writeFileSync(
+        `${queueLifecycleControl.stopPath}.ack`,
+        JSON.stringify({ nonce: request, pid: process.pid }),
+      );
+      process.exit(94);
+    }
+  };
+  setInterval(retireIfRequested, 20).unref();
+  retireIfRequested();
+}
+
+// Publish only after the optional fixture-owned retirement channel is installed.
 if (mockAgentOptions.pidFile) {
   writeFileSync(mockAgentOptions.pidFile, `${process.pid}\n`, "utf8");
 }
@@ -1713,6 +1927,14 @@ if (mockAgentOptions.ignoreSigterm) {
   process.on("SIGTERM", () => {
     // Intentionally ignore to exercise ACP client SIGKILL fallback behavior.
   });
+}
+
+const disconnectGateDirectory = process.env.ACPX_TEST_DISCONNECT_GATE;
+if (disconnectGateDirectory) {
+  setTimeout(() => {
+    process.stderr.write("Synthetic disconnect gate exceeded its 30-second safety bound\n");
+    process.exit(92);
+  }, 30_000);
 }
 
 const connection = new AgentSideConnection(

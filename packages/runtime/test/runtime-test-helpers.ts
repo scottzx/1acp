@@ -80,8 +80,12 @@ export async function withTempHome<T>(
   run: (homeDir: string) => Promise<T>,
 ): Promise<T> {
   const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   process.env.HOME = tempHome;
+  if (process.platform === "win32") {
+    process.env.USERPROFILE = tempHome;
+  }
 
   try {
     return await run(tempHome);
@@ -90,6 +94,13 @@ export async function withTempHome<T>(
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (process.platform === "win32") {
+      if (originalProfile == null) {
+        delete process.env.USERPROFILE;
+      } else {
+        process.env.USERPROFILE = originalProfile;
+      }
     }
     await fs.rm(tempHome, { recursive: true, force: true });
   }
@@ -163,6 +174,8 @@ export function createRuntimeOptions(params: {
   permissionPolicy?: AcpRuntimeOptions["permissionPolicy"];
   agentProcessEnv?: AcpRuntimeOptions["agentProcessEnv"];
   processLifecycle?: AcpRuntimeOptions["processLifecycle"];
+  fs?: AcpRuntimeOptions["fs"];
+  terminal?: AcpRuntimeOptions["terminal"];
   timeoutMs?: number;
 }): AcpRuntimeOptions {
   return {
@@ -181,5 +194,7 @@ export function createRuntimeOptions(params: {
     permissionPolicy: params.permissionPolicy,
     agentProcessEnv: params.agentProcessEnv,
     processLifecycle: params.processLifecycle,
+    ...(params.fs === undefined ? {} : { fs: params.fs }),
+    ...(params.terminal === undefined ? {} : { terminal: params.terminal }),
   };
 }

@@ -30,7 +30,7 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
+acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | watch [-s <name>] [--cursor <cursor>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -40,7 +40,7 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
+acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | watch [-s <name>] [--cursor <cursor>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
 The global `--mcp-config <path>` option loads an external JSON file's `mcpServers` array for the
@@ -69,6 +69,7 @@ Notes:
 - Top-level `flow run <file>` executes a user-authored workflow module and persists run state under `~/.acpx/flows/runs/`.
 - If a prompt argument is omitted, `acpx` reads prompt text from stdin when piped.
 - `--file` works for implicit prompt, `prompt`, and `exec` commands.
+- After an agent name, `--file` may appear before or after `prompt`/`exec`; an explicit value on the subcommand wins. `--no-wait` works before or after `prompt`, and omission still waits normally.
 - `acpx` with no args in an interactive terminal shows help.
 
 ## `flow run` subcommand
@@ -104,28 +105,30 @@ acpx --approve-all flow run examples/flows/pr-triage/pr-triage.flow.ts \
 The PR-triage example is only an example workflow. It can post GitHub comments
 or close a PR if you run it against a live repository.
 
+`acpx help` and `acpx help <command>` display command help without sending an agent prompt.
+
 ## Global options
 
 All global options:
 
-| Option                                   | Description                                    | Details                                                                                                                                               |
-| ---------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--agent <command>`                      | Raw ACP agent command (escape hatch)           | Do not combine with positional agent token.                                                                                                           |
-| `--cwd <dir>`                            | Working directory                              | Defaults to current directory. Stored as absolute path for scoping.                                                                                   |
-| `--approve-all`                          | Auto-approve all permissions                   | Permission mode `approve-all`.                                                                                                                        |
-| `--approve-reads`                        | Auto-approve reads/searches, prompt for others | Default permission mode.                                                                                                                              |
-| `--deny-all`                             | Deny all permissions                           | Permission mode `deny-all`.                                                                                                                           |
-| `--format <fmt>`                         | Output format                                  | `text` (default), `json`, `quiet`.                                                                                                                    |
-| `--suppress-reads`                       | Suppress read file contents                    | Replaces raw read payloads with `[read output suppressed]`.                                                                                           |
-| `--json-strict`                          | Strict JSON mode                               | Requires `--format json`; suppresses non-JSON stderr output.                                                                                          |
-| `--no-fs`                                | Disable ACP filesystem capabilities            | Advertises `clientCapabilities.fs.readTextFile` and `writeTextFile` as `false` during ACP initialize for new agent clients.                           |
-| `--no-terminal`                          | Disable ACP terminal capability                | Advertises `clientCapabilities.terminal: false` during ACP initialize for new agent clients.                                                          |
-| `--non-interactive-permissions <policy>` | Non-TTY prompt policy                          | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                      |
-| `--permission-policy <json-or-file>`     | Per-tool permission policy                     | JSON object or file path with `autoApprove`, `autoDeny`, `escalate`, and optional `defaultAction` (`approve`, `deny`, `escalate`). Alias: `--policy`. |
-| `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                            |
-| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                                                                                                      |
-| `--model <id>`                           | Set agent model                                | Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.      |
-| `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                                   |
+| Option                                   | Description                                         | Details                                                                                                                                               |
+| ---------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--agent <command>`                      | Raw ACP agent command (escape hatch)                | Do not combine with positional agent token.                                                                                                           |
+| `--cwd <dir>`                            | Working directory                                   | Defaults to current directory. Stored as absolute path for scoping.                                                                                   |
+| `--approve-all`                          | Approve remaining tool requests                     | Per-tool policy takes precedence over permission mode `approve-all`.                                                                                  |
+| `--approve-reads`                        | Approve remaining reads/searches; prompt for others | Default mode; per-tool policy takes precedence.                                                                                                       |
+| `--deny-all`                             | Deny remaining tool requests                        | Per-tool policy takes precedence over permission mode `deny-all`.                                                                                     |
+| `--format <fmt>`                         | Output format                                       | `text` (default), `json`, `quiet`.                                                                                                                    |
+| `--suppress-reads`                       | Suppress read file contents                         | Replaces raw read payloads with `[read output suppressed]`.                                                                                           |
+| `--json-strict`                          | Strict JSON mode                                    | Requires `--format json`; suppresses non-JSON stderr output.                                                                                          |
+| `--no-fs`                                | Disable ACP filesystem capabilities                 | Advertises `clientCapabilities.fs.readTextFile` and `writeTextFile` as `false` during ACP initialize for new agent clients.                           |
+| `--no-terminal`                          | Disable ACP terminal capability                     | Advertises `clientCapabilities.terminal: false` during ACP initialize for new agent clients.                                                          |
+| `--non-interactive-permissions <policy>` | Non-TTY prompt policy                               | `deny` (default) or `fail` when approval prompt cannot be shown.                                                                                      |
+| `--permission-policy <json-or-file>`     | Per-tool permission policy                          | JSON object or file path with `autoApprove`, `autoDeny`, `escalate`, and optional `defaultAction` (`approve`, `deny`, `escalate`). Alias: `--policy`. |
+| `--timeout <seconds>`                    | Max wait time for agent response                    | Must be positive. Decimal seconds allowed.                                                                                                            |
+| `--ttl <seconds>`                        | Queue owner idle TTL before shutdown                | Default `300`. `0` disables TTL.                                                                                                                      |
+| `--model <id>`                           | Set agent model                                     | Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.      |
+| `--verbose`                              | Enable verbose logs                                 | Prints ACP/debug details to stderr.                                                                                                                   |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
 
@@ -264,6 +267,7 @@ Behavior:
 
 - Creates temporary ACP session
 - Applies `--model`, then each repeatable `--config-option <key=value>`, before prompting
+- Uses the temporary session's latest catalog update received during creation for startup selections, including removal of model support
 - Sends prompt once
 - Does not write/use a saved session record
 - Supports prompt text from args, stdin, `--file <path>`, and `--file -`
@@ -322,6 +326,8 @@ Behavior:
 - Unsupported mode ids are rejected by the adapter (often as `Invalid params`).
 - Routes through queue-owner IPC when an owner is active.
 - Falls back to a direct client reconnect when no owner is running.
+- When fresh fallback is allowed, replaces the previous saved mode without replaying it; other saved settings restore first. A rejected replacement keeps the previous mode preference.
+- Prompt reconnect uses model metadata received while restoring a saved mode, including changed model controls and removed model support.
 
 ## `set` command
 
@@ -336,8 +342,9 @@ Behavior:
 - Routes through queue-owner IPC when an owner is active.
 - Falls back to a direct client reconnect when no owner is running.
 - **`set model <id>`**: Uses the advertised model config option through `session/set_config_option`; adapters that explicitly advertise legacy `models` metadata use `session/set_model`.
-- Saves accepted values for existing non-mode selections, including reasoning effort adjusted or removed by a model switch; does not pin unselected defaults.
-- Restores saved model and config selections after reconnect, before the next prompt; already loaded sessions are reused without replay.
+- A config key named `mode` keeps config-option transport; use `set-mode` for the separate legacy mode control.
+- Saves accepted values for existing config selections, including reasoning effort adjusted or removed by a model switch; does not pin unselected defaults. An acknowledgement that omits the option catalog retains the advertised options and the accepted value; an explicit empty catalog removes those options.
+- Restores saved model and config selections after reconnect, before the next prompt; already loaded sessions are reused without replay. Prompts without `--model` retain the current selection, including changes made through `set model`.
 
 ## `sessions` subcommand
 
@@ -355,6 +362,7 @@ acpx [global_options] <agent> sessions show
 acpx [global_options] <agent> sessions show <name>
 acpx [global_options] <agent> sessions history
 acpx [global_options] <agent> sessions history <name> [--limit <count>]
+acpx [global_options] <agent> sessions watch [-s <name>] [--cursor <cursor>]
 acpx [global_options] <agent> sessions export [name] --output <path> [--cwd <dir>]
 acpx [global_options] <agent> sessions import <archive> [--name <name>] [--cwd <dir>]
 acpx [global_options] <agent> sessions prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]
@@ -365,6 +373,7 @@ acpx [global_options] sessions ...   # defaults to codex
 Behavior:
 
 - `sessions` and `sessions list` are equivalent
+- `--local`, `--filter-cwd`, and the list `--cursor` may appear on `sessions` or `list`; explicit `list` values win. Combining `--local` with a cursor is rejected across either placement.
 - list uses ACP `session/list` when the agent advertises
   `sessionCapabilities.list`, returning agent-native `SessionInfo` metadata and
   `nextCursor` in JSON output
@@ -376,9 +385,10 @@ Behavior:
   instead of contacting the agent
 - when the agent does not support `session/list`, list falls back to local saved
   records unless agent-side list filters were requested
-- `sessions new` creates a fresh cwd-scoped default session
+- `sessions new` creates a fresh cwd-scoped default session; a failed creation leaves the previous session open
 - `sessions new --name <name>` creates a fresh named session for cwd
 - creating a fresh session soft-closes the previous open session in that scope (if present)
+- When `--resume-session <id>` selects an existing local record for the same resolved command, `sessions new` and a creating `sessions ensure` retire that record's owner before loading its associated ACP session, including changes to cwd or name. A successful resume reopens the same record; a failed resume leaves it closed. Resuming a provider session without a matching local record creates a new independent local ID.
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
 - `sessions ensure` returns the nearest matching active session or creates one for cwd
@@ -386,13 +396,17 @@ Behavior:
 - `sessions close` soft-closes the current cwd default session
 - `sessions close <name>` soft-closes current cwd named session
 - `sessions show [name]` displays stored session metadata
-- `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`)
+- `sessions history [name]` displays stored turn history previews (default 20, configurable with `--limit`); images use compact labels with their MIME type when available, without printing encoded image data
+- `sessions watch [-s <name>] [--cursor <cursor>]` replays retained events and follows new ones without affecting the active turn; see [Watching sessions](session-watch.md)
+- Watch inherits the agent's `-s`/`--session` selection unless its own `-s`/`--name` is set. Its journal cursor comes only from `watch --cursor`, independently of the list pagination cursor on `sessions`.
 - `sessions export [name] --output <path>` writes a portable JSON archive with session state and event history; `--cwd <dir>` selects a different source cwd relative to global `--cwd`
 - `sessions import <archive>` writes a fresh local record from a portable archive, reopens it as idle, keeps the provider session id, and clears source-machine process metadata
 - Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
 - `sessions import --name <name>` and `--cwd <dir>` override the imported destination scope; import fails instead of creating a duplicate when an active session already exists for that `(agent, cwd, name)` scope or when another local record already uses the same provider session id
+- Concurrent imports into the same local store wait for one another and recheck these collisions before publishing
+- Imports and CLI/shared session ensures coordinate for the same exact scope: ensure reuses an import that publishes first, while import rejects a scope created by ensure first
 - `sessions prune --dry-run` previews closed sessions that can be deleted
-- `sessions prune` deletes closed session records for the selected agent; add `--include-history` to delete event stream files too
+- `sessions prune` verifies the saved closed status and selected agent before deleting a record; add `--include-history` to delete only that session's active and rotated event files
 - `sessions prune --before <date>` and `--older-than <days>` filter by close time, falling back to last-used time for older records
 - close errors if the target session does not exist
 
@@ -409,9 +423,14 @@ Shows local process status for the cwd-scoped session:
 
 - `running`, `idle`, `dead`, or `no-session`
 - session id, agent command, live queue-owner pid when available
-- uptime when running
+- time since the most recent agent process launch, when the queue owner is running
 - last prompt timestamp
 - last known exit code/signal when dead
+
+The displayed `pid` identifies the queue owner, while `uptime` uses the most
+recent agent process start time. Uptime can keep advancing after that agent
+exits and resets when a replacement starts, even if the queue-owner PID stays
+the same. It uses wall-clock time, rounded down to whole seconds.
 
 `idle` means the persistent session is saved and resumable, but no queue owner is
 currently running. The next prompt starts a queue owner and reconnects the
@@ -483,6 +502,7 @@ Rules:
 - Do not combine positional agent and `--agent` in one command.
 - The resolved command string becomes the session scope key (`agentCommand`).
 - Invalid empty command or unterminated quoting in `--agent` is a usage error.
+- An explicitly empty or whitespace-only `--agent` is rejected before prompt input or adapter startup; omit the flag to use the configured default.
 
 ## Session behavior and scoping
 
@@ -492,11 +512,19 @@ Session records are stored in:
 ~/.acpx/sessions/*.json
 ```
 
+On POSIX systems, session records are written with mode
+`0600`, and their session directory uses `0700`. Each write reapplies these
+private permissions, including when replacing an older, more permissive file.
+The embedded runtime's `createFileSessionStore()` uses the same policy. This is
+storage hardening; it does not isolate agents running under the same OS user.
+Operator-managed session-directory symlinks remain supported; permissions apply
+to their target directory. Windows access remains governed by the directory's ACLs.
+
 ### Auto-resume
 
 For prompt commands:
 
-1. Detect the nearest git root by checking for `.git` while walking up from `absoluteCwd`.
+1. Detect the nearest git root by checking for a `.git` directory or file while walking up from `absoluteCwd`, including worktrees and submodules.
 2. If a git root is found, walk from `absoluteCwd` up to that git root (inclusive).
 3. If no git root exists, only check exact `absoluteCwd` (no parent-directory walk).
 4. At each checked directory, find the first active (non-closed) session matching `(agentCommand, dir, optionalName)`.
@@ -518,6 +546,77 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 4. after the queue drains, owner waits for new work up to TTL (`--ttl`, default 300s)
 5. submitter either blocks until completion (default) or exits immediately with `--no-wait`
 6. if interrupted (`Ctrl+C`) during an active turn, `acpx` sends `session/cancel` first, waits briefly for cancelled completion, then force-kills only if needed
+
+Slow submitters retain ordered live output in a temporary disk spool instead of
+an unbounded socket buffer. Each observer can retain up to 64 MiB of unread spool
+data; one queue owner allows at most 256 MiB of spool file extent, 64 open
+spools, and 64 observers with pending output, including completed responses whose last
+chunk is still buffered by the socket. Consumed disk space is reused.
+These are backlog limits, not limits on the total output of a progressing turn.
+The current serialized message still requires memory proportional to its size.
+
+Waiting clients assemble each owner response as a complete JSON line without an
+additional response-size ceiling. Client memory grows with the current response
+and its parsed data, including an unfinished line from a broken owner. Older
+clients retain their previous receive-buffer limit. Owner backlog limits still
+apply: even one large response can disconnect its observer if its remaining
+bytes cannot fit the available spool capacity.
+
+Spill and replay use bounded synchronous file operations. A full spool, exhausted
+owner budget, or storage failure disconnects that observer with a nonretryable
+unknown-outcome error. The admitted prompt continues and is not automatically
+replayed or cancelled. Use `sessions watch` or `sessions history` to inspect the
+recorded outcome before submitting again. When all output slots are occupied,
+new prompt and control responses are disconnected before queuing their bytes;
+their commands may still execute. Spools are unlinked before receiving
+payload and are discarded on disconnect or owner exit; they do not provide
+transport replay after a crash. macOS and Linux still disconnect readers that
+make no socket progress for one second. Windows preserves paused named-pipe
+readers within the storage limits because partial write progress is opaque.
+
+Queue-owner records remain private across heartbeat updates. Shutdown finishes
+pending record updates and closes the IPC server before releasing ownership.
+On macOS and Linux, repeated stop signals keep the same graceful shutdown in
+progress until cleanup and lease release finish.
+Current clients serialize lease publication, heartbeat updates, and cleanup across
+processes, so stale recovery cannot remove a replacement owner's files. Recovery
+rechecks the owner's generation and recorded OS birth identity before each
+termination signal. A confirmed exit or a different birth identity permits
+cleanup of that generation's abandoned files without signaling a replacement
+process. Linux uses raw process start ticks, boot identity, and the observer's PID
+and time namespaces, so wall-clock changes do not change process identity. Other
+POSIX birth timestamps have one-second precision. Process queries and signals
+are separate OS operations.
+
+Healthy owners from older versions remain usable through IPC. Explicit close
+requests their normal shutdown and waits for exit. A live owner without a
+verifiable birth identity is never forcibly terminated: recovery preserves its
+lease and reports `QUEUE_OWNER_IDENTITY_UNVERIFIED`. Restore local process-query
+access and retry, or let the owner finish its normal shutdown or idle expiry.
+Missing identity data also preserves a live owner's lease; confirmed local
+process exit still permits cleanup of older records. Incompatible identity kinds,
+unknown process scope, and another namespace in the same boot preserve custody,
+even when the numeric PID does not exist locally.
+
+An invalid descendant-retirement receipt also preserves its owner's
+lease and reports `QUEUE_OWNER_RETIREMENT_INCOMPLETE`. This includes receipt data
+that cannot be sized safely; recovery does not treat it as an absent owner.
+
+Abandoned incomplete reservations remain recoverable after the stale-owner window;
+ambiguous mutation guards are preserved instead of being removed by age. Guard
+cleanup errors remain retryable on the next status or ownership operation. A live
+owner stops accepting work and shuts down normally if its guard cleanup fails.
+The exclusion guarantee requires current clients in the same machine's local
+PID and time namespaces; do not share the queue home across hosts or namespaces. Older
+clients that bypass the guard do not participate.
+
+If an ambiguous `.acpx/queues/<queue-key>.lock.guard` file or its `.reclaim`
+directory prevents recovery, first stop all acpx commands, queue owners, and
+embedding hosts using that home directory, and prevent them from restarting.
+Only after establishing exclusive access may an operator remove the affected
+guard and reclamation directory. Leave the lease and socket for normal recovery,
+then retry status or the intended command. File age alone does not establish that
+cleanup is safe; if exclusive access cannot be established, preserve the files.
 
 ### Soft-close behavior
 
@@ -569,22 +668,22 @@ Hard rule for the ACP stream:
 - no synthetic `type`/`stream` wrapper fields,
 - no ACP payload key renaming.
 
-### Control-command JSON mapping
+### Command-specific JSON shapes
 
-When `--format json` is used:
-
-- commands that talk to an ACP adapter emit raw ACP JSON-RPC messages.
-- local query commands (`sessions list/show/history/export/import/prune`) emit local JSON documents (not ACP stream traffic).
+With `--format json`, `prompt` and `exec` emit raw ACP JSON-RPC messages. Controls such as `cancel`, `set-mode`, and `set`, and queries such as `sessions list`, `show`, and `history`, emit command-specific JSON result documents. A command contacting an adapter does not by itself determine its output shape.
 
 ### Sessions/query command output behavior
 
-- `sessions list` with `text`: tab-separated `id`, `name`, `cwd`, `lastUsedAt` (closed sessions include a `[closed]` marker next to id)
-- `sessions list` with `json`: a single JSON array of session records
-- `sessions list` with `quiet`: one session id per line (closed sessions include `[closed]`)
+- Agent-side `sessions list` with `text`: tab-separated `sessionId`, `title`, `cwd`, `updatedAt`, and metadata; a next cursor is printed when supplied.
+- Agent-side `sessions list` with `json`: one object with `source: "agent"` and `sessions`, plus optional `_meta`, `cursor`, `cwd`, and `nextCursor`. Entries use the adapter's `sessionId`.
+- Agent-side `sessions list` with `quiet`: one adapter session id per line.
+- Local `sessions list --local`, or a local fallback, with `text`: tab-separated local id, name, cwd, and last-used time.
+- Local listing with `json`: one array of full local session records.
+- Local listing with `quiet`: one local record id per line. Closed local records have a `[closed]` marker in text and quiet output.
 - `sessions show` with `text`: key/value metadata dump
 - `sessions show` with `json`: full session record object
 - `sessions history` with `text`: tab-separated `timestamp role textPreview` entries
-- `sessions history` with `json`: object containing `entries` array
+- `sessions history` with `json`: object containing `id`, `sessionId`, `limit`, `count`, and `entries`
 - `sessions export` with `text`: output path summary
 - `sessions export` with `json`: object containing `action` and `output`
 - `sessions export` with `quiet`: output path
@@ -600,9 +699,9 @@ When `--format json` is used:
 
 Choose exactly one mode:
 
-- `--approve-all`: auto-approve all permission requests
-- `--approve-reads`: auto-approve read/search requests, prompt for other kinds (default)
-- `--deny-all`: auto-deny/reject requests when possible
+- `--approve-all`: approve tool permission requests not resolved by a per-tool policy
+- `--approve-reads`: approve remaining read/search requests and prompt for other tools (default)
+- `--deny-all`: deny tool permission requests not resolved by a per-tool policy
 
 Prompting behavior in `--approve-reads`:
 
@@ -622,15 +721,15 @@ Per-tool policy:
 
 ## Exit codes
 
-| Code  | Meaning                                                                                    |
-| ----- | ------------------------------------------------------------------------------------------ |
-| `0`   | Success                                                                                    |
-| `1`   | Agent/protocol/runtime error                                                               |
-| `2`   | CLI usage error                                                                            |
-| `3`   | Timeout                                                                                    |
-| `4`   | No session found (prompt requires an explicit `sessions new`)                              |
-| `5`   | Permission denied (permission requested, none approved, and at least one denied/cancelled) |
-| `130` | Interrupted (`SIGINT`/`SIGTERM`)                                                           |
+| Code  | Meaning                                                                                                 |
+| ----- | ------------------------------------------------------------------------------------------------------- |
+| `0`   | Success                                                                                                 |
+| `1`   | Agent/protocol/runtime error                                                                            |
+| `2`   | CLI usage error                                                                                         |
+| `3`   | Timeout                                                                                                 |
+| `4`   | No session found (prompt requires an explicit `sessions new`)                                           |
+| `5`   | Permission denied in this turn (permission requested, none approved, and at least one denied/cancelled) |
+| `130` | Interrupted (`SIGINT`/`SIGTERM`)                                                                        |
 
 ## Environment variables
 
@@ -639,12 +738,17 @@ Claude Code user settings. By default, they load only project and local settings
 to avoid globally enabled channel or daemon plugins interfering with spawned ACP
 sessions.
 
+`ACPX_PERF_METRICS_FILE` enables optional NDJSON performance capture, including
+command arguments. On POSIX, capture files use `0600`; existing parent directory
+permissions are preserved. Symbolic links, hardlinked files, and special files such
+as FIFOs are skipped. Capture failures leave the command's exit status unchanged.
+
 Related runtime behavior:
 
 - session storage path is derived from OS home directory (`~/.acpx/sessions`)
 - child processes inherit the current environment by default
-- Windows terminal kill and release requests fail if process cleanup cannot finish after escalation. The terminal remains available for a cleanup retry; restore a working `taskkill` command before retrying.
-- ACP `terminal/create` honors agent `outputByteLimit`; `0` stores nothing and the default when omitted is 64 KiB. Hosts can opt into an additional per-terminal retention ceiling with `ACPX_TERMINAL_MAX_OUTPUT_BYTES` (for example, `16777216` for 16 MiB). Unset, empty, or zero disables only the host ceiling, preserving the agent limit and default. Positive values must be safe integers. The smaller limit applies to combined stdout and stderr, retaining the newest UTF-8 output and reporting `truncated: true` when exceeded. This bounds retained output per terminal, not total process memory. Each ACP client snapshots the setting at construction; restart warm queue owners to change it.
+- Windows shell commands keep stdout and stderr available through `terminal/output`. Terminal kill and release requests fail if process cleanup cannot finish after escalation. The terminal remains available for a cleanup retry; restore a working `taskkill` command before retrying.
+- ACP `terminal/create` honors agent `outputByteLimit`; `0` stores nothing and the default when omitted is 64 KiB. Hosts can opt into an additional per-terminal retention ceiling with `ACPX_TERMINAL_MAX_OUTPUT_BYTES` (for example, `16777216` for 16 MiB). Unset, empty, or zero disables only the host ceiling, preserving the agent limit and default. Positive values must be safe integers. The smaller limit applies to combined stdout and stderr, retaining the newest UTF-8 output and reporting `truncated: true` when exceeded. Truncation drops an incomplete leading code point across writes; the retained output can be empty if no complete code point fits. This bounds retained output per terminal, not total process memory. Each ACP client snapshots the setting at construction; restart warm queue owners to change it.
 
 ## Practical examples
 
@@ -663,9 +767,6 @@ acpx codex sessions new --name backend
 acpx codex sessions new --name docs
 acpx codex -s backend 'fix checkout timeout'
 acpx codex -s docs 'document payment retry behavior'
-
-# One-shot ask with no saved context
-acpx claude exec 'summarize src/session.ts in 5 bullets'
 
 # Manage sessions
 acpx codex sessions
@@ -689,6 +790,9 @@ acpx --format json codex exec 'review latest diff for security issues' \
   | jq -r 'select(.method=="session/update") | .params.update
            | select(.sessionUpdate=="tool_call" or .sessionUpdate=="tool_call_update")
            | [(.status // "-"), (.title // "-")] | @tsv'
+
+# One-shot ask with no saved context
+acpx claude exec 'summarize src/session.ts in 5 bullets'
 ```
 
 ### Queue request size
@@ -699,7 +803,7 @@ existing unlimited request size. Positive values must be safe integers.
 Clients with the same setting reject oversized submissions with
 `QUEUE_REQUEST_TOO_LARGE` before opening a socket. Owners disconnect a raw peer
 that exceeds the cap, including incomplete lines, while continuing to serve
-other clients. The existing owner-response limit is unchanged.
+other clients. Responses use the separate [queue output policy](#prompt-queueing).
 
 An owner keeps the setting with which it starts; setting the variable does not
 reconfigure an already-running owner. Request JSON can be larger than the prompt

@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { TimeoutError } from "../../async-control.js";
+import { InterruptedError, TimeoutError } from "../../async-control.js";
 import type { ShellActionExecution, ShellActionResult } from "../runtime.js";
+import { resolveFlowTimeoutMs } from "../timeout.js";
+import type { FlowShellExecution, FlowShellResult } from "../types.js";
 import { createShellOutputCapture, validateShellActionMaxBufferBytes } from "./shell-output.js";
 import { hasShellProcesses, stopShellProcess } from "./shell-process.js";
 
@@ -49,10 +51,7 @@ function createShellFailureError(
  * Positive values arm SIGTERM/SIGKILL after that many ms.
  */
 export function resolveShellActionTimeoutMs(timeoutMs: number | undefined): number | undefined {
-  if (timeoutMs == null || !(timeoutMs > 0)) {
-    return undefined;
-  }
-  return timeoutMs;
+  return resolveFlowTimeoutMs(timeoutMs);
 }
 
 export type ShellProcessOwner = {
@@ -98,31 +97,40 @@ function rejectIfShellFailed(
   return undefined;
 }
 
-function waitForShellExit(
+function waitForShellResult(
   child: ChildProcess,
   spec: ShellActionExecution,
   args: string[],
   cwd: string,
   startMs: number,
-  timeoutMs: number | undefined,
-  termination: { timedOut: () => boolean; cancel: ShellProcessOwner["cancel"] },
-): Promise<ShellActionResult> {
+  termination: {
+    timedOut: () => boolean;
+    cancelled: () => boolean;
+    cancel: ShellProcessOwner["cancel"];
+  },
+  mode: "node" | "command",
+): Promise<FlowShellResult> {
   const stdoutStream = child.stdout;
   const stderrStream = child.stderr;
   if (!stdoutStream || !stderrStream) {
     throw new Error("Shell action child is missing stdio pipes");
   }
 
-  return new Promise<ShellActionResult>((resolve, reject) => {
+  return new Promise<FlowShellResult>((resolve, reject) => {
     let settled = false;
+    let drainDeadline: NodeJS.Timeout | undefined;
     const fail = (error: unknown) => {
+      clearTimeout(drainDeadline);
       settled = true;
       reject(error);
     };
     const capture = createShellOutputCapture(
       spec.maxBufferBytes,
-      () => settled || termination.timedOut(),
+      () => settled || (mode === "node" && termination.cancelled()),
       (error) => {
+        if (termination.cancelled()) {
+          return;
+        }
         fail(error);
         void termination.cancel("SIGTERM").catch(fail);
       },
@@ -137,10 +145,19 @@ function waitForShellExit(
     });
 
     child.once("error", fail);
-    child.once("exit", (exitCode, signal) => {
+    const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(drainDeadline);
+      if (settled) {
+        return;
+      }
       settled = true;
+      if (mode === "node" && !termination.cancelled()) {
+        // Keep inherited pipes draining without holding a completed host alive.
+        (stdoutStream as typeof stdoutStream & { unref: () => void }).unref();
+        (stderrStream as typeof stderrStream & { unref: () => void }).unref();
+      }
       const { stdout, stderr } = capture.output;
-      const result: ShellActionResult = {
+      const result: FlowShellResult = {
         command: spec.command,
         args,
         cwd,
@@ -150,16 +167,20 @@ function waitForShellExit(
         exitCode,
         signal,
         durationMs: Date.now() - startMs,
+        timedOut: mode === "node" ? termination.cancelled() : termination.timedOut(),
       };
-
-      const error = rejectIfShellFailed(spec, args, result, termination.timedOut(), timeoutMs);
-      if (error) {
-        reject(error);
-        return;
-      }
-
       resolve(result);
-    });
+    };
+    child.once("close", finish);
+    if (mode === "node") {
+      child.once("exit", (exitCode, signal) => {
+        if (settled) {
+          return;
+        }
+        // Drain the wrapper's last writes, but bound inherited descendant pipes.
+        drainDeadline = setTimeout(() => finish(exitCode, signal), 100);
+      });
+    }
   });
 }
 
@@ -175,6 +196,7 @@ function createShellTermination(
   });
   let termination: Promise<void> | undefined;
   let timedOut = false;
+  let cancelled = false;
   let released = false;
   let deadline: NodeJS.Timeout | undefined;
   let monitor: NodeJS.Timeout | undefined;
@@ -203,7 +225,8 @@ function createShellTermination(
     if (released) {
       return Promise.resolve();
     }
-    timedOut = true;
+    clearDeadline();
+    cancelled = true;
     termination = stopShellProcess(child, closed, signal).finally(release);
     void termination.catch(rejectCleanup);
     return termination;
@@ -214,6 +237,7 @@ function createShellTermination(
   options.signal?.addEventListener("abort", onAbort, { once: true });
   if (timeoutMs != null) {
     deadline = setTimeout(() => {
+      timedOut = true;
       void cancel("SIGTERM");
     }, timeoutMs);
   }
@@ -236,6 +260,7 @@ function createShellTermination(
   return {
     cancel,
     timedOut: () => timedOut,
+    cancelled: () => cancelled,
     cleanupFailure,
     async dispose() {
       clearDeadline();
@@ -254,14 +279,41 @@ export async function runShellAction(
   spec: ShellActionExecution,
   options: RunShellActionOptions = {},
 ): Promise<ShellActionResult> {
-  if (options?.signal?.aborted) {
-    throw options.signal.reason;
+  const { timedOut, ...result } = await runShellProcess(spec, options, "node");
+  const failure = rejectIfShellFailed(
+    spec,
+    result.args,
+    result,
+    timedOut,
+    resolveShellActionTimeoutMs(spec.timeoutMs),
+  );
+  if (failure) {
+    throw failure;
   }
+  return result;
+}
+
+export async function runShellCommand(
+  spec: FlowShellExecution,
+  options: RunShellActionOptions,
+): Promise<FlowShellResult> {
+  return await runShellProcess(spec, options, "command");
+}
+
+async function runShellProcess(
+  spec: ShellActionExecution,
+  options: RunShellActionOptions,
+  mode: "node" | "command",
+): Promise<FlowShellResult> {
+  options.signal?.throwIfAborted();
   const cwd = spec.cwd ?? process.cwd();
   const args = spec.args ?? [];
   const startMs = Date.now();
   const timeoutMs = resolveShellActionTimeoutMs(spec.timeoutMs);
   validateShellActionMaxBufferBytes(spec.maxBufferBytes);
+  if (spec.stdin !== undefined && typeof spec.stdin !== "string") {
+    throw new TypeError("stdin must be a string");
+  }
   const child = spawn(spec.command, args, {
     cwd,
     env: {
@@ -275,11 +327,26 @@ export async function runShellAction(
   });
 
   const termination = createShellTermination(child, timeoutMs, options);
-  const finish = waitForShellExit(child, spec, args, cwd, startMs, timeoutMs, termination);
-  writeShellStdin(child, spec.stdin);
+  const finish = waitForShellResult(child, spec, args, cwd, startMs, termination, mode);
   try {
-    return await Promise.race([finish, termination.cleanupFailure]);
+    writeShellStdin(child, spec.stdin);
+    const result = await Promise.race([finish, termination.cleanupFailure]);
+    throwIfShellCancelled(options.signal, mode);
+    return result;
+  } catch (error) {
+    await termination.cancel("SIGTERM");
+    throw error;
   } finally {
     await termination.dispose();
+  }
+}
+
+function throwIfShellCancelled(signal: AbortSignal | undefined, mode: "node" | "command"): void {
+  if (!signal?.aborted) {
+    return;
+  }
+  const reason: unknown = signal.reason;
+  if (mode === "command" || reason instanceof TimeoutError || reason instanceof InterruptedError) {
+    throw reason;
   }
 }

@@ -13,7 +13,9 @@ description: Global and project JSON config files, supported keys, precedence ru
 3. CLI flags
 ```
 
-Each layer is a partial override merged on top of the previous one. Missing keys inherit; arrays and objects are replaced, not deep-merged (with the exception of the `agents` map, where keys merge and per-agent objects replace wholesale).
+Each layer is a partial override merged on top of the previous one. Missing keys inherit; arrays and objects are replaced rather than deep-merged, except that `agents` and `auth` merge by key. A project agent entry replaces the entire same-named global entry, and a project auth value replaces the same method's global value. Other global agent and auth entries remain available.
+
+When top-level `--cwd` or `--mcp-config` flags repeat, the final occurrence wins. Project configuration comes from that effective cwd, and relative MCP config paths resolve against it regardless of flag order.
 
 Inspect the resolved view:
 
@@ -26,6 +28,9 @@ Create a global template (only writes if the file does not already exist):
 ```bash
 acpx config init
 ```
+
+On POSIX systems, newly created config files use `0600` permissions and a newly
+created `.acpx` directory uses `0700`. Existing config files are never replaced.
 
 ## Supported keys
 
@@ -73,6 +78,10 @@ Use `--mcp-config <path>` when MCP servers belong to a session or automation job
 working tree. The file must contain the same top-level `mcpServers` array shown above; it replaces
 the project/global `mcpServers` value for that invocation. Relative paths resolve from `--cwd`.
 
+MCP `env` and `headers` entries use `{ "name": "…", "value": "…" }` pairs.
+Values are literal strings: empty strings and leading or trailing whitespace are
+preserved when creating or loading a session. Names must be non-empty and are trimmed.
+
 ```bash
 acpx --cwd /workspace --mcp-config /run/job-mcp.json codex 'use the configured tools'
 ```
@@ -100,7 +109,9 @@ Custom agents and overrides live here:
 Rules:
 
 - Keys are friendly names you would type at `acpx <name> …`.
+- Names such as `constructor` and `__proto__` work like any other custom name and remain visible in `config show`.
 - `argv` is the preferred form and is required for custom agent launches on Windows. Its first item is the executable and every remaining item is passed literally as one argument.
+- Windows batch wrappers, including extensionless commands, resolve from the selected `--cwd`; relative `PATH` directories use that same cwd.
 - Legacy `{ "command": "…", "args": […] }` entries migrate when `command` is an unquoted executable with no whitespace. Quoted executables and inline arguments are rejected as ambiguous; move the complete launch to `argv`.
 - A legacy `command` without `args` remains a raw command string for Unix compatibility. Windows rejects it with migration guidance because inferring argv would corrupt paths and quoting.
 - The raw `--agent <command>` escape hatch is likewise Unix-only.
@@ -131,7 +142,13 @@ ACPX_AUTH_OPENAI_API_KEY=sk-… acpx codex 'do the thing'
 { "auth": { "openai_api_key": "sk-…" } }
 ```
 
+The global and project `auth` maps merge by method ID. An empty project `auth` object does not clear global credentials; matching project keys replace the corresponding global values. Matching `ACPX_AUTH_*` environment variables still take precedence over the merged config map.
+
 Ambient provider env vars like `OPENAI_API_KEY` are still passed through to child agents in their environment, but they do **not** trigger ACP auth-method selection on their own. This is intentional — it avoids surprise login flows in adapters that interpret an ambient key as "go ahead and authenticate."
+
+When adding authentication aliases to the child environment, acpx preserves
+inherited values, including empty strings. On Windows, differently cased names
+refer to the same environment variable; Unix names remain case sensitive.
 
 When an adapter advertises auth methods, `acpx` invokes `authenticate` if it
 finds a matching `ACPX_AUTH_*` environment variable or `auth` config value.
@@ -206,6 +223,20 @@ Other ACP-relevant behavior:
 ```
 
 Then `acpx ci-bot 'run sanity checks'` resolves through the registry without any `--agent` flag.
+
+## Embedded session MCP servers
+
+In `acpx/runtime`, `AcpRuntimeOptions.mcpServers` accepts either an array or a
+synchronous resolver receiving `{ sessionKey, cwd, agentCommand, agentArgv }`.
+The resolver returns the complete server array for a new connection. ACPX calls
+it for session creation, reconnection, and controls or close operations that need
+a new connection. Existing retained connections keep their original servers.
+Initialization-only health probes do not invoke the resolver.
+
+The runtime does not store the resolver or its result in session records. Hosts
+must supply it again after restart. Configuration files continue to accept arrays
+only. See [Permissions](permissions.md#per-tool-policy) for turn-owned permission
+callbacks on a shared runtime.
 
 ## See also
 

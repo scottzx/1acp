@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import type { SessionModelState } from "../src/acp/model-support.js";
 import { AcpxOperationalError } from "../src/errors.js";
 import { AcpRuntimeManager } from "../src/runtime/engine/manager.js";
 import {
+  type SystemPromptOption,
   mergeSessionOptions,
   persistSessionOptions,
   sessionOptionsFromRecord,
 } from "../src/runtime/engine/session-options.js";
+import { createDeferred } from "../src/runtime/engine/turn.js";
 import type {
   AcpRuntimeEvent,
   AcpRuntimeHandle,
@@ -126,17 +129,6 @@ async function collectTurn(turn: AcpRuntimeTurn): Promise<{
   return { events, result };
 }
 
-function assertTurnResult(
-  result: AcpRuntimeTurnResult,
-  status: "completed" | "cancelled",
-  stopReason: string,
-): void {
-  assert.equal(result.status, status);
-  assert.equal(result.stopReason, stopReason);
-  assert.ok(result.runtimeRequestId);
-  assert.equal(result.promptMessageId, result.runtimeRequestId);
-}
-
 test("AcpRuntimeManager reuses compatible records without spawning a new client", async () => {
   const existing = makeSessionRecord({
     acpxRecordId: "session-key",
@@ -238,7 +230,6 @@ test("AcpRuntimeManager creates and resumes sessions through the client", async 
     escalate: ["execute"],
     defaultAction: "deny" as const,
   };
-  const processLifecycle = {};
   const lifecycle = {
     pid: 456,
     startedAt: "2026-01-01T00:00:00.000Z",
@@ -306,7 +297,6 @@ test("AcpRuntimeManager creates and resumes sessions through the client", async 
       sessionStore: store,
       permissionPolicy,
       agentProcessEnv,
-      processLifecycle,
     }),
     {
       clientFactory: (options) => {
@@ -355,10 +345,6 @@ test("AcpRuntimeManager creates and resumes sessions through the client", async 
     [permissionPolicy, permissionPolicy],
   );
   assert.deepEqual(
-    constructedOptions.map((options) => options.processLifecycle),
-    [processLifecycle, processLifecycle],
-  );
-  assert.deepEqual(
     constructedOptions.map((options) => options.processLaunchScope),
     [
       { kind: "runtime-session", sessionKey: "created-session" },
@@ -367,226 +353,181 @@ test("AcpRuntimeManager creates and resumes sessions through the client", async 
   );
 });
 
-test("AcpRuntimeManager adopts a pooled pre-warm record and moves idle updates to the real key", async () => {
-  const sourceId = "prewarm_grok_789";
-  const targetId = "real-1agents-session-789";
-  const store = new InMemorySessionStore();
-  let factoryCalls = 0;
-  let setModeCalls = 0;
-  let handlers: FakeClientHandlers = {};
-  let resolveUpdate: (() => void) | undefined;
-  const updatePersisted = new Promise<void>((resolve) => {
-    resolveUpdate = resolve;
-  });
-  const client: FakeClient = {
-    initializeResult: {
-      protocolVersion: 1,
-      agentCapabilities: { prompt: true },
-    },
-    start: async () => {},
-    close: async () => {},
-    createSession: async () => ({
-      sessionId: "sid-prewarmed",
-      agentSessionId: "agent-prewarmed",
-    }),
-    loadSession: async () => ({ agentSessionId: "agent-prewarmed" }),
-    hasReusableSession: (sessionId) => sessionId === "sid-prewarmed",
-    supportsLoadSession: () => true,
-    supportsResumeSession: () => false,
-    loadSessionWithOptions: async () => ({ agentSessionId: "agent-prewarmed" }),
-    getAgentLifecycleSnapshot: () => ({
-      pid: 789,
-      startedAt: "2026-01-01T00:00:00.000Z",
-      running: true,
-    }),
-    prompt: async () => ({ stopReason: "end_turn" }),
-    requestCancelActivePrompt: async () => false,
-    hasActivePrompt: () => false,
-    setSessionMode: async () => {
-      setModeCalls += 1;
-    },
-    setSessionConfigOption: async () => {},
-    clearEventHandlers: () => {
-      handlers = {};
-    },
-    setEventHandlers: (nextHandlers) => {
-      handlers = nextHandlers;
-    },
-  };
-  const manager = new AcpRuntimeManager(
-    {
-      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-      onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
-        assert.equal(sessionKey, targetId);
-        assert.equal(updateTag, "agent_message_chunk");
-        resolveUpdate?.();
+type PendingOneShotOptions = Parameters<AcpRuntimeManager["ensureSession"]>[0]["sessionOptions"];
+
+const pendingOneShotOptionCases: Array<{
+  label: string;
+  first?: PendingOneShotOptions;
+  second?: PendingOneShotOptions;
+  reuse: boolean;
+}> = [
+  { label: "omitted options", reuse: true },
+  { label: "omitted versus whitespace replacement", second: { systemPrompt: " " }, reuse: false },
+  {
+    label: "omitted versus whitespace append",
+    second: { systemPrompt: { append: " " } },
+    reuse: false,
+  },
+  {
+    label: "omitted versus own proto env key",
+    second: { env: Object.fromEntries([["__proto__", "SYNTHETIC_PROTO"]]) },
+    reuse: false,
+  },
+  { label: "empty options", first: {}, second: {}, reuse: true },
+  { label: "empty environment", first: { env: {} }, second: { env: {} }, reuse: true },
+  {
+    label: "explicit undefined beside an empty tool list",
+    first: { allowedTools: [], maxTurns: undefined },
+    second: { allowedTools: [], maxTurns: undefined },
+    reuse: true,
+  },
+  {
+    label: "explicit empty tool list",
+    first: { allowedTools: [] },
+    second: { allowedTools: [] },
+    reuse: true,
+  },
+  { label: "omitted followed by empty options", second: {}, reuse: true },
+  {
+    label: "omitted tools versus explicit empty tools",
+    second: { allowedTools: [] },
+    reuse: false,
+  },
+  { label: "explicit zero turns versus omitted turns", first: { maxTurns: 0 }, reuse: false },
+  {
+    label: "replacement versus appended system prompt",
+    first: { systemPrompt: "Synthetic guidance" },
+    second: { systemPrompt: { append: "Synthetic guidance" } },
+    reuse: false,
+  },
+  {
+    label: "literal environment whitespace",
+    first: { env: { SYNTHETIC_OPTION: "first" } },
+    second: { env: { SYNTHETIC_OPTION: " first " } },
+    reuse: false,
+  },
+  {
+    label: "literal system-prompt whitespace",
+    first: { systemPrompt: "Synthetic guidance" },
+    second: { systemPrompt: " Synthetic guidance " },
+    reuse: false,
+  },
+  {
+    label: "literal model spelling",
+    first: { model: "literal-model" },
+    second: { model: " literal-model " },
+    reuse: false,
+  },
+];
+
+for (const scenario of pendingOneShotOptionCases) {
+  test(`pending oneshot ownership preserves ${scenario.label}`, async (t) => {
+    const store = new InMemorySessionStore();
+    let createdSessions = 0;
+    let loadSessionCalls = 0;
+    let closeCalls = 0;
+    const manager = new AcpRuntimeManager(
+      createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      {
+        clientFactory: () =>
+          ({
+            initializeResult: {
+              protocolVersion: 1,
+              agentCapabilities: { loadSession: true },
+            },
+            start: async () => {},
+            close: async () => {
+              closeCalls += 1;
+            },
+            createSession: async () => ({
+              sessionId: `new-session-${++createdSessions}`,
+              agentSessionId: `agent-session-${createdSessions}`,
+              models: {
+                currentModelId: "literal-model",
+                availableModels: [{ modelId: "literal-model", name: "Synthetic model" }],
+              },
+            }),
+            loadSession: async () => ({ agentSessionId: "unused" }),
+            hasReusableSession: () => true,
+            supportsLoadSession: () => true,
+            supportsResumeSession: () => false,
+            loadSessionWithOptions: async () => {
+              loadSessionCalls += 1;
+              return { agentSessionId: "runtime-session" };
+            },
+            getAgentLifecycleSnapshot: () => ({ running: true }),
+            prompt: async () => ({ stopReason: "end_turn" }),
+            requestCancelActivePrompt: async () => false,
+            hasActivePrompt: () => false,
+            setSessionMode: async () => {},
+            setSessionModel: async () => {},
+            setSessionConfigOption: async () => {},
+            clearEventHandlers: () => {},
+            setEventHandlers: () => {},
+          }) as never,
       },
-    },
-    {
-      clientFactory: () => {
-        factoryCalls += 1;
-        return client as never;
-      },
-    },
-  );
+    );
+    t.after(() => manager.shutdown());
 
-  const source = await manager.ensureSession({
-    sessionKey: sourceId,
-    agent: "grok-build",
-    mode: "persistent",
-    cwd: "/workspace",
-  });
-  const adopted = await manager.adoptSession({
-    handle: createHandle(sourceId, source.acpxRecordId),
-    sessionKey: targetId,
-  });
+    const [first, second] = await Promise.all([
+      manager.ensureSession({
+        sessionKey: "oneshot-session",
+        agent: "codex",
+        mode: "oneshot",
+        sessionOptions: scenario.first,
+      }),
+      manager.ensureSession({
+        sessionKey: "oneshot-session",
+        agent: "codex",
+        mode: "oneshot",
+        sessionOptions: scenario.second,
+      }),
+    ]);
+    const initializedCount = scenario.reuse ? 1 : 2;
+    assert.equal(first.acpxRecordId === second.acpxRecordId, scenario.reuse);
+    assert.equal(first.acpSessionId === second.acpSessionId, scenario.reuse);
+    assert.equal(first.name, "oneshot-session");
+    assert.equal(second.name, "oneshot-session");
+    assert.equal(createdSessions, initializedCount);
+    assert.equal(store.records.size, initializedCount);
+    assert.equal(closeCalls, 0);
 
-  assert.equal(adopted.acpxRecordId, targetId);
-  assert.equal(adopted.name, targetId);
-  assert.equal(adopted.eventLog.active_path.includes(encodeURIComponent(targetId)), true);
-  assert.equal(adopted.eventLog.active_path.includes(sourceId), false);
-  assert.equal(await store.load(sourceId), undefined);
-  assert.equal((await store.load(targetId))?.acpSessionId, "sid-prewarmed");
+    const turn = manager.startTurn({
+      handle: createHandle("oneshot-session", second.acpxRecordId),
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "oneshot",
+      requestId: "req-oneshot",
+    });
+    assert.deepEqual((await collectTurn(turn)).result, {
+      status: "completed",
+      stopReason: "end_turn",
+    });
+    assert.equal(loadSessionCalls, 0);
+    assert.equal(closeCalls, 1);
 
-  handlers.onSessionUpdate?.({
-    sessionId: "sid-prewarmed",
-    update: {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "after adoption" },
-    },
-  });
-  await updatePersisted;
-  assert.equal(
-    JSON.stringify((await store.load(targetId))?.messages).includes("after adoption"),
-    true,
-  );
-  assert.equal(await store.load(sourceId), undefined);
-
-  await manager.setMode(createHandle(targetId), "auto");
-  assert.equal(factoryCalls, 1);
-  assert.equal(setModeCalls, 1);
-});
-
-test("AcpRuntimeManager refuses adoption when the real session key already exists", async () => {
-  const source = makeSessionRecord({
-    acpxRecordId: "prewarm_grok_existing",
-    acpSessionId: "sid-source",
-    agentCommand: "grok-build --acp",
-    cwd: "/workspace",
-  });
-  const target = makeSessionRecord({
-    acpxRecordId: "real-existing-session",
-    acpSessionId: "sid-target",
-    agentCommand: "grok-build --acp",
-    cwd: "/workspace",
-  });
-  const store = new InMemorySessionStore([source, target]);
-  const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-  );
-
-  await assert.rejects(
-    manager.adoptSession({
-      handle: createHandle(source.acpxRecordId),
-      sessionKey: target.acpxRecordId,
-    }),
-    /already exists/,
-  );
-  assert.equal((await store.load(source.acpxRecordId))?.acpSessionId, "sid-source");
-  assert.equal((await store.load(target.acpxRecordId))?.acpSessionId, "sid-target");
-});
-
-test("AcpRuntimeManager reuses pending oneshot initialization and closes it after the turn", async () => {
-  const store = new InMemorySessionStore();
-  let createdSessions = 0;
-  let loadSessionCalls = 0;
-  let closeCalls = 0;
-  const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-    {
-      clientFactory: () =>
-        ({
-          initializeResult: {
-            protocolVersion: 1,
-            agentCapabilities: { loadSession: true },
-          },
-          start: async () => {},
-          close: async () => {
-            closeCalls += 1;
-          },
-          createSession: async () => ({
-            sessionId: `new-session-${++createdSessions}`,
-            agentSessionId: `agent-session-${createdSessions}`,
-          }),
-          loadSession: async () => ({ agentSessionId: "unused" }),
-          hasReusableSession: () => true,
-          supportsLoadSession: () => true,
-          supportsResumeSession: () => false,
-          loadSessionWithOptions: async () => {
-            loadSessionCalls += 1;
-            return { agentSessionId: "runtime-session" };
-          },
-          getAgentLifecycleSnapshot: () => ({ running: true }),
-          prompt: async () => ({ stopReason: "end_turn" }),
-          requestCancelActivePrompt: async () => false,
-          hasActivePrompt: () => false,
-          setSessionMode: async () => {},
-          setSessionConfigOption: async () => {},
-          clearEventHandlers: () => {},
-          setEventHandlers: () => {},
-        }) as never,
-    },
-  );
-
-  const [first, second] = await Promise.all([
-    manager.ensureSession({
+    const next = await manager.ensureSession({
       sessionKey: "oneshot-session",
       agent: "codex",
       mode: "oneshot",
-    }),
-    manager.ensureSession({
-      sessionKey: "oneshot-session",
-      agent: "codex",
-      mode: "oneshot",
-    }),
-  ]);
+      sessionOptions: scenario.second,
+    });
+    assert.notEqual(
+      next.acpxRecordId,
+      second.acpxRecordId,
+      "a consumed one-shot owner must not be reused",
+    );
+    assert.equal(createdSessions, initializedCount + 1);
+    assert.equal(store.records.size, initializedCount + 1);
 
-  assert.equal(first.acpxRecordId, second.acpxRecordId);
-  assert.equal(first.acpSessionId, second.acpSessionId);
-  assert.equal(first.name, "oneshot-session");
-  assert.equal(second.name, "oneshot-session");
-  assert.equal(createdSessions, 1);
-  assert.equal(store.records.size, 1);
-  assert.equal(closeCalls, 0);
-
-  const turn = manager.startTurn({
-    handle: createHandle("oneshot-session", second.acpxRecordId),
-    text: "hello",
-    mode: "prompt",
-    sessionMode: "oneshot",
-    requestId: "req-oneshot",
+    await manager.close(createHandle("oneshot-session", next.acpxRecordId));
+    assert.equal(closeCalls, 2);
+    if (!scenario.reuse) {
+      await manager.close(createHandle("oneshot-session", first.acpxRecordId));
+      assert.equal(closeCalls, 3, "a distinct earlier one-shot record keeps its own owner");
+    }
   });
-  assert.deepEqual((await collectTurn(turn)).result, {
-    status: "completed",
-    stopReason: "end_turn",
-    promptMessageId: "req-oneshot",
-    runtimeRequestId: "req-oneshot",
-  });
-  assert.equal(loadSessionCalls, 0);
-  assert.equal(closeCalls, 1);
-
-  const next = await manager.ensureSession({
-    sessionKey: "oneshot-session",
-    agent: "codex",
-    mode: "oneshot",
-  });
-  assert.notEqual(next.acpxRecordId, second.acpxRecordId);
-  assert.equal(createdSessions, 2);
-  assert.equal(store.records.size, 2);
-
-  await manager.close(createHandle("oneshot-session", next.acpxRecordId));
-  assert.equal(closeCalls, 2);
-});
+}
 
 test("AcpRuntimeManager closes retained oneshot owners on pre-turn exits", async () => {
   const store = new InMemorySessionStore();
@@ -637,8 +578,6 @@ test("AcpRuntimeManager closes retained oneshot owners on pre-turn exits", async
   assert.deepEqual((await collectTurn(cancelled)).result, {
     status: "cancelled",
     stopReason: "cancelled",
-    promptMessageId: "req-cancelled-before-turn",
-    runtimeRequestId: "req-cancelled-before-turn",
   });
   assert.equal(closeCalls, 1);
 
@@ -741,24 +680,14 @@ test("AcpRuntimeManager streams runtime events and saves updated status", async 
     { type: "text_delta", text: "hello", stream: "output", tag: "agent_message_chunk" },
     { type: "status", text: "write_file ok saved notes.md" },
   ]);
-  assertTurnResult(result, "completed", "end_turn");
-  assert.deepEqual((result as { _meta?: unknown })._meta, {
-    transport: { model: "gpt-5.6-sol", effort: "xhigh" },
+  assert.deepEqual(result, {
+    status: "completed",
+    stopReason: "end_turn",
+    _meta: { transport: { model: "gpt-5.6-sol", effort: "xhigh" } },
   });
 
   const saved = await store.load("turn-session");
   assert.equal(saved?.lastRequestId, "req-1");
-  assert.equal(
-    saved?.messages.find((message) => typeof message === "object" && "User" in message)?.User.id,
-    "req-1",
-  );
-  assert.deepEqual(saved?.acpx?.turn_results?.["req-1"], {
-    status: "completed",
-    prompt_message_id: "req-1",
-    started_at: saved?.acpx?.turn_results?.["req-1"]?.started_at,
-    completed_at: saved?.acpx?.turn_results?.["req-1"]?.completed_at,
-    stop_reason: "end_turn",
-  });
   assert.equal(saved?.lastPromptAt != null, true);
   assert.equal(saved?.pid, 999);
   assert.equal(saved?.protocolVersion, 1);
@@ -895,12 +824,7 @@ test("AcpRuntimeManager resolves promptStarted while the submitted prompt is pen
 
   await turn.promptStarted;
   resolvePrompt({ stopReason: "end_turn" });
-  assert.deepEqual(await turn.result, {
-    status: "completed",
-    stopReason: "end_turn",
-    promptMessageId: "req-prompt-started",
-    runtimeRequestId: "req-prompt-started",
-  });
+  assert.deepEqual(await turn.result, { status: "completed", stopReason: "end_turn" });
 });
 
 test("AcpRuntimeManager rejects promptStarted when the turn fails before submission", async () => {
@@ -1079,12 +1003,7 @@ test("AcpRuntimeManager rejects promptStarted when cancelled before submission",
   });
 
   await assert.rejects(turn.promptStarted, /cancelled before prompt submission/);
-  assert.deepEqual(await turn.result, {
-    status: "cancelled",
-    stopReason: "cancelled",
-    promptMessageId: "req-prompt-cancelled",
-    runtimeRequestId: "req-prompt-cancelled",
-  });
+  assert.deepEqual(await turn.result, { status: "cancelled", stopReason: "cancelled" });
 });
 
 test("AcpRuntimeManager keeps promptStarted resolved when submission later fails", async () => {
@@ -1217,7 +1136,7 @@ test("AcpRuntimeManager persists prompt response usage and surfaces it in status
   });
   const { result } = await collectTurn(turn);
 
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   const saved = await store.load("response-usage-session");
   assert.ok(saved);
   const userMessage = saved.messages.find(
@@ -1320,7 +1239,7 @@ test("AcpRuntimeManager restores persisted session env when reconnecting startTu
   });
   const { result } = await collectTurn(turn);
 
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   assert.deepEqual((factoryCalls[0] as { sessionOptions?: unknown }).sessionOptions, {
     env: {
       GIT_AUTHOR_EMAIL: "turn-env@example.local",
@@ -1343,21 +1262,7 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
   let factoryCalls = 0;
   let closeCalls = 0;
   let promptCalls = 0;
-  let outOfTurnUpdateCalls = 0;
-  let resolveOutOfTurnUpdate: (() => void) | undefined;
-  const outOfTurnUpdate = new Promise<void>((resolve) => {
-    resolveOutOfTurnUpdate = resolve;
-  });
   let handlers: FakeClientHandlers = {};
-  let bufferedSessionUpdates: Record<string, unknown>[] = [];
-  let injectTransitionUpdate = true;
-  const emitSessionUpdate = (notification: Record<string, unknown>) => {
-    if (handlers.onSessionUpdate) {
-      handlers.onSessionUpdate(notification);
-    } else {
-      bufferedSessionUpdates.push(notification);
-    }
-  };
   const client: FakeClient = {
     initializeResult: {
       protocolVersion: 1,
@@ -1381,7 +1286,7 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
     prompt: async (sessionId) => {
       promptCalls += 1;
       assert.equal(sessionId, "pooled-sid");
-      emitSessionUpdate({
+      handlers.onSessionUpdate?.({
         sessionId: "pooled-sid",
         update: {
           sessionUpdate: "agent_message_chunk",
@@ -1397,36 +1302,13 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
     setSessionConfigOption: async () => {},
     clearEventHandlers: () => {
       handlers = {};
-      if (injectTransitionUpdate) {
-        injectTransitionUpdate = false;
-        emitSessionUpdate({
-          sessionId: "pooled-sid",
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "idle update" },
-          },
-        });
-      }
     },
     setEventHandlers: (nextHandlers) => {
       handlers = nextHandlers;
-      const pending = bufferedSessionUpdates;
-      bufferedSessionUpdates = [];
-      for (const notification of pending) {
-        handlers.onSessionUpdate?.(notification);
-      }
     },
   };
   const manager = new AcpRuntimeManager(
-    {
-      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-      onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
-        assert.equal(sessionKey, "pooled-persistent-session");
-        assert.equal(updateTag, "agent_message_chunk");
-        outOfTurnUpdateCalls += 1;
-        resolveOutOfTurnUpdate?.();
-      },
-    },
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
     {
       clientFactory: () => {
         factoryCalls += 1;
@@ -1444,10 +1326,6 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
       requestId: "req-pooled-1",
     }),
   );
-  await outOfTurnUpdate;
-  assert.equal(typeof handlers.onSessionUpdate, "function");
-  assert.equal(handlers.onClientOperation, undefined);
-
   const secondEvents = await collectEvents(
     manager.runTurn({
       handle: createHandle("pooled-persistent-session"),
@@ -1461,7 +1339,6 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
   assert.equal(factoryCalls, 1);
   assert.equal(promptCalls, 2);
   assert.equal(closeCalls, 0);
-  assert.equal(outOfTurnUpdateCalls, 1);
   assert.deepEqual(firstEvents, [
     { type: "text_delta", text: "turn 1", stream: "output", tag: "agent_message_chunk" },
     { type: "done", stopReason: "end_turn" },
@@ -1470,8 +1347,6 @@ test("AcpRuntimeManager keeps reusable persistent clients pooled across turns an
     { type: "text_delta", text: "turn 2", stream: "output", tag: "agent_message_chunk" },
     { type: "done", stopReason: "end_turn" },
   ]);
-  const saved = await store.load("pooled-persistent-session");
-  assert.equal(JSON.stringify(saved?.messages).includes("idle update"), true);
 
   await manager.close(createHandle("pooled-persistent-session"));
 
@@ -1617,7 +1492,7 @@ test("AcpRuntimeManager retains a reusable persistent client across turns", asyn
     });
     const { events, result } = await collectTurn(turn);
     assert.deepEqual(events, []);
-    assertTurnResult(result, "completed", "end_turn");
+    assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   }
 
   assert.equal(constructed, 1);
@@ -1993,12 +1868,7 @@ test("AcpRuntimeManager projects session updates before, during, and after turns
     requestId: "req-owned-session",
   });
   const result = await collectTurn(turn);
-  assert.deepEqual(result.result, {
-    status: "completed",
-    stopReason: "end_turn",
-    promptMessageId: "req-owned-session",
-    runtimeRequestId: "req-owned-session",
-  });
+  assert.deepEqual(result.result, { status: "completed", stopReason: "end_turn" });
   assert.equal(
     result.events.filter(
       (event) => event.type === "status" && event.availableCommands?.[0]?.name === "during-turn",
@@ -2016,104 +1886,117 @@ test("AcpRuntimeManager projects session updates before, during, and after turns
   assert.equal(closeCalls, 1);
 });
 
-test("AcpRuntimeManager closeStream suppresses future live events while preserving terminal completion", async () => {
-  const record = makeSessionRecord({
-    acpxRecordId: "stream-close-session",
-    acpSessionId: "stream-close-sid",
-    agentCommand: "codex --acp",
-    cwd: "/workspace",
-  });
-  const store = new InMemorySessionStore([record]);
-  let handlers: FakeClientHandlers = {};
-  let resolvePromptStart!: () => void;
-  let resolvePrompt!: (value: { stopReason: string }) => void;
-  const promptStarted = new Promise<void>((resolve) => {
-    resolvePromptStart = resolve;
-  });
-  const promptResult = new Promise<{ stopReason: string }>((resolve) => {
-    resolvePrompt = resolve;
-  });
-  const client: FakeClient = {
-    start: async () => {},
-    close: async () => {},
-    createSession: async () => ({ sessionId: "unused" }),
-    loadSession: async () => ({ agentSessionId: "unused" }),
-    hasReusableSession: () => true,
-    supportsLoadSession: () => true,
-    supportsResumeSession: () => false,
-    loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
-    getAgentLifecycleSnapshot: () => ({ running: true }),
-    prompt: async () => {
-      resolvePromptStart();
-      return await promptResult;
-    },
-    requestCancelActivePrompt: async () => false,
-    hasActivePrompt: () => true,
-    setSessionMode: async () => {},
-    setSessionConfigOption: async () => {},
-    clearEventHandlers: () => {
-      handlers = {};
-    },
-    setEventHandlers: (nextHandlers) => {
-      handlers = nextHandlers;
-    },
-  };
-  const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-    {
-      clientFactory: () => client as never,
-    },
-  );
+for (const stopReading of ["closeStream", "break"] as const) {
+  test(`AcpRuntimeManager ${stopReading} suppresses future live events while preserving terminal completion`, async () => {
+    const record = makeSessionRecord({
+      acpxRecordId: "stream-close-session",
+      acpSessionId: "stream-close-sid",
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+    });
+    const store = new InMemorySessionStore([record]);
+    let handlers: FakeClientHandlers = {};
+    let resolvePromptStart!: () => void;
+    let resolvePrompt!: (value: { stopReason: string }) => void;
+    const promptStarted = new Promise<void>((resolve) => {
+      resolvePromptStart = resolve;
+    });
+    const promptResult = new Promise<{ stopReason: string }>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const client: FakeClient = {
+      start: async () => {},
+      close: async () => {},
+      createSession: async () => ({ sessionId: "unused" }),
+      loadSession: async () => ({ agentSessionId: "unused" }),
+      hasReusableSession: () => true,
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      prompt: async () => {
+        resolvePromptStart();
+        return await promptResult;
+      },
+      requestCancelActivePrompt: async () => false,
+      hasActivePrompt: () => true,
+      setSessionMode: async () => {},
+      setSessionConfigOption: async () => {},
+      clearEventHandlers: () => {
+        handlers = {};
+      },
+      setEventHandlers: (nextHandlers) => {
+        handlers = nextHandlers;
+      },
+    };
+    const manager = new AcpRuntimeManager(
+      createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      {
+        clientFactory: () => client as never,
+      },
+    );
 
-  const turn = manager.startTurn({
-    handle: createHandle("stream-close-session"),
-    text: "hello",
-    mode: "prompt",
-    sessionMode: "persistent",
-    requestId: "req-close-stream",
-  });
-  const iterator = turn.events[Symbol.asyncIterator]();
+    const turn = manager.startTurn({
+      handle: createHandle("stream-close-session"),
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "req-close-stream",
+    });
+    const iterator = turn.events[Symbol.asyncIterator]();
 
-  const firstEventPromise = iterator.next();
-  await promptStarted;
-  handlers.onSessionUpdate?.({
-    sessionId: "stream-close-sid",
-    update: {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "visible" },
-    },
-  });
+    const firstEventPromise =
+      stopReading === "break"
+        ? (async () => {
+            let firstEvent: AcpRuntimeEvent | undefined;
+            for await (const event of turn.events) {
+              firstEvent = event;
+              break;
+            }
+            return { done: false, value: firstEvent };
+          })()
+        : iterator.next();
+    await promptStarted;
+    handlers.onSessionUpdate?.({
+      sessionId: "stream-close-sid",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "visible" },
+      },
+    });
 
-  assert.deepEqual(await firstEventPromise, {
-    done: false,
-    value: { type: "text_delta", text: "visible", stream: "output", tag: "agent_message_chunk" },
-  });
+    assert.deepEqual(await firstEventPromise, {
+      done: false,
+      value: { type: "text_delta", text: "visible", stream: "output", tag: "agent_message_chunk" },
+    });
 
-  await turn.closeStream({
-    reason: "observer closed stream",
-  });
+    if (stopReading === "closeStream") {
+      await turn.closeStream({ reason: "observer closed stream" });
+    }
 
-  handlers.onSessionUpdate?.({
-    sessionId: "stream-close-sid",
-    update: {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "suppressed" },
-    },
-  });
-  resolvePrompt({ stopReason: "end_turn" });
+    handlers.onSessionUpdate?.({
+      sessionId: "stream-close-sid",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "suppressed" },
+      },
+    });
+    resolvePrompt({ stopReason: "end_turn" });
 
-  assert.deepEqual(await iterator.next(), {
-    done: true,
-    value: undefined,
+    assert.deepEqual(await iterator.next(), {
+      done: true,
+      value: undefined,
+    });
+    assert.deepEqual(await turn.result, {
+      status: "completed",
+      stopReason: "end_turn",
+    });
+    assert.deepEqual(await iterator.next(), {
+      done: true,
+      value: undefined,
+    });
   });
-  const terminal = await turn.result;
-  assertTurnResult(terminal, "completed", "end_turn");
-  assert.equal(terminal.status === "completed" && terminal.finalAnswer, "visiblesuppressed");
-  assert.deepEqual(await iterator.next(), {
-    done: true,
-    value: undefined,
-  });
-});
+}
 
 test("AcpRuntimeManager does not pool a persistent client after active close", async () => {
   const record = makeSessionRecord({
@@ -2124,6 +2007,7 @@ test("AcpRuntimeManager does not pool a persistent client after active close", a
   });
   const store = new InMemorySessionStore([record]);
   let closeCalls = 0;
+  let promptCalls = 0;
   let promptActive = false;
   let resolvePromptStart!: () => void;
   let resolvePrompt!: (value: { stopReason: string }) => void;
@@ -2147,6 +2031,7 @@ test("AcpRuntimeManager does not pool a persistent client after active close", a
     loadSessionWithOptions: async () => ({ agentSessionId: "active-close-agent-id" }),
     getAgentLifecycleSnapshot: () => ({ running: promptActive }),
     prompt: async () => {
+      promptCalls += 1;
       promptActive = true;
       resolvePromptStart();
       return await promptResult;
@@ -2175,6 +2060,13 @@ test("AcpRuntimeManager does not pool a persistent client after active close", a
   });
   const eventsPromise = collectEvents(turn.events);
   await promptStarted;
+  const queued = manager.startTurn({
+    handle,
+    text: "queued",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "queued-close",
+  });
 
   await manager.close(handle);
 
@@ -2186,14 +2078,181 @@ test("AcpRuntimeManager does not pool a persistent client after active close", a
 
   const events = await eventsPromise;
   const result = await turn.result;
+  assert.equal((await queued.result).status, "cancelled");
   closed = await store.load("active-close-session");
 
   assert.deepEqual(events, []);
-  assertTurnResult(result, "cancelled", "cancelled");
+  assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
   assert.equal(closeCalls, 1);
+  assert.equal(promptCalls, 1);
   assert.equal(closed?.closed, true);
   assert.equal(typeof closed?.closedAt, "string");
 });
+
+test("AcpRuntimeManager queues one record without blocking other records or active controls", async (t) => {
+  const records = ["first", "other"].map((id) =>
+    makeSessionRecord({
+      acpxRecordId: id,
+      acpSessionId: id,
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+    }),
+  );
+  const store = new InMemorySessionStore(records);
+  const starts: string[] = [];
+  const controls: string[] = [];
+  let finishFirst!: (value: { stopReason: string }) => void;
+  const blocked = new Promise<{ stopReason: string }>((resolve) => {
+    finishFirst = resolve;
+  });
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () => {
+        const client = createModelsClientFactory({})();
+        let active = false;
+        client.hasReusableSession = () => true;
+        client.hasActivePrompt = () => active;
+        client.prompt = async (sessionId, _input, onRequestWritten) => {
+          const first = sessionId === "first" && !starts.includes("first");
+          starts.push(sessionId);
+          active = true;
+          await onRequestWritten?.();
+          const result = first ? await blocked : { stopReason: "end_turn" };
+          active = false;
+          return result;
+        };
+        client.setSessionMode = async () => {
+          controls.push("mode");
+        };
+        client.requestCancelActivePrompt = async () => {
+          controls.push("cancel");
+          finishFirst({ stopReason: "cancelled" });
+          return true;
+        };
+        return client as never;
+      },
+    },
+  );
+  t.after(async () => {
+    finishFirst({ stopReason: "cancelled" });
+    await manager.shutdown();
+  });
+  const start = (id: string, requestId: string) =>
+    manager.startTurn({
+      handle: createHandle(id),
+      text: requestId,
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId,
+    });
+  const first = start("first", "first-turn");
+  await first.promptStarted;
+  const next = start("first", "next-turn");
+  const cancelled = start("first", "cancelled-queued-turn");
+  await cancelled.cancel();
+  const other = start("other", "independent-turn");
+  assert.equal((await other.result).status, "completed");
+  assert.deepEqual(starts, ["first", "other"]);
+  await manager.setMode(createHandle("first"), "plan");
+  await manager.cancel(createHandle("first"));
+  assert.equal((await first.result).status, "cancelled");
+  assert.equal((await next.result).status, "completed");
+  assert.equal((await cancelled.result).status, "cancelled");
+  assert.deepEqual(starts, ["first", "other", "first"]);
+  assert.deepEqual(controls, ["mode", "cancel"]);
+});
+
+for (const active of [false, true]) {
+  test(`AcpRuntimeManager rejects fresh preparation when ${active ? "active" : "idle"} owner finalization fails`, async (t) => {
+    const store = new InMemorySessionStore();
+    let failClose = true;
+    let handlers: FakeClientHandlers = {};
+    let finishPrompt!: (value: { stopReason: string }) => void;
+    const prompt = new Promise<{ stopReason: string }>((resolve) => {
+      finishPrompt = resolve;
+    });
+    const client: FakeClient = {
+      start: async () => {},
+      close: async () => {
+        if (failClose) {
+          throw new Error("owner finalization failed");
+        }
+      },
+      createSession: async () => ({ sessionId: "retirement-backend" }),
+      loadSession: async () => ({}),
+      hasReusableSession: () => true,
+      supportsLoadSession: () => true,
+      loadSessionWithOptions: async () => ({}),
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      prompt: async (sessionId, _input, onRequestWritten) => {
+        await onRequestWritten?.();
+        handlers.onSessionUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "recovered" },
+          },
+        });
+        return await prompt;
+      },
+      requestCancelActivePrompt: async () => {
+        finishPrompt({ stopReason: "cancelled" });
+        return true;
+      },
+      hasActivePrompt: () => active,
+      setSessionMode: async () => {},
+      setSessionConfigOption: async () => {},
+      clearEventHandlers: () => {
+        handlers = {};
+      },
+      setEventHandlers: (next) => {
+        handlers = next;
+      },
+    };
+    const manager = new AcpRuntimeManager(
+      createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      { clientFactory: () => client as never },
+    );
+    t.after(async () => {
+      failClose = false;
+      finishPrompt({ stopReason: "cancelled" });
+      await manager.shutdown();
+    });
+    const record = await manager.ensureSession({
+      sessionKey: "retirement",
+      agent: "codex",
+      mode: "persistent",
+    });
+    const handle = createHandle("retirement", record.acpxRecordId);
+    if (active) {
+      const turn = manager.startTurn({
+        handle,
+        text: "stay active",
+        mode: "prompt",
+        sessionMode: "persistent",
+        requestId: "retirement",
+      });
+      await turn.promptStarted;
+    }
+
+    await assert.rejects(manager.prepareFreshSession(handle), /owner finalization failed/);
+    assert.equal((await store.load(record.acpxRecordId))?.acpx?.reset_on_next_ensure, undefined);
+    await assert.rejects(manager.prepareFreshSession(handle), /owner finalization failed/);
+    assert.equal((await store.load(record.acpxRecordId))?.acpx?.reset_on_next_ensure, undefined);
+    failClose = false;
+    finishPrompt({ stopReason: "end_turn" });
+    const retry = manager.startTurn({
+      handle,
+      text: "retry",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "retry",
+    });
+    const { events } = await collectTurn(retry);
+    assert.ok(events.some((event) => event.type === "text_delta" && event.text === "recovered"));
+  });
+}
 
 test("AcpRuntimeManager live checkpoints preserve active close state", async () => {
   const record = makeSessionRecord({
@@ -2283,7 +2342,7 @@ test("AcpRuntimeManager live checkpoints preserve active close state", async () 
   await turn.result;
 });
 
-test("AcpRuntimeManager accepts a session reply even when the prompt RPC times out", async () => {
+test("AcpRuntimeManager preserves partial output but fails an unresolved timed-out prompt", async () => {
   const record = makeSessionRecord({
     acpxRecordId: "late-reply-session",
     acpSessionId: "late-reply-sid",
@@ -2345,10 +2404,13 @@ test("AcpRuntimeManager accepts a session reply even when the prompt RPC times o
   assert.deepEqual(events, [
     { type: "text_delta", text: "late reply", stream: "output", tag: "agent_message_chunk" },
   ]);
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, {
+    status: "failed",
+    error: { code: "TIMEOUT", message: "Timed out after 20ms" },
+  });
 });
 
-test("AcpRuntimeManager waits for late reply chunks to settle before ending a salvaged turn", async () => {
+test("AcpRuntimeManager preserves a final response and chunks arriving during timeout draining", async () => {
   const record = makeSessionRecord({
     acpxRecordId: "late-reply-stream-session",
     acpSessionId: "late-reply-stream-sid",
@@ -2358,6 +2420,18 @@ test("AcpRuntimeManager waits for late reply chunks to settle before ending a sa
   const store = new InMemorySessionStore([record]);
   let handlers: FakeClientHandlers = {};
   let lastUpdateAt = Date.now();
+  let resolvePrompt!: (response: {
+    stopReason: string;
+    usage: { inputTokens: number };
+    _meta: { turn: string };
+  }) => void;
+  const pending = new Promise<{
+    stopReason: string;
+    usage: { inputTokens: number };
+    _meta: { turn: string };
+  }>((resolve) => {
+    resolvePrompt = resolve;
+  });
   const client: FakeClient = {
     start: async () => {},
     close: async () => {},
@@ -2388,8 +2462,13 @@ test("AcpRuntimeManager waits for late reply chunks to settle before ending a sa
             content: { type: "text", text: " reply" },
           },
         });
+        resolvePrompt({
+          stopReason: "max_tokens",
+          usage: { inputTokens: 17 },
+          _meta: { turn: "late-response" },
+        });
       }, 300);
-      return await new Promise<{ stopReason: string }>(() => {});
+      return await pending;
     },
     requestCancelActivePrompt: async () => false,
     hasActivePrompt: () => true,
@@ -2433,7 +2512,12 @@ test("AcpRuntimeManager waits for late reply chunks to settle before ending a sa
     { type: "text_delta", text: "late", stream: "output", tag: "agent_message_chunk" },
     { type: "text_delta", text: " reply", stream: "output", tag: "agent_message_chunk" },
   ]);
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, {
+    status: "completed",
+    stopReason: "max_tokens",
+    _meta: { turn: "late-response" },
+  });
+  assert.equal((await store.load(record.acpxRecordId))?.cumulative_token_usage.input_tokens, 17);
 });
 
 test("AcpRuntimeManager routes controls through the active controller while a turn is running", async () => {
@@ -2542,9 +2626,8 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
   assert.deepEqual(liveStatusAfterTurn.details?.configOptions, expectedConfigOptions);
   assert.equal(cancelRequested, 1);
   assert.deepEqual(events, []);
-  assertTurnResult(result, "cancelled", "cancelled");
+  assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
   assert.equal(typeof handlers.onSessionUpdate, "function");
-  assert.equal(handlers.onClientOperation, undefined);
 });
 
 test("AcpRuntimeManager rejects unsupported advertised config option keys after refresh", async () => {
@@ -2930,7 +3013,7 @@ test("AcpRuntimeManager maps active thinking controls and persists the accepted 
       value: "high",
     },
   ]);
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   assert.deepEqual(events, []);
   assert.deepEqual((await store.load(record.acpxRecordId))?.acpx?.desired_config_options, {
     effort: "medium",
@@ -3132,94 +3215,216 @@ test("AcpRuntimeManager waits for active load refresh before resolving generic c
       value: "high",
     },
   ]);
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   assert.deepEqual(events, []);
 });
 
-test("AcpRuntimeManager waits for oneshot load fallback to resolve before sending controls", async () => {
-  const record = makeSessionRecord({
-    acpxRecordId: "fallback-session",
-    acpSessionId: "stale-session",
-    agentCommand: "codex --acp",
-    cwd: "/workspace",
-  });
-  const store = new InMemorySessionStore([record]);
-  let promptActive = false;
-  let promptSessionId: string | undefined;
-  let setModeSessionId: string | undefined;
-  let resolveLoadFailure!: () => void;
-  const loadFailure = new Promise<void>((resolve) => {
-    resolveLoadFailure = resolve;
-  });
-  let resolvePromptStarted!: () => void;
-  const promptStarted = new Promise<void>((resolve) => {
-    resolvePromptStarted = resolve;
-  });
-  let resolvePrompt!: (value: { stopReason: string }) => void;
-  const promptResult = new Promise<{ stopReason: string }>((resolve) => {
-    resolvePrompt = resolve;
-  });
-  const client: FakeClient = {
-    start: async () => {},
-    close: async () => {},
-    createSession: async () => ({ sessionId: "fresh-session", agentSessionId: "fresh-agent" }),
-    loadSession: async () => ({ agentSessionId: "unused" }),
-    hasReusableSession: () => false,
-    supportsLoadSession: () => true,
-    supportsResumeSession: () => false,
-    loadSessionWithOptions: async () => {
-      await loadFailure;
-      throw { error: { code: -32002, message: "session not found" } };
-    },
-    getAgentLifecycleSnapshot: () => ({ running: true }),
-    prompt: async (sessionId) => {
-      promptActive = true;
-      promptSessionId = sessionId;
-      resolvePromptStarted();
-      return await promptResult;
-    },
-    requestCancelActivePrompt: async () => {
-      promptActive = false;
-      resolvePrompt({ stopReason: "cancelled" });
-      return true;
-    },
-    hasActivePrompt: () => promptActive,
-    setSessionMode: async (sessionId, modeId) => {
-      assert.equal(modeId, "plan");
-      setModeSessionId = sessionId;
-    },
-    setSessionConfigOption: async () => {},
-    clearEventHandlers: () => {},
-    setEventHandlers: () => {},
-  };
-  const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-    {
-      clientFactory: () => client as never,
-    },
-  );
+test(
+  "AcpRuntimeManager waits for oneshot load fallback to resolve before sending controls",
+  { timeout: 5_000 },
+  async (t) => {
+    const record = makeSessionRecord({
+      acpxRecordId: "fallback-session",
+      acpSessionId: "stale-session",
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+    });
+    const store = new InMemorySessionStore([record]);
+    const loadEntered = createDeferred<void>();
+    const releaseLoad = createDeferred<void>();
+    const promptEntered = createDeferred<void>();
+    const promptResult = createDeferred<{ stopReason: string }>();
+    const calls: {
+      method:
+        | "factory"
+        | "start"
+        | "load"
+        | "release-load"
+        | "create"
+        | "mode"
+        | "prompt"
+        | "cancel"
+        | "close";
+      client?: number;
+      sessionId?: string;
+      modeId?: string;
+    }[] = [];
+    let factoryCalls = 0;
+    const manager = new AcpRuntimeManager(
+      createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      {
+        clientFactory: () => {
+          const clientId = ++factoryCalls;
+          let createdSessions = 0;
+          let promptActive = false;
+          calls.push({ method: "factory", client: clientId });
+          const client: FakeClient = {
+            start: async () => {
+              calls.push({ method: "start", client: clientId });
+            },
+            close: async () => {
+              calls.push({ method: "close", client: clientId });
+            },
+            createSession: async (cwd) => {
+              assert.equal(cwd, record.cwd);
+              const sessionId = `fresh-client-${clientId}-session-${++createdSessions}`;
+              calls.push({ method: "create", client: clientId, sessionId });
+              return { sessionId, agentSessionId: `agent-${sessionId}` };
+            },
+            loadSession: async () => ({ agentSessionId: "unused" }),
+            hasReusableSession: () => false,
+            supportsLoadSession: () => true,
+            supportsResumeSession: () => false,
+            loadSessionWithOptions: async (sessionId, cwd, options) => {
+              calls.push({ method: "load", client: clientId, sessionId });
+              assert.equal(sessionId, record.acpSessionId);
+              assert.equal(cwd, record.cwd);
+              assert.equal(options.suppressReplayUpdates, true);
+              loadEntered.resolve();
+              await releaseLoad.promise;
+              throw { error: { code: -32002, message: "session not found" } };
+            },
+            getAgentLifecycleSnapshot: () => ({ running: true }),
+            prompt: async (sessionId) => {
+              promptActive = true;
+              calls.push({ method: "prompt", client: clientId, sessionId });
+              promptEntered.resolve();
+              return await promptResult.promise;
+            },
+            requestCancelActivePrompt: async () => {
+              calls.push({ method: "cancel", client: clientId });
+              promptActive = false;
+              promptResult.resolve({ stopReason: "cancelled" });
+              return true;
+            },
+            hasActivePrompt: () => promptActive,
+            setSessionMode: async (sessionId, modeId) => {
+              calls.push({ method: "mode", client: clientId, sessionId, modeId });
+            },
+            setSessionConfigOption: async () => {},
+            clearEventHandlers: () => {},
+            setEventHandlers: () => {},
+          };
+          return client as never;
+        },
+      },
+    );
 
-  const turn = manager.startTurn({
-    handle: createHandle("fallback-session"),
-    text: "hello",
-    mode: "prompt",
-    sessionMode: "oneshot",
-    requestId: "req-fallback",
-  });
-  const eventsPromise = collectEvents(turn.events);
-  const setModePromise = manager.setMode(createHandle("fallback-session"), "plan", "oneshot");
-  resolveLoadFailure();
-  await setModePromise;
-  await promptStarted;
-  await turn.cancel();
-  const events = await eventsPromise;
-  const result = await turn.result;
+    const handle = createHandle("fallback-session");
+    const turn = manager.startTurn({
+      handle,
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "oneshot",
+      requestId: "req-fallback",
+    });
+    const eventsPromise = collectEvents(turn.events);
+    const pending: Promise<unknown>[] = [eventsPromise, turn.result];
+    void Promise.allSettled(pending);
+    const aborted = createDeferred<never>();
+    const releaseGates = () => {
+      releaseLoad.resolve();
+      promptResult.resolve({ stopReason: "cancelled" });
+    };
+    const onAbort = () => {
+      releaseGates();
+      aborted.reject(t.signal.reason);
+    };
+    t.signal.addEventListener("abort", onAbort, { once: true });
+    const waitFor = <T>(promise: Promise<T>): Promise<T> =>
+      Promise.race([promise, aborted.promise]);
+    const failures: unknown[] = [];
 
-  assert.equal(setModeSessionId, "fresh-session");
-  assert.equal(promptSessionId, "fresh-session");
-  assert.deepEqual(events, []);
-  assertTurnResult(result, "cancelled", "cancelled");
-});
+    try {
+      await waitFor(loadEntered.promise);
+      let controlSettled = false;
+      const setModePromise = manager.setMode(handle, "plan", "oneshot");
+      pending.push(setModePromise);
+      void setModePromise.then(
+        () => {
+          controlSettled = true;
+        },
+        () => {
+          controlSettled = true;
+        },
+      );
+      // Load entry is the prerequisite; drain runnable work with that load still held.
+      await waitFor(nextTurn());
+      assert.deepEqual(calls, [
+        { method: "factory", client: 1 },
+        { method: "start", client: 1 },
+        { method: "load", client: 1, sessionId: "stale-session" },
+      ]);
+      assert.equal(controlSettled, false, "the control must wait for the held load");
+
+      calls.push({ method: "release-load" });
+      releaseLoad.resolve();
+      await waitFor(setModePromise);
+      await waitFor(promptEntered.promise);
+      const cancelPromise = turn.cancel();
+      pending.push(cancelPromise);
+      await waitFor(cancelPromise);
+      const events = await waitFor(eventsPromise);
+      const result = await waitFor(turn.result);
+      const sessionId = "fresh-client-1-session-1";
+      assert.deepEqual(
+        calls.filter((call) => call.method !== "prompt"),
+        [
+          { method: "factory", client: 1 },
+          { method: "start", client: 1 },
+          { method: "load", client: 1, sessionId: "stale-session" },
+          { method: "release-load" },
+          { method: "create", client: 1, sessionId },
+          { method: "mode", client: 1, sessionId, modeId: "plan" },
+          { method: "cancel", client: 1 },
+          { method: "close", client: 1 },
+        ],
+      );
+      assert.deepEqual(
+        calls.filter((call) => call.method === "prompt"),
+        [{ method: "prompt", client: 1, sessionId }],
+      );
+      assert.ok(
+        calls.findIndex((call) => call.method === "create") <
+          calls.findIndex((call) => call.method === "prompt"),
+      );
+      assert.deepEqual(events, []);
+      assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
+    } catch (error) {
+      failures.push(error);
+    } finally {
+      releaseGates();
+      let cleanupTimer: NodeJS.Timeout | undefined;
+      try {
+        const outcomes = await Promise.race([
+          Promise.allSettled(pending),
+          new Promise<never>((_resolve, reject) => {
+            cleanupTimer = setTimeout(
+              () => reject(new Error("fallback/control test cleanup did not settle")),
+              1_000,
+            );
+          }),
+        ]);
+        for (const outcome of outcomes) {
+          if (outcome.status === "rejected" && !failures.includes(outcome.reason)) {
+            failures.push(outcome.reason);
+          }
+        }
+      } catch (error) {
+        failures.push(error);
+      } finally {
+        clearTimeout(cleanupTimer);
+        t.signal.removeEventListener("abort", onAbort);
+      }
+    }
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "fallback/control test and cleanup failed");
+    }
+  },
+);
 
 test("AcpRuntimeManager honors aborts requested before prompt starts after oneshot load fallback", async () => {
   const record = makeSessionRecord({
@@ -3289,7 +3494,7 @@ test("AcpRuntimeManager honors aborts requested before prompt starts after onesh
   assert.equal(promptCalled, false);
   assert.equal(cancelCalls, 0);
   assert.deepEqual(events, []);
-  assertTurnResult(result, "cancelled", "cancelled");
+  assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
 });
 
 test("AcpRuntimeManager handles offline oneshot controls, status, close, and missing records", async () => {
@@ -3775,8 +3980,6 @@ test("AcpRuntimeManager surfaces normalized prompt failures", async () => {
   assert.deepEqual(events, []);
   assert.deepEqual(result, {
     status: "failed",
-    promptMessageId: "req-error",
-    runtimeRequestId: "req-error",
     error: {
       code: "RUNTIME",
       detailCode: "AGENT_DISCONNECTED",
@@ -3898,202 +4101,287 @@ test("AcpRuntimeManager maps audio attachments into ACP prompt blocks", async ()
   });
   const { result } = await collectTurn(turn);
 
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   assert.deepEqual(capturedPrompt, [
     { type: "text", text: "transcribe" },
     { type: "audio", mimeType: "audio/wav", data: "UklGRg==" },
   ]);
 });
 
-test("AcpRuntimeManager keeps failed reconnect results pending until PID persistence and client cleanup complete", async () => {
-  const runtimePid = 424_242;
-  let releaseFinalSave!: () => void;
-  const finalSaveGate = new Promise<void>((resolve) => {
-    releaseFinalSave = resolve;
-  });
-  let signalFinalSaveStarted!: () => void;
-  const finalSaveStarted = new Promise<void>((resolve) => {
-    signalFinalSaveStarted = resolve;
-  });
-  let finalSaveBlocked = false;
-  class LeaseRaceSessionStore extends InMemorySessionStore {
-    override async save(record: AcpSessionRecord): Promise<void> {
-      if (record.pid === runtimePid && !finalSaveBlocked) {
-        finalSaveBlocked = true;
-        signalFinalSaveStarted();
-        await finalSaveGate;
+test(
+  "AcpRuntimeManager keeps failed reconnect results pending until PID persistence and client cleanup complete",
+  { timeout: 5_000 },
+  async (t) => {
+    const runtimePid = 424_242;
+    let releaseFinalSave!: () => void;
+    const finalSaveGate = new Promise<void>((resolve) => {
+      releaseFinalSave = resolve;
+    });
+    let signalFinalSaveStarted!: () => void;
+    const finalSaveStarted = new Promise<void>((resolve) => {
+      signalFinalSaveStarted = resolve;
+    });
+    let finalSaveBlocked = false;
+    class LeaseRaceSessionStore extends InMemorySessionStore {
+      override async save(record: AcpSessionRecord): Promise<void> {
+        if (record.pid === runtimePid && !finalSaveBlocked) {
+          finalSaveBlocked = true;
+          signalFinalSaveStarted();
+          await finalSaveGate;
+        }
+        await super.save(record);
       }
-      await super.save(record);
     }
-  }
 
-  const record = makeSessionRecord({
-    acpxRecordId: "failed-reconnect-lease-session",
-    acpSessionId: "stale-backend-session",
-    agentCommand: "codex --acp",
-    cwd: "/workspace",
-    pid: 2_147_483_647,
-  });
-  const store = new LeaseRaceSessionStore([record]);
-  let clientCloseCompleted = false;
-  let promptCalled = false;
-  const client: FakeClient = {
-    start: async () => {},
-    close: async () => {
-      clientCloseCompleted = true;
-    },
-    createSession: async () => ({ sessionId: "unused" }),
-    loadSession: async () => ({ agentSessionId: "unused" }),
-    hasReusableSession: () => false,
-    supportsLoadSession: () => true,
-    supportsResumeSession: () => false,
-    loadSessionWithOptions: async () => {
-      throw new Error("saved session cannot be loaded");
-    },
-    getAgentLifecycleSnapshot: () => ({
-      pid: runtimePid,
-      startedAt: "2026-01-01T00:01:00.000Z",
-      running: true,
-    }),
-    prompt: async () => {
-      promptCalled = true;
-      return { stopReason: "end_turn" };
-    },
-    requestCancelActivePrompt: async () => false,
-    hasActivePrompt: () => false,
-    setSessionMode: async () => {},
-    setSessionConfigOption: async () => {},
-    clearEventHandlers: () => {},
-    setEventHandlers: () => {},
-  };
-  const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-    { clientFactory: () => client as never },
-  );
+    const record = makeSessionRecord({
+      acpxRecordId: "failed-reconnect-lease-session",
+      acpSessionId: "stale-backend-session",
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+      pid: 2_147_483_647,
+    });
+    const store = new LeaseRaceSessionStore([record]);
+    const closeEntered = createDeferred<void>();
+    const releaseClose = createDeferred<void>();
+    const closeCompleted = createDeferred<void>();
+    let clientCloseCompleted = false;
+    let promptCalled = false;
+    const client: FakeClient = {
+      start: async () => {},
+      close: async () => {
+        closeEntered.resolve();
+        await releaseClose.promise;
+        clientCloseCompleted = true;
+        closeCompleted.resolve();
+      },
+      createSession: async () => ({ sessionId: "unused" }),
+      loadSession: async () => ({ agentSessionId: "unused" }),
+      hasReusableSession: () => false,
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw new Error("saved session cannot be loaded");
+      },
+      getAgentLifecycleSnapshot: () => ({
+        pid: runtimePid,
+        startedAt: "2026-01-01T00:01:00.000Z",
+        running: true,
+      }),
+      prompt: async () => {
+        promptCalled = true;
+        return { stopReason: "end_turn" };
+      },
+      requestCancelActivePrompt: async () => false,
+      hasActivePrompt: () => false,
+      setSessionMode: async () => {},
+      setSessionConfigOption: async () => {},
+      clearEventHandlers: () => {},
+      setEventHandlers: () => {},
+    };
+    const manager = new AcpRuntimeManager(
+      createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      { clientFactory: () => client as never },
+    );
 
-  const turn = manager.startTurn({
-    handle: createHandle("failed-reconnect-lease-session"),
-    text: "hello",
-    mode: "prompt",
-    sessionMode: "persistent",
-    requestId: "req-failed-reconnect-lease",
-  });
-  const eventsPromise = collectEvents(turn.events);
-  let resultSettled = false;
-  let persistedPidAtResult: number | undefined;
-  let clientClosedAtResult = false;
-  const resultPromise = turn.result.then((result) => {
-    resultSettled = true;
-    persistedPidAtResult = store.records.get(record.acpxRecordId)?.pid;
-    clientClosedAtResult = clientCloseCompleted;
-    return result;
-  });
+    const turn = manager.startTurn({
+      handle: createHandle("failed-reconnect-lease-session"),
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "req-failed-reconnect-lease",
+    });
+    let emptyStreamReceipt: IteratorResult<AcpRuntimeEvent> | undefined;
+    const emptyStreamEnd = turn.events[Symbol.asyncIterator]()
+      .next()
+      .then((receipt) => {
+        emptyStreamReceipt = receipt;
+        return receipt;
+      });
+    let resultSettled = false;
+    let persistedPidAtResult: number | undefined;
+    let clientClosedAtResult = false;
+    let streamAtResult: IteratorResult<AcpRuntimeEvent> | undefined;
+    const resultPromise = turn.result.then((result) => {
+      resultSettled = true;
+      persistedPidAtResult = store.records.get(record.acpxRecordId)?.pid;
+      clientClosedAtResult = clientCloseCompleted;
+      streamAtResult = emptyStreamReceipt;
+      return result;
+    });
+    const settled = Promise.allSettled([emptyStreamEnd, resultPromise, closeCompleted.promise]);
+    const aborted = createDeferred<never>();
+    const releaseGates = () => {
+      releaseFinalSave();
+      releaseClose.resolve();
+    };
+    const onAbort = () => {
+      releaseGates();
+      aborted.reject(t.signal.reason);
+    };
+    t.signal.addEventListener("abort", onAbort, { once: true });
+    const waitFor = <T>(pending: Promise<T>): Promise<T> =>
+      Promise.race([pending, aborted.promise]);
 
-  await finalSaveStarted;
-  await Promise.resolve();
-  assert.equal(resultSettled, false);
-  releaseFinalSave();
+    try {
+      await waitFor(finalSaveStarted);
+      await nextTurn();
+      assert.equal(resultSettled, false, "the result must wait for PID persistence");
+      releaseFinalSave();
 
-  const result = await resultPromise;
-  assert.deepEqual(result, {
-    status: "failed",
-    error: {
-      code: "RUNTIME",
-      detailCode: "SESSION_RESUME_REQUIRED",
-      message:
-        "Persistent ACP session stale-backend-session could not be resumed: saved session cannot be loaded",
-      retryable: true,
-    },
-    promptMessageId: "req-failed-reconnect-lease",
-    runtimeRequestId: "req-failed-reconnect-lease",
-  });
-  assert.deepEqual(await eventsPromise, []);
-  assert.equal(promptCalled, false);
-  assert.equal(persistedPidAtResult, runtimePid);
-  assert.equal(clientClosedAtResult, true);
-});
+      await waitFor(closeEntered.promise);
+      // Drain runnable promise work while cleanup remains blocked, without a timed sleep.
+      await nextTurn();
+      assert.equal(clientCloseCompleted, false);
+      assert.equal(resultSettled, false, "the result must wait for client close completion");
+      releaseClose.resolve();
+      await waitFor(closeCompleted.promise);
 
-test("AcpRuntimeManager closes the stream and client before reporting an unexpected finalization failure", async () => {
-  const record = makeSessionRecord({
-    acpxRecordId: "finalization-failure-session:oneshot:1",
-    acpSessionId: "finalization-failure-backend-session",
-    agentCommand: "codex --acp",
-    cwd: "/workspace",
-  });
-  const store = new InMemorySessionStore([record]);
-  let signalFinalizationHookReached!: () => void;
-  const finalizationHookReached = new Promise<void>((resolve) => {
-    signalFinalizationHookReached = resolve;
-  });
-  let closeCalls = 0;
-  const client: FakeClient = {
-    start: async () => {},
-    close: async () => {
-      closeCalls += 1;
-    },
-    createSession: async () => ({ sessionId: "unused" }),
-    loadSession: async () => ({ agentSessionId: "unused" }),
-    hasReusableSession: () => false,
-    supportsLoadSession: () => true,
-    supportsResumeSession: () => false,
-    loadSessionWithOptions: async () => ({ agentSessionId: "finalization-failure-agent" }),
-    getAgentLifecycleSnapshot: () => ({ running: true }),
-    prompt: async () => ({ stopReason: "end_turn" }),
-    requestCancelActivePrompt: async () => false,
-    hasActivePrompt: () => false,
-    setSessionMode: async () => {},
-    setSessionConfigOption: async () => {},
-    clearEventHandlers: () => {
-      signalFinalizationHookReached();
-      throw new Error("finalization hook exploded");
-    },
-    setEventHandlers: () => {},
-  };
-  const manager = new AcpRuntimeManager(
-    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
-    { clientFactory: () => client as never },
-  );
+      const result = await waitFor(resultPromise);
+      assert.deepEqual(result, {
+        status: "failed",
+        error: {
+          code: "RUNTIME",
+          detailCode: "SESSION_RESUME_REQUIRED",
+          message:
+            "Persistent ACP session stale-backend-session could not be resumed: saved session cannot be loaded",
+          retryable: true,
+        },
+      });
+      assert.deepEqual(await waitFor(emptyStreamEnd), { done: true, value: undefined });
+      assert.deepEqual(streamAtResult, { done: true, value: undefined });
+      assert.equal(promptCalled, false);
+      assert.equal(persistedPidAtResult, runtimePid);
+      assert.equal(clientClosedAtResult, true);
+    } finally {
+      releaseGates();
+      try {
+        await waitFor(settled);
+      } finally {
+        t.signal.removeEventListener("abort", onAbort);
+      }
+    }
+  },
+);
 
-  const turn = manager.startTurn({
-    handle: createHandle(record.acpxRecordId),
-    text: "hello",
-    mode: "prompt",
-    sessionMode: "oneshot",
-    requestId: "req-finalization-failure",
-  });
-  let eventStreamClosed = false;
-  const eventsPromise = collectEvents(turn.events).then((events) => {
-    eventStreamClosed = true;
-    return events;
-  });
-  let resultSettled = false;
-  let clientClosedAtResult = false;
-  const resultPromise = turn.result.then((result) => {
-    resultSettled = true;
-    clientClosedAtResult = closeCalls === 1;
-    return result;
-  });
+test(
+  "AcpRuntimeManager closes the stream and client before reporting an unexpected finalization failure",
+  { timeout: 5_000 },
+  async (t) => {
+    const record = makeSessionRecord({
+      acpxRecordId: "finalization-failure-session:oneshot:1",
+      acpSessionId: "finalization-failure-backend-session",
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+    });
+    const store = new InMemorySessionStore([record]);
+    let signalFinalizationHookReached!: () => void;
+    const finalizationHookReached = new Promise<void>((resolve) => {
+      signalFinalizationHookReached = resolve;
+    });
+    const closeEntered = createDeferred<void>();
+    const releaseClose = createDeferred<void>();
+    const closeCompleted = createDeferred<void>();
+    let closeCalls = 0;
+    let clientCloseCompleted = false;
+    const client: FakeClient = {
+      start: async () => {},
+      close: async () => {
+        closeCalls += 1;
+        closeEntered.resolve();
+        await releaseClose.promise;
+        clientCloseCompleted = true;
+        closeCompleted.resolve();
+      },
+      createSession: async () => ({ sessionId: "unused" }),
+      loadSession: async () => ({ agentSessionId: "unused" }),
+      hasReusableSession: () => false,
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => ({ agentSessionId: "finalization-failure-agent" }),
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      prompt: async () => ({ stopReason: "end_turn" }),
+      requestCancelActivePrompt: async () => false,
+      hasActivePrompt: () => false,
+      setSessionMode: async () => {},
+      setSessionConfigOption: async () => {},
+      clearEventHandlers: () => {
+        signalFinalizationHookReached();
+        throw new Error("finalization hook exploded");
+      },
+      setEventHandlers: () => {},
+    };
+    const manager = new AcpRuntimeManager(
+      createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      { clientFactory: () => client as never },
+    );
 
-  await finalizationHookReached;
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(eventStreamClosed, true);
-  assert.equal(resultSettled, true);
+    const turn = manager.startTurn({
+      handle: createHandle(record.acpxRecordId),
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "oneshot",
+      requestId: "req-finalization-failure",
+    });
+    let emptyStreamReceipt: IteratorResult<AcpRuntimeEvent> | undefined;
+    const emptyStreamEnd = turn.events[Symbol.asyncIterator]()
+      .next()
+      .then((receipt) => {
+        emptyStreamReceipt = receipt;
+        return receipt;
+      });
+    let resultSettled = false;
+    let clientClosedAtResult = false;
+    let streamAtResult: IteratorResult<AcpRuntimeEvent> | undefined;
+    const resultPromise = turn.result.then((result) => {
+      resultSettled = true;
+      clientClosedAtResult = clientCloseCompleted;
+      streamAtResult = emptyStreamReceipt;
+      return result;
+    });
+    const settled = Promise.allSettled([emptyStreamEnd, resultPromise, closeCompleted.promise]);
+    const aborted = createDeferred<never>();
+    const releaseGates = () => releaseClose.resolve();
+    const onAbort = () => {
+      releaseGates();
+      aborted.reject(t.signal.reason);
+    };
+    t.signal.addEventListener("abort", onAbort, { once: true });
+    const waitFor = <T>(pending: Promise<T>): Promise<T> =>
+      Promise.race([pending, aborted.promise]);
 
-  assert.deepEqual(await eventsPromise, []);
-  assert.deepEqual(await resultPromise, {
-    status: "failed",
-    error: {
-      code: "RUNTIME",
-      message: "finalization hook exploded",
-    },
-    promptMessageId: "req-finalization-failure",
-    runtimeRequestId: "req-finalization-failure",
-  });
-  assert.equal(closeCalls, 1);
-  assert.equal(clientClosedAtResult, true);
-});
+    try {
+      await waitFor(finalizationHookReached);
+      await waitFor(closeEntered.promise);
+      await nextTurn();
+      assert.equal(closeCalls, 1);
+      assert.equal(clientCloseCompleted, false);
+      assert.equal(resultSettled, false, "finalization failure must wait for client cleanup");
+      releaseClose.resolve();
+      await waitFor(closeCompleted.promise);
 
-async function assertFinalPersistenceFailure(failAtSave: number): Promise<void> {
+      assert.deepEqual(await waitFor(resultPromise), {
+        status: "failed",
+        error: {
+          code: "RUNTIME",
+          message: "finalization hook exploded",
+        },
+      });
+      assert.deepEqual(await waitFor(emptyStreamEnd), { done: true, value: undefined });
+      assert.deepEqual(streamAtResult, { done: true, value: undefined });
+      assert.equal(closeCalls, 1);
+      assert.equal(clientClosedAtResult, true);
+    } finally {
+      releaseGates();
+      try {
+        await waitFor(settled);
+      } finally {
+        t.signal.removeEventListener("abort", onAbort);
+      }
+    }
+  },
+);
+
+test("AcpRuntimeManager fails the turn when the final owner checkpoint throws", async () => {
   const record = makeSessionRecord({
     acpxRecordId: "finalize-persist-session",
     acpSessionId: "finalize-persist-sid",
@@ -4106,9 +4394,7 @@ async function assertFinalPersistenceFailure(failAtSave: number): Promise<void> 
     override async save(next: AcpSessionRecord): Promise<void> {
       if (promptFinished) {
         savesAfterPrompt += 1;
-        if (savesAfterPrompt >= failAtSave) {
-          throw new Error("ENOSPC: no space left on device");
-        }
+        throw new Error("ENOSPC: no space left on device");
       }
       await super.save(next);
     }
@@ -4179,21 +4465,10 @@ async function assertFinalPersistenceFailure(failAtSave: number): Promise<void> 
       code: "RUNTIME",
       message: "ENOSPC: no space left on device",
     },
-    promptMessageId: "req-finalize-persist",
-    runtimeRequestId: "req-finalize-persist",
   });
   assert.equal(closeCalls, 1);
-  // The throwing save plus one more attempt from failRuntimeTurn's terminal snapshot.
-  assert.equal(savesAfterPrompt, failAtSave + 1);
+  assert.equal(savesAfterPrompt, 2);
   assert.ok(events.some((event) => event.type === "text_delta"));
-}
-
-test("AcpRuntimeManager fails the turn when checkpoint flush throws", async () => {
-  await assertFinalPersistenceFailure(2);
-});
-
-test("AcpRuntimeManager fails the turn when final session persist throws", async () => {
-  await assertFinalPersistenceFailure(3);
 });
 
 test("AcpRuntimeManager fails persistent turns clearly when session reuse is unavailable", async () => {
@@ -4249,8 +4524,6 @@ test("AcpRuntimeManager fails persistent turns clearly when session reuse is una
   assert.deepEqual(events, []);
   assert.deepEqual(result, {
     status: "failed",
-    promptMessageId: "req-persistent",
-    runtimeRequestId: "req-persistent",
     error: {
       code: "RUNTIME",
       detailCode: "SESSION_RESUME_REQUIRED",
@@ -4313,7 +4586,7 @@ test("AcpRuntimeManager still falls back to a fresh session for oneshot turns", 
   const { events, result } = await collectTurn(turn);
 
   assert.deepEqual(events, []);
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   assert.equal(promptSessionId, "fresh-session");
   const saved = await store.load("oneshot-session:oneshot:1");
   assert.equal(saved?.acpSessionId, "fresh-session");
@@ -4416,7 +4689,7 @@ test("AcpRuntimeManager falls back when a kept-open persistent client is no long
   const { events, result } = await collectTurn(turn);
 
   assert.deepEqual(events, []);
-  assertTurnResult(result, "completed", "end_turn");
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
   assert.equal(firstClientCloseCalls, 1);
   assert.equal(firstClientPromptCalls, 0);
   assert.equal(secondClientPromptCalls, 1);
@@ -4738,21 +5011,10 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
     agent: "codex",
     mode: "persistent",
     sessionOptions: { systemPrompt: "Be terse." },
-    agentArgv: ["grok", "agent", "--model", "provider-model", "stdio"],
-    authCredentials: { "xai.api_key": "must-not-persist" },
   });
 
   assert.equal(factoryCalls.length, 1);
   assert.deepEqual(factoryCalls[0]?.sessionOptions, { systemPrompt: "Be terse." });
-  assert.deepEqual(factoryCalls[0]?.agentArgv, [
-    "grok",
-    "agent",
-    "--model",
-    "provider-model",
-    "stdio",
-  ]);
-  assert.deepEqual(factoryCalls[0]?.authCredentials, { "xai.api_key": "must-not-persist" });
-  assert.equal(JSON.stringify(record).includes("must-not-persist"), false);
   assert.deepEqual(record.acpx?.session_options, {
     model: undefined,
     allowed_tools: undefined,
@@ -4861,26 +5123,32 @@ test("persistSessionOptions preserves session env as a serialized record", () =>
     cwd: "/workspace",
   });
 
-  persistSessionOptions(record, {
-    env: {
-      GIT_AUTHOR_EMAIL: "agent-pm@example.local",
-      GIT_COMMITTER_NAME: "Agent PM",
-    },
-  });
+  const env = Object.fromEntries([
+    ["__proto__", "session-literal-value"],
+    ["GIT_AUTHOR_EMAIL", "agent-pm@example.local"],
+    ["GIT_COMMITTER_NAME", "Agent PM"],
+  ]);
+  persistSessionOptions(record, { env });
 
   assert.deepEqual(record.acpx?.session_options, {
     model: undefined,
     allowed_tools: undefined,
     max_turns: undefined,
     system_prompt: undefined,
-    env: {
-      GIT_AUTHOR_EMAIL: "agent-pm@example.local",
-      GIT_COMMITTER_NAME: "Agent PM",
-    },
+    env,
   });
+  const persistedEnv = record.acpx?.session_options?.env;
+  assert.ok(persistedEnv);
+  assert.equal(Object.hasOwn(persistedEnv, "__proto__"), true);
+  assert.equal(Object.getPrototypeOf(persistedEnv), Object.prototype);
+  assert.equal(JSON.stringify(persistedEnv), JSON.stringify(env));
 });
 
 test("sessionOptionsFromRecord restores session env from a persisted record", () => {
+  const env = Object.fromEntries([
+    ["__proto__", "restored-literal-value"],
+    ["GIT_AUTHOR_EMAIL", "restored-pm@example.local"],
+  ]);
   const record = makeSessionRecord({
     acpxRecordId: "env-restore-session",
     acpSessionId: "env-restore-sid",
@@ -4888,15 +5156,84 @@ test("sessionOptionsFromRecord restores session env from a persisted record", ()
     cwd: "/workspace",
     acpx: {
       session_options: {
-        env: {
-          GIT_AUTHOR_EMAIL: "restored-pm@example.local",
-        },
+        env,
       },
     },
   });
 
   const restored = sessionOptionsFromRecord(record);
-  assert.deepEqual(restored?.env, { GIT_AUTHOR_EMAIL: "restored-pm@example.local" });
+  assert.deepEqual(restored?.env, env);
+  assert.ok(restored?.env);
+  assert.equal(Object.hasOwn(restored.env, "__proto__"), true);
+  assert.equal(Object.getPrototypeOf(restored.env), Object.prototype);
+});
+
+const literalSystemPromptCases: Array<{
+  label: string;
+  input: SystemPromptOption;
+  expected: SystemPromptOption | undefined;
+}> = [
+  { label: "whitespace replacement", input: " \t\n", expected: " \t\n" },
+  {
+    label: "whitespace append",
+    input: { append: " \t\n" },
+    expected: { append: " \t\n" },
+  },
+  { label: "padded replacement", input: "  guidance\t ", expected: "  guidance\t " },
+  {
+    label: "padded append",
+    input: { append: "  guidance\t " },
+    expected: { append: "  guidance\t " },
+  },
+  { label: "empty replacement", input: "", expected: undefined },
+  { label: "empty append", input: { append: "" }, expected: undefined },
+];
+
+test("persistSessionOptions preserves raw nonempty system prompts and omits empty prompts", () => {
+  for (const scenario of literalSystemPromptCases) {
+    const record = makeSessionRecord({
+      acpxRecordId: "literal-prompt-session",
+      acpSessionId: "literal-prompt-sid",
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+    });
+
+    persistSessionOptions(record, { systemPrompt: scenario.input });
+
+    assert.deepEqual(
+      record.acpx?.session_options?.system_prompt,
+      scenario.expected,
+      scenario.label,
+    );
+    if (scenario.expected === undefined) {
+      assert.equal(record.acpx?.session_options, undefined, scenario.label);
+    } else {
+      assert.equal(
+        JSON.stringify(record.acpx?.session_options?.system_prompt),
+        JSON.stringify(scenario.expected),
+        scenario.label,
+      );
+    }
+  }
+});
+
+test("sessionOptionsFromRecord restores raw nonempty prompts from independently seeded records", () => {
+  for (const scenario of literalSystemPromptCases) {
+    const record = makeSessionRecord({
+      acpxRecordId: "literal-prompt-restore-session",
+      acpSessionId: "literal-prompt-restore-sid",
+      agentCommand: "codex --acp",
+      cwd: "/workspace",
+      acpx: { session_options: { system_prompt: scenario.input } },
+    });
+
+    const restored = sessionOptionsFromRecord(record);
+
+    assert.deepEqual(restored?.systemPrompt, scenario.expected, scenario.label);
+    if (scenario.expected === undefined) {
+      assert.equal(restored, undefined, scenario.label);
+    }
+  }
 });
 
 test("mergeSessionOptions merges session env per key with preferred overriding fallback", () => {
@@ -5067,4 +5404,135 @@ test("AcpRuntimeManager getStatus accepts legacy available command names", async
   const status = await manager.getStatus(createHandle("legacy-commands:1"));
 
   assert.deepEqual(status.availableCommands, [{ name: "/compact" }, { name: "/clear" }]);
+});
+
+test("AcpRuntimeManager adopts a pooled pre-warm record and moves idle updates to the real key", async () => {
+  const sourceId = "prewarm_grok_789";
+  const targetId = "real-1agents-session-789";
+  const store = new InMemorySessionStore();
+  let factoryCalls = 0;
+  let setModeCalls = 0;
+  let handlers: FakeClientHandlers = {};
+  const client: FakeClient = {
+    initializeResult: {
+      protocolVersion: 1,
+      agentCapabilities: { prompt: true },
+    },
+    start: async () => {},
+    close: async () => {},
+    createSession: async () => ({
+      sessionId: "sid-prewarmed",
+      agentSessionId: "agent-prewarmed",
+    }),
+    loadSession: async () => ({ agentSessionId: "agent-prewarmed" }),
+    hasReusableSession: (sessionId) => sessionId === "sid-prewarmed",
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => ({ agentSessionId: "agent-prewarmed" }),
+    getAgentLifecycleSnapshot: () => ({
+      pid: 789,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      running: true,
+    }),
+    prompt: async () => ({ stopReason: "end_turn" }),
+    requestCancelActivePrompt: async () => false,
+    hasActivePrompt: () => false,
+    setSessionMode: async () => {
+      setModeCalls += 1;
+    },
+    setSessionConfigOption: async () => {},
+    clearEventHandlers: () => {
+      handlers = {};
+    },
+    setEventHandlers: (nextHandlers) => {
+      handlers = nextHandlers;
+    },
+  };
+  const manager = new AcpRuntimeManager(
+    {
+      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      onOutOfTurnSessionUpdate: (sessionKey, updateTag) => {
+        assert.equal(sessionKey, targetId);
+        assert.equal(updateTag, "agent_message_chunk");
+      },
+    },
+    {
+      clientFactory: () => {
+        factoryCalls += 1;
+        return client as never;
+      },
+    },
+  );
+
+  const source = await manager.ensureSession({
+    sessionKey: sourceId,
+    agent: "grok-build",
+    mode: "persistent",
+    cwd: "/workspace",
+  });
+  const adopted = await manager.adoptSession({
+    handle: createHandle(sourceId, source.acpxRecordId),
+    sessionKey: targetId,
+  });
+
+  assert.equal(adopted.acpxRecordId, targetId);
+  assert.equal(adopted.name, targetId);
+  assert.equal(adopted.eventLog.active_path.includes(encodeURIComponent(targetId)), true);
+  assert.equal(adopted.eventLog.active_path.includes(sourceId), false);
+  assert.equal(await store.load(sourceId), undefined);
+  assert.equal((await store.load(targetId))?.acpSessionId, "sid-prewarmed");
+
+  handlers.onSessionUpdate?.({
+    sessionId: "sid-prewarmed",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "after adoption" },
+    },
+  });
+  // The idle update persists on the debounced checkpoint; poll the store so
+  // the unref'd debounce timer does not need to keep the event loop alive.
+  let persisted = false;
+  for (let attempt = 0; attempt < 200 && !persisted; attempt += 1) {
+    persisted = JSON.stringify((await store.load(targetId))?.messages).includes(
+      "after adoption",
+    );
+    if (!persisted) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  assert.equal(persisted, true);
+  assert.equal(await store.load(sourceId), undefined);
+
+  await manager.setMode(createHandle(targetId), "auto");
+  assert.equal(factoryCalls, 1);
+  assert.equal(setModeCalls, 1);
+});
+
+test("AcpRuntimeManager refuses adoption when the real session key already exists", async () => {
+  const source = makeSessionRecord({
+    acpxRecordId: "prewarm_grok_existing",
+    acpSessionId: "sid-source",
+    agentCommand: "grok-build --acp",
+    cwd: "/workspace",
+  });
+  const target = makeSessionRecord({
+    acpxRecordId: "real-existing-session",
+    acpSessionId: "sid-target",
+    agentCommand: "grok-build --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([source, target]);
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+  );
+
+  await assert.rejects(
+    manager.adoptSession({
+      handle: createHandle(source.acpxRecordId),
+      sessionKey: target.acpxRecordId,
+    }),
+    /already exists/,
+  );
+  assert.equal((await store.load(source.acpxRecordId))?.acpSessionId, "sid-source");
+  assert.equal((await store.load(target.acpxRecordId))?.acpSessionId, "sid-target");
 });

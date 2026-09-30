@@ -1,5 +1,6 @@
 import { buildJsonRpcErrorResponse } from "../../acp/jsonrpc-error.js";
 import type {
+  AcpMessageDirection,
   OutputErrorAcpPayload,
   OutputErrorCode,
   OutputErrorOrigin,
@@ -42,6 +43,23 @@ function jsonRpcIdKey(value: unknown): string | undefined {
     return `n:${value}`;
   }
   return undefined;
+}
+
+function requestCorrelationKey(
+  id: unknown,
+  direction: AcpMessageDirection | undefined,
+): string | undefined {
+  const idKey = jsonRpcIdKey(id);
+  return idKey === undefined ? undefined : `${direction ?? "unknown"}:${idKey}`;
+}
+
+function reverseDirection(
+  direction: AcpMessageDirection | undefined,
+): AcpMessageDirection | undefined {
+  if (direction === undefined) {
+    return undefined;
+  }
+  return direction === "inbound" ? "outbound" : "inbound";
 }
 
 function sanitizeReadResult(result: unknown): unknown {
@@ -110,33 +128,21 @@ function sanitizedContent(update: Record<string, unknown>): unknown {
   return update.content;
 }
 
-class JsonOutputFormatter implements OutputFormatter {
-  private readonly stdout: WritableLike;
-  private readonly suppressReads: boolean;
-  private sessionId: string;
+export class JsonMessageSanitizer {
   private readonly requestMethodById = new Map<string, string>();
   private readonly toolStateById = new Map<string, { title?: string; kind?: string | null }>();
 
-  constructor(stdout: WritableLike, suppressReads: boolean, context?: OutputFormatterContext) {
-    this.stdout = stdout;
-    this.suppressReads = suppressReads;
-    this.sessionId = context?.sessionId?.trim() || DEFAULT_JSON_SESSION_ID;
-  }
+  constructor(
+    private readonly suppressReads: boolean,
+    private readonly partialHistory = false,
+  ) {}
 
-  setContext(context: OutputFormatterContext): void {
-    this.sessionId = context.sessionId?.trim() || this.sessionId || DEFAULT_JSON_SESSION_ID;
-  }
-
-  onAcpMessage(message: unknown): void {
-    this.stdout.write(`${JSON.stringify(this.sanitizeMessage(message))}\n`);
-  }
-
-  private sanitizeMessage(message: unknown): unknown {
+  sanitize(message: unknown, direction?: AcpMessageDirection): unknown {
     if (!this.suppressReads) {
       return message;
     }
 
-    const sanitizedResponse = this.sanitizeReadResponse(message);
+    const sanitizedResponse = this.sanitizeReadResponse(message, direction);
     if (sanitizedResponse !== message) {
       return sanitizedResponse;
     }
@@ -146,25 +152,28 @@ class JsonOutputFormatter implements OutputFormatter {
       return sanitizedToolMessage;
     }
 
-    this.trackRequestMethod(message);
+    this.trackRequestMethod(message, direction);
     return message;
   }
 
-  private trackRequestMethod(message: unknown): void {
+  private trackRequestMethod(message: unknown, direction: AcpMessageDirection | undefined): void {
     const candidate = message as JsonRpcRequestMessage;
     if (typeof candidate.method !== "string") {
       return;
     }
-    const idKey = jsonRpcIdKey(candidate.id);
+    const idKey = requestCorrelationKey(candidate.id, direction);
     if (!idKey) {
       return;
     }
     this.requestMethodById.set(idKey, candidate.method);
   }
 
-  private sanitizeReadResponse(message: unknown): unknown {
+  private sanitizeReadResponse(
+    message: unknown,
+    direction: AcpMessageDirection | undefined,
+  ): unknown {
     const candidate = message as JsonRpcResponseMessage;
-    const idKey = jsonRpcIdKey(candidate.id);
+    const idKey = requestCorrelationKey(candidate.id, reverseDirection(direction));
     if (!idKey) {
       return message;
     }
@@ -177,7 +186,7 @@ class JsonOutputFormatter implements OutputFormatter {
 
     const method = this.requestMethodById.get(idKey);
     this.requestMethodById.delete(idKey);
-    if (method !== "fs/read_text_file" || !hasResult) {
+    if (!hasResult || !this.suppressReadResponse(method)) {
       return message;
     }
 
@@ -190,6 +199,10 @@ class JsonOutputFormatter implements OutputFormatter {
       ...root,
       result: sanitizeReadResult(candidate.result),
     };
+  }
+
+  private suppressReadResponse(method: string | undefined): boolean {
+    return method === "fs/read_text_file" || (this.partialHistory && method === undefined);
   }
 
   private sanitizeReadToolMessage(message: unknown): unknown {
@@ -206,7 +219,8 @@ class JsonOutputFormatter implements OutputFormatter {
     const current = this.mergeToolState(toolCallId, update);
     this.toolStateById.set(toolCallId, current);
 
-    return isReadLikeTool(current) ? sanitizeToolMessage(message) : message;
+    const unclassified = this.partialHistory && !current.kind && !current.title;
+    return isReadLikeTool(current) || unclassified ? sanitizeToolMessage(message) : message;
   }
 
   private readToolUpdate(message: unknown): Record<string, unknown> | undefined {
@@ -236,6 +250,26 @@ class JsonOutputFormatter implements OutputFormatter {
       title: typeof update.title === "string" ? update.title : previous.title,
       kind: typeof update.kind === "string" || update.kind === null ? update.kind : previous.kind,
     };
+  }
+}
+
+class JsonOutputFormatter implements OutputFormatter {
+  private readonly stdout: WritableLike;
+  private readonly sanitizer: JsonMessageSanitizer;
+  private sessionId: string;
+
+  constructor(stdout: WritableLike, suppressReads: boolean, context?: OutputFormatterContext) {
+    this.stdout = stdout;
+    this.sanitizer = new JsonMessageSanitizer(suppressReads);
+    this.sessionId = context?.sessionId?.trim() || DEFAULT_JSON_SESSION_ID;
+  }
+
+  setContext(context: OutputFormatterContext): void {
+    this.sessionId = context.sessionId?.trim() || this.sessionId || DEFAULT_JSON_SESSION_ID;
+  }
+
+  onAcpMessage(message: unknown, direction?: AcpMessageDirection): void {
+    this.stdout.write(`${JSON.stringify(this.sanitizer.sanitize(message, direction))}\n`);
   }
 
   onError(params: {

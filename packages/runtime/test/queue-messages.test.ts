@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseQueueOwnerMessage, parseQueueRequest } from "../src/cli/queue/messages.js";
+import { parseQueueOwnerMessage, parseQueueRequest } from "../src/session/queue/messages.js";
 
 test("parseQueueRequest accepts submit_prompt with nonInteractivePermissions", () => {
   const parsed = parseQueueRequest({
@@ -668,8 +668,62 @@ test("parseQueueOwnerMessage rejects invalid structured owner message payloads",
     parseQueueOwnerMessage({
       type: "set_config_option_result",
       requestId: "req-config",
-      response: {},
+      response: { configOptions: null },
     }),
     null,
   );
 });
+
+for (const direction of ["inbound", "outbound"] as const) {
+  test(`queue event retains ${direction} transport metadata outside ACP JSON`, () => {
+    const message = { jsonrpc: "2.0", id: 7, result: { content: "SYNTHETIC_RESULT" } };
+    const input = { type: "event", requestId: "synthetic-submit", direction, message };
+    assert.deepEqual(parseQueueOwnerMessage(input), {
+      type: "event",
+      requestId: "synthetic-submit",
+      ownerGeneration: undefined,
+      direction,
+      message,
+    });
+    assert.deepEqual(message, { jsonrpc: "2.0", id: 7, result: { content: "SYNTHETIC_RESULT" } });
+  });
+}
+
+test("legacy queue event without direction remains accepted without inventing an endpoint", () => {
+  const message = { jsonrpc: "2.0", id: 7, result: {} };
+  const parsed = parseQueueOwnerMessage({ type: "event", requestId: "synthetic-submit", message });
+  assert.deepEqual(parsed, {
+    type: "event",
+    requestId: "synthetic-submit",
+    ownerGeneration: undefined,
+    message,
+  });
+  assert(parsed);
+  assert.equal(Object.hasOwn(parsed, "direction"), false);
+});
+
+for (const direction of [null, "incoming", "outgoing", 7, true]) {
+  test(`queue event rejects malformed direction ${JSON.stringify(direction)}`, () => {
+    assert.equal(
+      parseQueueOwnerMessage({
+        type: "event",
+        requestId: "synthetic-submit",
+        direction,
+        message: { jsonrpc: "2.0", id: 7, result: {} },
+      }),
+      null,
+    );
+  });
+}
+
+for (const type of ["set_model_result", "set_config_option_result"] as const) {
+  test(`queue accepts ${type} acknowledgements that omit the option catalog`, () => {
+    const input = {
+      type,
+      requestId: "empty-catalog",
+      response: {},
+      ...(type === "set_model_result" ? { modelId: "chosen" } : {}),
+    };
+    assert.deepEqual(parseQueueOwnerMessage(input), { ...input, ownerGeneration: undefined });
+  });
+}

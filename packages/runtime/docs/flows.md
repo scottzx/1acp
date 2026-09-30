@@ -36,7 +36,31 @@ What happens:
 - Run state (graph, ACP transcripts, artifacts, errors) is persisted as the run progresses.
 - The runtime exits when the graph terminates or a checkpoint pauses.
 
+On POSIX systems, run snapshots, projections, artifacts, and event logs use
+owner-only file permissions (`0600`); acpx-owned run directories use `0700`.
+Existing custom output-root directories keep their permissions. Snapshot writes
+publish complete files atomically and clean up failed staging writes. Event logs
+remain append-only and retain their existing ordering and size behavior.
+
 `--input-json` and `--input-file` are mutually exclusive ways to provide flow input. `--default-agent` supplies the default agent profile for `acp` nodes that do not pin one.
+
+The CLI resolves `acpx/flows` in the entry module and its imported helpers without rewriting source text or creating files beside the flow. Flows can run from read-only directories. Global `--system-prompt` and `--append-system-prompt` flags are forwarded to every ACP node, including isolated sessions.
+
+## Parsing JSON output
+
+`extractJsonObject(text)` and `parseJsonObject(text, { mode: "compat" })` try
+direct JSON, then a fenced JSON block, then balanced objects or arrays embedded
+in prose. Compatibility recovery parses candidates as it finds them and bounds
+the total scanning and parsing work relative to the input length. Large output
+or many separate malformed candidates do not by themselves prevent extraction.
+
+Repeatedly malformed or ambiguous prefixes can exhaust that recovery budget,
+including unmatched opening delimiters before a valid object. In that case the
+helper throws the usual `Could not parse JSON` error. Prefer direct or fenced
+JSON when recovery must not depend on surrounding prose; those parsing paths
+are unaffected by the compatibility recovery budget. Use
+`parseStrictJsonObject(text)` to require direct JSON, or `mode: "fenced"` to
+accept direct JSON and fenced blocks without embedded recovery.
 
 ## Node types
 
@@ -64,44 +88,67 @@ The agent owns reasoning, summarization, and tool calls inside `acp` and `decisi
 
 ## Authoring surface
 
+Node IDs and raw switch case keys are exact own string entries, including empty
+strings and names such as `__proto__`. Use a computed property such as
+`["__proto__"]` when declaring that key in JavaScript. Inherited properties do not
+declare nodes, cases, or edge routing fields.
+
 Define a flow with `defineFlow` from `acpx/flows`:
 
 ```ts
-import { defineFlow, acp, action, compute, decision } from "acpx/flows";
+import { acp, decision, decisionEdge, defineFlow } from "acpx/flows";
+
+type TriageInput = {
+  task: string;
+};
+
+const classifyChoices = ["bug", "feat", "doc"] as const;
 
 export default defineFlow({
-  id: "triage",
-  input: { task: "string" },
-  steps: {
+  name: "triage",
+  startAt: "classify",
+  nodes: {
     classify: decision({
-      agent: "codex",
-      prompt: ({ task }) => `Classify: ${task}\nLabels: bug | feat | doc`,
-      choices: ["bug", "feat", "doc"],
+      question: ({ input }) => `Classify: ${(input as TriageInput).task}`,
+      choices: classifyChoices,
     }),
-    fix: acp({ prompt: ({ task }) => `Implement and verify: ${task}` }),
-    write_doc: acp({ prompt: ({ task }) => `Draft docs entry for: ${task}` }),
+    fix: acp({
+      prompt: ({ input }) => `Implement and verify: ${(input as TriageInput).task}`,
+    }),
+    write_doc: acp({
+      prompt: ({ input }) => `Draft docs entry for: ${(input as TriageInput).task}`,
+    }),
   },
   edges: [
-    ["classify", "fix", (out) => out === "bug" || out === "feat"],
-    ["classify", "write_doc", (out) => out === "doc"],
+    decisionEdge({
+      from: "classify",
+      choices: classifyChoices,
+      cases: {
+        bug: "fix",
+        feat: "fix",
+        doc: "write_doc",
+      },
+    }),
   ],
 });
 ```
 
-The example above is illustrative — see `examples/flows/branch.flow.ts` for the canonical small `decision()` example.
+This flow expects input such as `{"task":"Fix the reconnect bug"}`. Callbacks receive it through `input`; the TypeScript assertion does not validate it at runtime. See `examples/flows/branch.flow.ts` for another small `decision()` example.
 
 ## Workspace isolation
 
-`acp` nodes can pin a per-step working directory:
+`acp` nodes can set a per-step working directory from an earlier node's output:
 
 ```ts
 acp({
-  cwd: "${workdir}/.work-tree",
-  prompt: ({ task }) => `Run inside the prepped tree: ${task}`,
+  cwd: ({ outputs }) => (outputs.prepare_workspace as { workdir: string }).workdir,
+  prompt: ({ input }) => `Run inside the prepared workspace: ${(input as { task: string }).task}`,
 });
 ```
 
-This lets a flow `action` step (e.g., `git worktree add`) prepare an isolated workspace, then have downstream `acp` nodes operate inside that cwd. `examples/flows/workdir.flow.ts` shows the pattern end-to-end.
+This fragment assumes an earlier `prepare_workspace` node returns `{ workdir: string }` and an edge connects it to this ACP node. A `cwd` string is a literal path; use a callback to read prior outputs. `examples/flows/workdir.flow.ts` shows a shell action creating a temporary directory and an ACP node using it.
+
+Persistent ACP steps reuse a session when their resolved command, explicit argument vector (when supplied), working directory, and session handle match. Different profile names may share a session when those values match. Argument boundaries and empty arguments are significant. Each step snapshots its resolved arguments, so a custom resolver reusing an array cannot change earlier step metadata.
 
 ## Permissions
 
@@ -132,11 +179,36 @@ Each run produces a bundle under `~/.acpx/flows/runs/<runId>/`:
 
 Bundles are immutable once a run terminates. They are the input for the [replay viewer](#replay-viewer).
 
+When an ACP prompt settles, its pending capture writes finish before the step result is recorded. Capture failures fail the step; if the agent also fails, its original prompt error remains visible and is saved with the run. Admitted heartbeat and session-bundle writes also finish before the next step or terminal snapshot is published. Concurrent runs on one runner keep their pending ACP clients separate.
+
 ## Timeouts
 
-`acp` and `action` nodes use the global `--timeout` value as their default per-step timeout. If `--timeout` is not set, flows default to **15 minutes per active step**. Override per step in the flow definition when needed.
+Every node uses the global `--timeout` value as its default per-step timeout. If `--timeout` is not set, flows default to **15 minutes per active step**. Override per step in the flow definition when needed. One deadline covers preparation, execution, parsing, and admitted runtime writes.
 
-A shell action's `timeoutMs: 0` disables its own deadline; an enclosing node deadline still applies. On expiry or interruption, acpx cancels active shell commands and waits for termination and output-stream cleanup before reporting cancellation. Cleanup failures are reported instead of silently claiming cleanup succeeded. An executor that resolves after its node has timed out or been interrupted cannot launch a new shell process.
+Callbacks receive `context.signal`, which aborts on timeout or interruption. After cancellation, the runtime denies new adapter launches, ACP requests, and managed shell commands, and waits for already owned work and cleanup before recording the outcome. Persistent ACP reconnection loads the same backend session; a failed load fails the step without creating a replacement session.
+
+Function actions also receive `context.runShell` for native commands:
+
+```ts
+action({
+  run: async (context) => {
+    const result = await context.runShell!({
+      command: "git",
+      args: ["status", "--short"],
+      timeoutMs: 30_000,
+    });
+    return { changedFiles: result.stdout, exitCode: result.exitCode, timedOut: result.timedOut };
+  },
+});
+```
+
+`runShell` waits for complete stdout and stderr, returns ordinary nonzero exits as results, and returns `timedOut: true` with partial output when its own deadline expires. Cancellation of the enclosing node rejects instead, after process cleanup; catching that error cannot authorize another managed command. The fields are optional on the shared `FlowNodeContext` type for compatibility with manually constructed contexts, but `FlowRunner` supplies the signal to every node and `runShell` to function actions.
+
+Arbitrary callback JavaScript cannot be forcibly stopped. Check `context.signal` before starting your own side effects and after awaits, or use `runShell` for owned native commands. The runner does not wait forever for an uncooperative callback and does not roll back completed external effects. The PR-triage example uses these boundaries for its commands and file writes.
+
+A shell action's `timeoutMs: 0` disables its own deadline; an enclosing node deadline still applies. Node and command deadlines must be finite and no greater than 2,147,483,647 milliseconds. Invalid command deadlines or non-string `stdin` values are rejected before spawning. On expiry or interruption, acpx cancels active shell commands and waits for termination and output-stream cleanup before reporting cancellation. Cleanup failures are reported instead of silently claiming cleanup succeeded. An executor that resolves after its node has timed out or been interrupted cannot launch a new shell process.
+
+A shell node drains its wrapper's final stdout and stderr after exit, waiting for pipe closure for up to 100 milliseconds. Inherited pipes from a surviving descendant do not keep a completed flow's host alive beyond that drain window. While other work keeps the host running, these pipes continue draining without extending the completed result.
 
 Set `maxBufferBytes` on the object returned by `shell().exec` to limit captured stdout and stderr independently. The value is a non-negative safe integer counting UTF-8 bytes; omission preserves unlimited capture, and zero permits empty output only. Overflow fails the action even with `allowNonZeroExit`, stops retaining output, and waits for the existing process-tree cleanup before returning the error. A timeout or cancellation already in progress keeps its original result.
 
@@ -159,6 +231,15 @@ pnpm viewer
 
 The viewer is read-only. It opens a saved bundle and lets you inspect what happened; it does not re-run the flow.
 
+Malformed HTTP or WebSocket input is rejected without stopping the viewer.
+Corrupt bundle metadata is skipped, and transient read failures do not prevent
+subsequent live updates. Opening or reconnecting another viewer preserves updates
+for clients that are already subscribed.
+
+If polling overlaps an atomic replacement of a live projection, the recent-runs
+list and selected run retain their last readable state until polling succeeds.
+A missing optional live projection still falls back to the saved run projection.
+
 ## Example flows in the source tree
 
 Under `examples/flows/`:
@@ -166,7 +247,7 @@ Under `examples/flows/`:
 - `echo.flow.ts` — minimal one-step ACP flow that returns a JSON reply
 - `branch.flow.ts` — `decision()` + `decisionEdge()` constrained-choice classification, then a deterministic branch
 - `shell.flow.ts` — one runtime-owned shell `action` returning structured JSON
-- `workdir.flow.ts` — `action` prepares a worktree, `acp` runs inside that cwd
+- `workdir.flow.ts` — `action` prepares a temporary workspace, `acp` runs inside that cwd
 - `two-turn.flow.ts` — same-session ACP example that uses tools across multiple steps
 - `pr-triage/pr-triage.flow.ts` — larger end-to-end example with a written spec; can comment on or close real GitHub PRs against a live repo
 

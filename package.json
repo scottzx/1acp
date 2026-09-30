@@ -2,7 +2,7 @@
   "name": "@1agents/acp-workspace",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.34.5",
+  "packageManager": "pnpm@11.27.1",
   "engines": {
     "node": ">=22.13.0"
   },

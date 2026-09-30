@@ -26,7 +26,11 @@ function commandHasPath(command: string): boolean {
   return command.includes("/") || command.includes("\\") || path.isAbsolute(command);
 }
 
-function resolveWindowsPathCommand(command: string, env: NodeJS.ProcessEnv): string | undefined {
+function resolveWindowsPathCommand(
+  command: string,
+  env: NodeJS.ProcessEnv,
+  cwd?: string,
+): string | undefined {
   const candidates = commandCandidates(command, env);
   const pathValue = readWindowsEnvValue(env, "PATH");
   if (!pathValue) {
@@ -34,7 +38,7 @@ function resolveWindowsPathCommand(command: string, env: NodeJS.ProcessEnv): str
   }
 
   for (const directory of pathValue.split(";")) {
-    const resolved = findExistingCommandInDirectory(directory, candidates);
+    const resolved = findExistingCommandInDirectory(directory, candidates, cwd);
     if (resolved) {
       return resolved;
     }
@@ -46,6 +50,7 @@ function resolveWindowsPathCommand(command: string, env: NodeJS.ProcessEnv): str
 function findExistingCommandInDirectory(
   directory: string,
   candidates: string[],
+  cwd?: string,
 ): string | undefined {
   const trimmedDirectory = directory.trim();
   if (trimmedDirectory.length === 0) {
@@ -53,8 +58,12 @@ function findExistingCommandInDirectory(
   }
 
   return candidates
-    .map((candidate) => path.join(trimmedDirectory, candidate))
+    .map((candidate) => fromWorkingDirectory(path.join(trimmedDirectory, candidate), cwd))
     .find((resolved) => fs.existsSync(resolved));
+}
+
+function fromWorkingDirectory(value: string, cwd?: string): string {
+  return cwd !== undefined && !path.isAbsolute(value) ? path.resolve(cwd, value) : value;
 }
 
 function resolveWindowsWrapperToken(token: string, wrapperPath: string): string | undefined {
@@ -90,14 +99,17 @@ function resolveWindowsWrapperExecutable(wrapperPath: string): string | undefine
 export function resolveWindowsCommand(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ): string | undefined {
   const candidates = commandCandidates(command, env);
 
   if (commandHasPath(command)) {
-    return candidates.find((candidate) => fs.existsSync(candidate));
+    return candidates
+      .map((candidate) => fromWorkingDirectory(candidate, cwd))
+      .find((candidate) => fs.existsSync(candidate));
   }
 
-  return resolveWindowsPathCommand(command, env);
+  return resolveWindowsPathCommand(command, env, cwd);
 }
 
 /**
@@ -110,8 +122,9 @@ export function resolveWindowsCommand(
 export function resolveWindowsExecutablePath(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ): string | undefined {
-  const resolved = resolveWindowsCommand(command, env);
+  const resolved = resolveWindowsCommand(command, env, cwd);
   if (!resolved) {
     return undefined;
   }
@@ -135,11 +148,12 @@ function shouldUseWindowsBatchShell(
   command: string,
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ): boolean {
   if (platform !== "win32") {
     return false;
   }
-  const resolvedCommand = resolveWindowsCommand(command, env) ?? command;
+  const resolvedCommand = resolveWindowsCommand(command, env, cwd) ?? command;
   const ext = path.extname(resolvedCommand).toLowerCase();
   return ext === ".cmd" || ext === ".bat";
 }
@@ -151,8 +165,6 @@ export type AgentSpawnCommand = {
 };
 
 const CMD_META_CHAR_RE = /([()\][%!^"`<>&|;, *?])/gu;
-const CMD_BACKSLASH_QUOTE_RE = /(?=(\\+?)?)\1"/gu;
-const CMD_TRAILING_BACKSLASH_RE = /(?=(\\+?)?)\1$/gu;
 const CMD_SHIM_RE = /node_modules[\\/].bin[\\/][^\\/]+\.cmd$/iu;
 
 function escapeCmdCommand(value: string): string {
@@ -160,11 +172,23 @@ function escapeCmdCommand(value: string): string {
 }
 
 function escapeCmdArgument(value: string, doubleEscapeMeta: boolean): string {
-  const quoted = `"${value
-    .replace(CMD_BACKSLASH_QUOTE_RE, '$1$1\\"')
-    .replace(CMD_TRAILING_BACKSLASH_RE, "$1$1")}"`;
+  const quoted = `"${escapeBackslashesForQuoting(value)}"`;
   const escaped = quoted.replace(CMD_META_CHAR_RE, "^$1");
   return doubleEscapeMeta ? escaped.replace(CMD_META_CHAR_RE, "^$1") : escaped;
+}
+
+function escapeBackslashesForQuoting(value: string): string {
+  let result = "";
+  let backslashes = 0;
+  for (const char of value) {
+    if (char === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    result += "\\".repeat(char === '"' ? backslashes * 2 + 1 : backslashes) + char;
+    backslashes = 0;
+  }
+  return result + "\\".repeat(backslashes * 2);
 }
 
 export function buildAgentSpawnCommand(
@@ -172,11 +196,12 @@ export function buildAgentSpawnCommand(
   args: readonly string[],
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ): AgentSpawnCommand {
-  if (!shouldUseWindowsBatchShell(command, platform, env)) {
+  if (!shouldUseWindowsBatchShell(command, platform, env, cwd)) {
     return { command, args: [...args] };
   }
-  const resolvedCommand = path.win32.normalize(resolveWindowsCommand(command, env) ?? command);
+  const resolvedCommand = path.win32.normalize(resolveWindowsCommand(command, env, cwd) ?? command);
   const doubleEscapeMeta = CMD_SHIM_RE.test(resolvedCommand);
   const shellCommand = [
     escapeCmdCommand(resolvedCommand),
@@ -194,8 +219,9 @@ export function buildSpawnCommandOptions(
   options: Parameters<typeof spawn>[2],
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
 ): Parameters<typeof spawn>[2] {
-  if (!shouldUseWindowsBatchShell(command, platform, env)) {
+  if (!shouldUseWindowsBatchShell(command, platform, env, cwd)) {
     return options;
   }
   return {
@@ -225,4 +251,27 @@ export function buildTerminalShellSpawnCommand(
     return { command: "cmd.exe", args: ["/d", "/s", "/c", command], killProcessGroup: true };
   }
   return { command: "/bin/sh", args: ["-c", command], killProcessGroup: true };
+}
+
+/** Finds an installed entrypoint without executing it. */
+export function resolveInstalledExecutable(command: string): string | undefined {
+  if (process.platform === "win32") {
+    const resolved = resolveWindowsCommand(command);
+    return resolved && fs.statSync(resolved, { throwIfNoEntry: false })?.isFile()
+      ? path.resolve(resolved)
+      : undefined;
+  }
+  const candidates = command.includes("/")
+    ? [path.resolve(command)]
+    : (process.env.PATH ?? "")
+        .split(path.delimiter)
+        .map((directory) => path.resolve(directory, command));
+  return candidates.find((candidate) => {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  });
 }

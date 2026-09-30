@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { modelStateFromConfigOptions } from "../src/acp/model-support.js";
-import { mergeConnectedModelState } from "../src/cli/session/runtime.js";
 import { applyConfigOptionsToState } from "../src/session/config-options.js";
+import { createConversation, reduceSessionUpdate } from "../src/session/conversation-reducer.js";
 import {
   cloneSessionAcpxState,
   createSessionConversation,
@@ -236,29 +236,33 @@ test("conversation model captures prompt, chunks, tool calls, and metadata", () 
   ]);
 });
 
-test("conversation model preserves assistant text beyond the runtime text limit", () => {
-  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+test("conversation model keeps full assistant text in lossless history and trims runtime copies", () => {
+  const lossless = createConversation("2026-02-27T10:00:00.000Z");
+  const runtime = createSessionConversation("2026-02-27T10:00:00.000Z");
   const text = "a".repeat(12_000);
 
-  recordSessionUpdate(conversation, undefined, {
+  const notification = {
     sessionId: "session-1",
     update: {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text },
     },
-  });
+  } as const;
+  reduceSessionUpdate(lossless, undefined, notification, "2026-02-27T10:00:00.000Z", "unused");
+  recordSessionUpdate(runtime, undefined, notification, "2026-02-27T10:00:00.000Z", "unused");
 
-  const message = conversation.messages[0];
-  assert.ok(typeof message === "object" && message !== null && "Agent" in message);
-  if (!(typeof message === "object" && message !== null && "Agent" in message)) {
-    assert.fail("expected Agent message");
-  }
-  const content = message.Agent.content[0];
-  assert.ok(content && "Text" in content);
-  if (!(content && "Text" in content)) {
-    assert.fail("expected agent text content");
-  }
-  assert.equal(content.Text, text);
+  const readText = (conversation: typeof lossless): string => {
+    const message = conversation.messages[0];
+    assert.ok(typeof message === "object" && message !== null && "Agent" in message);
+    const content = message.Agent.content[0];
+    assert.ok(content && "Text" in content);
+    return content.Text;
+  };
+  // The lossless conversation keeps the complete answer for replay and takeover.
+  assert.equal(readText(lossless), text);
+  // The runtime conversation is bounded by the retention limit after each update.
+  assert.equal(readText(runtime).length, 8_000);
+  assert.ok(readText(runtime).endsWith("..."));
 });
 
 test("conversation model preserves whitespace-only agent chunks", () => {
@@ -354,6 +358,10 @@ test("config option updates synchronize and clear advertised model state", () =>
 
   assert.equal(acpxState.current_model_id, "smart-model");
   assert.deepEqual(acpxState.available_models, ["fast-model", "smart-model"]);
+  assert.deepEqual(acpxState.available_model_names, {
+    "fast-model": "Fast",
+    "smart-model": "Smart",
+  });
 
   acpxState = recordSessionUpdate(conversation, acpxState, {
     sessionId: "session-1",
@@ -365,6 +373,7 @@ test("config option updates synchronize and clear advertised model state", () =>
 
   assert.equal(acpxState.current_model_id, undefined);
   assert.equal(acpxState.available_models, undefined);
+  assert.equal(acpxState.available_model_names, undefined);
 });
 
 test("config responses clear stale config models without erasing legacy model control", () => {
@@ -458,31 +467,36 @@ test("model config parsing ignores malformed raw and persisted snapshots", () =>
   );
 });
 
-test("connected model state propagates authoritative removals", () => {
-  const merged = mergeConnectedModelState(
-    {
-      desired_config_options: { reasoning_effort: "high" },
-      current_model_id: "stale-model",
-      available_models: ["stale-model"],
-      model_control: "config_option",
-      config_options: [
-        {
-          id: "model",
-          name: "Model",
-          category: "model",
-          type: "select",
-          currentValue: "stale-model",
-          options: [{ value: "stale-model", name: "Stale Model" }],
-        },
-      ],
-    },
-    {},
+test("recordPromptSubmission preserves image prompt content", () => {
+  const conversation = createSessionConversation("2026-02-27T10:00:00.000Z");
+
+  const messageId = recordPromptSubmission(
+    conversation,
+    [
+      { type: "text", text: "inspect" },
+      { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
+    ],
+    "2026-02-27T10:00:01.000Z",
   );
-  assert.equal(merged?.current_model_id, undefined);
-  assert.equal(merged?.available_models, undefined);
-  assert.equal(merged?.model_control, undefined);
-  assert.equal(merged?.config_options, undefined);
-  assert.equal(merged?.desired_config_options, undefined);
+
+  assert.equal(typeof messageId, "string");
+  assert.deepEqual(conversation.messages, [
+    {
+      User: {
+        id: messageId,
+        content: [
+          { Text: "inspect" },
+          {
+            Image: {
+              source: "iVBORw0KGgo=",
+              mime_type: "image/png",
+              size: null,
+            },
+          },
+        ],
+      },
+    },
+  ]);
 });
 
 test("recordPromptSubmission preserves audio prompt content", () => {

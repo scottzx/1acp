@@ -6,6 +6,279 @@ Repo: https://github.com/scottzx/1acp
 
 ## Unreleased
 
+### Fixes
+
+- Fix nested documentation builds without a custom domain and keep their canonical URLs within the deployment path.
+- Temporary sessions: preserve model catalogs updated during session creation before applying startup model and config selections, including removed model support.
+- Windows/terminals: preserve stdout and stderr from commands launched through the shell fallback.
+- Replay viewer: retain recoverable conversation history and long responses past checkpoint limits, keeping earlier attempt selections and saved message identities aligned across reloads.
+- Session metadata: preserve token usage across saving and reloading for opaque message IDs such as `__proto__`.
+- Replay viewer: keep graph edges attached to naturally sized cards and route branches around wrapped labels and changing outcome rows.
+- Replay viewer: avoid macOS file-watcher startup stalls that can time out requests, status checks, and live connections while preserving asset updates.
+- Replay viewer: complete shutdown while dependencies are still warming after the first page request.
+- Runtime/embedding: preserve literal environment keys such as `__proto__` in saved sessions and spawned agent processes.
+- Runtime/embedding: retain raw nonempty system-prompt replacement and append text across persistence and reconnects, including whitespace-only values.
+- Replay viewer: preserve the last readable recent-run and selected-run state during atomic live-projection replacement until polling recovers.
+
+- Filesystem/dependencies: update fs-safe for older Linux compatibility and guarded path handling, and refresh development tools and replay-viewer dependencies.
+
+- Claude: update the built-in adapter for current models and keep sessions saved under earlier built-in commands discoverable after upgrades, while preserving custom launchers. Thanks @idvorkin-ai-tools.
+
+- Development dependencies: patch the brace-expansion denial-of-service and fast-uri header-injection advisories in the pinned toolchain overrides.
+
+- Sessions: keep local records and flow histories separate when adapters reuse session IDs, including concurrent provider-session resumes, while preserving existing local handles. Thanks @odrobnik.
+- Session controls: retain the resolved model ID after an acknowledgement while preserving the requested alias for reconnect. Thanks @odrobnik.
+- Session controls: tolerate omitted or non-list option catalogs without losing accepted selections or failing with a TypeError. Thanks @odrobnik.
+- Sessions: retire an adapter when a prompt's model-selection request times out, so later turns reconnect to known state. Thanks @odrobnik.
+- Flows: preserve initialized protocol and capability metadata when a persistent prompt times out or is cancelled. Thanks @odrobnik.
+- Flows: forward system-prompt replacement and append flags to persistent and isolated ACP nodes. Thanks @odrobnik.
+- Flows: resolve runtime imports throughout helper modules without rewriting string data or requiring a writable flow directory. Thanks @odrobnik.
+- Flow shells: collect final output after process exit with a bounded drain for inherited pipes, and reject invalid stdin before spawning. Thanks @odrobnik.
+- Flow timers: reject non-finite or overflowing node and shell deadlines before they become immediate timeouts. Thanks @odrobnik.
+- Windows: preserve complete backslash runs before quotes and at the end of batch-wrapper arguments. Thanks @odrobnik.
+
+## 0.19.3 - 2026-09-25
+
+### Highlights
+
+- **More reliable sessions:** protect imported history, retry failed checkpoints, and preserve accepted settings and correct ownership across replacement and resume.
+- **Complete output and cleanup:** receive large queued responses, retain diagnostics after disconnects, and wait for terminal cleanup while allowing completed flow commands to exit.
+- **Replay viewer usability:** improve attempt navigation, conversation following, graph edges, tool status, and layouts on narrower screens.
+
+### Fixes
+
+- Windows/authentication: preserve inherited credential values when auth aliases use different environment-variable casing.
+- Replay viewer: let arrow keys select previous and next attempts without snapping back on every key release, and keep playback running when tabbing into the scrubber.
+- Replay viewer: reapply follow centering when a graph viewport is replaced, even when its target and layout identifiers are unchanged.
+- Replay viewer: restore conversation auto-follow on session changes and replay resume, and preserve upward keyboard or scrollbar scrolling after content updates that do not move the pane.
+- Sessions/filesystem: update fs-safe to 0.18.1 so lock waits use elapsed time across system-clock adjustments and temporary output storage uses verified directory ownership. Thanks @vincentkoc.
+- Sessions/import: publish imported history before making its session discoverable, so a failed history write does not leave a partial session that blocks retrying the archive.
+- Sessions/journal: retry captures changed by rotation without skipping retained events or reporting false corruption, and preserve reader progress when a page fails or is cancelled.
+- Sessions/checkpoints: keep failed saves pending so later flushes retry current state without losing updates or allowing replacement to bypass persistent storage failures.
+- Runtime/shutdown: drain retained and retiring session checkpoints, wait for every owner's cleanup, and report failures instead of silently succeeding after persistence errors.
+- Windows/processes: resolve relative batch commands and PATH entries from the selected child cwd for adapter launches, terminal commands, and native Claude executable discovery.
+- Sessions/shutdown: keep graceful queue-owner cleanup and lease release protected on macOS and Linux when another stop signal arrives, including while startup is still acquiring ownership.
+- Sessions/queue: receive complete large events and accumulated session records without failing at the old client buffer ceiling, while preserving owner output-backlog limits and unknown-outcome errors after disconnection.
+- Replay viewer: keep earlier attempt timing stable when later output grows in the same session by weighting only the selected attempt's recorded messages.
+- Replay viewer: mark the selected ACP conversation slice while paused without hiding surrounding messages or moving them when selection changes.
+- Replay viewer: keep forward branch merges solid and correctly ranked, and style return edges from their final layout direction while preserving loops and unused graph components.
+- Flow shell actions no longer keep a completed CLI alive when a surviving descendant inherits stdout or stderr.
+- CLI/sessions: show compact image labels in history instead of raw base64, preserving MIME types and older image records. Thanks @rome-xi and @odrobnik.
+- Sessions: preserve the previous session when replacement fails, keep model choices and permission results scoped to each turn, and retain config catalogs when an accepted control omits them. Thanks @odrobnik.
+- ACP/CLI: retain reconnect metadata and Claude settings isolation, correlate recovered load errors by direction, and report agent disconnects after partial exec output. Thanks @odrobnik.
+- CLI/history: make `help` display usage and preserve Unicode when trimming saved conversation text. Thanks @odrobnik.
+- Sessions/import: serialize concurrent imports so overlapping collision checks cannot create duplicate scopes or provider session identities.
+- Sessions/resume: retire the previous local owner before reusing the same session record and keep the resumed record open for subsequent prompts.
+- Sessions/import: coordinate imports with CLI and shared session ensures in the same scope, so ensure reuses an imported session or import reports the existing session instead of publishing a duplicate.
+- Conformance: join adapter, descendant, and transport cleanup before reporting; retain original errors alongside cleanup failures, stop later cases after incomplete retirement, and clean up before exiting on catchable interruption.
+- Sessions/resume: retire the original session owner before resuming the same local record from another cwd or name, including `sessions ensure`, so subsequent prompts use the requested workspace.
+- Replay viewer: show pending tools as running when status-only updates contain no raw output, while preserving completed and failed results.
+- Conformance: require completed filesystem callbacks with matching parameters and outcomes in the mock permission/read/write cases, so agent prose alone cannot make them pass.
+- Replay viewer: keep the graph, playback controls, inspector, and run selector accessible when panels stack on narrower screens.
+- Conformance: require per-prompt update evidence for single- and multi-turn checks instead of borrowing setup output or accumulated earlier updates.
+- Terminals: wait for admitted terminal creation and its cleanup before reporting session or runtime shutdown complete, including children still awaiting spawn adoption.
+- Docs/runtime: clarify that in-process steer turns wait for the active prompt and shared runtimes reject them. Thanks @saariuslystoned.
+
+## 0.19.2 - 2026-09-23
+
+### Highlights
+
+- **Reliable session output:** detect departed queue owners after PID reuse, drain retained events on close, and spool slow readers' output within bounded storage without cancelling their prompts.
+- **Replay viewer stability:** preserve playback timing, graph visibility, conversation context, and the latest run selection, with live-stream recovery after transient read failures.
+- **Better PR triage evidence:** collect every review/comment page, query CI for the observed PR head, preserve final review text, and report the latest completed conflict outcome.
+
+### Fixes
+
+- Sessions/watch: detect departed queue owners after PID reuse without signaling unrelated processes or changing session state. Bound identity observations and reread the journal after slow queries so replacement owners and settled results win over an unknown-outcome error.
+- Sessions/watch: allow process identity queries their existing provider budget so slow Windows observations can detect a departed owner instead of waiting indefinitely for an unfinished result.
+- Watching: drain retained events when a session closes while its observer is paused, preserving unfinished-outcome errors and exclusive cursor resumption.
+- Sessions/Windows: retire witnessed queue-owner descendants with bounded process snapshots, preserving birth checks and durable custody while avoiding one process query per survivor.
+- Sessions/output: spool slow queue observers to bounded temporary storage, preserve ordered delivery when readers resume, and detach failed observers without cancelling or replaying their prompts.
+- Sessions/Windows: preserve native command-line paths when closing saved agents, including batch launch wrappers, while leaving unmatched or unobservable processes alone.
+- PR triage example: collect all review/comment pages and query CI runs for the observed PR head instead of the oldest commit.
+- Replay viewer: preserve recorded attempt order when timestamps tie or move backward, and carry rounded seconds into minute duration labels.
+- Replay viewer: count readable run summaries toward the recent-run limit so incomplete directories cannot hide older valid runs.
+- Replay viewer: keep appended patch payloads unchanged when later operations edit their inserted data, and reuse private state while processing live patches.
+- Replay viewer: recover selected run streams after transient bundle read failures, preserving the last good state and clearing the matching warning after recovery.
+- Replay viewer: keep completed ACP conversation context visible while replaying later compute, action, and checkpoint steps.
+- PR triage example: retain complete review findings whose prose begins with “execution” and select the final assistant block instead of intermediate commentary and command logs.
+- PR triage example: report the latest completed conflict outcome in handoff prompts and final summaries, retaining resolution details and reasons that need human judgment across repeated checks.
+- Replay viewer: keep the latest run selection when a superseded load finishes, including reselecting the run already displayed.
+- Replay viewer: keep graph nodes visible during replay updates while retaining natural card resizing.
+- Replay viewer: render complete flow definitions containing unreachable loops without crashing.
+- Replay viewer: advance replay at the selected speed without losing animation intervals after renders or updates to the same run.
+- Sessions/watch: keep journal read offsets tied to exact file identities so rounded filesystem metadata cannot mix distinct segments during rotation.
+
+## 0.19.1 - 2026-09-22
+
+### Fixes
+
+- Compare: preserve actual permission counts on failed runs, distinguish permission failures from runtime errors, and reject conflicting permission modes before reading prompt or policy input.
+- Sessions/Windows: retain witnessed descendants in the existing queue-owner lease before forced cleanup, so another updated client can finish partial cleanup after the owner exits. Preserve incomplete or unverified cleanup through heartbeat and release; all participating clients must be updated for this guarantee.
+- Embedding: preserve host logging during overlapping ACP prompts and when the application replaces its logger.
+- Runtime: reuse pending one-shot initialization when repeated creation options differ only by undefined fields or empty environment maps, avoiding duplicate agent sessions and retained clients.
+- Processes/Linux: retain witnessed descendants across wall-clock adjustments by comparing scoped kernel start ticks, and keep terminal group cutoffs and cleanup deadlines independent of wall time.
+- Output: preserve live JSON read suppression when client and agent request IDs collide, including queued prompts with overlapping controls, without changing the raw ACP message format.
+- Sessions: reuse parent-directory sessions within worktrees, submodules, and directories beginning with two dots, while respecting the nearest repository boundary.
+- Flows: execute empty-string node IDs, retain outputs and results for names such as `__proto__`, and validate and route only declared own graph entries.
+- Adapter startup: use the selected child environment and working directory for compatibility checks and diagnostics, honor host admission for every adapter invocation, and retire timed-out probes and inherited output pipes.
+- Sessions: preserve queue-owner leases when deeply nested retirement receipt data cannot be sized, instead of treating the owner as missing during recovery.
+
+## 0.19.0 - 2026-09-22
+
+### Highlights
+
+- **Process and lock recovery:** clean up observed child processes across platforms and verify process birth identity before reclaiming queue owners and abandoned locks.
+- **Lower resource use:** release completed flow state and abandoned event buffers, stop orphaned terminal polling, and parse fragmented ACP messages in linear time.
+- **Embedding controls:** configure filesystem and terminal capabilities through the runtime while preserving existing defaults.
+
+### Changes
+
+- Runtime/embedding: expose optional `fs` and `terminal` capability switches on `AcpRuntimeOptions`, matching `AcpClientOptions`. Omitted options stay enabled; retained connections keep their original policy; health probes disable both callbacks while retaining the host permission policy. Disabled ACP callbacks are a protocol policy, not an OS sandbox. Thanks @saariuslystoned and @devSejung.
+
+### Upgrade notes
+
+- Sessions/ownership: update participating clients, restart embedding hosts after active turns finish, and let older queue owners expire while idle. New owners and locks record process birth identity. Healthy legacy owners remain usable, but forced retirement is refused when their live process identity cannot be verified.
+
+### Fixes
+
+- Sessions/storage: resolve scope, directory, ID, listing, and prune queries from current saved records instead of stale index metadata; save checkpoints without a shared index write that can fail after the record is committed. Ignore mismatched record filenames so copied records cannot create false matches or authorize pruning another record.
+- Sessions/ownership: retry failed turn-lock cleanup before the next operation so transient file errors cannot strand a live session, while preserving active owners and replacement locks.
+- Docs: correct session setup and query examples, clarify permission and storage boundaries, and synchronize agent guides with the current CLI.
+- Flows: stop late adapter and command dispatch after timeout or interruption, wait for owned process cleanup and pending writes before finishing, and keep concurrent runs' ACP clients separate. Function actions can use `context.signal` and `context.runShell`; PR triage preserves command diagnostics while refusing follow-up commands after cancellation.
+- Flows: release completed runs' cached manifests and sequence counters after cleanup so repeated runs on one runner do not retain past run metadata.
+- CLI: honor inherited prompt files, queue wait intent, and session-list options before subcommands; prefer explicit child values and apply validation to the combined options. Watch now honors inherited named-session selection while keeping its journal cursor separate from list pagination.
+- ACP/terminals: clean up POSIX descendants for direct commands and shell commands, including children that leave the original process group. Verify process identities before signaling and release terminal pipes after cleanup.
+- CLI/output: skip malformed message chunks and plan updates in text and quiet output so later valid output and completion survive; preserve raw notifications in JSON output. Thanks @SebTardif.
+- Flows/JSON: bound compatibility recovery by scanning and parsing work instead of collecting every candidate, preserving large and late embedded JSON while stopping excessive recovery through ambiguous text. Direct and fenced JSON parsing are unchanged. Thanks @SebTardif.
+- ACP: avoid repeated rescanning of unfinished message lines so large fragmented responses parse in linear time while preserving UTF-8 and message byte limits.
+- CLI/output: preserve received assistant text in quiet mode when direct or queued prompts fail, and drain failed or cancelled watch turns without requiring a final ACP response or duplicating completed output.
+- Sessions/queue: release completed IPC sockets and buffered output when a waiting client stops reading, without waiting for the shared owner to shut down.
+- Sessions/queue: preserve progressing Windows named-pipe readers, and release stalled live-output observers on macOS and Linux without cancelling or replaying their admitted prompts or disconnecting quiet active turns.
+- Runtime/capabilities: return independent mutable capability snapshots so editing one result cannot change another caller's controls or advertised config keys.
+- Runtime/processes: retire idle agents and delegated terminals when their ACP transport disconnects, and share in-flight cleanup so an old connection cannot close its replacement.
+- Docs/site: preserve Markdown link destinations containing underscores, query parameters, and attribute characters while keeping label formatting and relative links intact.
+- Windows/processes: clean up observed ACP bridge descendants after close, startup failure, or bridge exit, checking process creation timestamps before terminating them and ignoring stale parent links from reused PIDs.
+- PR-triage example: preserve the repository in pasted PR URLs, normalize decimal PR numbers without changing their identity, validate complete batches before dispatch, and support macOS Bash 3.2 with separate jobs for equal PR numbers in different repositories.
+- Sessions/config: preserve config-option transport for newly saved options named `mode`, including replay after reconnect, without overwriting independent legacy mode preferences.
+- Sessions/Windows: retire queue-owner process trees when closing or reclaiming live owners so detached agent descendants do not survive parent termination; report tree-cleanup failures before removing the lease.
+- Sessions/modes: allow an explicit mode change to replace a retired saved mode during fresh fallback while preserving sibling settings, rejection semantics, and same-session requirements.
+- Sessions/models: use model metadata received while restoring a saved mode during prompt reconnect, including changed model controls and explicit model removals.
+
+- Flows: release settled ACP event-write promises during long prompts while preserving journal drain, sequence ranges, and failure ordering.
+
+- Terminals: stop descendant polling when cleanup reaches its deadline so timed-out releases do not leave background timers retaining terminal state.
+
+- Runtime/events: release buffered output and stop collecting future events when a consumer leaves a turn's event stream, while letting the turn finish independently.
+
+- Conformance: separate mock-specific requirements from the core adapter profile, use baseline resource links, accept standard resource-not-found errors, and clarify prompt completion and cancellation responses.
+- Conformance/filesystem: keep callback reads, writes, and scratch-file cleanup inside the session cwd after resolving symlinks, while preserving contained aliases and parent traversal.
+
+- Windows/terminals: clean up observed detached descendants when releasing directly launched terminal commands, verifying process identities before signaling and preserving unrelated processes.
+
+- Sessions/close: wait for the selected queue owner to exit when it releases its lease during shutdown, without signaling a replacement owner.
+- Conformance: reject malformed case/profile instructions and duplicate IDs before starting adapters; preserve negative protocol payloads and literal saved keys so inherited object properties cannot produce false passing assertions.
+- Conformance/filesystem: honor requested read line windows using the production client's selection logic, including empty windows, without bypassing permission or filesystem checks.
+
+- Sessions/queue: verify the owner's OS birth identity before forced retirement so stale leases cannot terminate a different process that reused the PID. Use boot- and namespace-scoped Linux start ticks that survive wall-clock changes. Preserve healthy legacy IPC use and report unverified live ownership without discarding its lease.
+- Sessions/locks: record process birth on new turn and queue mutation locks so abandoned locks can recover after PID reuse; bound identity queries while preserving live and uncertain owners.
+- Flows/replay: retain captured diagnostics, bundled conversations, and step links after failed ACP prompts; preserve parser rejection values and use the real session identity for isolated step records.
+- Flows/replay: keep the initial session-binding artifact immutable when real session IDs or agent metadata arrive later, while preserving current binding metadata for replay readers.
+- Sessions/history: preserve meaningful whitespace in text and thought chunks, retain opaque tool IDs across updates and reloads, and keep tool failure state when a partial update omits status.
+- Runtime: keep early turn errors available for delayed consumers without an unhandled rejection terminating the host.
+- Flows: include explicit agent arguments in persistent session reuse and snapshot resolved arguments so later resolver changes cannot rewrite earlier step metadata.
+- MCP/config: preserve empty and whitespace-containing environment and header values through session creation, loading, and queue-owner startup.
+- Prompts: accept and preserve nullable resource-link titles in structured input and queued prompts.
+- Runtime/events: preserve the ACP `switch_mode` tool kind on initial calls and updates.
+- Prompts: validate required resource-link names and embedded text/blob payloads locally, while preserving valid text or blob alternatives.
+- CLI: reject explicitly empty or whitespace-only `--agent` commands before reading prompt input or selecting the default adapter.
+- CLI/output: route disabled-exec errors through shared formatting, preserving `EXEC_DISABLED` and exit `1` while emitting complete JSON-RPC errors and structured quiet diagnostics.
+- Conformance: fail initialization when returned agent capabilities are null, arrays, or primitive values instead of reporting a passing handshake.
+- Sessions: preserve Node loader arguments after bare debugger flags when starting a queue owner, and filter debugger wait mode and inspector flag aliases.
+- Terminals: retain a valid UTF-8 suffix within small output limits, including when a discarded character's continuation bytes arrive in later writes.
+- Compare: report only explicit token counts, leaving missing totals unknown instead of treating context capacity or occupancy as token consumption.
+- Compare: accept the `--json` alias with strict JSON output and honor command-local output selection for configuration and prompt-input errors, while preserving format precedence and literal prompt values.
+- Sessions/config: preserve opaque config option IDs through saving, replay, and removal, including `__proto__` and space-padded keys that differ from their unpadded siblings.
+
+## 0.18.0 - 2026-09-20
+
+### Highlights
+
+- **Shared-session controls:** change modes, models, and configuration through the shared runtime, and inspect capabilities without shelling out to the CLI.
+- **More reliable sessions:** preserve final output, usage, and accepted settings across cancellation, timeouts, reconnects, and owner transitions.
+- **Safer permissions:** keep interactive approvals separate, reject stale requests, and recheck authority before file writes or terminal launches.
+
+### Changes
+
+- Runtime/shared sessions: add `setMode()`, `setModel()`, `setConfigOption()`, and `getCapabilities()` to `createSharedAcpRuntime()`. Settings are applied by the running queue owner; without one, control requests fail with `ACP_BACKEND_UNAVAILABLE`. Thanks @saariuslystoned.
+
+### Upgrade notes
+
+- Shared sessions: update all participating clients and let older queue owners expire while idle before resuming work. The stronger ownership guards and control-persistence guarantees require updated clients and owners; mixed versions retain the older race conditions.
+- Replay viewer: wildcard binds (`--host 0.0.0.0` or `--host ::`) now reject unconfigured DNS aliases with HTTP 403. Use a numeric interface address, or bind with `--host <hostname>` to keep using that hostname.
+
+### Fixes
+
+- Sessions/timeouts: require a final ACP response before reporting completion, preserve late response outcomes, and retire unfinished connections before queued successors resume the saved session.
+- Sessions/cancellation: stop retries cancelled during backoff or prompt admission without discarding completed responses or cancelling independent queued turns. Soft-closing an active session preserves its final cancellation output, usage, and configuration updates.
+- Sessions/controls: apply settings on the retained adapter even while idle, save accepted mode, model, and configuration changes before acknowledgement, and preserve them through prompt completion, timeout cleanup, and close.
+- Runtime/controls: preserve completed output, usage, and accepted settings when control responses overlap turn finalization; wait for admitted controls before one-shot cleanup.
+- Runtime/sessions: reject incompatible replacement while turns or controls remain unfinished, preserve live state during compatible `ensureSession()` calls, and retire old owners before publishing replacements. Do not reuse closed one-shot owners.
+- Sessions/ownership: serialize abandoned turn recovery and final cleanup across processes, preserve live owners, and prevent cancelled waiters from acquiring a later turn.
+- Sessions/queue: serialize owner handoffs, heartbeats, and stale cleanup so an old cleanup cannot delete a replacement lease or socket. Preserve owners when process liveness is uncertain and drain shutdown after guard cleanup failures.
+- Model controls: validate selections against the connected session's advertised models, including after reconnect, while preserving exact IDs, Cursor's unique aliases, and the accepted configuration response.
+- Permissions: serialize interactive tool, file-write, and terminal questions so one answer cannot approve multiple requests; deny waiting questions when stdin closes.
+- Permissions/runtime: retire pending tool, file, and terminal requests with their owning prompt or ACP request, reject late approvals, and recheck authority before filesystem mutations and every terminal spawn attempt.
+- Permissions/output: infer tool kinds from complete leading action words, so read-like substrings in edit or command titles neither grant read approval nor hide their output.
+- Filesystem: preserve symlink and parent-directory traversal when reading or writing ACP paths, including aliased working directories, instead of accessing an unrelated lexical target.
+- Sessions/prune: recheck saved closed and agent state before pruning, and preserve neighboring sessions whose IDs overlap history filenames.
+- CLI/config: load project permissions and relative MCP configuration from the final top-level `--cwd` and `--mcp-config` values. Preserve custom agent names such as `constructor` and `__proto__` in resolution, listing, and config display.
+- CLI/output: honor explicit JSON and quiet output flags for configuration startup errors instead of printing an uncaught stack trace.
+- Compare: honor prompt delimiters with files or stdin, and resolve project configuration and relative input paths from the command's working directory. On interruption, stop launching agents, await active cleanup, and exit with code 130.
+- Replay viewer: reject foreign Host and Origin headers before HTTP access, WebSocket subscriptions, or shutdown, while preserving native clients without an Origin header. Fix IPv6 listener URLs and status/stop commands.
+
+## 0.17.1 - 2026-09-19
+
+**Highlights:** Configured runtime initialization deadlines now stop unresponsive agents and clean up abandoned launches safely. Embedding hosts gain model inspection and session-specific permissions. Antigravity joins the built-in agents; its fixed-choice questions require an interactive client, including for existing custom launchers.
+
+### Changes
+
+- Dependencies: update fs-safe to 0.12.0 and Zod to 4.6.5, including the matching native filesystem packages.
+- Agents/built-ins: add the `antigravity` shortcut for Google's official ACP runtime, with platform launch arguments and account setup guidance. Thanks @superbiche.
+- Runtime/embedding: inspect agent models without a runtime session store, with bounded discovery and awaited process cleanup.
+- Runtime/embedding: resolve session-specific client permissions without allocating a separate runtime.
+
+### Breaking
+
+- Antigravity/questions: cancel fixed-choice interaction questions with a user-answer-required error instead of selecting an answer through tool approval. This also applies to existing custom launchers and takes precedence over `--approve-all`, permission policies, and embedding host permission callbacks. Continue these conversations in an interactive client supporting Antigravity questions. Thanks @superbiche.
+
+### Fixes
+
+- ACP/capabilities: enforce `--no-fs` and `--no-terminal` against direct agent requests, keeping registered methods aligned with each connection's advertised capabilities.
+- Runtime/prompt admission: accept optional synchronous host authority checks through the final native prompt write, preventing revoked prompts from reaching the agent after preparation or transport queue waits; preserve cancellation results and retire connections closed by rejected writes.
+- Runtime/startup: honor the configured initialization timeout, clean up unresponsive agents and observed descendants, and retire abandoned late launches without disturbing replacement connections. Thanks @saariuslystoned.
+
+## 0.17.0 - 2026-09-17
+
+**Highlights:** Applications and CLI processes can share sessions through one local queue owner and watch session activity with cursor replay. Embedding hosts can guard session controls with optional authority checks. Direct session-journal consumers must distinguish local records from ACP messages.
+
+### Changes
+
+- Runtime/shared sessions: add `createSharedAcpRuntime()` so applications and CLI processes share one local queue owner, with targeted turn cancellation and explicit submission uncertainty. Thanks @mavam.
+- Sessions/watching: add passive `sessions watch` and shared-runtime `watchSession()` with cursor replay, request IDs, and settled turn outcomes. Thanks @mavam.
+
+### Breaking
+
+- Session journals: `.stream.ndjson` now includes local lifecycle and segment records alongside ACP messages; direct consumers must distinguish entries with `jsonrpc: "2.0"`. Built-in readers and portable ACP archives filter local records.
+
+### Fixes
+
+- Runtime/session controls: check optional host authority before sending mode, model, and configuration changes, including reconnect replay; preserve accepted replies and saved selections when authority is later revoked.
+
+## 0.16.0 - 2026-09-16
+
+**Highlights:** Embedding hosts gain session-specific tools, turn-owned approvals, model controls, and agent discovery. Session, filesystem, queue, and process hardening improves reliability; Devin, fx, and Junie join the built-in agents.
+
 ### Changes
 
 - Runtime/embedding: surface normalized ACP plan entries on status events and explicit empty snapshots that clear stale plans. Thanks @gadzan.
@@ -14,6 +287,15 @@ Repo: https://github.com/scottzx/1acp
 - Source builds: document Node 22.22.1 as the minimum Node 22 development version required by lint-staged; published CLI installs still support Node 22.13 and newer.
 
 - Dependencies: refresh Zod, tsx, React Flow, Oxlint, the Pi and Claude adapters, and transitive tooling dependencies while retaining the 48-hour release-age policy.
+- Runtime/embedding: support session-specific tool servers, turn-owned permission callbacks, session handle lookup, and shutdown that waits for owned connections and cleanup.
+
+- Runtime/model selection: expose a model setter that uses the adapter's advertised control and preserves the selected model across reconnects.
+
+- Runtime/discovery: expose installed agent entrypoints and native model display names through the existing registry and session status, with durable local fresh-session preparation for embedding hosts.
+- Dependencies: update Zod validation to 4.6.4. Thanks @dependabot.
+- Agents/built-ins: add the `devin` shortcut for the installed Devin CLI ACP server, preserving its scoped compatibility behavior and standard model selection. Thanks @wtfsayo.
+- Agents/built-ins: add the `fx` shortcut for the installed fx ACP server. Thanks @wtfsayo.
+- Agents/built-ins: add the `junie` shortcut for JetBrains Junie using its registry-standard `--acp=true` launch argument. Thanks @junie-agent.
 
 ### Breaking
 
@@ -23,6 +305,25 @@ Repo: https://github.com/scottzx/1acp
 - Replay viewer: preserve user-message identities across repeated transcript projection so idle polling does not emit spurious patches.
 - Tooling: prevent malformed TOML configuration from hanging documentation lint by overriding the vulnerable `smol-toml` pin with 1.7.2 (GHSA-7w5x-hrqm-74c2).
 - ACP/cancellation: coalesce repeated prompt cancellation, allow explicit retries after failed sends, and preserve successor prompt ownership when abort callbacks reenter the client.
+- Sessions/export: preserve large event segments without exceeding the JavaScript argument limit.
+
+- Sessions/hardening: keep session records and indexes private across atomic rewrites, including embedded file stores.
+- ACP/filesystem: return the standard resource-not-found error for missing files so agents can distinguish new files from failed reads.
+- Filesystem/hardening: use fs-safe roots for ACP file operations and replay-viewer reads, rejecting outside symlinks and special files while preserving contained aliases, normal file modes, and large reads.
+- Viewer/startup: release server resources when the HTTP port is unavailable and avoid opening an unused Vite WebSocket listener.
+- Storage/hardening: share private atomic writes across sessions, flow bundles, imports, and exports; keep history and new config files private while preserving output-directory permissions and append ordering.
+- Queue/hardening: deliver detached-owner startup options through stdin instead of temporary credential-bearing files, preserving large payloads and startup diagnostics.
+- Queue/ownership: keep lease records private and complete during heartbeat updates, drain pending writes before shutdown, and preserve replacement owners during stale recovery.
+- Sessions: preserve both completions when flows and CLI prompts share a session; keep live writers protected and cancel waiting turns without starting delayed prompts.
+- Replay viewer: reject malformed HTTP/WebSocket input and corrupt bundle metadata without terminating the server; recover live updates after transient read failures.
+- CLI/hardening: preserve Unicode across piped prompt chunks and keep optional performance captures private without blocking on special-file targets.
+- Conformance runner: reject successful operations when a case expects an error, and clear shutdown timers after the adapter exits.
+- Sessions: retain metadata updates received during saved-model replay and keep the adapter's later configuration acknowledgement authoritative.
+- Flows: settle pending ACP capture writes before reporting a prompt result, surface bundle write failures without crashing, and preserve visible adapter errors.
+- Replay viewer: keep existing clients synchronized when another viewer subscribes or reconnects, and serialize snapshot/poll publication to preserve patch version order.
+- Runtime/sessions: serialize turns per session record and finish cancellation and local finalization before acknowledging fresh-session preparation, preserving the reset across late writes and surfacing cleanup failures. Thanks @vincentkoc.
+- Codex/permissions: prefer offered one-time refusals that let the turn continue, and explain when safe cancellation can end the turn. Thanks @odrobnik.
+- ACP/processes: clean up witnessed POSIX descendants after bridge shutdown, startup failure, and observed exit, preserving signal inheritance and isolating late exits from replacement launches. Thanks @MertBasar0, @ma-pony, and @superWorldSavior.
 
 ## 0.15.1 - 2026-09-07
 

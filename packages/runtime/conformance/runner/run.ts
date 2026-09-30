@@ -5,11 +5,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   ClientSideConnection,
-  type ContentBlock,
   PROTOCOL_VERSION,
-  type PromptResponse,
   type ReadTextFileRequest,
   type ReadTextFileResponse,
   RequestError,
@@ -21,10 +20,35 @@ import {
   type WriteTextFileRequest,
   type WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
+import { FsSafeError } from "@openclaw/fs-safe/errors";
+import { root, type Root } from "@openclaw/fs-safe/root";
+import { sliceReadWindow } from "../../src/file-read-window.js";
+import { AdapterLifetime, AdapterRetirementError } from "./adapter-lifetime.js";
+import {
+  PromptObservations,
+  type ObservedPrompt,
+  type PromptObservation,
+} from "./prompt-observations.js";
+import {
+  parseCaseDefinition,
+  parseProfileDefinition,
+  type CaseDefinition,
+  type CaseStep,
+  type ErrorExpectation,
+  type ProfileDefinition,
+} from "./schema.js";
 
 type PermissionMode = "approve-all" | "deny-all";
 type OutputFormat = "text" | "json";
 type TimeoutKind = "request" | "update";
+
+type FilesystemOperation = {
+  method: "read_text_file" | "write_text_file";
+  sessionId: string;
+  path: string;
+  content?: string;
+  outcome: { type: "success"; content?: string } | { type: "error"; code?: number };
+};
 
 type CliOptions = {
   profilePath: string;
@@ -37,100 +61,6 @@ type CliOptions = {
   cwd: string;
   onlyCaseIds: Set<string> | undefined;
 };
-
-type ProfileDefinition = {
-  id: string;
-  required_cases: string[];
-};
-
-type CaseDefinition = {
-  id: string;
-  title?: string;
-  permission_mode?: PermissionMode;
-  steps?: CaseStep[];
-  checks?: CaseCheck[];
-  timeouts?: {
-    request_timeout_ms?: number;
-    update_timeout_ms?: number;
-    settle_timeout_ms?: number;
-  };
-};
-
-type ErrorExpectation = {
-  codes?: number[];
-  message_any?: string[];
-};
-
-type CaseStep =
-  | {
-      action: "new_session";
-      cwd?: unknown;
-      save_as?: string;
-      expect_error?: ErrorExpectation;
-    }
-  | {
-      action: "prompt";
-      session: unknown;
-      prompt: ContentBlock[];
-      save_as?: string;
-      expect_error?: ErrorExpectation;
-      suppress_console_error?: boolean;
-    }
-  | {
-      action: "prompt_background";
-      session: unknown;
-      prompt: ContentBlock[];
-      save_as: string;
-    }
-  | {
-      action: "await_background";
-      from: string;
-      save_as?: string;
-      expect_error?: ErrorExpectation;
-    }
-  | {
-      action: "cancel";
-      session: unknown;
-      expect_error?: ErrorExpectation;
-    }
-  | {
-      action: "sleep";
-      ms: number;
-    };
-
-type CaseCheck =
-  | {
-      type: "initialize_protocol_version_number";
-    }
-  | {
-      type: "saved_non_empty_string";
-      key: string;
-    }
-  | {
-      type: "saved_error_present";
-      key: string;
-    }
-  | {
-      type: "saved_stop_reason_in";
-      key: string;
-      values: string[];
-    }
-  | {
-      type: "updates_count_at_least";
-      min: number;
-    }
-  | {
-      type: "updates_all_session";
-      session: string;
-    }
-  | {
-      type: "updates_text_includes";
-      text: string;
-    }
-  | {
-      type: "updates_session_update_includes";
-      values: string[];
-    };
 
 type CaseResult = {
   id: string;
@@ -158,6 +88,7 @@ type RunReport = {
 type Harness = {
   connection: ClientSideConnection;
   client: RunnerClient;
+  prompts: PromptObservations;
   initializeResult: InitializeResponse;
   shutdown: () => Promise<void>;
 };
@@ -169,34 +100,36 @@ type ParsedCommand = {
 
 type ExecutionContext = {
   saved: Record<string, unknown>;
-  background: Map<string, Promise<PromptResponse>>;
+  background: Map<string, ObservedPrompt>;
+  promptSources: Map<string, PromptObservation>;
 };
+
+function saveStepValue(
+  context: ExecutionContext,
+  name: string,
+  value: unknown,
+  observation?: PromptObservation,
+): void {
+  context.saved[name] = value;
+  if (observation) {
+    context.promptSources.set(name, observation);
+  } else {
+    context.promptSources.delete(name);
+  }
+}
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_UPDATE_TIMEOUT_MS = 30_000;
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 10_000;
 
-function isWithinRoot(rootDir: string, targetPath: string): boolean {
-  const relative = path.relative(rootDir, targetPath);
-  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function resolvePathWithinRoot(rootDir: string, rawPath: string): string {
-  const resolved = path.isAbsolute(rawPath)
-    ? path.resolve(rawPath)
-    : path.resolve(rootDir, rawPath);
-  if (!isWithinRoot(rootDir, resolved)) {
-    throw new RequestError(-32001, `Path is outside session cwd root: ${resolved}`);
-  }
-  return resolved;
-}
-
 class RunnerClient implements Client {
   readonly updates: SessionNotification[] = [];
+  readonly filesystemOperations: FilesystemOperation[] = [];
   private readonly permissionMode: PermissionMode;
   private readonly defaultSessionCwd: string;
   private readonly sessionCwds = new Map<SessionId, string>();
-  private readonly createdFiles = new Set<string>();
+  private readonly workspaces = new Map<string, Promise<Root>>();
+  private readonly createdFiles = new Map<string, Root>();
 
   constructor(params: { permissionMode: PermissionMode; defaultSessionCwd: string }) {
     this.permissionMode = params.permissionMode;
@@ -239,32 +172,68 @@ class RunnerClient implements Client {
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-    const filePath = this.resolveSessionPath(params);
-    if (this.permissionMode === "deny-all") {
-      throw new RequestError(-32001, "Permission denied by conformance runner");
-    }
-    const content = await fs.readFile(filePath, "utf8");
-    return { content };
+    return await this.observeFileOperation("read_text_file", params, () =>
+      this.withSessionFile(params, async (workspace, filePath) => ({
+        content: sliceReadWindow(await workspace.readText(filePath), params.line, params.limit),
+      })),
+    );
   }
 
   async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    const filePath = this.resolveSessionPath(params);
-    if (this.permissionMode === "deny-all") {
-      throw new RequestError(-32001, "Permission denied by conformance runner");
+    return await this.observeFileOperation("write_text_file", params, () =>
+      this.withSessionFile(params, async (workspace, filePath) => {
+        const target = await workspace.resolve(filePath);
+        await using file = await workspace.openWritable(target, { mode: 0o666 });
+        if (file.createdForWrite) {
+          this.createdFiles.set(file.realPath, workspace);
+        }
+        await file.handle.writeFile(params.content, "utf8");
+        return {};
+      }),
+    );
+  }
+
+  private async observeFileOperation<T extends ReadTextFileResponse | WriteTextFileResponse>(
+    method: FilesystemOperation["method"],
+    params: ReadTextFileRequest | WriteTextFileRequest,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const request = {
+      method,
+      sessionId: params.sessionId,
+      path: params.path,
+      content: "content" in params ? params.content : undefined,
+    };
+    try {
+      const result = await operation();
+      // This records local completion, not response delivery or prompt attribution.
+      this.filesystemOperations.push({
+        ...request,
+        outcome: {
+          type: "success",
+          content:
+            "content" in result && typeof result.content === "string" ? result.content : undefined,
+        },
+      });
+      return result;
+    } catch (error) {
+      this.filesystemOperations.push({
+        ...request,
+        outcome: { type: "error", code: error instanceof RequestError ? error.code : undefined },
+      });
+      throw error;
     }
-    const fileDidExist = await this.pathExists(filePath);
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, params.content, "utf8");
-    if (!fileDidExist) {
-      this.createdFiles.add(filePath);
-    }
-    return {};
   }
 
   async cleanup(): Promise<void> {
-    for (const filePath of this.createdFiles) {
+    for (const [filePath, workspace] of this.createdFiles) {
       try {
-        await fs.rm(filePath, { force: true });
+        // Root expands leading ~/; keep recorded filenames literal during removal.
+        const relativePath = `.${path.sep}${path.relative(workspace.rootReal, filePath)}`;
+        await workspace.remove(relativePath, {
+          force: true,
+          mutationSymlinks: "reject",
+        });
       } catch {
         // Best-effort cleanup for scratch files created by conformance cases.
       }
@@ -272,17 +241,37 @@ class RunnerClient implements Client {
     this.createdFiles.clear();
   }
 
-  private resolveSessionPath(params: { sessionId: SessionId; path: string }): string {
+  private async withSessionFile<T>(
+    params: { sessionId: SessionId; path: string },
+    operation: (workspace: Root, filePath: string) => Promise<T>,
+  ): Promise<T> {
+    if (this.permissionMode === "deny-all") {
+      throw new RequestError(-32001, "Permission denied by conformance runner");
+    }
     const sessionCwd = this.sessionCwds.get(params.sessionId) ?? this.defaultSessionCwd;
-    return resolvePathWithinRoot(sessionCwd, params.path);
-  }
-
-  private async pathExists(filePath: string): Promise<boolean> {
+    // Keep symlink/.. traversal and literal ~/ names for filesystem resolution.
+    const filePath = path.isAbsolute(params.path)
+      ? params.path
+      : `${sessionCwd}${path.sep}${params.path}`;
     try {
-      await fs.access(filePath);
-      return true;
-    } catch {
-      return false;
+      let workspace = this.workspaces.get(sessionCwd);
+      if (!workspace) {
+        workspace = root(sessionCwd, {
+          symlinks: "follow-within-root",
+          hardlinks: "allow",
+          maxBytes: Infinity,
+        });
+        this.workspaces.set(sessionCwd, workspace);
+      }
+      return await operation(await workspace, filePath);
+    } catch (error) {
+      if (
+        error instanceof FsSafeError &&
+        ["outside-workspace", "path-alias", "symlink"].includes(error.code)
+      ) {
+        throw new RequestError(-32001, `Path is outside session cwd root: ${filePath}`);
+      }
+      throw error;
     }
   }
 }
@@ -388,31 +377,51 @@ function readArgValue(argv: string[], index: number, flag: string): string {
   return value.trim();
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  return awaitWithTimeout(promise, timeoutMs, label);
-}
-
-async function awaitWithTimeout<T>(
+async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
   label: string,
+  signal: AbortSignal,
 ): Promise<T> {
   return await new Promise<T>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
     const timer = setTimeout(() => {
+      cleanup();
       reject(new Error(`${label} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
-
+    signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        cleanup();
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       },
     );
+    if (signal.aborted) {
+      onAbort();
+    }
   });
+}
+
+async function waitForDelay(ms: number, signal: AbortSignal): Promise<void> {
+  try {
+    await delay(ms, undefined, { signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError" && error.cause === signal.reason) {
+      throw signal.reason;
+    }
+    throw error;
+  }
 }
 
 function resolveTimeoutMs(
@@ -495,7 +504,7 @@ function splitCommandLine(value: string): ParsedCommand {
   return { command: parts[0], args: parts.slice(1) };
 }
 
-async function loadJsonFile<T>(filePath: string): Promise<T> {
+async function loadJsonFile(filePath: string): Promise<unknown> {
   let raw: string;
   try {
     raw = await fs.readFile(filePath, "utf8");
@@ -506,7 +515,7 @@ async function loadJsonFile<T>(filePath: string): Promise<T> {
   }
 
   try {
-    return JSON.parse(raw) as T;
+    return JSON.parse(raw) as unknown;
   } catch (error) {
     throw new Error(`Failed to parse JSON ${filePath}: ${toErrorMessage(error)}`, { cause: error });
   }
@@ -517,21 +526,26 @@ async function loadProfileAndCases(options: CliOptions): Promise<{
   casesById: Map<string, CaseDefinition>;
   selectedCaseIds: string[];
 }> {
-  const profile = await loadJsonFile<ProfileDefinition>(options.profilePath);
-  if (!profile || typeof profile.id !== "string" || !Array.isArray(profile.required_cases)) {
-    throw new Error(`Invalid profile file: ${options.profilePath}`);
-  }
+  const profile = parseProfileDefinition(
+    await loadJsonFile(options.profilePath),
+    options.profilePath,
+  );
 
   const caseFiles = (await fs.readdir(options.casesDir))
     .filter((name) => name.endsWith(".json"))
     .map((name) => path.join(options.casesDir, name));
   const casesById = new Map<string, CaseDefinition>();
+  const sourcesById = new Map<string, string>();
 
   for (const filePath of caseFiles) {
-    const definition = await loadJsonFile<CaseDefinition>(filePath);
-    if (!definition || typeof definition.id !== "string") {
-      throw new Error(`Invalid case file (missing id): ${filePath}`);
+    const definition = parseCaseDefinition(await loadJsonFile(filePath), filePath);
+    const previous = sourcesById.get(definition.id);
+    if (previous !== undefined) {
+      throw new Error(
+        `Duplicate case ID ${JSON.stringify(definition.id)} in ${previous} and ${filePath}`,
+      );
     }
+    sourcesById.set(definition.id, filePath);
     casesById.set(definition.id, definition);
   }
 
@@ -559,16 +573,19 @@ async function loadProfileAndCases(options: CliOptions): Promise<{
   };
 }
 
-async function createHarness(options: CliOptions): Promise<Harness> {
+async function createHarness(options: CliOptions, signal: AbortSignal): Promise<Harness> {
   const parsed = splitCommandLine(options.agentCommand);
+  signal.throwIfAborted();
   const child = spawn(parsed.command, parsed.args, {
     cwd: options.agentCommandCwd,
     stdio: ["pipe", "pipe", "pipe"],
     env: process.env,
+    detached: process.platform !== "win32",
   });
+  const lifetime = new AdapterLifetime(child);
 
   if (!child.stdin || !child.stdout) {
-    child.kill();
+    await lifetime.shutdown(Promise.resolve());
     throw new Error("Failed to create stdio pipes for agent process");
   }
 
@@ -584,9 +601,10 @@ async function createHarness(options: CliOptions): Promise<Harness> {
     permissionMode: options.permissionMode,
     defaultSessionCwd: options.cwd,
   });
-  const connection = new ClientSideConnection(() => client, stream);
+  const prompts = new PromptObservations(client.updates);
+  const connection = new ClientSideConnection(() => client, prompts.observeStream(stream));
   let initializeResult: InitializeResponse;
-  let cleanedUp = false;
+  let shutdownPromise: Promise<void> | undefined;
   const waitForSpawn = new Promise<void>((resolve, reject) => {
     const onSpawn = () => {
       child.off("error", onError);
@@ -602,37 +620,32 @@ async function createHarness(options: CliOptions): Promise<Harness> {
     child.once("error", onError);
   });
 
-  const cleanupClientState = async (): Promise<void> => {
-    if (cleanedUp) {
-      return;
-    }
-    cleanedUp = true;
-    await client.cleanup();
-  };
-
-  const shutdown = async (): Promise<void> => {
-    if (child.killed || child.exitCode !== null) {
-      await cleanupClientState();
-      return;
-    }
-    child.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill("SIGKILL");
-        }
-      }, 1500);
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      setTimeout(() => resolve(), 2500);
-    });
-    await cleanupClientState();
+  const shutdown = (): Promise<void> => {
+    shutdownPromise ??= (async () => {
+      const failures: unknown[] = [];
+      try {
+        await lifetime.shutdown(connection.closed);
+      } catch (error) {
+        failures.push(new AdapterRetirementError(toErrorMessage(error), { cause: error }));
+      }
+      try {
+        await client.cleanup();
+      } catch (error) {
+        failures.push(error);
+      }
+      if (failures.length > 0) {
+        throw new AdapterRetirementError(failures.map(toErrorMessage).join("\n"), {
+          cause: new AggregateError(failures),
+        });
+      }
+    })();
+    return shutdownPromise;
   };
 
   try {
-    await waitForSpawn;
+    await withTimeout(waitForSpawn, DEFAULT_INITIALIZE_TIMEOUT_MS, "agent spawn", signal);
+    await lifetime.capture();
+    signal.throwIfAborted();
     initializeResult = await withTimeout(
       connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
@@ -649,17 +662,36 @@ async function createHarness(options: CliOptions): Promise<Harness> {
       }),
       DEFAULT_INITIALIZE_TIMEOUT_MS,
       "initialize",
+      signal,
     );
+    const capabilities: unknown = initializeResult.agentCapabilities;
+    if (
+      capabilities !== undefined &&
+      (capabilities === null || typeof capabilities !== "object" || Array.isArray(capabilities))
+    ) {
+      throw new Error("initialize response agentCapabilities must be an object when present");
+    }
+    await lifetime.capture();
+    signal.throwIfAborted();
   } catch (error) {
-    await shutdown();
+    let cleanupFailure: { error: unknown } | undefined;
+    try {
+      await shutdown();
+    } catch (cleanupError) {
+      cleanupFailure = { error: cleanupError };
+    }
     const detail = stderrBuffer.trim();
     const suffix = detail.length > 0 ? `\nagent stderr:\n${detail}` : "";
-    throw new Error(`initialize failed: ${toErrorMessage(error)}${suffix}`, { cause: error });
+    const failure = new Error(`initialize failed: ${toErrorMessage(error)}${suffix}`, {
+      cause: error,
+    });
+    throw cleanupFailure ? withCleanupFailure(failure, cleanupFailure.error) : failure;
   }
 
   return {
     connection,
     client,
+    prompts,
     initializeResult: initializeResult!,
     shutdown,
   };
@@ -682,6 +714,13 @@ function toErrorMessage(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+function withCleanupFailure(error: unknown, cleanupError: unknown): Error {
+  const ErrorType = cleanupError instanceof AdapterRetirementError ? AdapterRetirementError : Error;
+  return new ErrorType(`${toErrorMessage(error)}\nCleanup: ${toErrorMessage(cleanupError)}`, {
+    cause: new AggregateError([error, cleanupError]),
+  });
 }
 
 async function withSuppressedConsoleError<T>(fn: () => Promise<T>): Promise<T> {
@@ -753,20 +792,24 @@ async function executeWithExpectation<T>(params: {
   timeoutMs: number;
   expectError?: ErrorExpectation;
   operation: () => Promise<T>;
+  signal: AbortSignal;
 }): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+  let value: T;
   try {
-    const value = await withTimeout(params.operation(), params.timeoutMs, params.label);
-    if (params.expectError) {
-      throw new Error(`${params.label} succeeded but error was expected`);
-    }
-    return { ok: true, value };
+    params.signal.throwIfAborted();
+    value = await withTimeout(params.operation(), params.timeoutMs, params.label, params.signal);
   } catch (error) {
+    params.signal.throwIfAborted();
     if (!params.expectError) {
       throw error;
     }
     validateExpectedError(error, params.expectError);
     return { ok: false, error };
   }
+  if (params.expectError) {
+    throw new Error(`${params.label} succeeded but error was expected`);
+  }
+  return { ok: true, value };
 }
 
 async function executeCaseStep(params: {
@@ -776,8 +819,10 @@ async function executeCaseStep(params: {
   options: CliOptions;
   requestTimeoutMs: number;
   updateTimeoutMs: number;
+  signal: AbortSignal;
 }): Promise<void> {
-  const { step, harness, context, options, requestTimeoutMs, updateTimeoutMs } = params;
+  const { step, harness, context, options, requestTimeoutMs, updateTimeoutMs, signal } = params;
+  signal.throwIfAborted();
 
   switch (step.action) {
     case "sleep": {
@@ -786,7 +831,7 @@ async function executeCaseStep(params: {
         true,
         `Invalid sleep.ms: ${String(step.ms)}`,
       );
-      await new Promise((resolve) => setTimeout(resolve, Math.round(step.ms)));
+      await waitForDelay(Math.round(step.ms), signal);
       return;
     }
 
@@ -794,6 +839,7 @@ async function executeCaseStep(params: {
       const cwdCandidate = step.cwd === undefined ? options.cwd : step.cwd;
       const result = await executeWithExpectation({
         label: "session/new",
+        signal,
         timeoutMs: requestTimeoutMs,
         expectError: step.expect_error,
         operation: async () => {
@@ -813,27 +859,34 @@ async function executeCaseStep(params: {
       }
 
       if (step.save_as) {
-        context.saved[step.save_as] =
+        saveStepValue(
+          context,
+          step.save_as,
           result.ok && typeof result.value.sessionId === "string"
             ? result.value.sessionId
             : result.ok
               ? result.value
-              : result.error;
+              : result.error,
+        );
       }
       return;
     }
 
     case "prompt": {
       const sessionId = resolveMaybeSavedRef(step.session, context.saved);
-      const runPrompt = async () => {
-        return await harness.connection.prompt({
+      let observation: PromptObservation | undefined;
+      const runPrompt = () => {
+        const dispatched = harness.prompts.dispatch(harness.connection, {
           sessionId: sessionId as SessionId,
           prompt: step.prompt,
         });
+        observation = dispatched.observation;
+        return dispatched.pending;
       };
 
       const result = await executeWithExpectation({
         label: "session/prompt",
+        signal,
         timeoutMs: updateTimeoutMs,
         expectError: step.expect_error,
         operation: async () => {
@@ -845,38 +898,43 @@ async function executeCaseStep(params: {
       });
 
       if (step.save_as) {
-        context.saved[step.save_as] = result.ok ? result.value : result.error;
+        saveStepValue(context, step.save_as, result.ok ? result.value : result.error, observation);
       }
       return;
     }
 
     case "prompt_background": {
       const sessionId = resolveMaybeSavedRef(step.session, context.saved);
-      context.background.set(
-        step.save_as,
-        harness.connection.prompt({
-          sessionId: sessionId as SessionId,
-          prompt: step.prompt,
-        }),
-      );
+      const dispatched = harness.prompts.dispatch(harness.connection, {
+        sessionId: sessionId as SessionId,
+        prompt: step.prompt,
+      });
+      context.background.set(step.save_as, dispatched);
+      context.promptSources.set(step.save_as, dispatched.observation);
       return;
     }
 
     case "await_background": {
-      const pending = context.background.get(step.from);
-      if (!pending) {
+      const background = context.background.get(step.from);
+      if (!background) {
         throw new Error(`Unknown background prompt reference: ${step.from}`);
       }
 
       const result = await executeWithExpectation({
         label: `await_background:${step.from}`,
+        signal,
         timeoutMs: updateTimeoutMs,
         expectError: step.expect_error,
-        operation: async () => await pending,
+        operation: async () => await background.pending,
       });
 
       if (step.save_as) {
-        context.saved[step.save_as] = result.ok ? result.value : result.error;
+        saveStepValue(
+          context,
+          step.save_as,
+          result.ok ? result.value : result.error,
+          background.observation,
+        );
       }
       return;
     }
@@ -885,6 +943,7 @@ async function executeCaseStep(params: {
       const sessionId = resolveMaybeSavedRef(step.session, context.saved);
       await executeWithExpectation({
         label: "session/cancel",
+        signal,
         timeoutMs: requestTimeoutMs,
         expectError: step.expect_error,
         operation: async () => {
@@ -893,6 +952,8 @@ async function executeCaseStep(params: {
       });
       return;
     }
+    default:
+      throw new Error("Unsupported conformance step");
   }
 }
 
@@ -929,10 +990,19 @@ function evaluateCaseChecks(params: {
         break;
       }
       case "updates_count_at_least": {
+        const count =
+          check.from === undefined
+            ? params.harness.client.updates.length
+            : params.harness.prompts.count(
+                params.context.promptSources.get(check.from),
+                check.from,
+              );
         assert.equal(
-          params.harness.client.updates.length >= check.min,
+          count >= check.min,
           true,
-          `expected at least ${check.min} updates`,
+          check.from === undefined
+            ? `expected at least ${check.min} updates`
+            : `expected at least ${check.min} updates from ${JSON.stringify(check.from)}; observed ${count}`,
         );
         break;
       }
@@ -957,10 +1027,10 @@ function evaluateCaseChecks(params: {
         break;
       }
       case "updates_session_update_includes": {
-        const seen = new Set(
+        const seen = new Set<string>(
           params.harness.client.updates
             .map((update) => update.update?.sessionUpdate)
-            .filter((value): value is string => typeof value === "string"),
+            .filter((value) => typeof value === "string"),
         );
 
         for (const value of check.values) {
@@ -972,6 +1042,39 @@ function evaluateCaseChecks(params: {
         }
         break;
       }
+      case "filesystem_operation": {
+        const session = resolveMaybeSavedRef(check.session, params.context.saved);
+        const matched = params.harness.client.filesystemOperations.some((operation) => {
+          if (
+            operation.method !== check.method ||
+            operation.sessionId !== session ||
+            operation.path !== check.path ||
+            operation.content !== check.content
+          ) {
+            return false;
+          }
+          if (check.outcome.type === "error") {
+            return (
+              operation.outcome.type === "error" && operation.outcome.code === check.outcome.code
+            );
+          }
+          return (
+            operation.outcome.type === "success" &&
+            (check.outcome.content_includes === undefined ||
+              operation.outcome.content
+                ?.toLowerCase()
+                .includes(check.outcome.content_includes.toLowerCase()) === true)
+          );
+        });
+        assert.equal(
+          matched,
+          true,
+          `expected completed filesystem operation: ${JSON.stringify(check)}`,
+        );
+        break;
+      }
+      default:
+        throw new Error("Unsupported conformance check");
     }
   }
 }
@@ -979,7 +1082,8 @@ function evaluateCaseChecks(params: {
 async function runCase(
   caseDefinition: CaseDefinition,
   options: CliOptions,
-): Promise<{ passed: true } | { passed: false; error: string }> {
+  signal: AbortSignal,
+): Promise<{ passed: true } | { passed: false; error: string; retirementFailed?: boolean }> {
   const requestTimeoutMs = resolveTimeoutMs(caseDefinition, "request", DEFAULT_REQUEST_TIMEOUT_MS);
   const updateTimeoutMs = resolveTimeoutMs(caseDefinition, "update", DEFAULT_UPDATE_TIMEOUT_MS);
   const settleTimeoutMs = resolveSettleTimeoutMs(caseDefinition);
@@ -989,11 +1093,13 @@ async function runCase(
       : options;
   let harness: Harness | undefined;
   const context: ExecutionContext = {
-    saved: {},
+    saved: Object.create(null) as Record<string, unknown>,
     background: new Map(),
+    promptSources: new Map(),
   };
+  let failure: { error: unknown } | undefined;
   try {
-    harness = await createHarness(effectiveOptions);
+    harness = await createHarness(effectiveOptions, signal);
     const activeHarness = harness;
     for (const step of caseDefinition.steps ?? []) {
       await executeCaseStep({
@@ -1003,26 +1109,38 @@ async function runCase(
         options: effectiveOptions,
         requestTimeoutMs,
         updateTimeoutMs,
+        signal,
       });
     }
 
     if (settleTimeoutMs > 0) {
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, settleTimeoutMs);
-      });
+      await waitForDelay(settleTimeoutMs, signal);
     }
 
+    signal.throwIfAborted();
     evaluateCaseChecks({
       caseDefinition,
       harness: activeHarness,
       context,
     });
-    return { passed: true };
   } catch (error) {
-    return { passed: false, error: toErrorMessage(error) };
-  } finally {
-    await harness?.shutdown();
+    failure = { error };
   }
+  try {
+    await harness?.shutdown();
+  } catch (error) {
+    failure = { error: failure ? withCleanupFailure(failure.error, error) : error };
+  }
+  if (signal.aborted && !failure) {
+    failure = { error: signal.reason };
+  }
+  return failure
+    ? {
+        passed: false,
+        error: toErrorMessage(failure.error),
+        retirementFailed: failure.error instanceof AdapterRetirementError,
+      }
+    : { passed: true };
 }
 
 function extractErrorCode(error: unknown): number | undefined {
@@ -1043,7 +1161,7 @@ function extractErrorCode(error: unknown): number | undefined {
   return undefined;
 }
 
-function printTextSummary(report: RunReport): void {
+function formatTextSummary(report: RunReport): string {
   const passed = report.totals.passed;
   const failed = report.totals.failed;
   const lines = [
@@ -1059,63 +1177,106 @@ function printTextSummary(report: RunReport): void {
     lines.push(result.error ? `${base} -> ${result.error}` : base);
   }
 
-  process.stdout.write(`${lines.join("\n")}\n`);
+  return `${lines.join("\n")}\n`;
+}
+
+async function runSelectedCases(
+  definitions: CaseDefinition[],
+  options: CliOptions,
+  signal: AbortSignal,
+): Promise<CaseResult[]> {
+  const results: CaseResult[] = [];
+  for (const definition of definitions) {
+    if (signal.aborted) {
+      break;
+    }
+    const startedAt = Date.now();
+    const result = await runCase(definition, options, signal);
+    results.push({
+      id: definition.id,
+      title: definition.title ?? definition.id,
+      passed: result.passed,
+      durationMs: Date.now() - startedAt,
+      error: result.passed ? undefined : result.error,
+    });
+    if (!result.passed && result.retirementFailed) {
+      break;
+    }
+  }
+  return results;
+}
+
+async function writeOutput(stream: Writable, text: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    stream.write(text, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+async function reportFatalError(error: unknown): Promise<void> {
+  process.exitCode = 1;
+  await writeOutput(process.stderr, `conformance runner failed: ${toErrorMessage(error)}\n`);
 }
 
 async function main(): Promise<void> {
   const startedAtMs = Date.now();
   const options = parseArgs(process.argv.slice(2));
   const { profile, casesById, selectedCaseIds } = await loadProfileAndCases(options);
-
-  const results: CaseResult[] = [];
-
-  for (const caseId of selectedCaseIds) {
-    const definition = casesById.get(caseId);
-    assert(definition, `missing case definition: ${caseId}`);
-    const startedAt = Date.now();
-    const result = await runCase(definition, options);
-    results.push({
-      id: caseId,
-      title: definition.title ?? caseId,
-      passed: result.passed,
-      durationMs: Date.now() - startedAt,
-      error: result.passed ? undefined : result.error,
-    });
-  }
-
-  const passed = results.filter((result) => result.passed).length;
-  const report: RunReport = {
-    profileId: profile.id,
-    startedAt: new Date(startedAtMs).toISOString(),
-    completedAt: new Date().toISOString(),
-    agentCommand: options.agentCommand,
-    cwd: options.cwd,
-    permissionMode: options.permissionMode,
-    totals: {
-      cases: results.length,
-      passed,
-      failed: results.length - passed,
-    },
-    results,
-  };
-
-  if (options.reportPath) {
-    await fs.mkdir(path.dirname(options.reportPath), { recursive: true });
-    await fs.writeFile(options.reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-  }
-
-  if (options.format === "json") {
-    process.stdout.write(`${JSON.stringify(report)}\n`);
-  } else {
-    printTextSummary(report);
-  }
-
-  if (report.totals.failed > 0) {
-    process.exitCode = 1;
+  const definitions = selectedCaseIds.map((id) => {
+    const definition = casesById.get(id);
+    assert(definition, `missing case definition: ${id}`);
+    return definition;
+  });
+  const controller = new AbortController();
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const interruption: { signal?: (typeof signals)[number] } = {};
+  const handlers = signals.map((signal) => {
+    const handler = () => {
+      if (!interruption.signal) {
+        interruption.signal = signal;
+        controller.abort(new Error(`Conformance runner interrupted by ${signal}`));
+      }
+    };
+    process.on(signal, handler);
+    return { signal, handler };
+  });
+  try {
+    const results = await runSelectedCases(definitions, options, controller.signal);
+    const passed = results.filter((result) => result.passed).length;
+    const report: RunReport = {
+      profileId: profile.id,
+      startedAt: new Date(startedAtMs).toISOString(),
+      completedAt: new Date().toISOString(),
+      agentCommand: options.agentCommand,
+      cwd: options.cwd,
+      permissionMode: options.permissionMode,
+      totals: { cases: results.length, passed, failed: results.length - passed },
+      results,
+    };
+    if (options.reportPath) {
+      await fs.mkdir(path.dirname(options.reportPath), { recursive: true });
+      await fs.writeFile(options.reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    }
+    await writeOutput(
+      process.stdout,
+      options.format === "json" ? `${JSON.stringify(report)}\n` : formatTextSummary(report),
+    );
+    if (report.totals.failed > 0) {
+      process.exitCode = 1;
+    }
+  } catch (error) {
+    await reportFatalError(error);
+  } finally {
+    for (const { signal, handler } of handlers) {
+      process.off(signal, handler);
+    }
+    if (interruption.signal) {
+      process.exitCode = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 }[interruption.signal];
+      if (process.platform !== "win32") {
+        // Preserve native signal termination only after the report and owned cleanup settle.
+        process.kill(process.pid, interruption.signal);
+      }
+    }
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`conformance runner failed: ${toErrorMessage(error)}\n`);
-  process.exitCode = 1;
-});
+void main().catch(reportFatalError);

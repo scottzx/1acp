@@ -38,9 +38,9 @@ function cancelled(): RequestPermissionResponse {
   return { outcome: { outcome: "cancelled" } };
 }
 
-function withEscalationMetadata(
+export function withPermissionMetadata(
   response: RequestPermissionResponse,
-  event: PermissionEscalationEvent,
+  metadata: Record<string, unknown>,
 ): RequestPermissionResponse {
   return {
     ...response,
@@ -52,7 +52,7 @@ function withEscalationMetadata(
         !Array.isArray(response._meta.acpx)
           ? response._meta.acpx
           : {}),
-        permissionEscalation: event,
+        ...metadata,
       },
     },
   };
@@ -71,15 +71,15 @@ function pickOption(
   return undefined;
 }
 
-const TOOL_KIND_TITLE_MATCHERS: Array<{ kind: ToolKind; needles: readonly string[] }> = [
-  { kind: "read", needles: ["read", "cat"] },
-  { kind: "search", needles: ["search", "find", "grep"] },
-  { kind: "edit", needles: ["write", "edit", "patch"] },
-  { kind: "delete", needles: ["delete", "remove"] },
-  { kind: "move", needles: ["move", "rename"] },
-  { kind: "execute", needles: ["run", "execute", "bash"] },
-  { kind: "fetch", needles: ["fetch", "http", "url"] },
-  { kind: "think", needles: ["think"] },
+const TOOL_KIND_TITLE_MATCHERS: Array<{ kind: ToolKind; names: readonly string[] }> = [
+  { kind: "read", names: ["read", "cat"] },
+  { kind: "search", names: ["search", "find", "grep"] },
+  { kind: "edit", names: ["write", "edit", "patch"] },
+  { kind: "delete", names: ["delete", "remove"] },
+  { kind: "move", names: ["move", "rename"] },
+  { kind: "execute", names: ["run", "execute", "bash"] },
+  { kind: "fetch", names: ["fetch", "http", "url"] },
+  { kind: "think", names: ["think"] },
 ];
 
 export function inferToolKind(params: RequestPermissionRequest): ToolKind | undefined {
@@ -92,29 +92,27 @@ export function inferToolKind(params: RequestPermissionRequest): ToolKind | unde
     return undefined;
   }
 
-  const head = title.split(":", 1)[0]?.trim();
+  const head = title.split(/[:\s]/, 1)[0];
   if (!head) {
     return undefined;
   }
 
-  return titleHeadToolKind(head) ?? "other";
-}
-
-function titleHeadToolKind(head: string): ToolKind | undefined {
-  return TOOL_KIND_TITLE_MATCHERS.find(({ needles }) =>
-    needles.some((needle) => head.includes(needle)),
-  )?.kind;
+  return TOOL_KIND_TITLE_MATCHERS.find(({ names }) => names.includes(head))?.kind ?? "other";
 }
 
 function isAutoApprovedReadKind(kind: ToolKind | undefined): boolean {
   return kind === "read" || kind === "search";
 }
 
-async function promptForToolPermission(params: RequestPermissionRequest): Promise<boolean> {
+async function promptForToolPermission(
+  params: RequestPermissionRequest,
+  signal?: AbortSignal,
+): Promise<boolean> {
   const toolName = params.toolCall.title ?? "tool";
   const toolKind = inferToolKind(params) ?? "other";
   return await promptForPermission({
     prompt: `\n[permission] Allow ${toolName} [${toolKind}]? (y/N) `,
+    signal,
   });
 }
 
@@ -256,15 +254,16 @@ async function resolveEscalatingPermissionRequest(
   policyMatch: PermissionPolicyMatch,
   allowOption: PermissionOption | undefined,
   rejectOption: PermissionOption | undefined,
+  signal?: AbortSignal,
 ): Promise<ResolvedPermissionRequest> {
   if (canPromptForPermission()) {
-    return resolveInteractivePromptResult(params, allowOption, rejectOption);
+    return resolveInteractivePromptResult(params, allowOption, rejectOption, signal);
   }
 
   const escalation = buildEscalationEvent(params, policyMatch.matchedRule);
   const response = rejectOption ? selected(rejectOption.optionId) : cancelled();
   return {
-    response: withEscalationMetadata(response, escalation),
+    response: withPermissionMetadata(response, { permissionEscalation: escalation }),
     escalation,
   };
 }
@@ -273,8 +272,9 @@ async function resolveInteractivePromptResult(
   params: RequestPermissionRequest,
   allowOption: PermissionOption | undefined,
   rejectOption: PermissionOption | undefined,
+  signal?: AbortSignal,
 ): Promise<ResolvedPermissionRequest> {
-  const approved = await promptForToolPermission(params);
+  const approved = await promptForToolPermission(params, signal);
   if (approved && allowOption) {
     return { response: selected(allowOption.optionId) };
   }
@@ -290,6 +290,7 @@ function resolvePolicyMatch(
   options: PermissionOption[],
   allowOption: PermissionOption | undefined,
   rejectOption: PermissionOption | undefined,
+  signal?: AbortSignal,
 ): Promise<ResolvedPermissionRequest | undefined> | ResolvedPermissionRequest | undefined {
   if (policyMatch?.action === "approve") {
     return selectedOrFirst(options, allowOption);
@@ -298,7 +299,13 @@ function resolvePolicyMatch(
     return selectedOrCancelled(rejectOption);
   }
   if (policyMatch?.action === "escalate") {
-    return resolveEscalatingPermissionRequest(params, policyMatch, allowOption, rejectOption);
+    return resolveEscalatingPermissionRequest(
+      params,
+      policyMatch,
+      allowOption,
+      rejectOption,
+      signal,
+    );
   }
   return undefined;
 }
@@ -333,6 +340,7 @@ async function resolveReadOrPromptPermission(
   nonInteractivePolicy: NonInteractivePermissionPolicy,
   allowOption: PermissionOption | undefined,
   rejectOption: PermissionOption | undefined,
+  signal?: AbortSignal,
 ): Promise<ResolvedPermissionRequest> {
   const kind = inferToolKind(params);
   if (isAutoApprovedReadKind(kind) && allowOption) {
@@ -343,7 +351,7 @@ async function resolveReadOrPromptPermission(
     return resolveNonInteractivePermission(nonInteractivePolicy, rejectOption);
   }
 
-  return resolveInteractivePromptResult(params, allowOption, rejectOption);
+  return resolveInteractivePromptResult(params, allowOption, rejectOption, signal);
 }
 
 export function permissionModeSatisfies(actual: PermissionMode, required: PermissionMode): boolean {
@@ -355,12 +363,14 @@ export async function resolvePermissionRequest(
   mode: PermissionMode,
   nonInteractivePolicy: NonInteractivePermissionPolicy = "deny",
   policy?: PermissionPolicy,
+  signal?: AbortSignal,
 ): Promise<RequestPermissionResponse> {
   const result = await resolvePermissionRequestWithDetails(
     params,
     mode,
     nonInteractivePolicy,
     policy,
+    signal,
   );
   return result.response;
 }
@@ -370,6 +380,33 @@ export async function resolvePermissionRequestWithDetails(
   mode: PermissionMode,
   nonInteractivePolicy: NonInteractivePermissionPolicy = "deny",
   policy?: PermissionPolicy,
+  signal?: AbortSignal,
+): Promise<ResolvedPermissionRequest> {
+  try {
+    signal?.throwIfAborted();
+    const result = await resolvePermissionByPolicy(
+      params,
+      mode,
+      nonInteractivePolicy,
+      policy,
+      signal,
+    );
+    signal?.throwIfAborted();
+    return result;
+  } catch (error) {
+    if (signal?.aborted) {
+      return { response: cancelled() };
+    }
+    throw error;
+  }
+}
+
+async function resolvePermissionByPolicy(
+  params: RequestPermissionRequest,
+  mode: PermissionMode,
+  nonInteractivePolicy: NonInteractivePermissionPolicy,
+  policy: PermissionPolicy | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<ResolvedPermissionRequest> {
   const options = params.options ?? [];
   if (options.length === 0) {
@@ -386,6 +423,7 @@ export async function resolvePermissionRequestWithDetails(
     options,
     allowOption,
     rejectOption,
+    signal,
   );
   if (resolvedByPolicy) {
     return resolvedByPolicy;
@@ -396,7 +434,13 @@ export async function resolvePermissionRequestWithDetails(
     return resolvedByMode;
   }
 
-  return resolveReadOrPromptPermission(params, nonInteractivePolicy, allowOption, rejectOption);
+  return resolveReadOrPromptPermission(
+    params,
+    nonInteractivePolicy,
+    allowOption,
+    rejectOption,
+    signal,
+  );
 }
 
 const DECISION_FALLBACK_ORDER: Record<

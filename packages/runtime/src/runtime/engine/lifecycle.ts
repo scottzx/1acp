@@ -1,6 +1,38 @@
+import { normalizeAgentSessionId } from "../../acp/agent-session-id.js";
 import type { AgentLifecycleSnapshot } from "../../acp/client.js";
-import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
+import { createSessionConversation } from "../../session/conversation-model.js";
+import { defaultSessionEventLog } from "../../session/event-log.js";
 import type { SessionConversation, SessionRecord } from "../../types.js";
+
+export function createInitialSessionRecord(params: {
+  recordId: string;
+  name?: string;
+  sessionId: string;
+  agentCommand: string;
+  agentArgv?: string[];
+  cwd: string;
+  agentSessionId?: string;
+}): SessionRecord {
+  const now = new Date().toISOString();
+  return {
+    schema: "acpx.session.v1",
+    acpxRecordId: params.recordId,
+    acpSessionId: params.sessionId,
+    agentSessionId: params.agentSessionId,
+    agentCommand: params.agentCommand,
+    agentArgv: params.agentArgv,
+    cwd: params.cwd,
+    name: params.name,
+    createdAt: now,
+    lastUsedAt: now,
+    lastSeq: 0,
+    eventLog: defaultSessionEventLog(params.recordId),
+    closed: false,
+    closedAt: undefined,
+    ...createSessionConversation(now),
+    acpx: {},
+  };
+}
 
 export function applyLifecycleSnapshotToRecord(
   record: SessionRecord,
@@ -31,7 +63,7 @@ export function reconcileAgentSessionId(
   record: SessionRecord,
   agentSessionId: string | undefined,
 ): void {
-  const normalized = normalizeRuntimeSessionId(agentSessionId);
+  const normalized = normalizeAgentSessionId(agentSessionId);
   if (!normalized) {
     return;
   }

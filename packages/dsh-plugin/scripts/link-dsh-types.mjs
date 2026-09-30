@@ -1,5 +1,5 @@
 /** Link development declarations from a matching, already installed DSH checkout. */
-import { mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, lstatSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, realpathSync, symlinkSync, lstatSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 
 const checkout = process.argv[2];
@@ -11,7 +11,16 @@ for (const group of readdirSync(join(root, 'packages'), { withFileTypes: true })
   if (!group.isDirectory()) continue;
   for (const pkg of readdirSync(join(root, 'packages', group.name), { withFileTypes: true })) {
     if (!pkg.isDirectory()) continue;
-    const directory = join(root, 'packages', group.name, pkg.name);
+    let directory = join(root, 'packages', group.name, pkg.name);
+    if (!existsSync(join(directory, 'package.json'))) {
+      let nested = null;
+      for (const inner of readdirSync(directory, { withFileTypes: true })) {
+        if (!inner.isDirectory()) continue;
+        const innerDir = join(directory, inner.name);
+        if (existsSync(join(innerDir, 'package.json'))) { nested = innerDir; break; }
+      }
+      if (nested) directory = nested;
+    }
     let manifest;
     try { manifest = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') continue; throw error; }

@@ -1,10 +1,306 @@
 import assert from "node:assert/strict";
+import childProcess, { type ChildProcess, type SpawnOptions } from "node:child_process";
 import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { TerminalManager } from "../src/acp/terminal-manager.js";
 import { PermissionPromptUnavailableError } from "../src/errors.js";
+
+test(
+  "revoked terminal authority prevents a shell fallback spawn",
+  { skip: process.platform === "win32", timeout: 10_000 },
+  async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-fallback-authority-"));
+    const manager = new TerminalManager({ cwd, permissionMode: "approve-all" });
+    const closed: Array<Promise<void>> = [];
+    try {
+      const marker = path.join(cwd, "fallback.txt");
+      const script = "require('node:fs').writeFileSync(process.argv[1], 'fallback ran')";
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} ${JSON.stringify(marker)}`;
+      const params = { sessionId: "synthetic", command };
+      const control = await manager.createTerminal(params);
+      assert.equal(
+        (
+          await manager.waitForTerminalExit({
+            sessionId: "synthetic",
+            terminalId: control.terminalId,
+          })
+        ).exitCode,
+        0,
+      );
+      assert.equal(await fs.readFile(marker, "utf8"), "fallback ran");
+      await manager.releaseTerminal({ sessionId: "synthetic", terminalId: control.terminalId });
+      await fs.unlink(marker);
+
+      const controller = new AbortController();
+      const revoked = new Error("expired after failed direct launch");
+      let attempts = 0;
+      await withObservedSpawns(
+        (child) => {
+          attempts += 1;
+          closed.push(new Promise<void>((resolve) => child.once("close", () => resolve())));
+          child.once("error", () => controller.abort(revoked));
+        },
+        async () => {
+          await assert.rejects(
+            manager.createTerminal(params, { signal: controller.signal }),
+            (error) => error === revoked,
+          );
+        },
+      );
+      assert.equal(attempts, 1, "the revoked shell fallback must never be spawned");
+      await assert.rejects(fs.access(marker), { code: "ENOENT" });
+    } finally {
+      await manager.shutdown();
+      await Promise.all(closed);
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "terminal creation owns and cleans up a process cancelled during spawn adoption",
+  { timeout: 10_000 },
+  async (t) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-adoption-authority-"));
+    const manager = new TerminalManager({ cwd, permissionMode: "approve-all", killGraceMs: 10 });
+    let spawned: ChildProcess | undefined;
+    let closed: Promise<void> | undefined;
+    t.after(async () => {
+      if (spawned && spawned.exitCode === null && spawned.signalCode === null) {
+        spawned.kill("SIGKILL");
+      }
+      await closed;
+      await manager.shutdown();
+      await fs.rm(cwd, { recursive: true, force: true });
+    });
+    const controller = new AbortController();
+    const revoked = new Error("expired during spawn adoption");
+    await withObservedSpawns(
+      (child) => {
+        spawned = child;
+        closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+        child.once("spawn", () => controller.abort(revoked));
+      },
+      async () => {
+        await assert.rejects(
+          manager.createTerminal(
+            {
+              sessionId: "synthetic",
+              command: process.execPath,
+              args: ["-e", "setInterval(() => {}, 1000)"],
+            },
+            { signal: controller.signal },
+          ),
+          (error) => error === revoked,
+        );
+      },
+    );
+    assert(spawned);
+    assert(
+      spawned.exitCode !== null || spawned.signalCode !== null,
+      "creation must await process cleanup before rejecting",
+    );
+    await closed;
+    assert.equal((manager as unknown as { terminals: Map<string, unknown> }).terminals.size, 0);
+  },
+);
+
+async function withObservedSpawns(
+  observe: (child: ChildProcess) => void,
+  run: () => Promise<void>,
+): Promise<void> {
+  const original = childProcess.spawn;
+  childProcess.spawn = ((command: string, args: readonly string[], options: SpawnOptions) => {
+    const child = original(command, args, options);
+    observe(child);
+    return child;
+  }) as typeof childProcess.spawn;
+  syncBuiltinESMExports();
+  try {
+    await run();
+  } finally {
+    childProcess.spawn = original;
+    syncBuiltinESMExports();
+  }
+}
+
+test("terminal creation is admitted before operation callbacks can start shutdown", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-reentrant-shutdown-"));
+  let closing: Promise<void> | undefined;
+  const manager = new TerminalManager({
+    cwd,
+    permissionMode: "approve-all",
+    onOperation: (operation) => {
+      if (operation.method === "terminal/create" && operation.status === "running") {
+        closing = manager.shutdown();
+      }
+    },
+  });
+  try {
+    const created = await manager.createTerminal({
+      sessionId: "synthetic",
+      command: process.execPath,
+      args: ["-e", "process.exit(0)"],
+    });
+    assert(closing);
+    await closing;
+    await assert.rejects(
+      manager.terminalOutput({ sessionId: "synthetic", ...created }),
+      /Unknown terminal/u,
+    );
+  } finally {
+    await manager.shutdown();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const failure of [new Error("synthetic adoption cleanup failure"), undefined]) {
+  test(
+    `shutdown retains adoption cleanup failure ${String(failure)} after successful retry`,
+    { timeout: 10_000 },
+    async () => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-adoption-failure-"));
+      const manager = new TerminalManager({ cwd, permissionMode: "approve-all", killGraceMs: 10 });
+      const controller = new AbortController();
+      const release = manager.releaseTerminal.bind(manager);
+      let firstRelease = true;
+      let closing: Promise<unknown> | undefined;
+      const closed: Promise<void>[] = [];
+      manager.releaseTerminal = async (params) => {
+        if (firstRelease) {
+          firstRelease = false;
+          throw failure;
+        }
+        return await release(params);
+      };
+      try {
+        await withObservedSpawns(
+          (child) => {
+            closed.push(new Promise<void>((resolve) => child.once("close", () => resolve())));
+            child.once("spawn", () => {
+              controller.abort();
+              closing = manager.shutdown().then(
+                () => undefined,
+                (error: unknown) => error,
+              );
+            });
+          },
+          async () => {
+            await assert.rejects(
+              manager.createTerminal(
+                {
+                  sessionId: "synthetic",
+                  command: process.execPath,
+                  args: ["-e", "setInterval(() => {}, 1000)"],
+                },
+                { signal: controller.signal },
+              ),
+              (error: unknown) => error === failure,
+            );
+            assert(closing);
+            const error = await closing;
+            assert(error instanceof AggregateError);
+            assert.deepEqual(error.errors, [failure]);
+            await Promise.all(closed);
+          },
+        );
+        // A completed shutdown does not permanently close the reusable terminal owner.
+        const fresh = await manager.createTerminal({
+          sessionId: "fresh",
+          command: process.execPath,
+          args: ["-e", "process.exit(0)"],
+        });
+        assert.equal(
+          (await manager.waitForTerminalExit({ sessionId: "fresh", ...fresh })).exitCode,
+          0,
+        );
+        await manager.releaseTerminal({ sessionId: "fresh", ...fresh });
+      } finally {
+        manager.releaseTerminal = release;
+        await closing;
+        await manager.shutdown();
+        await Promise.all(closed);
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+for (const outcome of ["denied", "spawn-error", "cancelled"] as const) {
+  test(`ordinary ${outcome} terminal creation does not fail shutdown`, async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-create-error-"));
+    const manager = new TerminalManager({
+      cwd,
+      permissionMode: outcome === "denied" ? "deny-all" : "approve-all",
+    });
+    const controller = new AbortController();
+    if (outcome === "cancelled") {
+      controller.abort();
+    }
+    try {
+      const pending = manager.createTerminal(
+        { sessionId: "synthetic", command: path.join(cwd, "missing-native-executable"), args: [] },
+        { signal: controller.signal },
+      );
+      await Promise.all([assert.rejects(pending), manager.shutdown()]);
+    } finally {
+      await manager.shutdown();
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("shutdown joins another admitted creation after one creation fails", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-create-cohort-"));
+  let approve = (_approved: boolean) => {};
+  const approval = new Promise<boolean>((resolve) => {
+    approve = resolve;
+  });
+  let entered = () => {};
+  const question = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const manager = new TerminalManager({
+    cwd,
+    permissionMode: "approve-reads",
+    confirmExecute: async (command) => {
+      if (command.includes("denied-first")) {
+        return false;
+      }
+      entered();
+      return await approval;
+    },
+  });
+  const denied = manager.createTerminal({ sessionId: "first", command: "denied-first", args: [] });
+  const pending = manager.createTerminal({
+    sessionId: "second",
+    command: process.execPath,
+    args: ["-e", "process.exit(0)"],
+  });
+  let settled = false;
+  const closing = manager.shutdown().then(() => {
+    settled = true;
+  });
+  try {
+    await Promise.all([assert.rejects(denied), question]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "an earlier failure must not abandon the other creation");
+    approve(true);
+    const [created] = await Promise.all([pending, closing]);
+    await assert.rejects(
+      manager.terminalOutput({ sessionId: "second", ...created }),
+      /Unknown terminal/u,
+    );
+  } finally {
+    approve(false);
+    await Promise.allSettled([denied, pending, closing]);
+    await manager.shutdown();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
 
 function getManagedStdio(
   manager: TerminalManager,
@@ -187,6 +483,119 @@ test("terminal host ceiling preserves the UTF-8 suffix across stdout and stderr"
     await manager.shutdown();
   }
 });
+
+const terminalUtf8Cases: Array<{
+  name: string;
+  limit: number;
+  host?: string;
+  chunks: Array<{ stream: "stdout" | "stderr"; bytes: Buffer }>;
+  expected: string;
+  truncated: boolean;
+}> = [
+  ...["é", "€", "🙂"].flatMap((text) =>
+    Array.from({ length: Buffer.byteLength(text) - 1 }, (_, index) => ({
+      name: `${text} with a ${index + 1}-byte limit`,
+      limit: index + 1,
+      chunks: [{ stream: "stdout" as const, bytes: Buffer.from(text) }],
+      expected: "",
+      truncated: true,
+    })),
+  ),
+  {
+    name: "an empty suffix when a final code point exceeds the limit",
+    limit: 2,
+    chunks: [{ stream: "stdout", bytes: Buffer.from("A🙂") }],
+    expected: "",
+    truncated: true,
+  },
+  {
+    name: "fragmented continuation bytes after the prefix was discarded",
+    limit: 2,
+    chunks: [
+      { stream: "stdout", bytes: Buffer.from([0xf0, 0x9f, 0x99]) },
+      { stream: "stdout", bytes: Buffer.from([0x82]) },
+    ],
+    expected: "",
+    truncated: true,
+  },
+  {
+    name: "fragmented continuation bytes under the host ceiling",
+    limit: 2,
+    host: "2",
+    chunks: [
+      { stream: "stdout", bytes: Buffer.from([0xf0, 0x9f, 0x99]) },
+      { stream: "stdout", bytes: Buffer.from([0x82]) },
+    ],
+    expected: "",
+    truncated: true,
+  },
+  {
+    name: "ASCII arriving after a discarded fragmented code point",
+    limit: 2,
+    chunks: [
+      { stream: "stdout", bytes: Buffer.from([0xf0, 0x9f, 0x99]) },
+      { stream: "stdout", bytes: Buffer.from([0x82]) },
+      { stream: "stdout", bytes: Buffer.from("A") },
+    ],
+    expected: "A",
+    truncated: true,
+  },
+  {
+    name: "an exactly fitting fragmented code point without truncation",
+    limit: 4,
+    chunks: [
+      { stream: "stdout", bytes: Buffer.from([0xf0, 0x9f, 0x99]) },
+      { stream: "stdout", bytes: Buffer.from([0x82]) },
+    ],
+    expected: "🙂",
+    truncated: false,
+  },
+  {
+    name: "complete stdout and stderr code points below the limit",
+    limit: 8,
+    chunks: [
+      { stream: "stdout", bytes: Buffer.from("a") },
+      { stream: "stderr", bytes: Buffer.from("é") },
+    ],
+    expected: "aé",
+    truncated: false,
+  },
+  {
+    name: "the complete newest code point across stdout and stderr",
+    limit: 4,
+    chunks: [
+      { stream: "stdout", bytes: Buffer.from("a") },
+      { stream: "stderr", bytes: Buffer.from("🙂") },
+    ],
+    expected: "🙂",
+    truncated: true,
+  },
+];
+
+for (const scenario of terminalUtf8Cases) {
+  test(`terminal output retains ${scenario.name}`, async () => {
+    const manager = createManagerWithOutputCeiling(scenario.host);
+    try {
+      const { terminalId } = await manager.createTerminal({
+        sessionId: "session-1",
+        command: process.execPath,
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        outputByteLimit: scenario.host === undefined ? scenario.limit : 1000,
+      });
+      const stdio = getManagedStdio(manager, terminalId);
+      for (const chunk of scenario.chunks) {
+        stdio[chunk.stream].emit("data", chunk.bytes);
+      }
+      const output = await manager.terminalOutput({ sessionId: "session-1", terminalId });
+      assert.equal(output.output, scenario.expected);
+      assert.ok(Buffer.byteLength(output.output, "utf8") <= scenario.limit);
+      assert.doesNotMatch(output.output, /\uFFFD/u);
+      assert.equal(output.truncated, scenario.truncated);
+    } finally {
+      await manager.shutdown();
+    }
+  });
+}
 
 test("terminal manager ignores child stdout and stderr pipe-death errors", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-test-"));
@@ -1085,3 +1494,95 @@ test("terminal manager kill finishes when process listing hangs", async (t) => {
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
+
+test(
+  "terminal shutdown drains every native terminal before reporting a release failure",
+  { timeout: 10_000 },
+  async (t) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-shutdown-"));
+    const manager = new TerminalManager({ cwd, permissionMode: "approve-all", killGraceMs: 10 });
+    const children: ChildProcess[] = [];
+    const closed: Promise<void>[] = [];
+    let enterSecond = () => {};
+    const secondEntered = new Promise<void>((resolve) => {
+      enterSecond = resolve;
+    });
+    let releaseSecond = () => {};
+    const secondReleased = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const failure = new Error("synthetic first-terminal release failure");
+    const release = manager.releaseTerminal.bind(manager);
+    let running: Promise<unknown> | undefined;
+    try {
+      const ids: string[] = [];
+      await withObservedSpawns(
+        (child) => {
+          children.push(child);
+          closed.push(new Promise<void>((resolve) => child.once("close", () => resolve())));
+        },
+        async () => {
+          for (let i = 0; i < 2; i += 1) {
+            ids.push(
+              (
+                await manager.createTerminal({
+                  sessionId: "synthetic",
+                  command: process.execPath,
+                  args: ["-e", "setInterval(() => {}, 1000)"],
+                })
+              ).terminalId,
+            );
+          }
+        },
+      );
+      t.mock.method(
+        manager,
+        "releaseTerminal",
+        async (params: Parameters<TerminalManager["releaseTerminal"]>[0]) => {
+          const result = await release(params);
+          if (params.terminalId === ids[0]) {
+            throw failure;
+          }
+          enterSecond();
+          await secondReleased;
+          return result;
+        },
+      );
+      let settled = false;
+      running = manager.shutdown().then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await Promise.race([
+        secondEntered,
+        running.then(() => {
+          throw new Error("shutdown stopped before releasing the second terminal");
+        }),
+      ]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "shutdown must join the held terminal release");
+      releaseSecond();
+      const error = await running;
+      assert.ok(error instanceof AggregateError);
+      assert.deepEqual(error.errors, [failure]);
+      await Promise.all(closed);
+      assert.equal(children.length, 2);
+      for (const child of children) {
+        assert.ok(child.exitCode !== null || child.signalCode !== null);
+      }
+    } finally {
+      releaseSecond();
+      t.mock.restoreAll();
+      await running;
+      await manager.shutdown();
+      await Promise.all(closed);
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  },
+);

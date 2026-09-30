@@ -12,6 +12,7 @@ import {
   extractSessionUpdateNotification,
   parseJsonRpcErrorMessage,
   parsePromptStopReason,
+  parsePermissionNotice,
 } from "../../acp/jsonrpc.js";
 import type {
   AcpJsonRpcMessage,
@@ -64,6 +65,12 @@ type ToolRenderState = {
   finalSignature?: string;
 };
 
+type ToolDisplay = {
+  input?: string;
+  files?: string;
+  output?: string;
+};
+
 const MAX_THOUGHT_CHARS = 900;
 const MAX_INLINE_CHARS = 220;
 const MAX_OUTPUT_CHARS = 2_000;
@@ -90,18 +97,7 @@ function isFinalStatus(status: NormalizedToolStatus): status is "completed" | "f
 }
 
 function toStatusLabel(status: NormalizedToolStatus): string {
-  switch (status) {
-    case "in_progress":
-      return "running";
-    case "pending":
-      return "pending";
-    case "completed":
-      return "completed";
-    case "failed":
-      return "failed";
-    default:
-      return "running";
-  }
+  return isFinalStatus(status) || status === "pending" ? status : "running";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -158,18 +154,7 @@ function indentBlock(value: string, prefix: string): string {
 }
 
 function dedupeStrings(values: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-
-  for (const value of values) {
-    if (seen.has(value)) {
-      continue;
-    }
-    seen.add(value);
-    result.push(value);
-  }
-
-  return result;
+  return [...new Set(values)];
 }
 
 function safeJson(value: unknown, spacing: number): string | undefined {
@@ -771,6 +756,12 @@ class TextOutputFormatter implements OutputFormatter {
   }
 
   onAcpMessage(message: AcpJsonRpcMessage): void {
+    const notice = parsePermissionNotice(message);
+    if (notice) {
+      this.beginSection();
+      this.writeLine(`${this.bold("[permission]")} ${notice}`);
+      return;
+    }
     const notification = extractSessionUpdateNotification(message);
     if (notification) {
       this.renderSessionUpdate(notification);
@@ -778,7 +769,7 @@ class TextOutputFormatter implements OutputFormatter {
     }
 
     const method = extractJsonRpcMethod(message);
-    if (method && method !== "session/prompt" && method !== "session/cancel") {
+    if (method && !["session/prompt", "session/cancel", "session/update"].includes(method)) {
       this.onClientOperation({
         method: method as ClientOperation["method"],
         status: "running",
@@ -816,7 +807,7 @@ class TextOutputFormatter implements OutputFormatter {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         if (update.content.type === "text") {
-          this.writeAssistantChunk(update.content.text);
+          this.write(update.content.text);
         }
         return;
       }
@@ -933,13 +924,6 @@ class TextOutputFormatter implements OutputFormatter {
     }
   }
 
-  private writeAssistantChunk(text: string): void {
-    if (!text) {
-      return;
-    }
-    this.write(text);
-  }
-
   private flushThoughtBuffer(): void {
     const thought = truncate(normalizeLineEndings(this.thoughtBuffer).trim(), MAX_THOUGHT_CHARS);
     this.thoughtBuffer = "";
@@ -960,21 +944,26 @@ class TextOutputFormatter implements OutputFormatter {
     this.mergeToolState(state, update);
 
     const status = asStatus(state.status);
-    if (isFinalStatus(status)) {
-      const signature = this.toolSignature(state);
-      if (signature !== state.finalSignature) {
-        state.finalSignature = signature;
-        this.renderFinalToolState(state, status);
+    const final = isFinalStatus(status);
+    if (!final && state.startedPrinted) {
+      return;
+    }
+    const display: ToolDisplay = {
+      input: summarizeToolInput(state.rawInput),
+      files: formatLocations(state.locations),
+      output: final ? renderToolOutput(state, this.suppressReads) : undefined,
+    };
+    if (final) {
+      const payload = { title: state.title, status: state.status, kind: state.kind, ...display };
+      const signature = safeJson(payload, 0) ?? JSON.stringify(payload);
+      if (signature === state.finalSignature) {
+        return;
       }
-      return;
+      state.finalSignature = signature;
+    } else {
+      state.startedPrinted = true;
     }
-
-    if (state.startedPrinted) {
-      return;
-    }
-
-    state.startedPrinted = true;
-    this.renderStartingToolState(state, status);
+    this.renderToolState(state, status, display);
   }
 
   private getOrCreateToolState(toolCallId: string): ToolRenderState {
@@ -1023,66 +1012,27 @@ class TextOutputFormatter implements OutputFormatter {
     }
   }
 
-  private toolSignature(state: ToolRenderState): string {
-    const signaturePayload = {
-      title: state.title,
-      status: state.status,
-      kind: state.kind,
-      input: summarizeToolInput(state.rawInput),
-      files: formatLocations(state.locations),
-      output: renderToolOutput(state, this.suppressReads),
-    };
-
-    return safeJson(signaturePayload, 0) ?? JSON.stringify(signaturePayload);
-  }
-
-  private renderStartingToolState(
+  private renderToolState(
     state: ToolRenderState,
-    status: Exclude<NormalizedToolStatus, "completed" | "failed">,
+    status: NormalizedToolStatus,
+    display: ToolDisplay,
   ): void {
     this.beginSection();
-
-    const title = state.title ?? state.id;
-    const label = status === "pending" ? "pending" : "running";
-    const statusText = this.colorStatus(label, status);
-    this.writeLine(`${this.bold("[tool]")} ${title} (${statusText})`);
-
-    const input = summarizeToolInput(state.rawInput);
-    if (input) {
-      this.writeLine(`  input: ${input}`);
-    }
-
-    const files = formatLocations(state.locations);
-    if (files) {
-      this.writeLine(`  files: ${files}`);
-    }
-  }
-
-  private renderFinalToolState(state: ToolRenderState, status: "completed" | "failed"): void {
-    this.beginSection();
-
     const title = state.title ?? state.id;
     const statusText = this.colorStatus(toStatusLabel(status), status);
     this.writeLine(`${this.bold("[tool]")} ${title} (${statusText})`);
-
-    if (state.kind) {
+    if (isFinalStatus(status) && state.kind) {
       this.writeLine(`  kind: ${state.kind}`);
     }
-
-    const input = summarizeToolInput(state.rawInput);
-    if (input) {
-      this.writeLine(`  input: ${input}`);
+    if (display.input) {
+      this.writeLine(`  input: ${display.input}`);
     }
-
-    const files = formatLocations(state.locations);
-    if (files) {
-      this.writeLine(`  files: ${files}`);
+    if (display.files) {
+      this.writeLine(`  files: ${display.files}`);
     }
-
-    const output = renderToolOutput(state, this.suppressReads);
-    if (output) {
+    if (display.output) {
       this.writeLine("  output:");
-      this.writeLine(indentBlock(limitOutputBlock(output), "    "));
+      this.writeLine(indentBlock(limitOutputBlock(display.output), "    "));
     }
   }
 
@@ -1124,7 +1074,8 @@ class QuietOutputFormatter implements OutputFormatter {
   private readonly stdout: WritableLike;
   private readonly stderr: WritableLike;
   private chunks: string[] = [];
-  private flushed = false;
+  private finished = false;
+  private outputWritten = false;
   private metadataFlushed = false;
 
   constructor(stdout: WritableLike, stderr: WritableLike) {
@@ -1137,17 +1088,27 @@ class QuietOutputFormatter implements OutputFormatter {
   }
 
   onAcpMessage(message: AcpJsonRpcMessage): void {
+    const notice = parsePermissionNotice(message);
+    if (notice) {
+      this.stderr.write(`[acpx] permission: ${notice.replace(/\r\n?|\n/g, " ")}\n`);
+      return;
+    }
     const update = extractSessionUpdateNotification(message);
     if (
       update?.update.sessionUpdate === "agent_message_chunk" &&
       update.update.content.type === "text"
     ) {
-      this.chunks.push(update.update.content.text);
+      if (!this.finished) {
+        this.chunks.push(update.update.content.text);
+      }
       return;
     }
 
     if (parsePromptStopReason(message)) {
-      this.flushBufferedOutput();
+      if (!this.finished) {
+        this.finished = true;
+        this.flushBufferedOutput(true);
+      }
       this.flushMetadata(message);
     }
   }
@@ -1161,6 +1122,7 @@ class QuietOutputFormatter implements OutputFormatter {
     acp?: OutputErrorAcpPayload;
     timestamp?: string;
   }): void {
+    this.flush();
     const qualifier = params.detailCode ? `${params.code} ${params.detailCode}` : params.code;
     const message = preferredAcpErrorDetails(params.acp) ?? params.message;
     this.stderr.write(`[acpx] error: ${qualifier} ${message.replace(/\r\n?|\n/g, " ")}\n`);
@@ -1171,16 +1133,16 @@ class QuietOutputFormatter implements OutputFormatter {
   }
 
   flush(): void {
-    // no-op for streaming output
+    this.flushBufferedOutput();
   }
 
-  private flushBufferedOutput(): void {
-    if (this.flushed) {
+  private flushBufferedOutput(allowEmpty = false): void {
+    const text = this.chunks.join("");
+    this.chunks = [];
+    if (text.length === 0 && (!allowEmpty || this.outputWritten)) {
       return;
     }
-
-    this.flushed = true;
-    const text = this.chunks.join("");
+    this.outputWritten = true;
     this.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
   }
 

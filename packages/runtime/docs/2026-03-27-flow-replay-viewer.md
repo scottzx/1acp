@@ -202,6 +202,11 @@ the graph.
 
 That should be inferred after ranking nodes.
 
+Use the final node positions to distinguish rendered return edges from forward
+merges. Internal cycle breaking for fallback ranking must be definition-owned
+and independent of recorded attempt order; its feedback edges need not match
+the return direction chosen by the layout engine.
+
 Back edges must not be routed through the middle of the graph. They should be
 sent out to side rails when possible.
 
@@ -403,6 +408,22 @@ That means:
 - the viewer should not depend on default edge generation from rough node
   placement if the result causes avoidable crossings
 
+### Measured geometry
+
+Cards keep their natural dimensions. React Flow's measurements supply the layout
+rectangles, including wrapped labels and outcome rows. ELK uses fixed card-border
+ports corresponding to the named bottom source and top target handles.
+
+Layout waits for every definition node to be measured. Changes to those dimensions
+produce a new layout; ordinary playback or live data updates with unchanged
+dimensions do not. Measurements belong to one run, even when another run reuses
+the same node IDs.
+
+Node positions and routes are adopted together. While a replacement is pending,
+cards retain their previous positions and stale routes are withheld. Superseded
+asynchronous results cannot replace the current generation. If ELK fails, the
+existing provisional layout remains the fallback.
+
 ### Long-term architecture
 
 The durable architecture is:
@@ -431,6 +452,11 @@ The transport should behave like a media player.
 - compact icon buttons in the transport surface when space is tight
 - footer placement at the bottom of the graph card
 
+When the scrubber is focused, ordinary arrow presses select the previous or
+next discrete attempt, like the transport buttons, and stop active playback.
+Pointer dragging keeps its continuous preview and nearest-attempt commit.
+Tabbing into the scrubber or releasing an unrelated key should not commit a seek.
+
 ### Camera modes
 
 The graph should support two viewing modes:
@@ -445,6 +471,7 @@ The graph should support two viewing modes:
 - the camera tracks the currently active node
 - the camera transition eases from node to node
 - switching steps should not cause a hard jump
+- a replacement graph viewport follows the selected attempt, including runs with matching node IDs and layouts
 
 `overview` means:
 
@@ -529,6 +556,10 @@ minimum playback duration for presentation only.
 
 That synthetic duration must remain viewer-local and must not be written back to
 the bundle.
+
+Conversation-based replay timing should count only the selected attempt's
+recorded message range. Earlier and later conversation context should remain
+available without changing that attempt's duration as more output arrives.
 
 ### ACP message reveal
 

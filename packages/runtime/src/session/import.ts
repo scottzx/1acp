@@ -4,14 +4,18 @@ import os from "node:os";
 import path from "node:path";
 import { z, ZodError } from "zod";
 import { AcpxOperationalError } from "../errors.js";
+import { writePrivateFile } from "../state-files.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
 import {
+  absolutePath,
   findSession,
   listSessions,
+  normalizeName,
   parseSessionRecord,
   writeSessionRecord,
 } from "./persistence.js";
+import { acquireSessionImport, acquireSessionScope } from "./turn-ownership.js";
 
 const SUPPORTED_FORMAT_VERSION = 1;
 
@@ -313,18 +317,26 @@ export async function importSession(
     name: options.name,
   });
 
+  await using scope = await acquireSessionScope({
+    agentCommand: newRecord.agentCommand,
+    cwd: absolutePath(newRecord.cwd),
+    name: normalizeName(newRecord.name),
+  });
+  void scope;
+  await using admission = await acquireSessionImport();
+  void admission;
   await assertDestinationScopeAvailable(newRecord);
   await assertProviderSessionAvailable(newRecord);
-  await writeSessionRecord(newRecord);
 
   if (parsed.history.length > 0) {
     const history = parsed.history as AcpJsonRpcMessage[];
-    await fs.writeFile(
+    await writePrivateFile(
       sessionEventActivePath(newRecordId),
       `${history.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-      "utf8",
     );
   }
 
+  // A discoverable record must already have all of its imported history.
+  await writeSessionRecord(newRecord);
   return { record_id: newRecordId, cwd };
 }

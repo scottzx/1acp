@@ -15,6 +15,19 @@ pnpm install --frozen-lockfile
 pnpm run dev -- --help
 ```
 
+Full validation also runs the vendored Autoreview tests. Use an activated Python
+3.14 virtual environment with the locked test dependency:
+
+```bash
+python3.14 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-autoreview.txt
+```
+
+On Windows, create the environment with `py -3.14 -m venv .venv` and activate it
+using your shell's activation script under `.venv\Scripts`. The
+`pnpm run test:autoreview` command uses that environment's `python`.
+
 The source is in `src/`, the Node test suite is in `test/`, and protocol
 conformance cases are in `conformance/`. The replay viewer and sample workflows
 live in `examples/flows/`. See [AGENTS.md](AGENTS.md) for commands, dependency
@@ -39,7 +52,7 @@ Start with the smallest relevant test while iterating. Before requesting review:
 - Exercise the built CLI or public runtime on the affected path and record the
   commands and results in the PR. Bug fixes should include a regression test.
 - For non-trivial code changes, run the repository's isolated autoreview helper:
-  `.agents/skills/autoreview/scripts/autoreview`. Verify its findings and address
+  `.agents/skills/autoreview/scripts/autoreview --max-priority P2`. Verify its findings and address
   actionable problems before requesting review.
 - Ensure CI passes. For visual changes, include before/after screenshots using
   synthetic data and check that the captures contain no secrets or private data.
@@ -48,6 +61,38 @@ The CLI, runtime exports, flags, configuration keys, session records, and output
 formats are compatibility surfaces. Preserve existing behavior during refactors;
 explain intentional behavior changes and update the relevant documentation.
 Maintainers add user-facing changelog entries when landing contributions.
+
+## Updating review tooling
+
+The canonical Autoreview sync adopts one reviewer per invocation. Previously
+bundled `--panel`, `--reviewers`, `--allow-partial-panel`, `--parallel-tests`, and
+`--parallel-tests-shell` options are no longer accepted. Update saved closeout
+commands when upgrading this checkout.
+
+Run repository validation with `pnpm run check`; existing Node-only setups must
+first complete the Python setup above. Run review separately, and keep both the
+test result and review findings visible. When multiple reviewers are explicitly
+requested, invoke each separately and assess every result:
+
+```bash
+reviewer=".agents/skills/autoreview/scripts/autoreview"
+"$reviewer" --engine codex --max-priority P2
+"$reviewer" --engine claude --max-priority P2
+```
+
+Keep `--max-priority P2` for repository closeout; the canonical helper defaults to
+P0 without that flag. Its Codex model default is now GPT-6 Sol with an access-only
+Luna fallback. To retain the previous model selection, or when the new defaults
+are unavailable to your account, use an explicit model:
+
+```bash
+"$reviewer" --engine codex --model gpt-5.6-sol --thinking high --max-priority P2
+```
+
+Explicit `gpt-5.6-sol` retains its access-only `gpt-5.6-terra` fallback. See the
+[canonical skill](.agents/skills/autoreview/SKILL.md) for current engine,
+isolation, and result contracts. A clean result from one review does not erase a
+failure or finding from another.
 
 ## Agent documentation
 

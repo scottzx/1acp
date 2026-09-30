@@ -4,8 +4,16 @@ import { once } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { LEGACY_AGENT_COMMANDS } from "../src/acp/builtin-command-migration.js";
+import { normalizeAgentCommandInput, splitCommandLine } from "../src/acp/client-process.js";
 import { AGENT_ARGV_REGISTRY, AGENT_REGISTRY } from "../src/agent-registry.js";
-import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import { withTimeout } from "../src/async-control.js";
+import {
+  parseSessionRecord,
+  resolveSessionRecord,
+  serializeSessionRecordForDisk,
+  writeSessionRecord as persistSessionRecord,
+} from "../src/session/persistence.js";
 import {
   fileExists,
   makeSessionRecord as makeSessionRecordFixture,
@@ -18,17 +26,42 @@ type SessionModule = typeof import("../src/session/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
 
-test("SessionRecord allows optional closed and closedAt fields", () => {
-  const record = makeSessionRecord({
-    acpxRecordId: "type-check",
-    acpSessionId: "type-check",
+for (const messageId of ["__proto__", "constructor", "toString"]) {
+  const identity = {
+    acpxRecordId: "opaque-usage",
+    acpSessionId: "opaque-usage",
     agentCommand: "agent",
-    cwd: "/tmp/type-check",
+    cwd: "/tmp/opaque-usage",
+  };
+  test(`request usage preserves opaque ${messageId} across disk serialization and parsing`, () => {
+    const expectedUsage = Object.fromEntries([
+      ["neighbor", { output_tokens: 3 }],
+      [messageId, { input_tokens: 2, output_tokens: 7 }],
+    ]);
+    const record = makeSessionRecord({ ...identity, request_token_usage: expectedUsage });
+    const serialized = JSON.stringify(serializeSessionRecordForDisk(record));
+    const parsed = parseSessionRecord(JSON.parse(serialized));
+
+    assert.ok(parsed);
+    assert.equal(Object.hasOwn(parsed.request_token_usage, messageId), true);
+    assert.equal(Object.getPrototypeOf(parsed.request_token_usage), Object.prototype);
+    assert.deepEqual(parsed.request_token_usage, expectedUsage);
+    assert.equal(JSON.stringify(parsed.request_token_usage), JSON.stringify(expectedUsage));
+    const reloaded = parseSessionRecord(
+      JSON.parse(JSON.stringify(serializeSessionRecordForDisk(parsed))),
+    );
+    assert.deepEqual(reloaded?.request_token_usage, expectedUsage);
   });
 
-  assert.equal(record.closed, false);
-  assert.equal(record.closedAt, undefined);
-});
+  test(`request usage rejects invalid counters under opaque ${messageId}`, () => {
+    const record = makeSessionRecord({
+      ...identity,
+      request_token_usage: Object.fromEntries([[messageId, { output_tokens: -1 }]]),
+    });
+    const serialized = JSON.stringify(serializeSessionRecordForDisk(record));
+    assert.equal(parseSessionRecord(JSON.parse(serialized)), null);
+  });
+}
 
 test("parseSessionRecord preserves structured agent argv", () => {
   const serialized = serializeSessionRecordForDisk(
@@ -92,6 +125,209 @@ test("parseSessionRecord backfills argv for historical built-in commands", () =>
     assert.ok(parsed);
     assert.deepEqual(parsed.agentArgv, expectedArgv);
   }
+});
+
+const PREVIOUS_CLAUDE_COMMAND = "npx -y @agentclientprotocol/claude-agent-acp@^0.76.0";
+
+function serializeWithAgent(
+  id: string,
+  agentCommand: string,
+  agentArgv: string[] | undefined,
+): Record<string, unknown> {
+  const serialized = serializeSessionRecordForDisk(
+    makeSessionRecord({
+      acpxRecordId: id,
+      acpSessionId: id,
+      agentCommand,
+      agentArgv,
+      cwd: "/tmp/built-in-identity-migration",
+    }),
+  );
+  if (agentArgv === undefined) {
+    delete serialized.agent_argv;
+  }
+  return serialized;
+}
+
+test("parseSessionRecord migrates records saved under earlier built-in commands", () => {
+  for (const [agentCommand, agentArgv, name] of [
+    [
+      PREVIOUS_CLAUDE_COMMAND,
+      ["npx", "-y", "@agentclientprotocol/claude-agent-acp@^0.76.0"],
+      "claude",
+    ],
+    ["npx -y @agentclientprotocol/claude-agent-acp@^0.60.0", undefined, "claude"],
+    ["npm exec @agentclientprotocol/claude-agent-acp@^0.76.0", undefined, "claude"],
+    [PREVIOUS_CLAUDE_COMMAND, AGENT_ARGV_REGISTRY.claude, "claude"],
+    ["npx pi-acp@^0.0.31", ["npx", "pi-acp@^0.0.31"], "pi"],
+  ] as const) {
+    const parsed = parseSessionRecord(
+      serializeWithAgent(agentCommand, agentCommand, agentArgv ? [...agentArgv] : undefined),
+    );
+
+    assert.ok(parsed, agentCommand);
+    assert.equal(parsed.agentCommand, AGENT_REGISTRY[name], agentCommand);
+    assert.deepEqual(parsed.agentArgv, AGENT_ARGV_REGISTRY[name], agentCommand);
+  }
+});
+
+test("parseSessionRecord keeps custom launchers that are not earlier built-in defaults", () => {
+  for (const [agentCommand, agentArgv] of [
+    [PREVIOUS_CLAUDE_COMMAND, ["/opt/claude-agent-acp/bin/claude-agent-acp", "--debug"]],
+    [
+      "npx -y @agentclientprotocol/claude-agent-acp@0.76.0",
+      ["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.76.0"],
+    ],
+    ["custom-agent --acp", ["custom-agent", "--acp"]],
+  ] as const) {
+    const parsed = parseSessionRecord(
+      serializeWithAgent(agentCommand, agentCommand, [...agentArgv]),
+    );
+
+    assert.ok(parsed, agentCommand);
+    assert.equal(parsed.agentCommand, agentCommand);
+    assert.deepEqual(parsed.agentArgv, agentArgv);
+  }
+});
+
+test("agent-scoped lookup finds sessions saved under the previous Claude command", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "saved-before-upgrade",
+        acpSessionId: "saved-before-upgrade",
+        agentCommand: PREVIOUS_CLAUDE_COMMAND,
+        agentArgv: ["npx", "-y", "@agentclientprotocol/claude-agent-acp@^0.76.0"],
+        cwd,
+      }),
+    );
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "closed-before-upgrade",
+        acpSessionId: "closed-before-upgrade",
+        agentCommand: PREVIOUS_CLAUDE_COMMAND,
+        cwd,
+        name: "old",
+        closed: true,
+        closedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+
+    for (const agentCommand of [AGENT_REGISTRY.claude, PREVIOUS_CLAUDE_COMMAND]) {
+      const found = await session.findSession({ agentCommand, cwd });
+      assert.equal(found?.acpxRecordId, "saved-before-upgrade", agentCommand);
+      assert.equal(found?.agentCommand, AGENT_REGISTRY.claude);
+      assert.deepEqual(found?.agentArgv, AGENT_ARGV_REGISTRY.claude);
+
+      const walked = await session.findSessionByDirectoryWalk({ agentCommand, cwd });
+      assert.equal(walked?.acpxRecordId, "saved-before-upgrade", agentCommand);
+
+      const listed = await session.listSessionsForAgent(agentCommand);
+      assert.deepEqual(
+        listed.map((record) => record.acpxRecordId).toSorted(),
+        ["closed-before-upgrade", "saved-before-upgrade"],
+        agentCommand,
+      );
+    }
+
+    const pruned = await session.pruneSessions({
+      agentCommand: AGENT_REGISTRY.claude,
+      dryRun: true,
+    });
+    assert.deepEqual(
+      pruned.pruned.map((record) => record.acpxRecordId),
+      ["closed-before-upgrade"],
+    );
+    assert.equal(await session.findSession({ agentCommand: AGENT_REGISTRY.codex, cwd }), undefined);
+  });
+});
+
+test("every earlier built-in default stays in its agent's scope after migration", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const entries = Object.entries(LEGACY_AGENT_COMMANDS).flatMap(([name, commands]) =>
+      commands.map((agentCommand, index) => ({ name, agentCommand, index })),
+    );
+    assert.ok(entries.length > 30);
+    for (const { name, agentCommand, index } of entries) {
+      const cwd = path.join(homeDir, name, String(index));
+      await fs.mkdir(cwd, { recursive: true });
+      const { command, args } = splitCommandLine(agentCommand);
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: `${name}-${index}`,
+          acpSessionId: `${name}-${index}`,
+          agentCommand,
+          agentArgv: [command, ...args],
+          cwd,
+        }),
+      );
+    }
+
+    for (const { name, agentCommand, index } of entries) {
+      const cwd = path.join(homeDir, name, String(index));
+      for (const query of [AGENT_REGISTRY[name], agentCommand]) {
+        const found = await session.findSession({ agentCommand: query, cwd });
+        assert.equal(found?.acpxRecordId, `${name}-${index}`, `${agentCommand} via ${query}`);
+        assert.equal(found?.agentCommand, AGENT_REGISTRY[name], agentCommand);
+        assert.deepEqual(found?.agentArgv, AGENT_ARGV_REGISTRY[name], agentCommand);
+      }
+    }
+  });
+});
+
+test("exact-command lookup still finds custom launchers saved under an earlier built-in command", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const customArgv = ["/opt/claude-agent-acp/bin/claude-agent-acp", "--debug"];
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "custom-launcher",
+        acpSessionId: "custom-launcher",
+        agentCommand: PREVIOUS_CLAUDE_COMMAND,
+        agentArgv: customArgv,
+        cwd,
+      }),
+    );
+
+    const found = await session.findSession({ agentCommand: PREVIOUS_CLAUDE_COMMAND, cwd });
+    assert.equal(found?.acpxRecordId, "custom-launcher");
+    assert.equal(found?.agentCommand, PREVIOUS_CLAUDE_COMMAND);
+    assert.deepEqual(found?.agentArgv, customArgv);
+    assert.equal(
+      await session.findSession({ agentCommand: AGENT_REGISTRY.claude, cwd }),
+      undefined,
+    );
+  });
+});
+
+test("agent-scoped lookup prefers the most recently used of migrated and current records", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    for (const [id, agentCommand, lastUsedAt] of [
+      ["previous-scope", PREVIOUS_CLAUDE_COMMAND, "2026-01-02T00:00:00.000Z"],
+      ["current-scope", AGENT_REGISTRY.claude, "2026-01-03T00:00:00.000Z"],
+    ] as const) {
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({ acpxRecordId: id, acpSessionId: id, agentCommand, cwd, lastUsedAt }),
+      );
+    }
+
+    const found = await session.findSession({ agentCommand: AGENT_REGISTRY.claude, cwd });
+    assert.equal(found?.acpxRecordId, "current-scope");
+  });
 });
 
 test("parseSessionRecord preserves persisted session env", () => {
@@ -531,7 +767,72 @@ test("findSession and findSessionByDirectoryWalk resolve expected records", asyn
   });
 });
 
-test("writeSessionRecord maintains an index and listSessions rebuilds it when missing", async () => {
+for (const [scenario, existingFileMode, existingDirMode] of [
+  ["new records", undefined, undefined],
+  ["private rewrites", 0o600, 0o700],
+  ["legacy shared rewrites", 0o664, 0o775],
+  ["symlinked session directories", undefined, undefined],
+] as const) {
+  test(
+    `writeSessionRecord keeps records private for ${scenario} under a permissive umask`,
+    { skip: process.platform === "win32" },
+    async () => {
+      await withTempHome(async (homeDir) => {
+        const previousUmask = process.umask(0o002);
+        try {
+          const session = await loadSessionModule();
+          const record = makeSessionRecord({
+            acpxRecordId: "private-session",
+            acpSessionId: "private-session",
+            agentCommand: "agent-a",
+            cwd: path.join(homeDir, "repo"),
+            name: "before",
+          });
+          const recordPath = sessionFilePath(homeDir, record.acpxRecordId);
+          const sessionDir = path.dirname(recordPath);
+          const symlinkTarget = path.join(homeDir, "session-target");
+
+          if (scenario === "symlinked session directories") {
+            await fs.mkdir(path.dirname(sessionDir), { recursive: true });
+            await fs.mkdir(symlinkTarget, { mode: 0o775 });
+            await fs.symlink(symlinkTarget, sessionDir, "dir");
+          }
+
+          if (existingFileMode !== undefined && existingDirMode !== undefined) {
+            await persistSessionRecord(record);
+            await fs.chmod(recordPath, existingFileMode);
+            await fs.chmod(sessionDir, existingDirMode);
+          }
+
+          record.name = "after";
+          record.messages = [{ Agent: { content: [{ Text: "saved reply" }], tool_results: {} } }];
+          await persistSessionRecord(record);
+
+          assert.equal((await fs.stat(recordPath)).mode & 0o777, 0o600, "session record mode");
+          assert.equal((await fs.stat(sessionDir)).mode & 0o777, 0o700, "session directory mode");
+          if (scenario === "symlinked session directories") {
+            assert.equal(await fs.readlink(sessionDir), symlinkTarget);
+            assert.equal((await fs.stat(symlinkTarget)).mode & 0o777, 0o700, "symlink target mode");
+          }
+          assert.deepEqual(
+            (await resolveSessionRecord(record.acpxRecordId)).messages,
+            record.messages,
+          );
+          const indexed = await session.findSession({
+            agentCommand: record.agentCommand,
+            cwd: record.cwd,
+            name: "after",
+          });
+          assert.equal(indexed?.acpxRecordId, record.acpxRecordId);
+        } finally {
+          process.umask(previousUmask);
+        }
+      });
+    },
+  );
+}
+
+test("session discovery reads canonical records without creating a legacy index", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
     const cwd = path.join(homeDir, "repo");
@@ -551,15 +852,15 @@ test("writeSessionRecord maintains an index and listSessions rebuilds it when mi
       initialSessions.some((entry) => entry.acpxRecordId === "indexed-session"),
       true,
     );
-    assert.equal(await fileExists(indexPath), true);
+    assert.equal(await fileExists(indexPath), false);
 
-    await fs.rm(indexPath, { force: true });
+    await fs.writeFile(indexPath, "{");
     const sessions = await session.listSessions();
     assert.equal(
       sessions.some((entry) => entry.acpxRecordId === "indexed-session"),
       true,
     );
-    assert.equal(await fileExists(indexPath), true);
+    assert.equal(await fs.readFile(indexPath, "utf8"), "{");
   });
 });
 
@@ -567,27 +868,26 @@ test("closeSession soft-closes and terminates matching process", async () => {
   await withTempHome(async (homeDir) => {
     const session = await loadSessionModule();
 
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    const argv = [process.execPath, "-e", "setInterval(() => {}, 1000);"];
+    const child = spawn(argv[0], argv.slice(1), {
       stdio: "ignore",
     });
-    await once(child, "spawn");
-
-    const sessionId = "live-session";
-    const cwd = path.join(homeDir, "repo");
-    await writeSessionRecord(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: sessionId,
-        acpSessionId: sessionId,
-        agentCommand: process.execPath,
-        cwd,
-        pid: child.pid,
-      }),
-    );
-
-    const filePath = sessionFilePath(homeDir, sessionId);
-
+    const childClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
     try {
+      await withTimeout(once(child, "spawn"), 5_000);
+      const sessionId = "live-session";
+      const cwd = path.join(homeDir, "repo");
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: sessionId,
+          acpSessionId: sessionId,
+          ...normalizeAgentCommandInput(argv),
+          cwd,
+          pid: child.pid,
+        }),
+      );
+      const filePath = sessionFilePath(homeDir, sessionId);
       const closed = await session.closeSession(sessionId);
       assert.equal(closed.closed, true);
       assert.equal(typeof closed.closedAt, "string");
@@ -598,12 +898,12 @@ test("closeSession soft-closes and terminates matching process", async () => {
       assert.equal(stored.closed, true);
       assert.equal(typeof stored.closed_at, "string");
 
-      const exited = await waitForExit(child.pid);
-      assert.equal(exited, true);
+      await withTimeout(childClosed, 3_000);
     } finally {
       if (child.exitCode == null && child.signalCode == null) {
         child.kill("SIGKILL");
       }
+      await withTimeout(childClosed, 5_000);
     }
   });
 });
@@ -641,24 +941,4 @@ function makeSessionRecord(
   overrides: Parameters<typeof makeSessionRecordFixture>[0],
 ): ReturnType<typeof makeSessionRecordFixture> {
   return makeSessionRecordFixture(overrides, { defaultName: false, defaultAcpx: false });
-}
-
-async function waitForExit(pid: number | undefined): Promise<boolean> {
-  if (pid == null) {
-    return true;
-  }
-
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return true;
-    }
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 50);
-    });
-  }
-
-  return false;
 }

@@ -3,10 +3,10 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createViteServer, type ViteDevServer } from "vite";
-import { readBundleFile } from "./filesystem-bundle-reader.js";
 import { createFilesystemRunSource } from "./live-source.js";
 import { createReplayLiveSyncServer } from "./live-sync.js";
-import { defaultRunsDir, listRunBundles } from "./run-bundles.js";
+import { formatViewerOrigin, isAllowedViewerRequest } from "./request-origin.js";
+import { defaultRunsDir, listRunBundles, readRunBundleFile } from "./run-bundles.js";
 
 const SERVER_ID = "acpx-flow-replay-viewer";
 
@@ -35,6 +35,8 @@ export async function createReplayViewerServer(
 ): Promise<ReplayViewerServer> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4173;
+  // Reject unrepresentable origins before allocating the Vite server or TCP listener.
+  formatViewerOrigin(host, port);
   const runsDir = options.runsDir ?? defaultRunsDir();
   const viewerDir = path.dirname(fileURLToPath(import.meta.url));
   const configFile = resolveViewerConfigFile(viewerDir);
@@ -43,17 +45,29 @@ export async function createReplayViewerServer(
     appType: "spa",
     ...(options.disableDependencyOptimization
       ? {
-          optimizeDeps: {
-            noDiscovery: true,
-          },
+          plugins: [
+            {
+              name: "acpx-replay-disable-dependency-optimization",
+              enforce: "post",
+              configEnvironment(_name, config) {
+                // React adds explicit includes; noDiscovery alone leaves those active.
+                config.optimizeDeps ??= {};
+                config.optimizeDeps.noDiscovery = true;
+                config.optimizeDeps.include = [];
+              },
+            },
+          ],
         }
       : {}),
     server: {
       middlewareMode: true,
       hmr: false,
+      ws: false,
       host,
       port,
       strictPort: false,
+      // Polling avoids native watcher stalls and follows atomic replacements on macOS.
+      ...(process.platform === "darwin" ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
   });
   const liveSyncServer = createReplayLiveSyncServer({
@@ -69,39 +83,50 @@ export async function createReplayViewerServer(
     return closePromise;
   };
 
-  const server = http.createServer(async (request, response) => {
-    if (
-      await handleApiRequest(request, response, host, port, runsDir, {
-        requestClose,
-      })
-    ) {
+  const server = http.createServer((request, response) => {
+    if (!isAllowedViewerRequest(request, host)) {
+      writeJson(response, 403, { error: "Forbidden" });
       return;
     }
-
-    vite.middlewares(request, response, (error: unknown) => {
-      if (error) {
-        response.statusCode = 500;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(
-          JSON.stringify({
-            error: formatPublicError(error),
-          }),
-        );
+    const fail = () => {
+      if (response.headersSent) {
+        response.destroy();
         return;
       }
+      writeJson(response, 500, { error: "Replay viewer request failed" });
+    };
+    void handleApiRequest(request, response, runsDir, { requestClose })
+      .then((handled) => {
+        if (handled) {
+          return;
+        }
+        vite.middlewares(request, response, (error: unknown) => {
+          if (error) {
+            fail();
+            return;
+          }
 
-      response.statusCode = 404;
-      response.end("Not found");
-    });
+          response.statusCode = 404;
+          response.end("Not found");
+        });
+      })
+      .catch(fail);
   });
 
   server.on("upgrade", (request, socket, head) => {
-    void liveSyncServer.handleUpgrade(request, socket, head).then((handled) => {
-      if (handled) {
+    try {
+      if (!isAllowedViewerRequest(request, host)) {
+        socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", () =>
+          socket.destroy(),
+        );
         return;
       }
+      if (!liveSyncServer.handleUpgrade(request, socket, head)) {
+        socket.destroy();
+      }
+    } catch {
       socket.destroy();
-    });
+    }
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -110,6 +135,9 @@ export async function createReplayViewerServer(
       server.off("error", reject);
       resolve();
     });
+  }).catch(async (error) => {
+    await requestClose().catch(() => {});
+    throw error;
   });
 
   const address = server.address();
@@ -121,7 +149,7 @@ export async function createReplayViewerServer(
   return {
     host,
     port: actualPort,
-    baseUrl: `http://${host}:${actualPort}`,
+    baseUrl: formatViewerOrigin(host, actualPort),
     async close(): Promise<void> {
       await requestClose();
     },
@@ -139,14 +167,12 @@ function resolveViewerConfigFile(viewerServerDir: string): string {
 export async function handleApiRequest(
   request: http.IncomingMessage,
   response: http.ServerResponse,
-  host: string,
-  port: number,
   runsDir: string,
   options: {
     requestClose?: () => Promise<void>;
   } = {},
 ): Promise<boolean> {
-  const url = new URL(request.url ?? "/", `http://${host}:${port}`);
+  const url = new URL(request.url ?? "/", "http://viewer.invalid");
 
   if (url.pathname === "/api/health") {
     writeJson(response, 200, {
@@ -161,7 +187,9 @@ export async function handleApiRequest(
       ok: true,
     });
     setImmediate(() => {
-      void options.requestClose?.();
+      void options.requestClose?.().catch((error: unknown) => {
+        console.error("Replay viewer shutdown failed", error);
+      });
     });
     return true;
   }
@@ -176,17 +204,12 @@ export async function handleApiRequest(
 
   const runFileMatch = url.pathname.match(/^\/api\/runs\/([^/]+)\/files\/(.+)$/);
   if (runFileMatch) {
-    const [, encodedRunId, encodedRelativePath] = runFileMatch;
-    const runId = decodeURIComponent(encodedRunId ?? "");
-    const relativePath = encodedRelativePath
-      ?.split("/")
-      .map((segment) => decodeURIComponent(segment))
-      .join("/");
-
     try {
-      const payload = await readBundleFile(runsDir, runId, relativePath ?? "");
+      const runId = decodeURIComponent(runFileMatch[1] ?? "");
+      const relativePath = decodeURIComponent(runFileMatch[2] ?? "");
+      const payload = await readRunBundleFile(runsDir, runId, relativePath);
       response.statusCode = 200;
-      response.setHeader("content-type", contentTypeFor(relativePath ?? ""));
+      response.setHeader("content-type", contentTypeFor(relativePath));
       response.end(payload);
     } catch {
       writeJson(response, 404, {
@@ -268,19 +291,6 @@ function writeJson(response: http.ServerResponse, statusCode: number, value: unk
   response.statusCode = statusCode;
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.end(JSON.stringify(value));
-}
-
-function formatPublicError(error: unknown): string {
-  if (error instanceof Error) {
-    return "Replay viewer request failed";
-  }
-  if (typeof error === "string") {
-    return error;
-  }
-  if (typeof error === "number" || typeof error === "boolean" || typeof error === "bigint") {
-    return String(error);
-  }
-  return "Unknown error";
 }
 
 function contentTypeFor(filePath: string): string {

@@ -1,19 +1,14 @@
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { canonicalAgentCommand } from "../../acp/builtin-command-migration.js";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
+import { writePrivateJsonFile } from "../../state-files.js";
 import type { SessionRecord } from "../../types.js";
-import { createAtomicWriteTempPath } from "./atomic-write.js";
-import {
-  loadOrRebuildSessionIndex,
-  rebuildSessionIndex,
-  toSessionIndexEntry,
-  writeSessionIndex,
-  type SessionIndexEntry,
-} from "./index.js";
+import { safeSessionId, sessionBaseDir } from "../event-log.js";
+import { scanSessionRecords } from "./discovery.js";
 import { parseSessionRecord } from "./parse.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 
@@ -24,6 +19,7 @@ type FindSessionOptions = {
   cwd: string;
   name?: string;
   includeClosed?: boolean;
+  readOnly?: boolean;
 };
 
 type FindSessionByDirectoryWalkOptions = {
@@ -34,44 +30,37 @@ type FindSessionByDirectoryWalkOptions = {
 };
 
 function sessionFilePath(acpxRecordId: string): string {
-  const safeId = encodeURIComponent(acpxRecordId);
+  const safeId = safeSessionId(acpxRecordId);
   return path.join(sessionBaseDir(), `${safeId}.json`);
 }
 
-function sessionBaseDir(): string {
-  return path.join(os.homedir(), ".acpx", "sessions");
-}
-
 async function ensureSessionDir(): Promise<void> {
-  await fs.mkdir(sessionBaseDir(), { recursive: true });
+  await fs.mkdir(sessionBaseDir(), { recursive: true, mode: 0o700 });
 }
 
-async function loadRecordFromIndexEntry(
-  entry: SessionIndexEntry,
-): Promise<SessionRecord | undefined> {
-  try {
-    const payload = await fs.readFile(path.join(sessionBaseDir(), entry.file), "utf8");
-    return parseSessionRecord(JSON.parse(payload)) ?? undefined;
-  } catch {
-    return undefined;
+async function* sessionRecords(readOnly = false): AsyncGenerator<SessionRecord> {
+  if (!readOnly) {
+    await ensureSessionDir();
   }
+  yield* scanSessionRecords(sessionBaseDir());
 }
 
-async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
-  await ensureSessionDir();
-  const index = await measurePerf("session.index_load", async () => {
-    return await loadOrRebuildSessionIndex(sessionBaseDir());
-  });
-  return index.entries;
+/**
+ * Commands a scoped query matches: the query itself, plus the current built-in
+ * command when the query is an earlier built-in default (records under it are
+ * migrated on read unless they carry a custom launcher).
+ */
+function agentScope(agentCommand: string): ReadonlySet<string> {
+  return new Set([agentCommand, canonicalAgentCommand(agentCommand)]);
 }
 
-function matchesSessionEntry(
-  session: SessionIndexEntry,
-  normalizedCwd: string,
+function matchesSession(
+  session: SessionRecord,
+  scope: ReadonlySet<string>,
   normalizedName: string | undefined,
   includeClosed = false,
 ): boolean {
-  if (session.cwd !== normalizedCwd) {
+  if (!scope.has(session.agentCommand)) {
     return false;
   }
   if (!includeClosed && session.closed) {
@@ -83,52 +72,36 @@ function matchesSessionEntry(
   return session.name === normalizedName;
 }
 
+function isNewer(record: SessionRecord, previous: SessionRecord | undefined): boolean {
+  return !previous || record.lastUsedAt.localeCompare(previous.lastUsedAt) > 0;
+}
+
 export async function writeSessionRecord(record: SessionRecord): Promise<void> {
   await measurePerf("session.write_record", async () => {
-    await ensureSessionDir();
-
     const persisted = serializeSessionRecordForDisk(record);
     assertPersistedKeyPolicy(persisted);
 
     const file = sessionFilePath(record.acpxRecordId);
-    const tempFile = createAtomicWriteTempPath(file);
-    const payload = JSON.stringify(persisted, null, 2);
-    await fs.writeFile(tempFile, `${payload}\n`, "utf8");
-    await fs.rename(tempFile, file);
-
-    const sessionDir = sessionBaseDir();
-    const index = await loadOrRebuildSessionIndex(sessionDir);
-    const fileName = path.basename(file);
-    const entries = index.entries.filter((entry) => entry.file !== fileName);
-    entries.push(toSessionIndexEntry(record, fileName));
-    const files = [...new Set([...index.files.filter((entry) => entry !== fileName), fileName])];
-    await writeSessionIndex(sessionDir, { files, entries });
+    await writePrivateJsonFile(file, persisted);
   });
 }
 
 export async function resolveSessionRecord(sessionId: string): Promise<SessionRecord> {
   await ensureSessionDir();
 
-  const directPath = sessionFilePath(sessionId);
   try {
-    const directPayload = await measurePerf("session.resolve_direct", async () => {
-      return await fs.readFile(directPath, "utf8");
-    });
-    const directRecord = parseSessionRecord(JSON.parse(directPayload));
-    if (directRecord) {
+    const directRecord = await measurePerf(
+      "session.resolve_direct",
+      async () => await readSessionRecord(sessionId),
+    );
+    if (directRecord?.acpxRecordId === sessionId) {
       return directRecord;
     }
   } catch {
-    // fallback to indexed search
+    // Fall back to canonical discovery.
   }
 
-  const entries = await loadSessionIndexEntries();
-  const exactEntries = entries.filter(
-    (entry) => entry.acpxRecordId === sessionId || entry.acpSessionId === sessionId,
-  );
-  const exactRecords = (
-    await Promise.all(exactEntries.map((entry) => loadRecordFromIndexEntry(entry)))
-  ).filter((entry): entry is SessionRecord => Boolean(entry));
+  const { exactRecords, suffixRecords } = await findSessionIdMatches(sessionId);
   if (exactRecords.length === 1) {
     return exactRecords[0];
   }
@@ -136,12 +109,6 @@ export async function resolveSessionRecord(sessionId: string): Promise<SessionRe
     throw new SessionResolutionError(`Multiple sessions match id: ${sessionId}`);
   }
 
-  const suffixEntries = entries.filter(
-    (entry) => entry.acpxRecordId.endsWith(sessionId) || entry.acpSessionId.endsWith(sessionId),
-  );
-  const suffixRecords = (
-    await Promise.all(suffixEntries.map((entry) => loadRecordFromIndexEntry(entry)))
-  ).filter((entry): entry is SessionRecord => Boolean(entry));
   if (suffixRecords.length === 1) {
     return suffixRecords[0];
   }
@@ -153,10 +120,52 @@ export async function resolveSessionRecord(sessionId: string): Promise<SessionRe
   throw new SessionNotFoundError(sessionId);
 }
 
-function hasGitDirectory(dir: string): boolean {
+async function findSessionIdMatches(
+  sessionId: string,
+): Promise<{ exactRecords: SessionRecord[]; suffixRecords: SessionRecord[] }> {
+  const exactRecords: SessionRecord[] = [];
+  const suffixRecords: SessionRecord[] = [];
+  for await (const record of sessionRecords()) {
+    if (record.acpxRecordId === sessionId || record.acpSessionId === sessionId) {
+      retainMatch(exactRecords, record);
+    }
+    if (record.acpxRecordId.endsWith(sessionId) || record.acpSessionId.endsWith(sessionId)) {
+      retainMatch(suffixRecords, record);
+    }
+  }
+  return { exactRecords, suffixRecords };
+}
+
+function retainMatch(matches: SessionRecord[], record: SessionRecord): void {
+  if (matches.length < 2) {
+    matches.push(record);
+  }
+}
+
+/** Reads one canonical record without creating directories or scanning other sessions. */
+export async function readSessionRecord(sessionId: string): Promise<SessionRecord | undefined> {
+  let payload: string;
+  try {
+    payload = await fs.readFile(sessionFilePath(sessionId), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+  try {
+    const record = parseSessionRecord(JSON.parse(payload));
+    return record?.acpxRecordId === sessionId ? record : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasGitMarker(dir: string): boolean {
   const gitPath = path.join(dir, ".git");
   try {
-    return statSync(gitPath).isDirectory();
+    const marker = statSync(gitPath);
+    return marker.isDirectory() || marker.isFile();
   } catch {
     return false;
   }
@@ -164,7 +173,7 @@ function hasGitDirectory(dir: string): boolean {
 
 function isWithinBoundary(boundary: string, target: string): boolean {
   const relative = path.relative(boundary, target);
-  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 export function absolutePath(value: string): string {
@@ -176,7 +185,7 @@ export function findGitRepositoryRoot(startDir: string): string | undefined {
   const root = path.parse(current).root;
 
   for (;;) {
-    if (hasGitDirectory(current)) {
+    if (hasGitMarker(current)) {
       return current;
     }
 
@@ -206,74 +215,77 @@ export function isoNow(): string {
 }
 
 export async function listSessions(): Promise<SessionRecord[]> {
-  await ensureSessionDir();
-  const entries = await loadSessionIndexEntries();
-  const records: SessionRecord[] = [];
-
-  for (const entry of entries) {
-    const parsed = await loadRecordFromIndexEntry(entry);
-    if (parsed) {
-      records.push(parsed);
-    }
-  }
-
-  records.sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
-  return records;
+  return await collectSessionRecords();
 }
 
 export async function listSessionsForAgent(agentCommand: string): Promise<SessionRecord[]> {
-  const entries = (await loadSessionIndexEntries()).filter(
-    (session) => session.agentCommand === agentCommand,
-  );
-  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
-  return records
-    .filter((entry): entry is SessionRecord => Boolean(entry))
-    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+  return await collectSessionRecords(agentCommand);
+}
+
+async function collectSessionRecords(agentCommand?: string): Promise<SessionRecord[]> {
+  const scope = agentCommand === undefined ? undefined : agentScope(agentCommand);
+  const records: SessionRecord[] = [];
+  for await (const record of sessionRecords()) {
+    if (scope === undefined || scope.has(record.agentCommand)) {
+      records.push(record);
+    }
+  }
+  return records.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
 export async function findSession(options: FindSessionOptions): Promise<SessionRecord | undefined> {
   const normalizedCwd = absolutePath(options.cwd);
   const normalizedName = normalizeName(options.name);
-  const entries = await loadSessionIndexEntries();
-  const match = entries.find(
-    (session) =>
-      session.agentCommand === options.agentCommand &&
-      matchesSessionEntry(session, normalizedCwd, normalizedName, options.includeClosed),
-  );
-  if (!match) {
-    return undefined;
+  const scope = agentScope(options.agentCommand);
+  let match: SessionRecord | undefined;
+  for await (const record of sessionRecords(options.readOnly)) {
+    if (
+      record.cwd === normalizedCwd &&
+      matchesSession(record, scope, normalizedName, options.includeClosed) &&
+      isNewer(record, match)
+    ) {
+      match = record;
+    }
   }
-  return await loadRecordFromIndexEntry(match);
+  return match;
 }
 
 export async function findSessionByDirectoryWalk(
   options: FindSessionByDirectoryWalkOptions,
 ): Promise<SessionRecord | undefined> {
   const normalizedName = normalizeName(options.name);
+  const scope = agentScope(options.agentCommand);
+  const directories = walkDirectories(options);
+  let match: SessionRecord | undefined;
+  let distance = Infinity;
+  for await (const record of sessionRecords()) {
+    const candidateDistance = directories.get(record.cwd);
+    if (
+      candidateDistance !== undefined &&
+      matchesSession(record, scope, normalizedName) &&
+      (candidateDistance < distance || (candidateDistance === distance && isNewer(record, match)))
+    ) {
+      match = record;
+      distance = candidateDistance;
+    }
+  }
+  return match;
+}
+
+function walkDirectories(options: FindSessionByDirectoryWalkOptions): Map<string, number> {
   const normalizedStart = absolutePath(options.cwd);
   const normalizedBoundary = absolutePath(options.boundary ?? normalizedStart);
   const walkBoundary = isWithinBoundary(normalizedBoundary, normalizedStart)
     ? normalizedBoundary
     : normalizedStart;
-  const sessions = (await loadSessionIndexEntries()).filter(
-    (session) => session.agentCommand === options.agentCommand,
-  );
-
-  let current = normalizedStart;
-  const walkRoot = path.parse(current).root;
-
-  for (;;) {
-    const match = sessions.find((session) => matchesSessionEntry(session, current, normalizedName));
-    if (match) {
-      return await loadRecordFromIndexEntry(match);
-    }
-
-    const parent = nextWalkParent(current, walkBoundary, walkRoot);
-    if (!parent) {
-      return undefined;
-    }
-    current = parent;
+  const directories = new Map<string, number>();
+  const walkRoot = path.parse(normalizedStart).root;
+  let current: string | undefined = normalizedStart;
+  while (current) {
+    directories.set(current, directories.size);
+    current = nextWalkParent(current, walkBoundary, walkRoot);
   }
+  return directories;
 }
 
 function nextWalkParent(
@@ -291,19 +303,6 @@ function nextWalkParent(
   }
 
   return parent;
-}
-
-function killSignalCandidates(signal: NodeJS.Signals | undefined): NodeJS.Signals[] {
-  if (!signal) {
-    return ["SIGTERM", "SIGKILL"];
-  }
-
-  const normalized = signal.toUpperCase() as NodeJS.Signals;
-  if (normalized === "SIGKILL") {
-    return ["SIGKILL"];
-  }
-
-  return [normalized, "SIGKILL"];
 }
 
 export type PruneOptions = {
@@ -325,24 +324,21 @@ function closedAtOrLastUsedAt(record: SessionRecord): string {
 }
 
 function isSessionStreamFile(fileName: string, safeId: string): boolean {
+  const segmentPrefix = `${safeId}.stream.`;
   return (
     fileName === `${safeId}.stream.ndjson` ||
     fileName === `${safeId}.stream.lock` ||
-    fileName.startsWith(`${safeId}.stream.`)
+    (fileName.startsWith(segmentPrefix) &&
+      /^\d+\.ndjson$/.test(fileName.slice(segmentPrefix.length)))
   );
 }
 
 export async function pruneSessions(options: PruneOptions = {}): Promise<PruneResult> {
-  await ensureSessionDir();
-  const entries = await loadSessionIndexEntries();
-
-  const eligible = filterPruneCandidates(entries, options.agentCommand);
-
   const cutoff =
     options.before ??
     (options.olderThanMs != null ? new Date(Date.now() - options.olderThanMs) : undefined);
 
-  const records = await loadPrunableRecords(eligible, cutoff);
+  const records = await loadPrunableRecords(cutoff, options.agentCommand);
 
   if (options.dryRun) {
     return { pruned: records, bytesFreed: 0, dryRun: true };
@@ -371,35 +367,29 @@ export async function pruneSessions(options: PruneOptions = {}): Promise<PruneRe
     );
   }
 
-  await rebuildSessionIndex(sessionDir).catch(() => {
-    // best effort cache rebuild
-  });
-
   return { pruned: records, bytesFreed, dryRun: false };
 }
 
-function filterPruneCandidates(
-  entries: SessionIndexEntry[],
-  agentCommand: string | undefined,
-): SessionIndexEntry[] {
-  return entries.filter(
-    (entry) => entry.closed && (!agentCommand || entry.agentCommand === agentCommand),
-  );
+function isPruneCandidate(
+  record: Pick<SessionRecord, "closed" | "agentCommand">,
+  scope: ReadonlySet<string> | undefined,
+): boolean {
+  return record.closed === true && (!scope || scope.has(record.agentCommand));
 }
 
 async function loadPrunableRecords(
-  entries: SessionIndexEntry[],
   cutoff: Date | undefined,
+  agentCommand: string | undefined,
 ): Promise<SessionRecord[]> {
   const records: SessionRecord[] = [];
   const cutoffIso = cutoff?.toISOString();
-  for (const entry of entries) {
-    const record = await loadRecordFromIndexEntry(entry);
-    if (record && isBeforeCutoff(record, cutoffIso)) {
+  const scope = agentCommand === undefined ? undefined : agentScope(agentCommand);
+  for await (const record of sessionRecords()) {
+    if (isPruneCandidate(record, scope) && isBeforeCutoff(record, cutoffIso)) {
       records.push(record);
     }
   }
-  return records;
+  return records.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
 function isBeforeCutoff(record: SessionRecord, cutoffIso: string | undefined): boolean {
@@ -412,7 +402,7 @@ async function pruneSessionFiles(
   dirEntries: string[],
   includeHistory: boolean,
 ): Promise<number> {
-  const safeId = encodeURIComponent(record.acpxRecordId);
+  const safeId = safeSessionId(record.acpxRecordId);
   let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
   if (includeHistory) {
     for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
@@ -432,31 +422,4 @@ async function unlinkCountingBytes(filePath: string): Promise<number> {
   }
   await fs.unlink(filePath).catch(() => undefined);
   return bytes;
-}
-
-export async function closeSession(id: string): Promise<SessionRecord> {
-  const record = await resolveSessionRecord(id);
-  const now = isoNow();
-
-  if (record.pid) {
-    for (const signal of killSignalCandidates(record.lastAgentExitSignal ?? undefined)) {
-      try {
-        process.kill(record.pid, signal);
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  record.closed = true;
-  record.closedAt = now;
-  record.pid = undefined;
-  record.lastUsedAt = now;
-  record.lastPromptAt = record.lastPromptAt ?? now;
-
-  await writeSessionRecord(record);
-  await rebuildSessionIndex(sessionBaseDir()).catch(() => {
-    // best effort cache rebuild
-  });
-  return record;
 }

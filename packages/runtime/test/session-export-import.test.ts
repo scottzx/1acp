@@ -1,95 +1,18 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { exportSession } from "../src/session/export.js";
 import { importSession } from "../src/session/import.js";
 import { resolveSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
-import type { SessionRecord } from "../src/types.js";
-
-function makeSessionRecord(
-  overrides: Partial<SessionRecord> & {
-    acpxRecordId: string;
-    acpSessionId: string;
-    agentCommand: string;
-    cwd: string;
-  },
-): SessionRecord {
-  const timestamp = "2026-01-01T00:00:00.000Z";
-  return {
-    schema: "acpx.session.v1",
-    acpxRecordId: overrides.acpxRecordId,
-    acpSessionId: overrides.acpSessionId,
-    agentSessionId: overrides.agentSessionId,
-    agentCommand: overrides.agentCommand,
-    cwd: path.resolve(overrides.cwd),
-    name: overrides.name ?? overrides.acpxRecordId,
-    createdAt: overrides.createdAt ?? timestamp,
-    lastUsedAt: overrides.lastUsedAt ?? timestamp,
-    lastSeq: overrides.lastSeq ?? 0,
-    lastRequestId: overrides.lastRequestId,
-    eventLog: overrides.eventLog ?? {
-      active_path: ".stream.ndjson",
-      segment_count: 1,
-      max_segment_bytes: 1024,
-      max_segments: 1,
-      last_write_at: overrides.lastUsedAt ?? timestamp,
-      last_write_error: null,
-    },
-    closed: overrides.closed ?? false,
-    closedAt: overrides.closedAt,
-    pid: overrides.pid,
-    agentStartedAt: overrides.agentStartedAt,
-    lastPromptAt: overrides.lastPromptAt,
-    lastAgentExitCode: overrides.lastAgentExitCode,
-    lastAgentExitSignal: overrides.lastAgentExitSignal,
-    lastAgentExitAt: overrides.lastAgentExitAt,
-    lastAgentDisconnectReason: overrides.lastAgentDisconnectReason,
-    protocolVersion: overrides.protocolVersion,
-    agentCapabilities: overrides.agentCapabilities,
-    title: overrides.title ?? null,
-    messages: overrides.messages ?? [],
-    updated_at: overrides.updated_at ?? overrides.lastUsedAt ?? timestamp,
-    cumulative_token_usage: overrides.cumulative_token_usage ?? {},
-    request_token_usage: overrides.request_token_usage ?? {},
-    acpx: overrides.acpx ?? {},
-    importedFrom: overrides.importedFrom,
-  };
-}
-
-async function withTempHome<T>(prefix: string, run: (homeDir: string) => Promise<T>): Promise<T> {
-  const originalHome = process.env.HOME;
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  process.env.HOME = tempHome;
-
-  try {
-    return await run(tempHome);
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(tempHome, { recursive: true, force: true });
-  }
-}
-
-function sessionFilePath(homeDir: string, acpxRecordId: string): string {
-  return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`);
-}
-
-async function writeSessionRecordFile(homeDir: string, record: SessionRecord): Promise<void> {
-  const filePath = sessionFilePath(homeDir, record.acpxRecordId);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(
-    filePath,
-    `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`,
-    "utf8",
-  );
-}
+import {
+  makeSessionRecord,
+  sessionFilePath,
+  withTempHome,
+  writeSessionRecordFile,
+} from "./runtime-test-helpers.js";
 
 function streamPath(homeDir: string, recordId: string): string {
   return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(recordId)}.stream.ndjson`);
@@ -123,7 +46,76 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-test("exportSession and importSession round-trip session state with a fresh record id", async () => {
+test(
+  "exportSession preserves output aliases and rejects special files",
+  { skip: process.platform === "win32" },
+  async () => {
+    await withTempHome("acpx-export-alias-", async (homeDir) => {
+      const source = makeSessionRecord({
+        acpxRecordId: "export-alias-source",
+        acpSessionId: "export-alias-provider",
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd: homeDir,
+      });
+      await writeSessionRecordFile(homeDir, source);
+      const directory = path.join(homeDir, "shared-output");
+      await fs.mkdir(directory);
+      await fs.chmod(directory, 0o775);
+      for (const existing of [false, true]) {
+        const target = path.join(directory, `target-${existing}.json`);
+        const alias = path.join(directory, `alias-${existing}.json`);
+        if (existing) {
+          await fs.writeFile(target, "previous export");
+        }
+        await fs.symlink(target, alias);
+        await exportSession(
+          { agentCommand: source.agentCommand, cwd: homeDir, name: source.name },
+          alias,
+        );
+        assert.equal((await fs.lstat(alias)).isSymbolicLink(), true);
+        assert.equal(JSON.parse(await fs.readFile(target, "utf8")).format_version, 1);
+        assert.equal((await fs.stat(target)).mode & 0o777, 0o600);
+        assert.equal((await fs.stat(directory)).mode & 0o777, 0o775);
+      }
+      assert.equal((await fs.readdir(directory)).length, 4);
+      const nestedTarget = path.join(directory, "nested");
+      await fs.mkdir(nestedTarget);
+      const directoryAlias = path.join(homeDir, "directory-alias");
+      await fs.symlink(nestedTarget, directoryAlias);
+      await exportSession(
+        { agentCommand: source.agentCommand, cwd: homeDir, name: source.name },
+        `${directoryAlias}/../parent-export.json`,
+      );
+      assert.equal(
+        JSON.parse(await fs.readFile(path.join(directory, "parent-export.json"), "utf8"))
+          .format_version,
+        1,
+      );
+      await assert.rejects(fs.access(path.join(homeDir, "parent-export.json")), { code: "ENOENT" });
+      const fifoPath = path.join(directory, "archive.pipe");
+      assert.equal(spawnSync("mkfifo", [fifoPath]).status, 0);
+      const fifoIdentity = await fs.stat(fifoPath);
+      const fifoAlias = path.join(directory, "pipe-alias");
+      await fs.symlink(fifoPath, fifoAlias);
+      for (const output of [fifoPath, fifoAlias]) {
+        await assert.rejects(
+          exportSession(
+            { agentCommand: source.agentCommand, cwd: homeDir, name: source.name },
+            output,
+          ),
+          /regular file/,
+        );
+        const after = await fs.stat(fifoPath);
+        assert.equal(after.isFIFO(), true);
+        assert.equal(after.ino, fifoIdentity.ino);
+      }
+    });
+  },
+);
+
+test("exportSession and importSession round-trip session state with a fresh record id", async (t) => {
+  const previousUmask = process.umask(0o002);
+  t.after(() => process.umask(previousUmask));
   await withTempHome("acpx-export-import-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const archivePath = path.join(homeDir, "archive.json");
@@ -174,6 +166,10 @@ test("exportSession and importSession round-trip session state with a fresh reco
     assert.equal(record.cwd, source.cwd);
     assert.deepEqual(record.messages, source.messages);
     assert.deepEqual(await readHistory(homeDir, imported.record_id), history);
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(streamPath(homeDir, imported.record_id))).mode & 0o777, 0o600);
+      assert.equal((await fs.stat(archivePath)).mode & 0o777, 0o600);
+    }
     assert.deepEqual(record.importedFrom, {
       recordId: source.acpxRecordId,
       cwdOriginal: "workspace",
@@ -229,6 +225,40 @@ test("exportSession scrubs source absolute paths from portable archives", async 
     assert.equal(archive.session?.cwd_absolute_original, undefined);
     assert.equal(archive.session?.state?.cwd, "workspace");
     assert.equal(archive.session?.state?.event_log?.active_path, ".stream.ndjson");
+  });
+});
+
+test("exportSession preserves large active and rotated event segments in order", async () => {
+  await withTempHome("acpx-export-large-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const archivePath = path.join(homeDir, "archive.json");
+    const record = makeSessionRecord({
+      acpxRecordId: "large-history",
+      acpSessionId: "large-history",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+
+    const count = 150_000;
+    const history = Array.from({ length: count * 2 }, (_, id) => ({
+      jsonrpc: "2.0",
+      id,
+      result: {},
+    }));
+    await writeHistory(homeDir, record.acpxRecordId, history.slice(0, count));
+    await fs.rename(
+      streamPath(homeDir, record.acpxRecordId),
+      path.join(homeDir, ".acpx", "sessions", "large-history.stream.1.ndjson"),
+    );
+    await writeHistory(homeDir, record.acpxRecordId, history.slice(count));
+
+    await exportSession({ agentCommand: record.agentCommand, cwd, name: record.name }, archivePath);
+
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")) as {
+      history: unknown[];
+    };
+    assert.deepEqual(archive.history, history);
   });
 });
 

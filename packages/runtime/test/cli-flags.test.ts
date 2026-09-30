@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
+import { scanCompareArgs } from "../src/cli/compare-args.js";
 import type { ResolvedAcpxConfig } from "../src/cli/config.js";
 import {
   addExecConfigOption,
@@ -27,7 +28,9 @@ import {
   resolveGlobalFlags,
   resolveOutputPolicy,
   resolvePermissionMode,
+  resolvePromptFlags,
   resolveSessionNameFromFlags,
+  resolveSessionsListFlags,
   resolveSystemPromptFlag,
 } from "../src/cli/flags.js";
 
@@ -53,9 +56,11 @@ function config(overrides: Partial<ResolvedAcpxConfig> = {}): ResolvedAcpxConfig
 }
 
 function commandWithOptions(options: Record<string, unknown>): Command {
-  return {
-    optsWithGlobals: () => options,
-  } as unknown as Command;
+  const command = new Command();
+  for (const [key, value] of Object.entries(options)) {
+    command.setOptionValue(key, value);
+  }
+  return command;
 }
 
 function parseCommand(command: Command, argv: string[]): Command {
@@ -277,29 +282,6 @@ test("resolveGlobalFlags ignores malformed dynamic options and keeps typed confi
   assert.equal(flags.promptRetries, undefined);
 });
 
-test("resolveGlobalFlags treats non-object Commander options as absent", () => {
-  const flags = resolveGlobalFlags(
-    {
-      optsWithGlobals: () => [],
-    } as unknown as Command,
-    config({
-      authPolicy: "fail",
-      nonInteractivePermissions: "fail",
-      ttlMs: 1_234,
-      format: "quiet",
-    }),
-  );
-
-  assert.equal(flags.authPolicy, "fail");
-  assert.equal(flags.nonInteractivePermissions, "fail");
-  assert.equal(flags.ttl, 1_234);
-  assert.equal(flags.format, "quiet");
-  assert.equal(flags.suppressReads, false);
-  assert.equal(flags.approveAll, undefined);
-  assert.equal(flags.approveReads, undefined);
-  assert.equal(flags.denyAll, undefined);
-});
-
 test("resolveGlobalFlags preserves boolean flag intent and alias-only policy values", () => {
   const approveAllFlags = resolveGlobalFlags(
     commandWithOptions({
@@ -356,6 +338,52 @@ test("resolveGlobalFlags rejects invalid json-strict combinations", () => {
       ),
     /--json-strict cannot be combined with --verbose/,
   );
+});
+
+test("resolveGlobalFlags applies the compare JSON alias before strict validation", () => {
+  for (const format of ["text", "quiet"]) {
+    const command = commandWithOptions({ format, json: true, jsonStrict: true });
+    assert.equal(resolveGlobalFlags(command, config()).format, "json");
+  }
+  assert.throws(
+    () =>
+      resolveGlobalFlags(
+        commandWithOptions({ format: "text", json: true, jsonStrict: true, verbose: true }),
+        config(),
+      ),
+    /--json-strict cannot be combined with --verbose/,
+  );
+});
+
+test("compare output discovery skips consumed values and stops at its delimiter", () => {
+  assert.deepEqual(
+    scanCompareArgs(["fast", "--json", "--format=quiet", "--", "--format", "text"]),
+    {
+      cwd: undefined,
+      json: true,
+      format: "quiet",
+      promptTokens: ["--format", "text"],
+    },
+  );
+  for (const flag of ["--file", "-f", "--prompt-file"]) {
+    assert.deepEqual(scanCompareArgs([flag, "--json", "fast"]), { cwd: undefined });
+  }
+  assert.deepEqual(scanCompareArgs(["--file=--json", "fast"]), { cwd: undefined });
+  assert.deepEqual(scanCompareArgs(["--format", "--json", "fast"]), {
+    cwd: undefined,
+    format: "--json",
+  });
+  assert.deepEqual(scanCompareArgs(["--file", "--", "--json", "--", "literal"]), {
+    cwd: undefined,
+    json: true,
+    promptTokens: ["literal"],
+  });
+  assert.deepEqual(scanCompareArgs(["fast", "--", "--json"]), {
+    cwd: undefined,
+    promptTokens: ["--json"],
+  });
+  assert.deepEqual(scanCompareArgs(["--format", "invalid"]), { cwd: undefined, format: "invalid" });
+  assert.deepEqual(scanCompareArgs(["--format"]), { cwd: undefined, format: undefined });
 });
 
 test("global flag registration parses each supported option", () => {
@@ -464,27 +492,86 @@ test("session and prompt option registration parse command-local flags", () => {
   });
 });
 
-test("resolveSessionNameFromFlags falls back through global and parent command options", () => {
-  assert.equal(
-    resolveSessionNameFromFlags({ session: "direct" }, commandWithOptions({})),
-    "direct",
-  );
+test("resolveSessionNameFromFlags honors direct and inherited Commander options", () => {
+  for (const [argv, expected] of [
+    [["cancel"], undefined],
+    [["-s", "parent", "cancel"], "parent"],
+    [["cancel", "-s", "child"], "child"],
+  ] as const) {
+    const parent = addSessionNameOption(new Command()).enablePositionalOptions();
+    const child = addSessionNameOption(parent.command("cancel")).action(() => {});
+    parseCommand(parent, [...argv]);
+    assert.equal(resolveSessionNameFromFlags({}, child), expected);
+    assert.equal(resolveSessionNameFromFlags({ session: "direct" }, child), "direct");
+  }
+});
 
-  assert.equal(
-    resolveSessionNameFromFlags({} as const, commandWithOptions({ session: "global" })),
-    "global",
-  );
+test("prompt flags select explicit child or parent options before parser defaults", () => {
+  const cases = [
+    { argv: ["prompt"], file: undefined, wait: true },
+    { argv: ["-f", " parent file ", "prompt"], file: " parent file ", wait: true },
+    { argv: ["prompt", "--file", "child"], file: "child", wait: true },
+    { argv: ["-f", "parent", "prompt", "-f", "-"], file: "-", wait: true },
+    { argv: ["--no-wait", "prompt"], file: undefined, wait: false },
+    { argv: ["prompt", "--no-wait"], file: undefined, wait: false },
+    { argv: ["--no-wait", "prompt", "--no-wait"], file: undefined, wait: false },
+  ];
+  for (const expected of cases) {
+    const parent = addPromptInputOption(addSessionOption(new Command())).enablePositionalOptions();
+    const child = addPromptInputOption(addSessionOption(parent.command("prompt"))).action(() => {});
+    parseCommand(parent, expected.argv);
+    const parentBefore = structuredClone(parent.opts());
+    const childBefore = structuredClone(child.opts());
+    const actual = resolvePromptFlags(child.opts(), child);
+    assert.equal(actual.file, expected.file, expected.argv.join(" "));
+    assert.equal(actual.wait, expected.wait, expected.argv.join(" "));
+    assert.deepEqual(parent.opts(), parentBefore);
+    assert.deepEqual(child.opts(), childBefore);
+  }
+});
 
-  const command = {
-    optsWithGlobals: () => ({}),
-    parent: {
-      opts: () => ({ session: "parent" }),
+test("list flags resolve explicit values from the closest command without merging other options", () => {
+  const listOptions = (command: Command) =>
+    command.option("--local").option("--cursor <cursor>").option("--filter-cwd <dir>");
+  const cases = [
+    { argv: ["list"], local: false, cursor: undefined, filterCwd: undefined },
+    { argv: ["--local", "list"], local: true, cursor: undefined, filterCwd: undefined },
+    { argv: ["list", "--local"], local: true, cursor: undefined, filterCwd: undefined },
+    {
+      argv: ["--cursor", "parent", "--filter-cwd", "parent-dir", "list"],
+      local: false,
+      cursor: "parent",
+      filterCwd: "parent-dir",
     },
-  } as unknown as Command;
-  assert.equal(resolveSessionNameFromFlags({}, command), "parent");
-
-  const commandWithoutCommanderHelpers = {} as unknown as Command;
-  assert.equal(resolveSessionNameFromFlags({}, commandWithoutCommanderHelpers), undefined);
+    {
+      argv: [
+        "--cursor",
+        "parent",
+        "--filter-cwd",
+        "parent-dir",
+        "list",
+        "--cursor",
+        "child",
+        "--filter-cwd",
+        "child-dir",
+      ],
+      local: false,
+      cursor: "child",
+      filterCwd: "child-dir",
+    },
+  ];
+  for (const { argv, ...expected } of cases) {
+    const parent = listOptions(new Command())
+      .enablePositionalOptions()
+      .option("--unrelated <value>");
+    const child = listOptions(parent.command("list")).action(() => {});
+    parseCommand(parent, ["--unrelated", "keep-local", ...argv]);
+    const parentBefore = structuredClone(parent.opts());
+    const childBefore = structuredClone(child.opts());
+    assert.deepEqual(resolveSessionsListFlags(child.opts(), child), expected);
+    assert.deepEqual(parent.opts(), parentBefore);
+    assert.deepEqual(child.opts(), childBefore);
+  }
 });
 
 test("resolveOutputPolicy maps json-strict output behavior", () => {
@@ -505,6 +592,37 @@ test("resolveOutputPolicy maps json-strict output behavior", () => {
     queueErrorAlreadyEmitted: false,
     suppressSdkConsoleErrors: true,
   });
+});
+
+test("raw-agent resolution distinguishes omission from an explicitly blank command", () => {
+  const defaults = config({
+    defaultAgent: "fixture",
+    agents: { fixture: { command: "default-fixture" } },
+  });
+  const flags = resolveGlobalFlags(commandWithOptions({}), defaults);
+  assert.equal(flags.agent, undefined);
+  assert.equal(resolveAgentInvocation(undefined, flags, defaults).agentCommand, "default-fixture");
+
+  for (const agent of ["", " \t\n"]) {
+    assert.throws(
+      () => resolveGlobalFlags(commandWithOptions({ agent }), defaults),
+      InvalidArgumentError,
+    );
+    for (const positional of [undefined, "fixture"]) {
+      assert.throws(
+        () => resolveAgentInvocation(positional, { ...flags, agent }, defaults),
+        InvalidArgumentError,
+      );
+    }
+  }
+});
+
+test("raw-agent resolution preserves quoting and spaces inside a valid command", () => {
+  const agent = '  node "./agent dir/server.mjs" --label "  two words  "  ';
+  const flags = resolveGlobalFlags(commandWithOptions({ agent }), config());
+  const invocation = resolveAgentInvocation(undefined, flags, config());
+  assert.equal(invocation.agentCommand, agent.trim());
+  assert.equal(invocation.agentArgv, undefined);
 });
 
 test("resolveAgentInvocation rejects conflicting positional and override agents", () => {
@@ -556,6 +674,31 @@ test("resolveAgentInvocation rejects conflicting positional and override agents"
       ),
     /Do not combine positional agent with --agent override/,
   );
+});
+
+test("resolveAgentInvocation ignores inherited agent entries and preserves explicit ones", () => {
+  const flags = {
+    cwd: process.cwd(),
+    nonInteractivePermissions: "deny" as const,
+    ttl: 300_000,
+    format: "text" as const,
+  };
+  for (const name of ["constructor", "__proto__", "toString"]) {
+    assert.deepEqual(resolveAgentInvocation(name, flags, config()), {
+      agentName: name,
+      agentCommand: name,
+      cwd: process.cwd(),
+    });
+    const agents = Object.fromEntries([
+      [name.toLowerCase(), { command: "custom-agent", argv: ["custom-agent"] }],
+    ]);
+    assert.deepEqual(resolveAgentInvocation(name, flags, config({ agents })), {
+      agentName: name,
+      agentCommand: "custom-agent",
+      agentArgv: ["custom-agent"],
+      cwd: process.cwd(),
+    });
+  }
 });
 
 test("resolveAgentInvocation applies canonical config overrides through aliases", () => {

@@ -35,10 +35,7 @@ export function getDesiredConfigOptions(
   }
 
   return Object.fromEntries(
-    Object.entries(desired).flatMap(([configId, value]) => {
-      const normalizedConfigId = normalizeModeId(configId);
-      return normalizedConfigId && typeof value === "string" ? [[normalizedConfigId, value]] : [];
-    }),
+    Object.entries(desired).filter(([, value]) => typeof value === "string"),
   );
 }
 
@@ -59,12 +56,11 @@ export function clearDesiredConfigOption(
   state: SessionAcpxState,
   configId: string | undefined,
 ): void {
-  const normalizedConfigId = normalizeModeId(configId);
-  if (!normalizedConfigId || !state.desired_config_options) {
+  if (typeof configId !== "string" || !state.desired_config_options) {
     return;
   }
   const desired = { ...state.desired_config_options };
-  delete desired[normalizedConfigId];
+  delete desired[configId];
   if (Object.keys(desired).length > 0) {
     state.desired_config_options = desired;
   } else {
@@ -113,19 +109,6 @@ export function setDesiredModelId(
     acpx,
     modelConfigId ?? modelStateFromConfigOptions(acpx.config_options)?.configId,
   );
-  record.acpx = acpx;
-}
-
-export function setCurrentModelId(record: SessionRecord, modelId: string | undefined): void {
-  const acpx = ensureAcpxState(record.acpx);
-  const normalized = normalizeModelId(modelId);
-
-  if (normalized) {
-    acpx.current_model_id = normalized;
-  } else {
-    delete acpx.current_model_id;
-  }
-
   record.acpx = acpx;
 }
 

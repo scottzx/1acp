@@ -1,45 +1,48 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
+import { pathToFileURL } from "node:url";
 import {
   PROTOCOL_VERSION,
+  RequestError,
   client,
   methods,
   type AnyMessage,
+  type ClientConnection,
+  type ClientCapabilities,
   type AuthMethod,
   type AuthenticateRequest,
   type CreateElicitationRequest,
   type CreateElicitationResponse,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
+  type InitializeRequest,
   type InitializeResponse,
   type JsonRpcId,
   type ListSessionsRequest,
   type ListSessionsResponse,
-  type KillTerminalRequest,
-  type KillTerminalResponse,
   type LoadSessionResponse,
   type NewSessionResponse,
   type PromptResponse,
   type ReadTextFileRequest,
   type ReadTextFileResponse,
-  type ReleaseTerminalRequest,
-  type ReleaseTerminalResponse,
   type ResumeSessionResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
   type SetSessionConfigOptionResponse,
-  type TerminalOutputRequest,
-  type TerminalOutputResponse,
-  type WaitForTerminalExitRequest,
-  type WaitForTerminalExitResponse,
   type WriteTextFileRequest,
   type WriteTextFileResponse,
   type SessionConfigOption,
 } from "@agentclientprotocol/sdk";
+import { FsSafeError } from "@openclaw/fs-safe/errors";
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
-import { TimeoutError, withTimeout } from "../async-control.js";
+import {
+  assertControlAuthority,
+  TimeoutError,
+  withTimeout,
+  type AcpControlAuthority,
+} from "../async-control.js";
 import {
   AgentDisconnectedError,
   AgentSpawnError,
@@ -57,13 +60,14 @@ import {
   decisionToResponse,
   inferToolKind,
   resolvePermissionRequestWithDetails,
+  withPermissionMetadata,
 } from "../permissions.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
-import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
   AcpElicitationHandler,
+  AcpPermissionHandler,
   AcpElicitationMode,
   AcpProcessLaunch,
   AcpProcessLaunchScope,
@@ -92,6 +96,7 @@ import {
   resolveGeminiCommandArgs,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
+import { extractAgentSessionId } from "./agent-session-id.js";
 import {
   applyClaudeSettingsEnvironment,
   buildAgentSpawnOptions,
@@ -108,13 +113,18 @@ import {
   waitForChildExit,
   waitForSpawn,
 } from "./client-process.js";
+import { resolveClientCapabilities, resolveClientInfo } from "./client-protocol.js";
 import {
-  createAgentConnectionFacade,
-  resolveClientCapabilities,
-  resolveClientInfo,
-  type AcpAgentConnection,
-} from "./client-protocol.js";
-import { isCodexAcpCommand, resolveCodexExecutable } from "./codex-compat.js";
+  codexPermissionNotice,
+  isCodexAcpCommand,
+  preferCodexPermissionRefusal,
+  resolveCodexExecutable,
+} from "./codex-compat.js";
+import {
+  admitCommandProbe,
+  captureCommandProbeOutput,
+  CommandProbeAdmissionError,
+} from "./command-probe.js";
 import { extractAcpError } from "./error-shapes.js";
 import {
   cancelledAskUserResponse,
@@ -134,7 +144,7 @@ import {
   type GrokExitPlanOutcome,
 } from "./grok-exit-plan.js";
 import {
-  modelStateFromConfigOptions,
+  assertRequestedModelSupported,
   modelStateFromSessionResponse,
   RequestedModelUnsupportedError,
   resolveRequestedModelId,
@@ -146,6 +156,7 @@ import {
   readMaxAcpMessageBytes,
 } from "./ndjson-stream.js";
 import { observeAcpStream } from "./observed-stream.js";
+import { ProcessDescendants } from "./process-descendants.js";
 import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
@@ -167,10 +178,8 @@ const REPLAY_DRAIN_TIMEOUT_MS = 5_000;
 const DRAIN_POLL_INTERVAL_MS = 20;
 const AGENT_CLOSE_TERM_GRACE_MS = 1_500;
 const AGENT_CLOSE_KILL_GRACE_MS = 1_000;
+const AGENT_CLEANUP_BUDGET_MS = 8_000;
 const STARTUP_STDERR_MAX_CHARS = 8_192;
-const DEEPSEEK_BUILD_DEFAULT_MODEL = "deepseek-v4-flash";
-const DEEPSEEK_BUILD_API_BASE_URL = "https://api.deepseek.com";
-const DEEPSEEK_BUILD_MODELS_URL = `${DEEPSEEK_BUILD_API_BASE_URL}/models`;
 // Align with Grok CLI `--permission-mode` / config `defaultMode`:
 // default | acceptEdits | auto | dontAsk | bypassPermissions | plan
 const GROK_PERMISSION_MODE_IDS = [
@@ -191,12 +200,10 @@ function isGrokPermissionMode(value: string): value is GrokPermissionMode {
 
 type GrokShortCircuitOutcome = "allow_once" | "reject_once";
 
-type GrokAcpProfile = "deepseek" | "grok";
-
 function resolveGrokAcpProfile(
   agentCommand: string,
   agentArgv: string[] | undefined,
-): GrokAcpProfile | undefined {
+): "grok" | undefined {
   const { command, args } = resolveAgentCommandParts(agentCommand, agentArgv);
   const executable = command
     .replace(/\\/g, "/")
@@ -212,36 +219,11 @@ function resolveGrokAcpProfile(
   if (stdioIndex < 0) {
     return undefined;
   }
-  if (stdioIndex === 3 && args[1] === "--model" && args[2] === DEEPSEEK_BUILD_DEFAULT_MODEL) {
-    return "deepseek";
-  }
   return "grok";
 }
 
 function nonEmptyEnvironmentValue(value: string | undefined): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
-}
-
-function applyDeepSeekBuildEnvironment(
-  env: NodeJS.ProcessEnv,
-  enabled: boolean,
-  apiKey: string | undefined,
-): void {
-  if (!enabled) {
-    return;
-  }
-  if (!apiKey) {
-    throw new AuthPolicyError(
-      "deepseek-build requires transient xai.api_key credentials or DEEPSEEK_API_KEY",
-    );
-  }
-  env.DEEPSEEK_API_KEY = apiKey;
-  env.GROK_XAI_API_BASE_URL = DEEPSEEK_BUILD_API_BASE_URL;
-  env.GROK_MODELS_BASE_URL = DEEPSEEK_BUILD_API_BASE_URL;
-  env.GROK_MODELS_LIST_URL = DEEPSEEK_BUILD_MODELS_URL;
-  env.GROK_DEFAULT_MODEL = DEEPSEEK_BUILD_DEFAULT_MODEL;
-  env.XAI_API_KEY = apiKey;
-  delete env.GROK_CODE_XAI_API_KEY;
 }
 
 function isMutationKind(kind: string | undefined): boolean {
@@ -346,16 +328,25 @@ function elicitationRequestScopeId(request: CreateElicitationRequest): JsonRpcId
     : undefined;
 }
 
-function waitForAbort(signal: AbortSignal): Promise<{ kind: "aborted" }> {
-  if (signal.aborted) {
-    return Promise.resolve({ kind: "aborted" });
-  }
-  return new Promise((resolve) => {
-    signal.addEventListener("abort", () => resolve({ kind: "aborted" }), { once: true });
+async function raceWithAbort<T>(signal: AbortSignal, pending: Promise<T>): Promise<T | undefined> {
+  let onAbort!: () => void;
+  const aborted = new Promise<undefined>((resolve) => {
+    onAbort = () => resolve(undefined);
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 type LoadSessionOptions = {
+  authority?: AcpControlAuthority;
   suppressReplayUpdates?: boolean;
   replayIdleMs?: number;
   replayDrainTimeoutMs?: number;
@@ -392,7 +383,21 @@ function normalizeResponseConfigOptions(
   if (!response || !("configOptions" in response)) {
     return undefined;
   }
-  return response.configOptions ?? [];
+  return Array.isArray(response.configOptions) ? response.configOptions : undefined;
+}
+
+function normalizeConfigOptionAcknowledgement(
+  response: SetSessionConfigOptionResponse | undefined,
+): SetSessionConfigOptionResponse {
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    return {} as SetSessionConfigOptionResponse;
+  }
+  if (Array.isArray(response.configOptions)) {
+    return response;
+  }
+  const acknowledgement: Partial<SetSessionConfigOptionResponse> = { ...response };
+  delete acknowledgement.configOptions;
+  return acknowledgement as SetSessionConfigOptionResponse;
 }
 
 function toReconnectedSessionResult(
@@ -400,10 +405,10 @@ function toReconnectedSessionResult(
 ): SessionLoadResult {
   const configOptions = normalizeResponseConfigOptions(response);
   return {
-    agentSessionId: extractRuntimeSessionId(response?._meta),
+    agentSessionId: extractAgentSessionId(response?._meta),
     configOptions,
     models: modelStateFromSessionResponse({ configOptions, response }),
-    configOptionsPresent: hasResponseField(response, "configOptions"),
+    configOptionsPresent: configOptions !== undefined,
     legacyModelMetadataPresent: hasResponseField(response, "models"),
   };
 }
@@ -421,8 +426,17 @@ type ActivePromptState = {
   promise?: Promise<PromptResponse>;
   cancelPromise?: Promise<void>;
   onRequestWritten?: () => Promise<void> | void;
+  authority?: AcpControlAuthority;
+  admissionFailure?: { error: unknown };
   elicitationHandler?: AcpElicitationHandler;
+  permissionHandler?: AcpPermissionHandler;
   elicitationController: AbortController;
+  requestController: AbortController;
+};
+
+type DelegatedRequestOwner = AcpControlAuthority & {
+  signal: AbortSignal;
+  permissionHandler?: AcpPermissionHandler;
 };
 
 type ElicitationOwner = {
@@ -473,6 +487,7 @@ type AgentLaunchPlan = {
   codexAcp: boolean;
   agentType?: string;
   spawnOptions: ReturnType<typeof buildAgentSpawnOptions>;
+  commandContext: Parameters<typeof resolveGeminiCommandArgs>[2];
 };
 
 type StartupFailureWatcher = {
@@ -485,10 +500,6 @@ type SessionUpdateSuppressionState = {
   suppressSessionUpdates: boolean;
   suppressReplaySessionUpdateMessages: boolean;
 };
-
-type ModelControl = { kind: "config_option"; configId: string } | { kind: "legacy_set_model" };
-type ModelControlOverride = Pick<SessionModelState, "configId"> &
-  Partial<Pick<SessionModelState, "availableModels">>;
 
 export type AgentExitInfo = {
   exitCode: number | null;
@@ -504,8 +515,6 @@ export type AgentLifecycleSnapshot = {
   running: boolean;
   lastExit?: AgentExitInfo;
 };
-
-type ConsoleErrorMethod = typeof console.error;
 
 function childProcessIsRunning(
   agent: ChildProcessByStdio<Writable, Readable, Readable> | undefined,
@@ -524,30 +533,13 @@ function cancelledPermissionResponse(): RequestPermissionResponse {
   };
 }
 
-function shouldSuppressSdkConsoleError(args: unknown[]): boolean {
-  if (args.length === 0) {
-    return false;
-  }
-  return typeof args[0] === "string" && args[0] === "Error handling request";
-}
-
-function installSdkConsoleErrorSuppression(): () => void {
-  const originalConsoleError: ConsoleErrorMethod = console.error;
-  console.error = (...args: unknown[]) => {
-    if (shouldSuppressSdkConsoleError(args)) {
-      return;
-    }
-    originalConsoleError(...args);
-  };
-  return () => {
-    console.error = originalConsoleError;
-  };
-}
-
 export class AcpClient {
-  private options: AcpClientOptions;
-  private connection?: AcpAgentConnection;
+  private options: AcpClientOptions & { elicitationModes: readonly AcpElicitationMode[] };
+  private connection?: ClientConnection;
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
+  private readonly agentDescendants = new WeakMap<ChildProcess, ProcessDescendants>();
+  private readonly agentCleanups = new WeakMap<ChildProcess, Promise<void>>();
+  private readonly commandProbes = new Set<ChildProcess>();
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
   private eventHandlers: Pick<
@@ -583,6 +575,9 @@ export class AcpClient {
   private readonly cancellingSessionIds = new Set<string>();
   private readonly permissionAbortControllers = new Map<string, AbortController>();
   private closing = false;
+  private closeTask?: Promise<void>;
+  // Bumped by close() so a start() still launching can tell it was abandoned.
+  private closeEpoch = 0;
   private agentStartedAt?: string;
   private lastAgentExit?: AgentExitInfo;
   private lastKnownPid?: number;
@@ -617,11 +612,20 @@ export class AcpClient {
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       ...(grokBuildAcp
         ? {
-            confirmWrite: async (filePath: string, preview: string, sessionId: string) =>
-              await this.confirmGrokClientOperation(sessionId, "edit", `Write ${filePath}`, {
-                path: filePath,
-                preview,
-              }),
+            confirmWrite: async (
+              filePath: string,
+              preview: string,
+              ctx: { sessionId?: string; signal?: AbortSignal },
+            ) =>
+              await this.confirmGrokClientOperation(
+                ctx.sessionId ?? "",
+                "edit",
+                `Write ${filePath}`,
+                {
+                  path: filePath,
+                  preview,
+                },
+              ),
           }
         : {}),
       onOperation: (operation) => {
@@ -634,10 +638,18 @@ export class AcpClient {
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       ...(grokBuildAcp
         ? {
-            confirmExecute: async (commandLine: string, sessionId: string) =>
-              await this.confirmGrokClientOperation(sessionId, "execute", `Run ${commandLine}`, {
-                command: commandLine,
-              }),
+            confirmExecute: async (
+              commandLine: string,
+              ctx: { sessionId?: string; signal?: AbortSignal },
+            ) =>
+              await this.confirmGrokClientOperation(
+                ctx.sessionId ?? "",
+                "execute",
+                `Run ${commandLine}`,
+                {
+                  command: commandLine,
+                },
+              ),
           }
         : {}),
       onOperation: (operation) => {
@@ -792,13 +804,18 @@ export class AcpClient {
     );
   }
 
-  hasReusableSession(sessionId: string): boolean {
+  private hasLiveConnection(): boolean {
     return (
+      !this.closing &&
       this.connection != null &&
+      !this.connection.signal.aborted &&
       this.agent != null &&
-      isChildProcessRunning(this.agent) &&
-      this.loadedSessionId === sessionId
+      isChildProcessRunning(this.agent)
     );
+  }
+
+  hasReusableSession(sessionId: string): boolean {
+    return this.hasLiveConnection() && this.loadedSessionId === sessionId;
   }
 
   hasActivePrompt(sessionId?: string): boolean {
@@ -815,32 +832,43 @@ export class AcpClient {
     return this.activePrompt !== undefined;
   }
 
-  endPromptElicitation(sessionId: string): void {
-    const active = this.activePrompt;
-    if (!active || active.sessionId !== sessionId) {
-      return;
+  private abortSessionRequests(sessionId: string): void {
+    const owners = this.pendingPromptOwners.filter((owner) => owner.sessionId === sessionId);
+    const fallback = this.takePermissionAbortController(sessionId);
+    for (const owner of owners) {
+      owner.elicitationHandler = undefined;
+      owner.elicitationController.abort();
+      owner.requestController.abort();
     }
-    active.elicitationHandler = undefined;
-    active.elicitationController.abort();
+    fallback?.abort();
   }
 
-  async start(): Promise<void> {
-    if (this.connection && this.agent && isChildProcessRunning(this.agent)) {
+  async start(
+    authority?: AcpControlAuthority,
+    options?: Pick<AcpClientOptions, "sessionOptions">,
+  ): Promise<void> {
+    assertControlAuthority(authority);
+    if (options) {
+      this.options.sessionOptions = structuredClone(options.sessionOptions);
+    }
+    if (this.hasLiveConnection()) {
       return;
     }
-    if (this.connection || this.agent) {
-      await this.close();
-    }
-
+    const epoch = await this.waitForPreviousClose();
     const maxMessageBytes = readMaxAcpMessageBytes();
-    const launch = await this.resolveAgentLaunchPlan();
+    const launch = await this.resolveAgentLaunchPlan(epoch, authority);
+    this.assertCommandProbeActive(epoch, authority);
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
-    const { child, process: startedProcess } = await this.spawnAgentProcess(launch);
-    this.closing = false;
-    this.agentStartedAt = startedProcess.startedAt;
-    this.lastAgentExit = undefined;
-    this.lastKnownPid = startedProcess.pid;
+    this.assertCommandProbeActive(epoch, authority);
+    const { child, process: startedProcess } = await this.spawnAgentProcess(launch, authority);
+    if (this.closeEpoch === epoch) {
+      this.agent = child;
+      this.closing = false;
+      this.agentStartedAt = startedProcess.startedAt;
+      this.lastAgentExit = undefined;
+      this.lastKnownPid = startedProcess.pid;
+    }
     const startupStderr: string[] = [];
 
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -861,10 +889,11 @@ export class AcpClient {
       startupFailure.dispose();
       throw error;
     }
+    await this.stopIfClosedDuringLaunch(epoch, child, startupFailure, authority);
 
     const input = Writable.toWeb(child.stdin);
     const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
-    let connection: AcpAgentConnection | undefined;
+    let connection: ClientConnection | undefined;
     const stream = this.createTappedStream(
       createNdJsonMessageStream(
         this.options.agentCommand,
@@ -873,29 +902,55 @@ export class AcpClient {
         maxMessageBytes,
         (error) => {
           this.rejectPendingConnectionRequests(error);
-          connection?.close?.(error);
+          connection?.close(error);
         },
       ),
     );
 
-    connection = this.createConnection(stream, launch);
-    connection.signal.addEventListener(
-      "abort",
-      () => {
-        this.recordAgentExit("connection_close", child.exitCode ?? null, child.signalCode ?? null);
-      },
-      { once: true },
-    );
+    const capabilities = resolveClientCapabilities({
+      devinAcp: launch.devinAcp,
+      fs: this.options.fs !== false,
+      terminal: this.options.terminal !== false,
+      elicitationModes: this.options.elicitationModes,
+    });
+    connection = this.createConnection(stream, launch, capabilities);
+    const onConnectionClose = () => {
+      this.handleAgentDisconnect(
+        child,
+        "connection_close",
+        child.exitCode ?? null,
+        child.signalCode ?? null,
+      );
+    };
+    connection.signal.addEventListener("abort", onConnectionClose, { once: true });
     await this.initializeAgentConnection({
       child,
       connection,
       startupFailure,
       startupStderr,
       launch,
+      capabilities,
     });
+    if (connection.signal.aborted) {
+      onConnectionClose();
+    }
   }
 
-  private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
+  private async waitForPreviousClose(): Promise<number> {
+    const cleanup = this.closeTask ?? (this.connection || this.agent ? this.close() : undefined);
+    const epoch = this.closeEpoch;
+    await cleanup;
+    // A start may wait for retirement, but a later close must still cancel it.
+    if (this.closeEpoch !== epoch) {
+      throw new Error("ACP client was closed while the agent was starting");
+    }
+    return epoch;
+  }
+
+  private async resolveAgentLaunchPlan(
+    epoch: number,
+    authority?: AcpControlAuthority,
+  ): Promise<AgentLaunchPlan> {
     const configuredCommand = resolveAgentCommandParts(
       this.options.agentCommand,
       this.options.agentArgv,
@@ -903,10 +958,6 @@ export class AcpClient {
     const resolvedBuiltInLaunch = resolveBuiltInAgentLaunch(this.options.agentCommand);
     const spawnCommand = resolvedBuiltInLaunch?.command ?? configuredCommand.command;
     let args = resolvedBuiltInLaunch?.args ?? configuredCommand.args;
-    args = await resolveGeminiCommandArgs(spawnCommand, args);
-    if (isQoderAcpCommand(spawnCommand, args)) {
-      args = buildQoderAcpCommandArgs(args, this.options);
-    }
     const claudeAcp = isClaudeAcpCommand(spawnCommand, args);
     const codexAcp = isCodexAcpCommand(spawnCommand, args);
     const spawnOptions = buildAgentSpawnOptions(
@@ -916,11 +967,36 @@ export class AcpClient {
       this.options.agentProcessEnv,
       claudeAcp,
     );
-    applyDeepSeekBuildEnvironment(
-      spawnOptions.env,
-      this.isDeepSeekBuildAgent(),
-      this.readDeepSeekApiKey(),
-    );
+    const commandContext: AgentLaunchPlan["commandContext"] = {
+      env: spawnOptions.env,
+      readOutput: async (command, args, timeoutMs, diagnostic = false) => {
+        try {
+          const output = await this.readAgentCommandOutput(
+            command,
+            args,
+            timeoutMs,
+            spawnOptions,
+            epoch,
+            authority,
+          );
+          // Retirement may await while close() revokes this startup generation.
+          await admitCommandProbe(() => this.assertCommandProbeActive(epoch, authority));
+          return output;
+        } catch (error) {
+          if (error instanceof CommandProbeAdmissionError) {
+            if (diagnostic) {
+              return undefined;
+            }
+            throw error.reason;
+          }
+          throw error;
+        }
+      },
+    };
+    args = await resolveGeminiCommandArgs(spawnCommand, args, commandContext);
+    if (isQoderAcpCommand(spawnCommand, args)) {
+      args = buildQoderAcpCommandArgs(args, this.options);
+    }
     return {
       spawnCommand,
       args,
@@ -931,6 +1007,7 @@ export class AcpClient {
       claudeAcp,
       codexAcp,
       spawnOptions,
+      commandContext,
     };
   }
 
@@ -953,7 +1030,7 @@ export class AcpClient {
 
   private async ensureLaunchSupport(plan: AgentLaunchPlan): Promise<void> {
     if (plan.copilotAcp) {
-      await ensureCopilotAcpSupport(plan.spawnCommand);
+      await ensureCopilotAcpSupport(plan.spawnCommand, plan.commandContext);
     }
     if (plan.codexAcp) {
       const codexExe = resolveCodexExecutable(process.platform, plan.spawnOptions.env);
@@ -965,40 +1042,65 @@ export class AcpClient {
     if (!plan.claudeAcp) {
       return;
     }
-    const claudeExe = resolveClaudeCodeExecutable(process.platform, plan.spawnOptions.env);
+    const claudeExe = resolveClaudeCodeExecutable(
+      process.platform,
+      plan.spawnOptions.env,
+      plan.spawnOptions.cwd,
+    );
     if (claudeExe) {
       plan.spawnOptions.env.CLAUDE_CODE_EXECUTABLE = claudeExe;
       this.log(`resolved system Claude Code executable: ${claudeExe}`);
     }
   }
 
-  private async spawnAgentProcess(plan: AgentLaunchPlan): Promise<{
+  private prepareProcessLaunch(
+    command: string,
+    args: readonly string[],
+    options: Pick<ReturnType<typeof buildAgentSpawnOptions>, "cwd" | "env">,
+  ): { launch: AcpProcessLaunch; windowsVerbatimArguments?: boolean } {
+    const resolved = buildAgentSpawnCommand(
+      command,
+      args,
+      process.platform,
+      options.env,
+      options.cwd,
+    );
+    return {
+      launch: Object.freeze({
+        launchId: randomUUID(),
+        scope: snapshotProcessLaunchScope(this.options.processLaunchScope),
+        command: resolved.command,
+        args: Object.freeze([...resolved.args]),
+        cwd: options.cwd,
+      }),
+      windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+    };
+  }
+
+  private startedProcess(launch: AcpProcessLaunch, pid: number): AcpProcessStarted {
+    return Object.freeze({ ...launch, pid, startedAt: isoNow() });
+  }
+
+  private async spawnAgentProcess(
+    plan: AgentLaunchPlan,
+    authority?: AcpControlAuthority,
+  ): Promise<{
     child: ChildProcessByStdio<Writable, Readable, Readable>;
     process: AcpProcessStarted;
   }> {
     if (plan.claudeAcp) {
       applyClaudeSettingsEnvironment(plan.spawnOptions.env);
     }
-    const spawnCommand = buildAgentSpawnCommand(
-      plan.spawnCommand,
-      plan.args,
-      process.platform,
-      plan.spawnOptions.env,
-    );
-    const launch: AcpProcessLaunch = Object.freeze({
-      launchId: randomUUID(),
-      scope: snapshotProcessLaunchScope(this.options.processLaunchScope),
-      command: spawnCommand.command,
-      args: Object.freeze([...spawnCommand.args]),
-      cwd: this.options.cwd,
-    });
+    const prepared = this.prepareProcessLaunch(plan.spawnCommand, plan.args, plan.spawnOptions);
+    const { launch } = prepared;
     await this.options.processLifecycle?.onBeforeSpawn?.(launch);
+    assertControlAuthority(authority);
 
     let spawnedChild: ChildProcessByStdio<Writable, Readable, Readable>;
     try {
-      spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
+      spawnedChild = spawn(launch.command, [...launch.args], {
         ...plan.spawnOptions,
-        windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
+        windowsVerbatimArguments: prepared.windowsVerbatimArguments,
       });
       await waitForSpawn(spawnedChild);
     } catch (error) {
@@ -1008,6 +1110,7 @@ export class AcpClient {
     }
 
     const child = requireAgentStdio(spawnedChild);
+    this.agentDescendants.set(child, new ProcessDescendants(child));
     const pid = child.pid;
     if (pid === undefined) {
       const spawnError = new AgentSpawnError(
@@ -1018,27 +1121,118 @@ export class AcpClient {
       await this.terminateAgentProcess(child);
       throw spawnError;
     }
-    return {
-      child,
-      process: Object.freeze({
-        ...launch,
-        pid,
-        startedAt: isoNow(),
-      }),
-    };
+    return { child, process: this.startedProcess(launch, pid) };
+  }
+
+  private assertCommandProbeActive(epoch: number, authority?: AcpControlAuthority): void {
+    assertControlAuthority(authority);
+    if (this.closeEpoch !== epoch) {
+      throw new Error("ACP client was closed while the agent was starting");
+    }
+  }
+
+  private async readAgentCommandOutput(
+    command: string,
+    args: readonly string[],
+    timeoutMs: number,
+    options: Pick<ReturnType<typeof buildAgentSpawnOptions>, "cwd" | "env">,
+    epoch: number,
+    authority?: AcpControlAuthority,
+  ): Promise<string | undefined> {
+    const prepared = this.prepareProcessLaunch(command, args, options);
+    const { launch } = prepared;
+    await admitCommandProbe(async () => {
+      this.assertCommandProbeActive(epoch, authority);
+      await this.options.processLifecycle?.onBeforeSpawn?.(launch);
+    });
+    // No await may separate this check from the actual probe spawn.
+    try {
+      this.assertCommandProbeActive(epoch, authority);
+    } catch (error) {
+      throw new CommandProbeAdmissionError(error);
+    }
+
+    let child: ChildProcess;
+    try {
+      child = spawn(launch.command, [...launch.args], {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        windowsVerbatimArguments: prepared.windowsVerbatimArguments,
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      this.notifyProcessSpawnFailure(launch, new AgentSpawnError(command, error));
+      return undefined;
+    }
+    this.commandProbes.add(child);
+    this.agentDescendants.set(child, new ProcessDescendants(child, { ownProcessGroup: true }));
+    const capture = captureCommandProbeOutput(child, timeoutMs, () =>
+      this.terminateAgentProcess(child),
+    );
+    try {
+      try {
+        await waitForSpawn(child);
+      } catch (error) {
+        this.notifyProcessSpawnFailure(launch, new AgentSpawnError(command, error));
+        return undefined;
+      }
+      if (child.pid === undefined) {
+        this.notifyProcessSpawnFailure(
+          launch,
+          new AgentSpawnError(command, new Error("spawned probe did not expose a PID")),
+        );
+        return undefined;
+      }
+      const started = this.startedProcess(launch, child.pid);
+      await this.admitSpawnedProcess(
+        child,
+        (barrier) => this.attachProcessExitObserver(child, started, barrier),
+        () =>
+          admitCommandProbe(async () => {
+            await this.options.processLifecycle?.onSpawned?.(started);
+            this.assertCommandProbeActive(epoch, authority);
+          }),
+      );
+      const output = await capture.result;
+      await admitCommandProbe(() => this.assertCommandProbeActive(epoch, authority));
+      return output;
+    } finally {
+      try {
+        await this.terminateAgentProcess(child);
+      } finally {
+        capture.dispose();
+        this.commandProbes.delete(child);
+      }
+    }
   }
 
   private async admitAndObserveSpawnedProcess(
     child: ChildProcessByStdio<Writable, Readable, Readable>,
     process: AcpProcessStarted,
   ): Promise<void> {
+    await this.admitSpawnedProcess(
+      child,
+      (barrier) => this.attachAgentLifecycleObservers(child, process, barrier),
+      async () => {
+        await this.options.processLifecycle?.onSpawned?.(process);
+      },
+    );
+  }
+
+  private async admitSpawnedProcess(
+    child: ChildProcess,
+    observe: (barrier: Promise<void>) => void,
+    admit: () => Promise<void>,
+  ): Promise<void> {
     let releaseExitNotification = () => {};
-    const exitNotificationBarrier = new Promise<void>((resolve) => {
+    const barrier = new Promise<void>((resolve) => {
       releaseExitNotification = resolve;
     });
-    this.attachAgentLifecycleObservers(child, process, exitNotificationBarrier);
+    observe(barrier);
     try {
-      await this.options.processLifecycle?.onSpawned?.(process);
+      await admit();
     } catch (error) {
       await this.terminateAgentProcess(child);
       throw error;
@@ -1053,39 +1247,48 @@ export class AcpClient {
       writable: WritableStream<AnyMessage>;
     },
     launch: Pick<AgentLaunchPlan, "devinAcp">,
-  ): AcpAgentConnection {
+    capabilities: ClientCapabilities,
+  ): ClientConnection {
     const app = client({ name: "acpx" })
       .onNotification(methods.client.session.update, async ({ params }) => {
         await this.handleSessionUpdate(params);
       })
       .onNotification(methods.client.elicitation.complete, async () => {})
-      .onRequest(methods.client.session.requestPermission, async ({ params }) => {
-        return await this.handlePermissionRequest(params);
+      .onRequest(methods.client.session.requestPermission, async ({ params, signal }) => {
+        return await this.handlePermissionRequest(params, signal);
       })
       .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
         return await this.handleElicitationRequest(params, requestId, signal);
-      })
-      .onRequest(methods.client.fs.readTextFile, async ({ params }) => {
-        return await this.handleReadTextFile(params);
-      })
-      .onRequest(methods.client.fs.writeTextFile, async ({ params }) => {
-        return await this.handleWriteTextFile(params);
-      })
-      .onRequest(methods.client.terminal.create, async ({ params }) => {
-        return await this.handleCreateTerminal(params);
-      })
-      .onRequest(methods.client.terminal.output, async ({ params }) => {
-        return await this.handleTerminalOutput(params);
-      })
-      .onRequest(methods.client.terminal.waitForExit, async ({ params }) => {
-        return await this.handleWaitForTerminalExit(params);
-      })
-      .onRequest(methods.client.terminal.kill, async ({ params }) => {
-        return await this.handleKillTerminal(params);
-      })
-      .onRequest(methods.client.terminal.release, async ({ params }) => {
-        return await this.handleReleaseTerminal(params);
       });
+
+    if (capabilities.fs?.readTextFile) {
+      app.onRequest(methods.client.fs.readTextFile, async ({ params, signal }) => {
+        return await this.handleReadTextFile(params, signal);
+      });
+    }
+    if (capabilities.fs?.writeTextFile) {
+      app.onRequest(methods.client.fs.writeTextFile, async ({ params, signal }) => {
+        return await this.handleWriteTextFile(params, signal);
+      });
+    }
+    if (capabilities.terminal) {
+      app
+        .onRequest(methods.client.terminal.create, async ({ params, signal }) => {
+          return await this.handleCreateTerminal(params, signal);
+        })
+        .onRequest(methods.client.terminal.output, async ({ params }) => {
+          return await this.terminalManager.terminalOutput(params);
+        })
+        .onRequest(methods.client.terminal.waitForExit, async ({ params }) => {
+          return await this.terminalManager.waitForTerminalExit(params);
+        })
+        .onRequest(methods.client.terminal.kill, async ({ params }) => {
+          return await this.terminalManager.killTerminal(params);
+        })
+        .onRequest(methods.client.terminal.release, async ({ params }) => {
+          return await this.terminalManager.releaseTerminal(params);
+        });
+    }
 
     if (launch.devinAcp) {
       app.onRequest(
@@ -1119,46 +1322,46 @@ export class AcpClient {
       return await this.handleGrokExitPlanMode(params);
     });
 
-    return createAgentConnectionFacade(app.connect(stream));
+    return app.connect(stream);
   }
 
   private async initializeAgentConnection(params: {
     child: ChildProcessByStdio<Writable, Readable, Readable>;
-    connection: AcpAgentConnection;
+    connection: ClientConnection;
     startupFailure: StartupFailureWatcher;
     startupStderr: string[];
     launch: AgentLaunchPlan;
+    capabilities: ClientCapabilities;
   }): Promise<void> {
     try {
       const initResult = await Promise.race([
-        this.initializeProtocolConnection(params.connection, params.launch),
+        this.initializeProtocolConnection(params.connection, params.launch, params.capabilities),
         params.startupFailure.promise,
       ]);
       params.startupFailure.dispose();
       this.connection = params.connection;
-      this.agent = params.child;
       this.initResult = initResult;
+      await this.captureAgentDescendants(params.child);
       this.log(`initialized protocol version ${initResult.protocolVersion}`);
     } catch (error) {
-      params.connection.close?.(error);
+      params.connection.close(error);
       await this.handleInitializeFailure(params, error);
     }
   }
 
   private async initializeProtocolConnection(
-    connection: AcpAgentConnection,
+    connection: ClientConnection,
     launch: Pick<AgentLaunchPlan, "devinAcp" | "geminiAcp">,
+    capabilities: ClientCapabilities,
   ): Promise<InitializeResponse> {
-    const initializePromise = connection.initialize({
-      protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: resolveClientCapabilities({
-        devinAcp: launch.devinAcp,
-        fs: this.options.fs !== false,
-        terminal: this.options.terminal !== false,
-        elicitationModes: this.options.elicitationModes ?? [],
-      }),
-      clientInfo: resolveClientInfo(launch.devinAcp),
-    });
+    const initializePromise = connection.agent.request<InitializeResponse, InitializeRequest>(
+      methods.agent.initialize,
+      {
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: capabilities,
+        clientInfo: resolveClientInfo(launch.devinAcp),
+      },
+    );
     const initialized = launch.geminiAcp
       ? await withTimeout(initializePromise, resolveGeminiAcpStartupTimeoutMs())
       : await initializePromise;
@@ -1176,18 +1379,18 @@ export class AcpClient {
     error: unknown,
   ): Promise<never> {
     params.startupFailure.dispose();
+    await this.captureAgentDescendants(params.child);
     const normalizedError =
       error instanceof AcpMessageLimitError
         ? error
         : await this.normalizeInitializeError(error, params.child, params.startupStderr);
-    try {
-      params.child.kill();
-    } catch {
-      // best effort
-    }
+    await this.terminateAgentProcess(params.child);
     if (params.launch.geminiAcp && error instanceof TimeoutError) {
       throw new GeminiAcpStartupTimeoutError(
-        await buildGeminiAcpStartupTimeoutMessage(params.launch.spawnCommand),
+        await buildGeminiAcpStartupTimeoutMessage(
+          params.launch.spawnCommand,
+          params.launch.commandContext,
+        ),
         {
           cause: error,
           retryable: true,
@@ -1208,11 +1411,27 @@ export class AcpClient {
       },
       suppressReplaySessionUpdates: () => this.suppressReplaySessionUpdateMessages,
       bindPromptOwner: (owner) => this.bindPromptOwner(owner),
+      assertPromptActive: (active) => this.assertPromptActive(active),
       onPromptRequestWritten: (active, owner) => this.onPromptRequestWritten(active, owner),
     });
   }
 
-  async createSession(cwd = this.options.cwd): Promise<SessionCreateResult> {
+  private sessionMeta(): Record<string, unknown> | undefined {
+    const { command, args } = resolveAgentCommandParts(
+      this.options.agentCommand,
+      this.options.agentArgv,
+    );
+    return buildClaudeCodeOptionsMeta(
+      this.options.sessionOptions,
+      isClaudeAcpCommand(command, args),
+    );
+  }
+
+  async createSession(
+    cwd = this.options.cwd,
+    authority?: AcpControlAuthority,
+  ): Promise<SessionCreateResult> {
+    assertControlAuthority(authority);
     const connection = this.getConnection();
     const { command, args } = resolveAgentCommandParts(
       this.options.agentCommand,
@@ -1223,12 +1442,14 @@ export class AcpClient {
 
     let result: NewSessionResponse;
     try {
-      const createPromise = this.runConnectionRequest(() =>
-        connection.newSession({
-          cwd: sessionCwd,
-          mcpServers: this.options.mcpServers ?? [],
-          _meta: buildClaudeCodeOptionsMeta(this.options.sessionOptions, claudeAcp),
-        }),
+      const createPromise = this.runConnectionRequest(
+        () =>
+          connection.agent.request(methods.agent.session.new, {
+            cwd: sessionCwd,
+            mcpServers: this.options.mcpServers ?? [],
+            _meta: this.sessionMeta(),
+          }),
+        authority,
       );
       result = claudeAcp
         ? await withTimeout(createPromise, resolveClaudeAcpSessionCreateTimeoutMs())
@@ -1249,11 +1470,11 @@ export class AcpClient {
       normalizeResponseConfigOptions(result),
     );
     const models = modelStateFromSessionResponse({ configOptions, response: result });
-    this.rememberSessionModels(result.sessionId, models);
+    await this.captureAgentDescendants(this.agent);
 
     return {
       sessionId: result.sessionId,
-      agentSessionId: extractRuntimeSessionId(result._meta),
+      agentSessionId: extractAgentSessionId(result._meta),
       configOptions,
       models,
       configOptionsPresent:
@@ -1274,6 +1495,7 @@ export class AcpClient {
   ): Promise<SessionLoadResult> {
     const connection = this.getConnection();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    assertControlAuthority(options.authority);
     const previousSuppression = this.applySessionUpdateSuppression(
       Boolean(options.suppressReplayUpdates),
     );
@@ -1281,12 +1503,15 @@ export class AcpClient {
     let response: LoadSessionResponse | undefined;
 
     try {
-      response = await this.runConnectionRequest(() =>
-        connection.loadSession({
-          sessionId,
-          cwd: sessionCwd,
-          mcpServers: this.options.mcpServers ?? [],
-        }),
+      response = await this.runConnectionRequest(
+        () =>
+          connection.agent.request(methods.agent.session.load, {
+            sessionId,
+            cwd: sessionCwd,
+            mcpServers: this.options.mcpServers ?? [],
+            _meta: this.sessionMeta(),
+          }),
+        options.authority,
       );
 
       await this.waitForSessionUpdateDrain(
@@ -1305,18 +1530,27 @@ export class AcpClient {
     );
     result.configOptionsPresent = result.configOptionsPresent || result.configOptions !== undefined;
     this.updateRememberedSessionModels(sessionId, result);
+    await this.captureAgentDescendants(this.agent);
     return result;
   }
 
-  async resumeSession(sessionId: string, cwd = this.options.cwd): Promise<SessionResumeResult> {
+  async resumeSession(
+    sessionId: string,
+    cwd = this.options.cwd,
+    authority?: AcpControlAuthority,
+  ): Promise<SessionResumeResult> {
+    assertControlAuthority(authority);
     const connection = this.getConnection();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
-    const response = await this.runConnectionRequest(() =>
-      connection.resumeSession({
-        sessionId,
-        cwd: sessionCwd,
-        mcpServers: this.options.mcpServers ?? [],
-      }),
+    const response = await this.runConnectionRequest(
+      () =>
+        connection.agent.request(methods.agent.session.resume, {
+          sessionId,
+          cwd: sessionCwd,
+          mcpServers: this.options.mcpServers ?? [],
+          _meta: this.sessionMeta(),
+        }),
+      authority,
     );
 
     this.loadedSessionId = sessionId;
@@ -1327,6 +1561,7 @@ export class AcpClient {
     );
     result.configOptionsPresent = result.configOptionsPresent || result.configOptions !== undefined;
     this.updateRememberedSessionModels(sessionId, result);
+    await this.captureAgentDescendants(this.agent);
     return result;
   }
 
@@ -1351,41 +1586,47 @@ export class AcpClient {
     prompt: PromptInput | string,
     onRequestWritten?: () => Promise<void> | void,
     onElicitation?: AcpElicitationHandler,
+    onPermissionRequest?: AcpPermissionHandler,
+    authority?: AcpControlAuthority,
   ): Promise<PromptResponse> {
     const connection = this.getConnection();
     const normalizedPrompt = this.normalizePromptForAgent(prompt);
-    const restoreConsoleError = this.options.suppressSdkConsoleErrors
-      ? installSdkConsoleErrorSuppression()
-      : undefined;
 
     const previousActivePrompt = this.activePrompt;
-    const activePrompt = this.beginActivePrompt(sessionId, onRequestWritten, onElicitation);
+    const replacedOwners = this.pendingPromptOwners.filter(
+      (owner) => owner.sessionId === sessionId,
+    );
+    const activePrompt = this.beginActivePrompt(
+      sessionId,
+      onRequestWritten,
+      onElicitation,
+      onPermissionRequest,
+      authority,
+    );
 
-    let promptPromise: Promise<PromptResponse>;
     try {
-      promptPromise = this.runConnectionRequest(() =>
-        connection.prompt({
-          sessionId,
-          prompt: normalizedPrompt,
-        }),
+      const promptPromise = this.runConnectionRequest(
+        () =>
+          connection.agent.request(methods.agent.session.prompt, {
+            sessionId,
+            prompt: normalizedPrompt,
+          }),
+        authority,
       );
-    } catch (error) {
-      this.clearActivePrompt(activePrompt);
-      restoreConsoleError?.();
-      throw error;
-    }
-
-    activePrompt.promise = promptPromise;
-
-    try {
+      activePrompt.promise = promptPromise;
       // Queue this prompt before abort listeners can cancel its newly published owner.
       previousActivePrompt?.elicitationController?.abort();
+      for (const owner of replacedOwners) {
+        owner.requestController.abort();
+      }
       return this.returnPromptResponseOrPermissionFailure(sessionId, await promptPromise);
     } catch (error) {
+      if (activePrompt.admissionFailure) {
+        throw activePrompt.admissionFailure.error;
+      }
       this.throwPromptPermissionFailureIfPresent(sessionId);
       throw error;
     } finally {
-      restoreConsoleError?.();
       this.clearActivePrompt(activePrompt);
     }
   }
@@ -1394,13 +1635,18 @@ export class AcpClient {
     sessionId: string,
     onRequestWritten: (() => Promise<void> | void) | undefined,
     elicitationHandler: AcpElicitationHandler | undefined,
+    permissionHandler: AcpPermissionHandler | undefined,
+    authority: AcpControlAuthority | undefined,
   ): ActivePromptState {
     this.cancellingSessionIds.delete(sessionId);
     const active: ActivePromptState = {
       sessionId,
       onRequestWritten,
+      authority,
       elicitationHandler,
+      permissionHandler,
       elicitationController: new AbortController(),
+      requestController: new AbortController(),
     };
     this.activePrompt = active;
     this.pendingPromptOwners.push(active);
@@ -1418,6 +1664,16 @@ export class AcpClient {
       active.requestId = owner.requestId;
     }
     return active;
+  }
+
+  private assertPromptActive(active: ActivePromptState): void {
+    try {
+      assertControlAuthority(active.authority);
+    } catch (error) {
+      // Connection close observers may otherwise replace this with a disconnect error.
+      active.admissionFailure = { error };
+      throw error;
+    }
   }
 
   private onPromptRequestWritten(
@@ -1454,6 +1710,7 @@ export class AcpClient {
     }
     // Finish bookkeeping before callbacks can admit another prompt or permission request.
     active.elicitationController.abort();
+    active.requestController.abort();
     permissionController?.abort();
   }
 
@@ -1484,7 +1741,11 @@ export class AcpClient {
     }
   }
 
-  async setSessionMode(sessionId: string, modeId: string): Promise<void> {
+  async setSessionMode(
+    sessionId: string,
+    modeId: string,
+    authority?: AcpControlAuthority,
+  ): Promise<void> {
     const isGrokSession = this.grokPermissionModes.has(sessionId);
     if (isGrokSession && !isGrokPermissionMode(modeId)) {
       throw new Error(
@@ -1496,16 +1757,15 @@ export class AcpClient {
     // short-circuit cache — it must not replace session/set_mode (plan /
     // acceptEdits only take effect on the agent when forwarded).
     const connection = this.getConnection();
-    try {
-      await this.runConnectionRequest(() =>
-        connection.setSessionMode({
+    await this.runConnectionRequest(
+      () =>
+        connection.agent.request(methods.agent.session.setMode, {
           sessionId,
           modeId,
         }),
-      );
-    } catch (error) {
-      throw maybeWrapSessionControlError("session/set_mode", error, `for mode "${modeId}"`);
-    }
+      authority,
+      (error) => maybeWrapSessionControlError("session/set_mode", error, `for mode "${modeId}"`),
+    );
 
     if (isGrokSession && isGrokPermissionMode(modeId)) {
       this.rememberGrokPermissionMode(sessionId, modeId);
@@ -1537,83 +1797,104 @@ export class AcpClient {
     sessionId: string,
     configId: string,
     value: string,
+    models: SessionModelState | undefined,
+    authority?: AcpControlAuthority,
   ): Promise<SetSessionConfigOptionResponse> {
+    assertControlAuthority(authority);
+    const resolvedValue =
+      models?.configId === configId ? this.resolveSessionModelId(value, models) : value;
     const connection = this.getConnection();
-    try {
-      return await this.runConnectionRequest(() =>
-        connection.setSessionConfigOption({
+    const response = await this.runConnectionRequest(
+      () =>
+        connection.agent.request(methods.agent.session.setConfigOption, {
           sessionId,
           configId,
-          value,
+          value: resolvedValue,
         }),
-      );
-    } catch (error) {
-      throw maybeWrapSessionControlError(
-        "session/set_config_option",
-        error,
-        `for "${configId}"="${value}"`,
-      );
-    }
+      authority,
+      (error) =>
+        maybeWrapSessionControlError(
+          "session/set_config_option",
+          error,
+          `for "${configId}"="${value}"`,
+        ),
+    );
+    return normalizeConfigOptionAcknowledgement(response);
   }
 
   async setSessionModel(
     sessionId: string,
     modelId: string,
-    controlOverride?: ModelControlOverride,
+    models: SessionModelState | undefined,
+    authority?: AcpControlAuthority,
   ): Promise<SetSessionConfigOptionResponse | undefined> {
-    const control = this.resolveModelControl(sessionId, controlOverride);
-    if (!control) {
+    assertControlAuthority(authority);
+    if (!models) {
       throw new RequestedModelUnsupportedError(
         `Cannot set model "${modelId}": the ACP session did not advertise a model config option or legacy session/set_model support.`,
         "missing-capability",
       );
     }
-    const resolvedModelId = resolveRequestedModelId({
+    const resolvedModelId = this.resolveSessionModelId(modelId, models);
+    return models.configId
+      ? await this.setSessionModelThroughConfig(
+          sessionId,
+          resolvedModelId,
+          models.configId,
+          authority,
+        )
+      : await this.setSessionModelThroughLegacyMethod(sessionId, resolvedModelId, authority);
+  }
+
+  private resolveSessionModelId(modelId: string, models: SessionModelState): string {
+    const params = {
       requestedModel: modelId,
-      models: controlOverride?.availableModels
-        ? { availableModels: controlOverride.availableModels }
-        : undefined,
+      models,
       agentCommand: this.options.agentCommand,
-    });
-    return control.kind === "config_option"
-      ? await this.setSessionModelThroughConfig(sessionId, resolvedModelId, control.configId)
-      : await this.setSessionModelThroughLegacyMethod(sessionId, resolvedModelId);
+    };
+    assertRequestedModelSupported({ ...params, context: "apply" });
+    return resolveRequestedModelId(params);
   }
 
   private async setSessionModelThroughConfig(
     sessionId: string,
     modelId: string,
     configId: string,
+    authority?: AcpControlAuthority,
   ): Promise<SetSessionConfigOptionResponse> {
     const connection = this.getConnection();
-    try {
-      const response = await this.runConnectionRequest(() =>
-        connection.setSessionConfigOption({
+    const response = await this.runConnectionRequest(
+      () =>
+        connection.agent.request(methods.agent.session.setConfigOption, {
           sessionId,
           configId,
           value: modelId,
         }),
-      );
-      this.rememberSessionModels(sessionId, modelStateFromConfigOptions(response.configOptions));
-      return response;
-    } catch (error) {
-      return this.throwSessionModelError("session/set_config_option", modelId, error);
-    }
+      authority,
+      (error) => this.throwSessionModelError("session/set_config_option", modelId, error),
+    );
+    return normalizeConfigOptionAcknowledgement(response);
   }
 
   private async setSessionModelThroughLegacyMethod(
     sessionId: string,
     modelId: string,
+    authority?: AcpControlAuthority,
   ): Promise<undefined> {
     const connection = this.getConnection();
-    try {
-      await this.runConnectionRequest(() =>
-        connection.extMethod("session/set_model", { sessionId, modelId }),
-      );
-      return undefined;
-    } catch (error) {
-      return this.throwSessionModelError("session/set_model", modelId, error);
-    }
+    await this.runConnectionRequest(
+      () =>
+        connection.agent.request<Record<string, unknown>, Record<string, unknown>>(
+          "session/set_model",
+          {
+            sessionId,
+            modelId,
+          },
+        ),
+      authority,
+      (error) => this.throwSessionModelError("session/set_model", modelId, error),
+    );
+    return undefined;
   }
 
   private throwSessionModelError(
@@ -1634,22 +1915,6 @@ export class AcpClient {
     throw new Error(`Failed ${method} for model "${modelId}": ${summary}`, {
       cause: error,
     });
-  }
-
-  private resolveModelControl(
-    sessionId: string,
-    controlOverride: ModelControlOverride | undefined,
-  ): ModelControl | undefined {
-    if (controlOverride) {
-      return controlOverride.configId
-        ? { kind: "config_option", configId: controlOverride.configId }
-        : { kind: "legacy_set_model" };
-    }
-    const configId = this.modelConfigIds.get(sessionId);
-    if (configId) {
-      return { kind: "config_option", configId };
-    }
-    return this.legacyModelSessionIds.has(sessionId) ? { kind: "legacy_set_model" } : undefined;
   }
 
   private rememberSessionModels(sessionId: string, models: SessionModelState | undefined): void {
@@ -1676,11 +1941,14 @@ export class AcpClient {
 
   async cancel(sessionId: string): Promise<void> {
     const connection = this.getConnection();
-    const active = this.activePrompt?.sessionId === sessionId ? this.activePrompt : undefined;
+    const owners = this.pendingPromptOwners.filter((owner) => owner.sessionId === sessionId);
+    const active = owners.at(-1);
     // Queue and latch before abort listeners can reenter cancellation or start another prompt.
     const cancellation: Promise<void> =
       active?.cancelPromise ??
-      this.runConnectionRequest(() => connection.cancel({ sessionId })).catch((error: unknown) => {
+      this.runConnectionRequest(() =>
+        connection.agent.notify(methods.agent.session.cancel, { sessionId }),
+      ).catch((error: unknown) => {
         if (active?.cancelPromise === cancellation) {
           active.cancelPromise = undefined;
         }
@@ -1690,9 +1958,12 @@ export class AcpClient {
     if (active) {
       active.cancelPromise = cancellation;
       this.cancellingSessionIds.add(sessionId);
-      active.elicitationController?.abort();
     } else {
       this.cancellingSessionIds.delete(sessionId);
+    }
+    for (const owner of owners) {
+      owner.elicitationController.abort();
+      owner.requestController.abort();
     }
     permissionController?.abort();
     await cancellation;
@@ -1701,11 +1972,9 @@ export class AcpClient {
   async closeSession(sessionId: string): Promise<void> {
     const connection = this.getConnection();
     this.cancellingSessionIds.add(sessionId);
-    if (this.activePrompt?.sessionId === sessionId) {
-      this.activePrompt.elicitationController?.abort();
-    }
+    this.abortSessionRequests(sessionId);
     await this.runConnectionRequest(() =>
-      connection.closeSession({
+      connection.agent.request(methods.agent.session.close, {
         sessionId,
       }),
     );
@@ -1720,12 +1989,16 @@ export class AcpClient {
 
   async listSessions(params: ListSessionsRequest = {}): Promise<ListSessionsResponse> {
     const connection = this.getConnection();
-    return await this.runConnectionRequest(() => connection.listSessions(params));
+    return await this.runConnectionRequest(() =>
+      connection.agent.request(methods.agent.session.list, params),
+    );
   }
 
   async deleteSession(sessionId: string): Promise<void> {
     const connection = this.getConnection();
-    await this.runConnectionRequest(() => connection.deleteSession({ sessionId }));
+    await this.runConnectionRequest(() =>
+      connection.agent.request(methods.agent.session.delete, { sessionId }),
+    );
     if (this.loadedSessionId === sessionId) {
       this.loadedSessionId = undefined;
     }
@@ -1742,7 +2015,7 @@ export class AcpClient {
       this.options.agentCommand,
     );
     const response = await this.runConnectionRequest(() =>
-      connection.unstable_forkSession({
+      connection.agent.request(methods.agent.session.fork, {
         sessionId: input.sessionId,
         cwd: sessionCwd,
         mcpServers: this.options.mcpServers ?? [],
@@ -1757,7 +2030,7 @@ export class AcpClient {
     this.rememberSessionModels(response.sessionId, models);
     return {
       sessionId: response.sessionId,
-      agentSessionId: extractRuntimeSessionId(response._meta),
+      agentSessionId: extractAgentSessionId(response._meta),
       configOptions,
       models,
       configOptionsPresent:
@@ -1768,13 +2041,13 @@ export class AcpClient {
 
   async logout(): Promise<void> {
     const connection = this.getConnection();
-    await this.runConnectionRequest(() => connection.logout({}));
+    await this.runConnectionRequest(() => connection.agent.request(methods.agent.logout, {}));
   }
 
   async authenticate(methodId: string, credentials?: Record<string, string>): Promise<void> {
     const connection = this.getConnection();
     await this.runConnectionRequest(() =>
-      connection.authenticate({
+      connection.agent.request(methods.agent.authenticate, {
         methodId,
         credentials,
         _meta: {
@@ -1834,33 +2107,35 @@ export class AcpClient {
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
     this.closing = true;
+    this.closeEpoch += 1;
+    if (this.closeTask) {
+      return this.closeTask;
+    }
+    // Publish retirement before callbacks can start a replacement. Every closer
+    // must await the same cleanup so an older close cannot reset a newer launch.
+    this.closeTask = Promise.resolve()
+      .then(() => this.finishClose())
+      .finally(() => {
+        this.closeTask = undefined;
+      });
+    return this.closeTask;
+  }
+
+  private async finishClose(): Promise<void> {
+    const permissionControllers = [...this.permissionAbortControllers.values()];
+    this.permissionAbortControllers.clear();
+    const owners = [...this.pendingPromptOwners];
     this.abortActiveElicitation();
-
-    await this.terminalManager.shutdown();
-
-    const agent = this.agent;
-    if (agent) {
-      await this.terminateAgentProcess(agent);
+    for (const owner of owners) {
+      owner.requestController.abort();
     }
-    this.closeConnection();
-    if (this.pendingConnectionRequests.size > 0) {
-      this.rejectPendingConnectionRequests(
-        this.lastAgentExit
-          ? new AgentDisconnectedError(
-              this.lastAgentExit.reason,
-              this.lastAgentExit.exitCode,
-              this.lastAgentExit.signal,
-              {
-                outputAlreadyEmitted: Boolean(this.activePrompt),
-              },
-            )
-          : new AgentDisconnectedError("connection_close", null, null, {
-              outputAlreadyEmitted: Boolean(this.activePrompt),
-            }),
-      );
+    for (const controller of permissionControllers) {
+      controller.abort();
     }
+
+    await this.retireNativeResources();
 
     this.sessionUpdateChain = Promise.resolve();
     this.observedSessionUpdates = 0;
@@ -1885,33 +2160,124 @@ export class AcpClient {
     this.agent = undefined;
   }
 
+  private async retireNativeResources(): Promise<void> {
+    const owned = [...this.commandProbes, ...(this.agent ? [this.agent] : [])];
+    const failures: unknown[] = [];
+    try {
+      await this.terminalManager.shutdown();
+    } catch (error) {
+      failures.push(error);
+    }
+    const retired = await Promise.allSettled(
+      owned.map((child) => this.terminateAgentProcess(child)),
+    );
+    for (const result of retired) {
+      if (result.status === "rejected") {
+        failures.push(result.reason);
+      }
+    }
+    // Transport retirement must unblock owned requests even when native cleanup fails.
+    try {
+      this.closeConnection();
+    } finally {
+      this.rejectPendingConnectionRequests(
+        this.lastAgentExit
+          ? new AgentDisconnectedError(
+              this.lastAgentExit.reason,
+              this.lastAgentExit.exitCode,
+              this.lastAgentExit.signal,
+              {
+                outputAlreadyEmitted: Boolean(this.activePrompt),
+              },
+            )
+          : new AgentDisconnectedError("connection_close", null, null, {
+              outputAlreadyEmitted: Boolean(this.activePrompt),
+            }),
+      );
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "ACP client cleanup failed", { cause: failures[0] });
+    }
+  }
+
+  // Retire only this launch: close() may already have been followed by a replacement start().
+  private async stopIfClosedDuringLaunch(
+    epoch: number,
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    startupFailure: StartupFailureWatcher,
+    authority?: AcpControlAuthority,
+  ): Promise<void> {
+    if (this.closeEpoch === epoch) {
+      return;
+    }
+    startupFailure.dispose();
+    await this.terminateAgentProcess(child);
+    assertControlAuthority(authority);
+    throw new Error("ACP client was closed while the agent was starting");
+  }
+
   private abortActiveElicitation(): void {
     this.activePrompt?.elicitationController?.abort();
   }
 
   private closeConnection(): void {
-    this.connection?.close?.();
+    this.connection?.close();
   }
 
-  private async terminateAgentProcess(
-    child: ChildProcessByStdio<Writable, Readable, Readable>,
-  ): Promise<void> {
-    const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
-    this.endAgentStdin(child);
-    let exited = await waitForChildExit(child, stdinCloseGraceMs);
-    exited = await this.killAgentIfRunning(child, exited, "SIGTERM", AGENT_CLOSE_TERM_GRACE_MS);
-    if (!exited) {
-      this.log(`agent did not exit after ${AGENT_CLOSE_TERM_GRACE_MS}ms; forcing SIGKILL`);
-      exited = await this.killAgentIfRunning(child, exited, "SIGKILL", AGENT_CLOSE_KILL_GRACE_MS);
+  private async captureAgentDescendants(child: ChildProcess | undefined): Promise<void> {
+    const descendants = child && this.agentDescendants.get(child);
+    if (descendants && !(await descendants.capture())) {
+      this.log("could not verify agent descendants; skipping unverified process cleanup");
     }
-
-    // Ensure stdio handles don't keep this process alive after close() returns.
-    this.detachAgentHandles(child, !exited);
   }
 
-  private endAgentStdin(child: ChildProcessByStdio<Writable, Readable, Readable>): void {
+  private terminateAgentProcess(child: ChildProcess): Promise<void> {
+    if (child.pid === undefined) {
+      this.agentDescendants.get(child)?.retire();
+      this.detachAgentHandles(child, true);
+      return Promise.resolve();
+    }
+    let cleanup = this.agentCleanups.get(child);
+    if (!cleanup) {
+      cleanup = Promise.resolve().then(() => this.cleanupAgentProcess(child));
+      this.agentCleanups.set(child, cleanup);
+    }
+    return cleanup;
+  }
+
+  private async cleanupAgentProcess(child: ChildProcess): Promise<void> {
+    const descendants = this.agentDescendants.get(child);
+    const deadline = performance.now() + AGENT_CLEANUP_BUDGET_MS;
+    const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
+    try {
+      if (descendants) {
+        await descendants.capture(Math.max(1, deadline - performance.now()));
+      }
+      this.endAgentStdin(child);
+      await waitForChildExit(
+        child,
+        Math.min(stdinCloseGraceMs, Math.max(0, deadline - performance.now())),
+      );
+      const exited = await this.signalAgentAndDescendants(
+        child,
+        "SIGTERM",
+        AGENT_CLOSE_TERM_GRACE_MS,
+        deadline,
+      );
+      if (!exited) {
+        this.log("agent processes did not exit after SIGTERM; forcing SIGKILL");
+        await this.signalAgentAndDescendants(child, "SIGKILL", AGENT_CLOSE_KILL_GRACE_MS, deadline);
+      }
+    } finally {
+      descendants?.retire();
+      // Stdio must not keep acpx alive after teardown, even if an OS query failed.
+      this.detachAgentHandles(child, isChildProcessRunning(child));
+    }
+  }
+
+  private endAgentStdin(child: ChildProcess): void {
     // Closing stdin is the most graceful shutdown signal for stdio-based ACP agents.
-    if (child.stdin.destroyed) {
+    if (!child.stdin || child.stdin.destroyed) {
       return;
     }
     try {
@@ -1921,21 +2287,29 @@ export class AcpClient {
     }
   }
 
-  private async killAgentIfRunning(
-    child: ChildProcessByStdio<Writable, Readable, Readable>,
-    alreadyExited: boolean,
+  private async signalAgentAndDescendants(
+    child: ChildProcess,
     signal: NodeJS.Signals,
     waitMs: number,
+    deadline: number,
   ): Promise<boolean> {
-    if (alreadyExited || !isChildProcessRunning(child)) {
-      return alreadyExited;
+    const descendants = this.agentDescendants.get(child);
+    if (descendants && performance.now() < deadline) {
+      await descendants.signal(signal, deadline - performance.now());
     }
-    try {
-      child.kill(signal);
-    } catch {
-      // best effort
+    if (isChildProcessRunning(child)) {
+      try {
+        child.kill(signal);
+      } catch {
+        // The direct child may have exited during descendant inspection.
+      }
     }
-    return await waitForChildExit(child, waitMs);
+    const remaining = Math.min(waitMs, Math.max(0, deadline - performance.now()));
+    const [exited, descendantsExited] = await Promise.all([
+      waitForChildExit(child, remaining),
+      descendants ? descendants.waitForExit(remaining) : Promise.resolve(true),
+    ]);
+    return exited && descendantsExited;
   }
 
   private detachAgentHandles(agent: ChildProcess, unref: boolean): void {
@@ -1956,7 +2330,7 @@ export class AcpClient {
     }
   }
 
-  private getConnection(): AcpAgentConnection {
+  private getConnection(): ClientConnection {
     if (!this.connection) {
       throw new Error("ACP client not started");
     }
@@ -2135,18 +2509,11 @@ export class AcpClient {
     if (!this.isGrokBuildAcpCommand() || methodId !== "xai.api_key") {
       return undefined;
     }
-    if (this.isDeepSeekBuildAgent()) {
-      return this.readDeepSeekApiKey();
-    }
     return nonEmptyEnvironmentValue(process.env.XAI_API_KEY);
   }
 
   private selectAgentManagedAuthMethod(methodId: string): AuthSelection | undefined {
-    if (
-      !this.isGrokBuildAcpCommand() ||
-      this.isDeepSeekBuildAgent() ||
-      methodId !== "cached_token"
-    ) {
+    if (!this.isGrokBuildAcpCommand() || methodId !== "cached_token") {
       return undefined;
     }
     return {
@@ -2157,22 +2524,6 @@ export class AcpClient {
 
   private isGrokBuildAcpCommand(): boolean {
     return resolveGrokAcpProfile(this.options.agentCommand, this.options.agentArgv) != null;
-  }
-
-  private isDeepSeekBuildAgent(): boolean {
-    return resolveGrokAcpProfile(this.options.agentCommand, this.options.agentArgv) === "deepseek";
-  }
-
-  private readDeepSeekApiKey(): string | undefined {
-    const transient = resolveConfiguredAuthCredential("xai.api_key", this.options.authCredentials);
-    if (transient !== undefined) {
-      return nonEmptyEnvironmentValue(transient);
-    }
-    const sessionValue = this.options.sessionOptions?.env?.DEEPSEEK_API_KEY;
-    if (sessionValue !== undefined) {
-      return nonEmptyEnvironmentValue(sessionValue);
-    }
-    return nonEmptyEnvironmentValue(process.env.DEEPSEEK_API_KEY);
   }
 
   private applyGrokPermissionModeCompatibility(
@@ -2233,7 +2584,7 @@ export class AcpClient {
   }
 
   private async authenticateIfRequired(
-    connection: AcpAgentConnection,
+    connection: ClientConnection,
     authMethods: AuthMethod[],
   ): Promise<void> {
     if (authMethods.length === 0) {
@@ -2254,7 +2605,7 @@ export class AcpClient {
       return;
     }
 
-    await connection.authenticate({
+    await connection.agent.request(methods.agent.authenticate, {
       methodId: selected.methodId,
     });
 
@@ -2381,29 +2732,67 @@ export class AcpClient {
 
   private async handlePermissionRequest(
     params: RequestPermissionRequest,
+    requestSignal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
-    if (this.cancellingSessionIds.has(params.sessionId)) {
+    const owner = this.captureDelegatedRequestOwner(params.sessionId, requestSignal);
+    if (!this.isDelegatedRequestActive(owner)) {
       return cancelledPermissionResponse();
+    }
+    if (!this.hasPermissionOwner(params.sessionId)) {
+      return this.finishPermissionRequest(params, owner, cancelledPermissionResponse());
     }
 
     const grokModeResponse = this.resolveGrokPermissionModeDecision(params);
     if (grokModeResponse) {
-      this.recordPermissionDecision(classifyPermissionDecision(params, grokModeResponse));
-      return grokModeResponse;
+      return this.finishPermissionRequest(params, owner, grokModeResponse);
     }
 
-    const hostResponse = await this.tryHandlePermissionRequestWithHost(params);
-    if (hostResponse) {
-      return hostResponse;
+    // Antigravity encodes questions as permissions, with answers marked allow_once.
+    // Neither permission policies nor the host's allow/reject API can answer them.
+    const antigravityResponse = this.resolveAntigravityInteractionResponse(params);
+    if (antigravityResponse) {
+      return this.finishPermissionRequest(params, owner, antigravityResponse);
     }
 
-    const { response, recorded } = await this.resolvePermissionRequestFromMode(params);
-    if (!recorded) {
-      const decision = classifyPermissionDecision(params, response);
-      this.recordPermissionDecision(decision);
-    }
+    const response =
+      (await this.tryHandlePermissionRequestWithHost(params, owner)) ??
+      (await this.resolvePermissionRequestFromMode(params, owner));
+    return this.finishPermissionRequest(params, owner, response);
+  }
 
-    return response;
+  private resolveAntigravityInteractionResponse(
+    params: RequestPermissionRequest,
+  ): RequestPermissionResponse | undefined {
+    const isAntigravityInteraction =
+      this.initResult?.agentInfo?.name === "antigravity-acp" &&
+      params.toolCall.toolCallId.startsWith("interaction_");
+    if (!isAntigravityInteraction) {
+      return undefined;
+    }
+    return this.handleModePermissionError(
+      params.sessionId,
+      new PermissionPromptUnavailableError(
+        "Antigravity requested a user answer. acpx cannot answer Antigravity interaction questions; continue in an interactive client.",
+      ),
+    );
+  }
+
+  private finishPermissionRequest(
+    params: RequestPermissionRequest,
+    owner: DelegatedRequestOwner,
+    response: RequestPermissionResponse,
+  ): RequestPermissionResponse {
+    const result = this.isDelegatedRequestActive(owner) ? response : cancelledPermissionResponse();
+    this.recordPermissionDecision(classifyPermissionDecision(params, result));
+    return result;
+  }
+
+  private hasPermissionOwner(sessionId: string): boolean {
+    // Unowned requests must not bypass a pending turn's permission handler via fallback policy.
+    return (
+      !this.pendingPromptOwners.some((owner) => owner.permissionHandler !== undefined) ||
+      this.pendingPromptOwners.some((owner) => owner.sessionId === sessionId)
+    );
   }
 
   private async handleElicitationRequest(
@@ -2417,19 +2806,26 @@ export class AcpClient {
     }
     const { active, handler } = resolved.owner;
 
-    const signal = AbortSignal.any([requestSignal, active.elicitationController.signal]);
+    const signal = AbortSignal.any(
+      [requestSignal, active.elicitationController.signal, active.authority?.signal].filter(
+        (candidate): candidate is AbortSignal => candidate !== undefined,
+      ),
+    );
     const handlerAttempt = Promise.resolve()
-      .then(async () => await handler(request, { requestId, signal }))
+      .then(async () => {
+        signal.throwIfAborted();
+        return await handler(request, { requestId, signal });
+      })
       .then(
         (response) => ({ kind: "response" as const, response }),
         (error: unknown) => ({ kind: "error" as const, error }),
       );
-    const outcome = await Promise.race([handlerAttempt, waitForAbort(signal)]);
+    const outcome = await raceWithAbort(signal, handlerAttempt);
 
     if (this.activePrompt !== active) {
       return cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.inactive);
     }
-    if (outcome.kind === "aborted" || signal.aborted) {
+    if (!outcome || signal.aborted) {
       return cancelledElicitationResponse(ELICITATION_CANCEL_MESSAGES.cancelled);
     }
     if (outcome.kind === "error" || !isKnownElicitationResponse(outcome.response)) {
@@ -2486,52 +2882,94 @@ export class AcpClient {
     return this.closing || this.cancellingSessionIds.has(sessionId);
   }
 
+  private captureDelegatedRequestOwner(
+    sessionId: string,
+    requestSignal?: AbortSignal,
+  ): DelegatedRequestOwner {
+    const active = this.pendingPromptOwners.findLast((owner) => owner.sessionId === sessionId);
+    const signal = AbortSignal.any(
+      [
+        active?.requestController.signal ?? this.cancellationSignalForSession(sessionId),
+        active?.authority?.signal,
+        requestSignal,
+      ].filter((candidate): candidate is AbortSignal => candidate !== undefined),
+    );
+    const epoch = this.closeEpoch;
+    return {
+      signal,
+      permissionHandler: active?.permissionHandler ?? this.options.onPermissionRequest,
+      assertActive: () => {
+        if (this.closing || this.closeEpoch !== epoch || this.cancellingSessionIds.has(sessionId)) {
+          throw RequestError.requestCancelled();
+        }
+      },
+    };
+  }
+
+  private isDelegatedRequestActive(owner: DelegatedRequestOwner): boolean {
+    try {
+      assertControlAuthority(owner);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async tryHandlePermissionRequestWithHost(
     params: RequestPermissionRequest,
+    owner: DelegatedRequestOwner,
   ): Promise<RequestPermissionResponse | undefined> {
-    if (!this.options.onPermissionRequest) {
+    const handler = owner.permissionHandler;
+    if (!handler) {
       return undefined;
     }
-    const signal = this.cancellationSignalForSession(params.sessionId);
+    const { signal } = owner;
+    if (!this.isDelegatedRequestActive(owner)) {
+      return cancelledPermissionResponse();
+    }
     try {
-      const decision = await this.options.onPermissionRequest(
-        {
-          sessionId: params.sessionId,
-          raw: params,
-          inferredKind: inferToolKind(params),
-        },
-        { signal },
+      const decision = await raceWithAbort(
+        signal,
+        handler(
+          {
+            sessionId: params.sessionId,
+            raw: params,
+            inferredKind: inferToolKind(params),
+          },
+          { signal },
+        ),
       );
-      return this.hostPermissionDecisionResponse(params, signal, decision);
+      return this.hostPermissionDecisionResponse(params, owner, decision);
     } catch (error) {
-      return this.hostPermissionErrorResponse(params, signal, error);
+      return this.hostPermissionErrorResponse(owner, error);
     }
   }
 
   private hostPermissionDecisionResponse(
     params: RequestPermissionRequest,
-    signal: AbortSignal,
+    owner: DelegatedRequestOwner,
     decision: Parameters<typeof decisionToResponse>[1] | undefined,
   ): RequestPermissionResponse | undefined {
-    if (signal.aborted || this.cancellingSessionIds.has(params.sessionId)) {
-      this.recordPermissionDecision("cancelled");
+    if (!this.isDelegatedRequestActive(owner)) {
       return cancelledPermissionResponse();
     }
     if (!decision) {
       return undefined;
     }
-    const response = decisionToResponse(params, decision);
-    this.recordPermissionDecision(classifyPermissionDecision(params, response));
-    return response;
+    const response = decisionToResponse(
+      preferCodexPermissionRefusal(params, this.initResult?.agentInfo?.name),
+      decision,
+    );
+    return decision.outcome === "cancel"
+      ? response
+      : this.explainPermissionRefusal(params, response);
   }
 
   private hostPermissionErrorResponse(
-    params: RequestPermissionRequest,
-    signal: AbortSignal,
+    owner: DelegatedRequestOwner,
     error: unknown,
   ): RequestPermissionResponse | undefined {
-    if (signal.aborted || this.cancellingSessionIds.has(params.sessionId)) {
-      this.recordPermissionDecision("cancelled");
+    if (!this.isDelegatedRequestActive(owner)) {
       return cancelledPermissionResponse();
     }
     // Fall through to the mode-based resolver so a host UI error
@@ -2546,19 +2984,47 @@ export class AcpClient {
 
   private async resolvePermissionRequestFromMode(
     params: RequestPermissionRequest,
-  ): Promise<{ response: RequestPermissionResponse; recorded: boolean }> {
+    owner: DelegatedRequestOwner,
+  ): Promise<RequestPermissionResponse> {
     try {
+      assertControlAuthority(owner);
       const result = await resolvePermissionRequestWithDetails(
-        params,
+        preferCodexPermissionRefusal(params, this.initResult?.agentInfo?.name),
         this.options.permissionMode,
         this.options.nonInteractivePermissions ?? "deny",
         this.options.permissionPolicy,
+        owner.signal,
       );
+      assertControlAuthority(owner);
       this.emitPermissionEscalation(result.escalation);
-      return { response: result.response, recorded: false };
+      return this.explainPermissionRefusal(params, result.response);
     } catch (error) {
+      if (!this.isDelegatedRequestActive(owner)) {
+        return cancelledPermissionResponse();
+      }
       return this.handleModePermissionError(params.sessionId, error);
     }
+  }
+
+  private explainPermissionRefusal(
+    params: RequestPermissionRequest,
+    response: RequestPermissionResponse,
+  ): RequestPermissionResponse {
+    const notice = codexPermissionNotice(params, response, this.initResult?.agentInfo?.name);
+    if (!notice || this.cancellingSessionIds.has(params.sessionId)) {
+      return response;
+    }
+    try {
+      this.eventHandlers.onClientOperation?.({
+        method: "session/request_permission",
+        status: "completed",
+        summary: notice,
+        timestamp: isoNow(),
+      });
+    } catch {
+      // A diagnostic observer must not change the resolved permission decision.
+    }
+    return withPermissionMetadata(response, { permissionNotice: notice });
   }
 
   private emitPermissionEscalation(
@@ -2569,16 +3035,12 @@ export class AcpClient {
     }
   }
 
-  private handleModePermissionError(
-    sessionId: string,
-    error: unknown,
-  ): { response: RequestPermissionResponse; recorded: boolean } {
+  private handleModePermissionError(sessionId: string, error: unknown): RequestPermissionResponse {
     if (!(error instanceof PermissionPromptUnavailableError)) {
       throw error;
     }
     this.notePromptPermissionFailure(sessionId, error);
-    this.recordPermissionDecision("cancelled");
-    return { response: cancelledPermissionResponse(), recorded: true };
+    return cancelledPermissionResponse();
   }
 
   private attachAgentLifecycleObservers(
@@ -2586,28 +3048,65 @@ export class AcpClient {
     startedProcess: AcpProcessStarted,
     exitNotificationBarrier: Promise<void>,
   ): void {
+    this.attachProcessExitObserver(
+      child,
+      startedProcess,
+      exitNotificationBarrier,
+      (exitCode, signal) => {
+        this.handleAgentDisconnect(child, "process_exit", exitCode, signal);
+        void this.terminateAgentProcess(child);
+      },
+    );
+
+    child.once("close", (exitCode, signal) => {
+      this.handleAgentDisconnect(child, "process_close", exitCode, signal);
+    });
+
+    child.stdout.once("close", () => {
+      this.handleAgentDisconnect(
+        child,
+        "pipe_close",
+        child.exitCode ?? null,
+        child.signalCode ?? null,
+      );
+    });
+  }
+
+  private attachProcessExitObserver(
+    child: ChildProcess,
+    started: AcpProcessStarted,
+    barrier: Promise<void>,
+    onProcessExit?: (exitCode: number | null, signal: NodeJS.Signals | null) => void,
+  ): void {
     const onExit = (exitCode: number | null, signal: NodeJS.Signals | null) => {
       const exitedAt = isoNow();
-      this.recordAgentExit("process_exit", exitCode, signal);
-      void exitNotificationBarrier.then(() => {
-        this.notifyProcessExit(startedProcess, exitCode, signal, exitedAt);
-      });
+      onProcessExit?.(exitCode, signal);
+      void barrier.then(() => this.notifyProcessExit(started, exitCode, signal, exitedAt));
     };
     child.once("exit", onExit);
-
-    // A child can exit between spawn completion and observer attachment.
-    // Replay Node's recorded state so host process ownership cannot remain stale.
+    // Short probes may finish before their spawned-admission observer is attached.
     if (child.exitCode !== null || child.signalCode !== null) {
       child.off("exit", onExit);
       onExit(child.exitCode, child.signalCode);
     }
+  }
 
-    child.once("close", (exitCode, signal) => {
-      this.recordAgentExit("process_close", exitCode, signal);
-    });
-
-    child.stdout.once("close", () => {
-      this.recordAgentExit("pipe_close", child.exitCode ?? null, child.signalCode ?? null);
+  private handleAgentDisconnect(
+    child: ChildProcess,
+    reason: AgentDisconnectReason,
+    exitCode: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    this.recordAgentExit(child, reason, exitCode, signal);
+    // Initialization owns its failure cleanup so retirement cannot replace the
+    // original protocol error with the process exit caused by that cleanup.
+    if (this.agent !== child || this.closing || !this.connection) {
+      return;
+    }
+    // Idle owners have no turn finalizer to retire a broken transport's agent
+    // and delegated terminals. Stale launch events must not close a replacement.
+    void this.close().catch((error: unknown) => {
+      this.log(`disconnected agent cleanup failed: ${String(error)}`);
     });
   }
 
@@ -2661,11 +3160,12 @@ export class AcpClient {
   }
 
   private recordAgentExit(
+    child: ChildProcess,
     reason: AgentDisconnectReason,
     exitCode: number | null,
     signal: NodeJS.Signals | null,
   ): void {
-    if (this.lastAgentExit) {
+    if (this.agent !== child || this.lastAgentExit) {
       return;
     }
 
@@ -2702,11 +3202,22 @@ export class AcpClient {
     return error;
   }
 
-  private async runConnectionRequest<T>(run: () => Promise<T>): Promise<T> {
+  private async runConnectionRequest<T>(
+    run: () => Promise<T>,
+    authority?: AcpControlAuthority,
+    mapRequestError?: (error: unknown) => unknown,
+  ): Promise<T> {
     return await new Promise<T>((resolve, reject) => {
+      const rejectRequestError = (error: unknown) => {
+        try {
+          reject(mapRequestError ? mapRequestError(error) : error);
+        } catch (mappedError) {
+          reject(mappedError);
+        }
+      };
       const pending: PendingConnectionRequest = {
         settled: false,
-        reject,
+        reject: rejectRequestError,
       };
 
       const finish = (cb: () => void) => {
@@ -2724,6 +3235,13 @@ export class AcpClient {
           if (pending.settled) {
             return { started: false as const };
           }
+          // Check in the dispatch microtask; once sent, the native response must still settle.
+          try {
+            assertControlAuthority(authority);
+          } catch (error) {
+            finish(() => reject(error));
+            return { started: false as const };
+          }
           return { started: true as const, value: await run() };
         })
         .then(
@@ -2732,7 +3250,7 @@ export class AcpClient {
               finish(() => resolve(outcome.value));
             }
           },
-          (error) => finish(() => reject(error)),
+          (error) => finish(() => rejectRequestError(error)),
         );
     });
   }
@@ -2749,55 +3267,61 @@ export class AcpClient {
     }
   }
 
-  private async handleReadTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+  private async handleReadTextFile(
+    params: ReadTextFileRequest,
+    requestSignal?: AbortSignal,
+  ): Promise<ReadTextFileResponse> {
     try {
-      return await this.filesystem.readTextFile(params);
+      return await this.runDelegatedOperation(params.sessionId, requestSignal, (owner) =>
+        this.filesystem.readTextFile(params, owner),
+      );
     } catch (error) {
-      this.recordPermissionError(params.sessionId, error);
+      if (
+        (error instanceof FsSafeError && error.code === "not-found") ||
+        (error instanceof Error && "code" in error && error.code === "ENOENT")
+      ) {
+        throw RequestError.resourceNotFound(pathToFileURL(params.path).href);
+      }
       throw error;
     }
   }
 
-  private async handleWriteTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    try {
-      return await this.filesystem.writeTextFile(params);
-    } catch (error) {
-      this.recordPermissionError(params.sessionId, error);
-      throw error;
-    }
+  private async handleWriteTextFile(
+    params: WriteTextFileRequest,
+    requestSignal?: AbortSignal,
+  ): Promise<WriteTextFileResponse> {
+    return await this.runDelegatedOperation(params.sessionId, requestSignal, (owner) =>
+      this.filesystem.writeTextFile(params, owner),
+    );
   }
 
   private async handleCreateTerminal(
     params: CreateTerminalRequest,
+    requestSignal?: AbortSignal,
   ): Promise<CreateTerminalResponse> {
+    return await this.runDelegatedOperation(params.sessionId, requestSignal, (owner) =>
+      this.terminalManager.createTerminal(params, owner),
+    );
+  }
+
+  private async runDelegatedOperation<T>(
+    sessionId: string,
+    requestSignal: AbortSignal | undefined,
+    run: (owner: DelegatedRequestOwner) => Promise<T>,
+  ): Promise<T> {
+    const owner = this.captureDelegatedRequestOwner(sessionId, requestSignal);
     try {
-      return await this.terminalManager.createTerminal(params);
+      assertControlAuthority(owner);
+      const result = await run(owner);
+      assertControlAuthority(owner);
+      return result;
     } catch (error) {
-      this.recordPermissionError(params.sessionId, error);
+      if (!this.isDelegatedRequestActive(owner)) {
+        throw RequestError.requestCancelled();
+      }
+      this.recordPermissionError(sessionId, error);
       throw error;
     }
-  }
-
-  private async handleTerminalOutput(
-    params: TerminalOutputRequest,
-  ): Promise<TerminalOutputResponse> {
-    return await this.terminalManager.terminalOutput(params);
-  }
-
-  private async handleWaitForTerminalExit(
-    params: WaitForTerminalExitRequest,
-  ): Promise<WaitForTerminalExitResponse> {
-    return await this.terminalManager.waitForTerminalExit(params);
-  }
-
-  private async handleKillTerminal(params: KillTerminalRequest): Promise<KillTerminalResponse> {
-    return await this.terminalManager.killTerminal(params);
-  }
-
-  private async handleReleaseTerminal(
-    params: ReleaseTerminalRequest,
-  ): Promise<ReleaseTerminalResponse> {
-    return await this.terminalManager.releaseTerminal(params);
   }
 
   private cancellationSignalForSession(sessionId: string): AbortSignal {

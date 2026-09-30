@@ -15,6 +15,7 @@ import type {
   WaitForTerminalExitRequest,
   WaitForTerminalExitResponse,
 } from "@agentclientprotocol/sdk";
+import { assertControlAuthority, type AcpControlAuthority } from "../async-control.js";
 import { PermissionDeniedError, PermissionPromptUnavailableError } from "../errors.js";
 import { promptForPermission } from "../permission-prompt.js";
 import {
@@ -24,7 +25,8 @@ import {
   type TerminalSpawnCommand,
 } from "../spawn-command-options.js";
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "../types.js";
-import { PROCESS_HELPER_TIMEOUT_MS, runTimedExecFile } from "./client-process.js";
+import { PROCESS_HELPER_TIMEOUT_MS, runTimedExecFile, waitForSpawn } from "./client-process.js";
+import { ProcessDescendants } from "./process-descendants.js";
 
 const DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_KILL_GRACE_MS = 1_500;
@@ -33,6 +35,7 @@ type ManagedTerminal = {
   process: ChildProcessByStdio<null, Readable, Readable>;
   killProcessGroup: boolean;
   descendantPids: Set<number>;
+  descendants?: ProcessDescendants;
   processGroupSnapshotPromise?: Promise<void>;
   processHelperTimeoutMs: number;
   output: Buffer;
@@ -44,12 +47,19 @@ type ManagedTerminal = {
   resolveExit: (response: WaitForTerminalExitResponse) => void;
 };
 
+type TerminalCreation = {
+  cleanupFailure?: { error: unknown };
+};
+
 export type TerminalManagerOptions = {
   cwd: string;
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   onOperation?: (operation: ClientOperation) => void;
-  confirmExecute?: (commandLine: string, sessionId: string) => Promise<boolean>;
+  confirmExecute?: (
+    commandLine: string,
+    ctx: { sessionId?: string; signal?: AbortSignal },
+  ) => Promise<boolean>;
   killGraceMs?: number;
   processHelperTimeoutMs?: number;
 };
@@ -102,6 +112,7 @@ export function buildTerminalSpawnOptions(
     options,
     platform,
     resolvedEnv ?? process.env,
+    cwd,
   ) as TerminalSpawnOptions;
 }
 
@@ -119,44 +130,52 @@ function readTerminalOutputCeiling(): number | undefined {
   return bytes === 0 ? undefined : bytes;
 }
 
+function resolveTerminalOutputLimit(
+  requested: CreateTerminalRequest["outputByteLimit"],
+  ceiling: number | undefined,
+): number {
+  return Math.min(
+    Math.max(0, Math.round(requested ?? DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES)),
+    ceiling ?? Number.POSITIVE_INFINITY,
+  );
+}
+
+function tracksTerminalDescendants(terminal: ManagedTerminal): boolean {
+  return terminal.killProcessGroup || terminal.descendants !== undefined;
+}
+
+function createTerminalDescendants(
+  proc: ManagedTerminal["process"],
+  killProcessGroup: boolean,
+): ProcessDescendants | undefined {
+  // Windows shell launches retain their taskkill tree-cleanup path.
+  return process.platform === "win32" && killProcessGroup
+    ? undefined
+    : new ProcessDescendants(proc, { ownProcessGroup: true });
+}
+
 function trimToUtf8Boundary(buffer: Buffer, limit: number): Buffer {
   if (limit <= 0) {
     return Buffer.alloc(0);
   }
-  if (buffer.length <= limit) {
-    return buffer;
-  }
-
-  let start = buffer.length - limit;
+  let start = Math.max(0, buffer.length - limit);
   while (start < buffer.length && (buffer[start] & 0b1100_0000) === 0b1000_0000) {
     start += 1;
   }
 
   if (start >= buffer.length) {
-    start = buffer.length - limit;
+    return Buffer.alloc(0);
   }
   return buffer.subarray(start);
 }
 
-function waitForSpawn(process: ChildProcessByStdio<null, Readable, Readable>): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const onSpawn = () => {
-      process.off("error", onError);
-      resolve();
-    };
-    const onError = (error: Error) => {
-      process.off("spawn", onSpawn);
-      reject(error);
-    };
-
-    process.once("spawn", onSpawn);
-    process.once("error", onError);
-  });
-}
-
-async function defaultConfirmExecute(commandLine: string): Promise<boolean> {
+async function defaultConfirmExecute(
+  commandLine: string,
+  ctx: { sessionId?: string; signal?: AbortSignal },
+): Promise<boolean> {
   return await promptForPermission({
     prompt: `\n[permission] Allow terminal command "${commandLine}"? (y/N) `,
+    signal: ctx.signal,
   });
 }
 
@@ -180,11 +199,12 @@ export class TerminalManager {
   private nonInteractivePermissions: NonInteractivePermissionPolicy;
   private readonly onOperation?: (operation: ClientOperation) => void;
   private readonly usesDefaultConfirmExecute: boolean;
-  private readonly confirmExecute: (commandLine: string, sessionId: string) => Promise<boolean>;
+  private readonly confirmExecute: NonNullable<TerminalManagerOptions["confirmExecute"]>;
   private readonly killGraceMs: number;
   private readonly processHelperTimeoutMs: number;
   private readonly outputCeilingBytes: number | undefined;
   private readonly terminals = new Map<string, ManagedTerminal>();
+  private readonly creations = new Map<Promise<CreateTerminalResponse>, TerminalCreation>();
 
   constructor(options: TerminalManagerOptions) {
     this.outputCeilingBytes = readTerminalOutputCeiling();
@@ -194,7 +214,10 @@ export class TerminalManager {
     this.onOperation = options.onOperation;
     this.usesDefaultConfirmExecute = options.confirmExecute == null;
     this.confirmExecute = options.confirmExecute ?? defaultConfirmExecute;
-    this.killGraceMs = Math.max(0, Math.round(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS));
+    const killGraceMs = Math.max(0, Math.round(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS));
+    // Match Node's timer clamp so invalid delays cannot create an infinite deadline.
+    this.killGraceMs =
+      Number.isFinite(killGraceMs) && killGraceMs <= 2_147_483_647 ? killGraceMs : 1;
     this.processHelperTimeoutMs = Math.max(
       1,
       Math.round(options.processHelperTimeoutMs ?? PROCESS_HELPER_TIMEOUT_MS),
@@ -209,7 +232,25 @@ export class TerminalManager {
     this.nonInteractivePermissions = nonInteractivePermissions ?? "deny";
   }
 
-  async createTerminal(params: CreateTerminalRequest): Promise<CreateTerminalResponse> {
+  createTerminal(
+    params: CreateTerminalRequest,
+    authority?: AcpControlAuthority,
+  ): Promise<CreateTerminalResponse> {
+    const creation: TerminalCreation = {};
+    // Publish admission before authority or operation callbacks can reenter shutdown.
+    const pending = Promise.resolve().then(() => this.create(params, authority, creation));
+    this.creations.set(pending, creation);
+    const remove = () => this.creations.delete(pending);
+    void pending.then(remove, remove);
+    return pending;
+  }
+
+  private async create(
+    params: CreateTerminalRequest,
+    authority: AcpControlAuthority | undefined,
+    creation: TerminalCreation,
+  ): Promise<CreateTerminalResponse> {
+    assertControlAuthority(authority);
     const commandLine = toCommandLine(params.command, params.args);
     const summary = `terminal/create: ${commandLine}`;
 
@@ -221,19 +262,21 @@ export class TerminalManager {
     });
 
     try {
-      if (!(await this.isExecuteApproved(commandLine, params.sessionId))) {
+      const approved = await this.isExecuteApproved(
+        commandLine,
+        params.sessionId,
+        authority?.signal,
+      );
+      assertControlAuthority(authority);
+      if (!approved) {
         throw new PermissionDeniedError("Permission denied for terminal/create");
       }
 
-      const requestedLimit = Math.max(
-        0,
-        Math.round(params.outputByteLimit ?? DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES),
+      const outputByteLimit = resolveTerminalOutputLimit(
+        params.outputByteLimit,
+        this.outputCeilingBytes,
       );
-      const outputByteLimit = Math.min(
-        requestedLimit,
-        this.outputCeilingBytes ?? Number.POSITIVE_INFINITY,
-      );
-      const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd);
+      const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd, authority);
 
       let resolveExit: (response: WaitForTerminalExitResponse) => void = () => {};
       const exitPromise = new Promise<WaitForTerminalExitResponse>((resolve) => {
@@ -244,6 +287,7 @@ export class TerminalManager {
         process: proc,
         killProcessGroup: spawnCommand.killProcessGroup,
         descendantPids: new Set(),
+        descendants: createTerminalDescendants(proc, spawnCommand.killProcessGroup),
         processHelperTimeoutMs: this.processHelperTimeoutMs,
         output: Buffer.alloc(0),
         truncated: false,
@@ -261,9 +305,10 @@ export class TerminalManager {
         }
 
         terminal.output = Buffer.concat([terminal.output, bytes]);
-        if (terminal.output.length > terminal.outputByteLimit) {
+        terminal.truncated ||= terminal.output.length > terminal.outputByteLimit;
+        // Later chunks can finish a code point whose prefix was already discarded.
+        if (terminal.truncated) {
           terminal.output = trimToUtf8Boundary(terminal.output, terminal.outputByteLimit);
-          terminal.truncated = true;
         }
       };
 
@@ -274,9 +319,12 @@ export class TerminalManager {
       proc.once("exit", (exitCode, signal) => {
         terminal.exitCode = exitCode;
         terminal.signal = signal;
-        terminal.processGroupSnapshotPromise = rememberProcessGroupPids(terminal);
+        terminal.processGroupSnapshotPromise = terminal.descendants
+          ? terminal.descendants.capture(terminal.processHelperTimeoutMs).then(() => {})
+          : rememberProcessGroupPids(terminal);
         void (async () => {
           await terminal.processGroupSnapshotPromise;
+          terminal.processGroupSnapshotPromise = undefined;
           terminal.resolveExit({
             exitCode: exitCode ?? null,
             signal: signal ?? null,
@@ -286,6 +334,18 @@ export class TerminalManager {
 
       const terminalId = randomUUID();
       this.terminals.set(terminalId, terminal);
+      try {
+        await terminal.descendants?.capture(terminal.processHelperTimeoutMs);
+        assertControlAuthority(authority);
+      } catch (error) {
+        try {
+          await this.releaseTerminal({ terminalId, sessionId: params.sessionId });
+        } catch (cleanupError) {
+          creation.cleanupFailure = { error: cleanupError };
+          throw cleanupError;
+        }
+        throw error;
+      }
 
       this.emitOperation({
         method: "terminal/create",
@@ -416,6 +476,9 @@ export class TerminalManager {
       await terminal.exitPromise.catch(() => {
         // ignore best-effort wait failures
       });
+      terminal.descendants?.retire();
+      terminal.process.stdout.destroy();
+      terminal.process.stderr.destroy();
       terminal.output = Buffer.alloc(0);
       this.terminals.delete(params.terminalId);
 
@@ -440,8 +503,25 @@ export class TerminalManager {
   }
 
   async shutdown(): Promise<void> {
-    for (const terminalId of Array.from(this.terminals.keys())) {
-      await this.releaseTerminal({ terminalId, sessionId: "shutdown" });
+    const creations = [...this.creations];
+    await Promise.allSettled(creations.map(([pending]) => pending));
+    const results = await Promise.allSettled(
+      Array.from(this.terminals.keys(), (terminalId) =>
+        this.releaseTerminal({ terminalId, sessionId: "shutdown" }),
+      ),
+    );
+    // Creation failures retain their own results; failed adoption cleanup also
+    // belongs to this shutdown, even if the following release retry succeeds.
+    const failures: unknown[] = creations.flatMap(([, creation]) =>
+      creation.cleanupFailure ? [creation.cleanupFailure.error] : [],
+    );
+    for (const result of results) {
+      if (result.status === "rejected") {
+        failures.push(result.reason);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "Terminal shutdown failed", { cause: failures[0] });
     }
   }
 
@@ -453,7 +533,11 @@ export class TerminalManager {
     this.onOperation?.(operation);
   }
 
-  private async isExecuteApproved(commandLine: string, sessionId: string): Promise<boolean> {
+  private async isExecuteApproved(
+    commandLine: string,
+    sessionId?: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     if (this.permissionMode === "approve-all") {
       return true;
     }
@@ -467,7 +551,7 @@ export class TerminalManager {
     ) {
       throw new PermissionPromptUnavailableError();
     }
-    return await this.confirmExecute(commandLine, sessionId);
+    return await this.confirmExecute(commandLine, { sessionId, signal });
   }
 
   private isRunning(terminal: ManagedTerminal): boolean {
@@ -475,7 +559,7 @@ export class TerminalManager {
   }
 
   private async killProcess(terminal: ManagedTerminal): Promise<void> {
-    if (!this.isRunning(terminal) && !terminal.killProcessGroup) {
+    if (!this.isRunning(terminal) && !tracksTerminalDescendants(terminal)) {
       return;
     }
 
@@ -486,7 +570,7 @@ export class TerminalManager {
     }
 
     const exitedAfterTerm = await this.waitForCleanupAfterSignal(terminal);
-    if (exitedAfterTerm && !terminal.killProcessGroup) {
+    if (exitedAfterTerm && (!terminal.killProcessGroup || terminal.descendants)) {
       return;
     }
 
@@ -500,13 +584,17 @@ export class TerminalManager {
   }
 
   private async signalProcess(terminal: ManagedTerminal, signal: NodeJS.Signals): Promise<void> {
+    if (terminal.descendants) {
+      // Signal each witnessed process once, including children that left the group.
+      await terminal.descendants.signal(signal, terminal.processHelperTimeoutMs);
+      if (this.isRunning(terminal)) {
+        terminal.process.kill(signal);
+      }
+      return;
+    }
     const pid = terminal.process.pid;
     if (terminal.killProcessGroup && pid && process.platform === "win32") {
       await this.signalWindowsProcessGroup(terminal, pid, signal);
-      return;
-    }
-    if (terminal.killProcessGroup && pid) {
-      await this.signalPosixProcessGroup(terminal, pid, signal);
       return;
     }
     terminal.process.kill(signal);
@@ -524,21 +612,6 @@ export class TerminalManager {
     }
     for (const descendantPid of terminal.descendantPids) {
       await killWindowsProcessTree(descendantPid, signal, terminal.processHelperTimeoutMs);
-    }
-  }
-
-  private async signalPosixProcessGroup(
-    terminal: ManagedTerminal,
-    pid: number,
-    signal: NodeJS.Signals,
-  ): Promise<void> {
-    await this.captureDescendantPids(terminal, pid);
-    if (hasLiveProcessGroup(pid)) {
-      sendSignal(-pid, signal);
-      return;
-    }
-    for (const descendantPid of terminal.descendantPids) {
-      sendSignal(descendantPid, signal);
     }
   }
 
@@ -561,26 +634,29 @@ export class TerminalManager {
   }
 
   private async waitForCleanupAfterSignal(terminal: ManagedTerminal): Promise<boolean> {
-    return await Promise.race([
-      this.waitForTerminalAndTrackedDescendants(terminal).then(() => true),
-      waitMs(this.killGraceMs).then(() => false),
-    ]);
-  }
-
-  private async waitForTerminalAndTrackedDescendants(terminal: ManagedTerminal): Promise<void> {
-    await terminal.exitPromise;
-    while (hasLiveTerminalProcessGroup(terminal)) {
-      await waitMs(25);
+    const deadline = performance.now() + this.killGraceMs;
+    // This deadline owns every poll, including the exit snapshot. Racing an
+    // unbounded waiter leaves timers retaining terminal state after cleanup returns.
+    while (
+      this.isRunning(terminal) ||
+      terminal.processGroupSnapshotPromise ||
+      (await hasLiveTerminalDescendants(terminal, deadline - performance.now())) ||
+      hasLivePid(terminal.descendantPids)
+    ) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        return false;
+      }
+      await waitMs(Math.min(25, remaining));
     }
-    while (hasLivePid(terminal.descendantPids)) {
-      await waitMs(25);
-    }
+    return true;
   }
 }
 
 async function spawnTerminalProcess(
   params: CreateTerminalRequest,
   defaultCwd: string,
+  authority?: AcpControlAuthority,
 ): Promise<{
   proc: ChildProcessByStdio<null, Readable, Readable>;
   spawnCommand: TerminalSpawnCommand;
@@ -588,7 +664,7 @@ async function spawnTerminalProcess(
   const directCommand = buildTerminalSpawnCommand(params.command, params.args);
   try {
     return {
-      proc: await spawnAndWait(directCommand, params, defaultCwd),
+      proc: await spawnAndWait(directCommand, params, defaultCwd, authority),
       spawnCommand: directCommand,
     };
   } catch (error) {
@@ -600,7 +676,7 @@ async function spawnTerminalProcess(
       throw error;
     }
     return {
-      proc: await spawnAndWait(fallbackCommand, params, defaultCwd),
+      proc: await spawnAndWait(fallbackCommand, params, defaultCwd, authority),
       spawnCommand: fallbackCommand,
     };
   }
@@ -610,17 +686,20 @@ async function spawnAndWait(
   spawnCommand: TerminalSpawnCommand,
   params: CreateTerminalRequest,
   defaultCwd: string,
+  authority?: AcpControlAuthority,
 ): Promise<ChildProcessByStdio<null, Readable, Readable>> {
   const spawnOptions = buildTerminalSpawnOptions(
     spawnCommand.command,
     params.cwd ?? defaultCwd,
     params.env,
   );
-  if (spawnCommand.killProcessGroup) {
+  // A detached Windows shell redirects its children's output to a new console.
+  if (process.platform !== "win32") {
     spawnOptions.detached = true;
   }
   // ACP terminal/create is a permission-gated command-execution surface.
   // CodeQL otherwise treats the intentional shell fallback as accidental injection.
+  assertControlAuthority(authority);
   // codeql[js/shell-command-injection-from-environment]
   // lgtm[js/shell-command-injection-from-environment]
   const proc = spawn(spawnCommand.command, spawnCommand.args, spawnOptions);
@@ -677,7 +756,7 @@ function commandPathExists(command: string, cwd: string): boolean {
 async function listDescendantPids(rootPid: number, timeoutMs: number): Promise<number[]> {
   let output: string;
   try {
-    output = await runProcessListCommand(timeoutMs);
+    output = await runWindowsProcessListCommand(timeoutMs);
   } catch {
     return [];
   }
@@ -725,60 +804,15 @@ function parseProcessListLine(line: string): { pid: number; parentPid: number } 
   return { pid, parentPid };
 }
 
-async function runProcessListCommand(timeoutMs: number): Promise<string> {
-  if (process.platform === "win32") {
-    return await runWindowsProcessListCommand(timeoutMs);
-  }
-
-  return await runTimedExecFile("ps", ["-eo", "pid=,ppid="], { timeoutMs });
-}
-
 async function rememberProcessGroupPids(terminal: ManagedTerminal): Promise<void> {
   const processGroupId = terminal.process.pid;
   if (!terminal.killProcessGroup || !processGroupId) {
     return;
   }
 
-  if (process.platform === "win32") {
-    for (const pid of await listDescendantPids(processGroupId, terminal.processHelperTimeoutMs)) {
-      terminal.descendantPids.add(pid);
-    }
-    return;
+  for (const pid of await listDescendantPids(processGroupId, terminal.processHelperTimeoutMs)) {
+    terminal.descendantPids.add(pid);
   }
-
-  for (const pid of await listProcessGroupPids(processGroupId, terminal.processHelperTimeoutMs)) {
-    if (pid !== processGroupId) {
-      terminal.descendantPids.add(pid);
-    }
-  }
-}
-
-async function listProcessGroupPids(processGroupId: number, timeoutMs: number): Promise<number[]> {
-  let output: string;
-  try {
-    output = await runProcessGroupListCommand(timeoutMs);
-  } catch {
-    return [];
-  }
-
-  const pids: number[] = [];
-  for (const line of output.split("\n")) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
-    if (!match) {
-      continue;
-    }
-
-    const pid = Number(match[1]);
-    const pgid = Number(match[2]);
-    if (Number.isInteger(pid) && Number.isInteger(pgid) && pid > 0 && pgid === processGroupId) {
-      pids.push(pid);
-    }
-  }
-  return pids;
-}
-
-async function runProcessGroupListCommand(timeoutMs: number): Promise<string> {
-  return await runTimedExecFile("ps", ["-eo", "pid=,pgid="], { timeoutMs });
 }
 
 async function runWindowsProcessListCommand(timeoutMs: number): Promise<string> {
@@ -809,28 +843,18 @@ export async function killWindowsProcessTree(
   }
 }
 
-function sendSignal(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(pid, signal);
-  } catch {
-    // Process tree cleanup is best-effort because descendants can exit between ps and kill.
-  }
-}
-
-function hasLiveProcessGroup(processGroupId: number): boolean {
-  try {
-    process.kill(-processGroupId, 0);
-    return true;
-  } catch {
+async function hasLiveTerminalDescendants(
+  terminal: ManagedTerminal,
+  timeoutMs: number,
+): Promise<boolean> {
+  const descendants = terminal.descendants;
+  if (!descendants) {
     return false;
   }
-}
-
-function hasLiveTerminalProcessGroup(terminal: ManagedTerminal): boolean {
-  const pid = terminal.process.pid;
-  return Boolean(
-    terminal.killProcessGroup && pid && process.platform !== "win32" && hasLiveProcessGroup(pid),
-  );
+  if (timeoutMs > 0) {
+    await descendants.capture(Math.min(terminal.processHelperTimeoutMs, timeoutMs));
+  }
+  return descendants.hasTrackedProcesses();
 }
 
 function hasLivePid(pids: Set<number>): boolean {

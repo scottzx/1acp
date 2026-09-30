@@ -1,11 +1,21 @@
-import { constants as fsConstants } from "node:fs";
-import fs, { type FileHandle } from "node:fs/promises";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { FsSafeError } from "@openclaw/fs-safe";
+import { hasNodeErrorCode, isPathInside } from "@openclaw/fs-safe/path";
+import { root, type Root } from "@openclaw/fs-safe/root";
+import { isPathMismatchError } from "../src/lib/read-errors.js";
 import { mergeLiveRunState } from "../src/lib/run-state.js";
 import type { FlowRunManifest, FlowRunState, RunBundleSummary } from "../src/types.js";
 
 const DEFAULT_MAX_RUNS = 24;
+
+export class RunBundleNotFoundError extends Error {
+  constructor(cause: unknown) {
+    super("Run bundle not found", { cause });
+    this.name = "RunBundleNotFoundError";
+  }
+}
 
 export function defaultRunsDir(): string {
   return process.env.ACPX_FLOW_RUNS_DIR ?? path.join(os.homedir(), ".acpx", "flows", "runs");
@@ -28,62 +38,37 @@ export async function listRunBundles(
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .toSorted()
-    .toReversed()
-    .slice(0, maxRuns);
+    .toReversed();
 
-  const runs = await Promise.all(
-    candidateIds.map(async (runId) => readRunBundleSummary(runsDir, runId).catch(() => null)),
-  );
-
-  return runs
-    .filter((run): run is RunBundleSummary => run != null)
-    .toSorted((left, right) => {
-      const byStartedAt = Date.parse(right.startedAt) - Date.parse(left.startedAt);
-      if (byStartedAt !== 0) {
-        return byStartedAt;
-      }
-      return right.runId.localeCompare(left.runId);
-    });
-}
-
-export async function resolveRunBundleFilePath(
-  runsDir: string,
-  runId: string,
-  relativePath: string,
-): Promise<string> {
-  return (await resolveRunBundleFileTarget(runsDir, runId, relativePath)).realPath;
-}
-
-async function resolveRunBundleFileTarget(
-  runsDir: string,
-  runId: string,
-  relativePath: string,
-): Promise<{ realPath: string; realRunDir: string }> {
-  const normalizedRelativePath = normalizeRelativePath(relativePath);
-  const resolvedRunsDir = path.resolve(runsDir);
-  const runDir = path.resolve(resolvedRunsDir, runId);
-  if (!isPathInsideDirectory(resolvedRunsDir, runDir, { allowSamePath: false })) {
-    throw new Error(`Refusing to read run bundle outside runs directory: ${runId}`);
-  }
-  const resolvedPath = path.resolve(runDir, normalizedRelativePath);
-
-  if (!isPathInsideDirectory(runDir, resolvedPath)) {
-    throw new Error(`Refusing to read outside run bundle: ${relativePath}`);
+  const limit = candidateIds.slice(0, maxRuns).length;
+  const runs: RunBundleSummary[] = [];
+  for (let offset = 0; offset < candidateIds.length && runs.length < limit;) {
+    const batchIds = candidateIds.slice(
+      offset,
+      offset + Math.min(DEFAULT_MAX_RUNS, limit - runs.length),
+    );
+    offset += batchIds.length;
+    const batch = await Promise.all(
+      batchIds.map((runId) =>
+        readRunBundleSummary(runsDir, runId).catch((error: unknown) => {
+          // A replacement race must not make an existing run disappear.
+          if (isPathMismatchError(error)) {
+            throw error;
+          }
+          return null;
+        }),
+      ),
+    );
+    runs.push(...batch.filter((run): run is RunBundleSummary => run != null));
   }
 
-  const [realRunsDir, realRunDir, realPath] = await Promise.all([
-    fs.realpath(resolvedRunsDir),
-    fs.realpath(runDir),
-    fs.realpath(resolvedPath),
-  ]);
-  if (!isPathInsideDirectory(realRunsDir, realRunDir, { allowSamePath: false })) {
-    throw new Error(`Refusing to read run bundle outside runs directory: ${runId}`);
-  }
-  if (!isPathInsideDirectory(realRunDir, realPath)) {
-    throw new Error(`Refusing to read outside run bundle: ${relativePath}`);
-  }
-
-  return { realPath, realRunDir };
+  return runs.toSorted((left, right) => {
+    const byStartedAt = Date.parse(right.startedAt) - Date.parse(left.startedAt);
+    if (byStartedAt !== 0) {
+      return byStartedAt;
+    }
+    return right.runId.localeCompare(left.runId);
+  });
 }
 
 export async function readRunBundleTextFile(
@@ -91,12 +76,7 @@ export async function readRunBundleTextFile(
   runId: string,
   relativePath: string,
 ): Promise<string> {
-  const file = await openContainedRunBundleFile(runsDir, runId, relativePath);
-  try {
-    return await file.readFile("utf8");
-  } finally {
-    await file.close();
-  }
+  return (await readRunBundleFile(runsDir, runId, relativePath)).toString("utf8");
 }
 
 export async function readRunBundleFile(
@@ -104,41 +84,67 @@ export async function readRunBundleFile(
   runId: string,
   relativePath: string,
 ): Promise<Buffer> {
-  const file = await openContainedRunBundleFile(runsDir, runId, relativePath);
+  const normalizedRelativePath = normalizeRelativePath(relativePath);
+  const resolvedRunsDir = path.resolve(runsDir);
+  const runDir = path.resolve(resolvedRunsDir, runId);
+  if (runDir === resolvedRunsDir || !isPathInside(resolvedRunsDir, runDir)) {
+    throw new Error(`Refusing to read run bundle outside runs directory: ${runId}`);
+  }
+  const runs = await openRunsRoot(resolvedRunsDir);
+  const bundle = await openBundleRoot(
+    runs,
+    `.${path.sep}${path.relative(resolvedRunsDir, runDir)}`,
+  );
+  if (bundle.rootReal === runs.rootReal || !isPathInside(runs.rootReal, bundle.rootReal)) {
+    throw new Error(`Refusing to read run bundle outside runs directory: ${runId}`);
+  }
+  const relativeFilePath = `.${path.sep}${normalizedRelativePath}`;
   try {
-    return await file.readFile();
-  } finally {
-    await file.close();
+    return await bundle.readBytes(relativeFilePath);
+  } catch (error) {
+    // A dangling denied file alias must not become a recoverable missing-file error.
+    await bundle.stat(relativeFilePath);
+    throw error;
   }
 }
 
-async function openContainedRunBundleFile(
-  runsDir: string,
-  runId: string,
-  relativePath: string,
-): Promise<FileHandle> {
-  const { realPath: checkedPath, realRunDir } = await resolveRunBundleFileTarget(
-    runsDir,
-    runId,
-    relativePath,
-  );
-  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-  const file = await fs.open(checkedPath, fsConstants.O_RDONLY | noFollow);
+async function openRunsRoot(runsDir: string): Promise<Root> {
   try {
-    const [openedStat, currentPath] = await Promise.all([
-      file.stat(),
-      fs.realpath(path.resolve(runsDir, runId, normalizeRelativePath(relativePath))),
-    ]);
-    if (!isPathInsideDirectory(realRunDir, currentPath)) {
-      throw new Error(`Refusing to read outside run bundle: ${relativePath}`);
-    }
-    const currentStat = await fs.stat(currentPath);
-    if (openedStat.dev !== currentStat.dev || openedStat.ino !== currentStat.ino) {
-      throw new Error(`Refusing changed run bundle path: ${relativePath}`);
-    }
-    return file;
+    return await root(runsDir);
   } catch (error) {
-    await file.close();
+    if (error instanceof FsSafeError && error.code === "not-found") {
+      throw new RunBundleNotFoundError(error);
+    }
+    throw error;
+  }
+}
+
+async function openBundleRoot(runs: Root, relativeRunPath: string): Promise<Root> {
+  const resolvedRunPath = await runs.resolve(relativeRunPath);
+  try {
+    return await root(resolvedRunPath, {
+      symlinks: "follow-within-root",
+      hardlinks: "allow",
+      maxBytes: Infinity,
+    });
+  } catch (error) {
+    // A failed final-symlink target must pass strict containment before absence is trusted.
+    await confirmMissingBundleRoot(runs, relativeRunPath);
+    throw error;
+  }
+}
+
+async function confirmMissingBundleRoot(runs: Root, relativeRunPath: string): Promise<void> {
+  try {
+    await runs.stat(relativeRunPath);
+  } catch (error) {
+    if (
+      error instanceof FsSafeError &&
+      error.code === "not-found" &&
+      (hasNodeErrorCode(error.cause, "ENOENT") || hasNodeErrorCode(error.cause, "ENOTDIR"))
+    ) {
+      throw new RunBundleNotFoundError(error);
+    }
     throw error;
   }
 }
@@ -148,6 +154,9 @@ async function readRunBundleSummary(runsDir: string, runId: string): Promise<Run
   const manifest = JSON.parse(
     await readRunBundleTextFile(runsDir, runId, "manifest.json"),
   ) as FlowRunManifest;
+  if (typeof manifest.runId !== "string" || typeof manifest.startedAt !== "string") {
+    throw new Error("Invalid run bundle identity or start time");
+  }
   // The manifest is bundle-controlled data, so its projection paths are
   // constrained to the run bundle before being read. Otherwise a crafted
   // manifest could point runProjection/liveProjection at an arbitrary file
@@ -157,7 +166,12 @@ async function readRunBundleSummary(runsDir: string, runId: string): Promise<Run
   ) as FlowRunState;
   const live = await readRunBundleTextFile(runsDir, runId, manifest.paths.liveProjection)
     .then((text) => JSON.parse(text) as Partial<FlowRunState>)
-    .catch(() => null);
+    .catch((error: unknown) => {
+      if (isPathMismatchError(error)) {
+        throw error;
+      }
+      return null;
+    });
   const mergedRun = mergeLiveRunState(run, live);
 
   return {
@@ -186,21 +200,4 @@ function normalizeRelativePath(relativePath: string): string {
     throw new Error("Parent directory traversal is not allowed");
   }
   return normalized;
-}
-
-function isPathInsideDirectory(
-  rootDir: string,
-  candidatePath: string,
-  options: { allowSamePath?: boolean } = {},
-): boolean {
-  const relativePath = path.relative(rootDir, candidatePath);
-  if (!options.allowSamePath && relativePath.length === 0) {
-    return false;
-  }
-  return (
-    relativePath.length === 0 ||
-    (!relativePath.startsWith(`..${path.sep}`) &&
-      relativePath !== ".." &&
-      !path.isAbsolute(relativePath))
-  );
 }

@@ -2,15 +2,8 @@
   "name": "@scottzx/1acp",
   "version": "0.15.1",
   "description": "Headless CLI client for the Agent Client Protocol (ACP) — talk to coding agents from the command line",
-  "keywords": [
-    "acp",
-    "agent-client-protocol",
-    "ai",
-    "claude-code",
-    "cli",
-    "codex",
-    "coding-agent"
-  ],
+  "homepage": null,
+  "bugs": null,
   "license": "MIT",
   "author": "scottzx",
   "repository": {
@@ -31,16 +24,17 @@
   "type": "module",
   "exports": {
     ".": "./dist/cli.js",
-    "./runtime": "./dist/runtime.js",
     "./flows": "./dist/flows.js",
     "./dist/*": "./dist/*",
-    "./package.json": "./package.json"
+    "./runtime": "./dist/runtime.js",
+    "./package.json": "./package.json",
+    "./agent-registry": "./dist/agent-registry.js"
   },
   "scripts": {
-    "build": "tsdown src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
-    "build:quiet": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "build": "tsdown src/cli.ts src/flows.ts src/runtime.ts src/agent-registry.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "build:quiet": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts src/agent-registry.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
     "build:test": "node -e \"require('node:fs').rmSync('dist-test',{recursive:true,force:true})\" && tsc -p tsconfig.test.json",
-    "check": "pnpm run format:check && pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run viewer:typecheck && pnpm run viewer:build && pnpm run test:coverage",
+    "check": "pnpm run format:check && pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run viewer:typecheck && pnpm run viewer:build && pnpm run test:coverage && pnpm run test:autoreview",
     "check:changed": "pnpm run check",
     "check:docs": "pnpm run format:docs:check && pnpm run lint:docs && pnpm run docs:site",
     "check:mutation": "pnpm run mutate",
@@ -64,10 +58,12 @@
     "mutate": "stryker run",
     "perf:report": "tsx scripts/perf-report.ts",
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
-    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
-    "test": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js",
+    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts src/agent-registry.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
+    "prepare": "husky",
+    "test": "pnpm run build && pnpm run build:test && node --test --test-concurrency=4 dist-test/test/*.test.js",
+    "test:autoreview": "python -I -B scripts/check-autoreview.py",
     "test:changed": "pnpm run test:coverage",
-    "test:coverage": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js && c8 --all --check-coverage --lines 85 --branches 85 --functions 85 --statements 85 --include 'dist-test/src/flows/authoring.js' --include 'dist-test/src/flows/decision.js' --include 'dist-test/src/flows/definition.js' --include 'dist-test/src/flows/json.js' --include 'dist-test/src/flows/schema.js' --include 'dist-test/src/flows/store.js' --include 'dist-test/src/runtime/public/**/*.js' --include 'dist-test/src/runtime/engine/manager.js' --include 'dist-test/src/runtime/engine/status.js' --exclude 'dist-test/test/**/*.js' --exclude 'dist/**/*.js' node --test dist-test/test/flows.test.js dist-test/test/flows-store.test.js dist-test/test/runtime.test.js dist-test/test/runtime-events.test.js dist-test/test/runtime-manager.test.js dist-test/test/runtime-probe.test.js",
+    "test:coverage": "pnpm run build && pnpm run build:test && node --test --test-concurrency=4 dist-test/test/*.test.js && c8 --all --check-coverage --lines 85 --branches 85 --functions 85 --statements 85 --include 'dist-test/src/flows/authoring.js' --include 'dist-test/src/flows/decision.js' --include 'dist-test/src/flows/definition.js' --include 'dist-test/src/flows/json.js' --include 'dist-test/src/flows/schema.js' --include 'dist-test/src/flows/store.js' --include 'dist-test/src/runtime/public/**/*.js' --include 'dist-test/src/runtime/engine/manager.js' --include 'dist-test/src/runtime/engine/status.js' --exclude 'dist-test/test/**/*.js' --exclude 'dist/**/*.js' node --test dist-test/test/flows.test.js dist-test/test/flows-store.test.js dist-test/test/runtime.test.js dist-test/test/runtime-events.test.js dist-test/test/runtime-manager.test.js dist-test/test/runtime-probe.test.js",
     "test:live": "pnpm run build:test && node --test dist-test/test/cursor-live.integration.js",
     "typecheck": "tsc --noEmit",
     "typecheck:tsc": "tsc --noEmit",
@@ -81,15 +77,16 @@
     "viewer:typecheck": "tsc -p examples/flows/replay-viewer/tsconfig.json --noEmit && tsc -p examples/flows/replay-viewer/tsconfig.server.json --noEmit"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.4.0",
+    "@agentclientprotocol/sdk": "^1.5.0",
+    "@openclaw/fs-safe": "^0.20.0",
     "commander": "^15.0.0",
     "skillflag": "^0.2.1",
-    "tsx": "^4.23.13",
-    "zod": "^4.6.2"
+    "tsx": "^4.23.15",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@stryker-mutator/core": "^10.0.0",
-    "@types/node": "^26.5.1",
+    "@types/node": "^26.6.2",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/react-test-renderer": "^19.3.0",
@@ -102,29 +99,20 @@
     "fast-json-patch": "^3.1.1",
     "husky": "^9.1.7",
     "lint-staged": "^17.5.1",
-    "markdownlint-cli2": "^0.23.2",
-    "oxfmt": "^0.67.0",
-    "oxlint": "^1.82.0",
-    "oxlint-tsgolint": "^7.0.2001",
+    "markdownlint-cli2": "^0.23.3",
+    "oxfmt": "^0.70.0",
+    "oxlint": "^1.85.0",
+    "oxlint-tsgolint": "^7.0.2002",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-test-renderer": "^19.3.0",
     "tsdown": "^0.23.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vite": "^8.3.0",
+    "vite": "^8.3.1",
     "ws": "^8.21.3"
-  },
-  "lint-staged": {
-    "*.{js,ts}": [
-      "oxfmt --write",
-      "oxlint --fix"
-    ],
-    "*.{json,md}": [
-      "oxfmt --write"
-    ]
   },
   "engines": {
     "node": ">=22.13.0"
   },
-  "packageManager": "pnpm@10.34.5"
+  "packageManager": "pnpm@11.27.1"
 }

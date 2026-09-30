@@ -1,15 +1,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { AcpxOperationalError } from "../errors.js";
 import { isProcessAlive } from "../process-liveness.js";
+import { writePrivateFile } from "../state-files.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
-import {
-  sessionEventActivePath,
-  sessionEventLockPath,
-  sessionEventSegmentPath,
-} from "./event-log.js";
+import { sessionEventLockPath } from "./event-log.js";
+import { listSessionEvents } from "./events.js";
 import { findSession, listSessions, normalizeName } from "./persistence.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 
@@ -138,41 +135,6 @@ async function isSessionActive(record: SessionRecord): Promise<boolean> {
   return isProcessAlive(record.pid) || (await hasLiveEventLock(record.acpxRecordId));
 }
 
-async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {
-  const payload = await fs.readFile(filePath, "utf8").catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "";
-    }
-    throw error;
-  });
-  const history: AcpJsonRpcMessage[] = [];
-  for (const line of payload.split("\n").filter((entry) => entry.trim().length > 0)) {
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (isAcpJsonRpcMessage(parsed)) {
-        history.push(parsed);
-      }
-    } catch {
-      // Match event listing resilience: tolerate truncated NDJSON writes.
-    }
-  }
-  return history;
-}
-
-async function readSessionHistory(record: SessionRecord): Promise<AcpJsonRpcMessage[]> {
-  const history: AcpJsonRpcMessage[] = [];
-  const maxSegments = Number.isInteger(record.eventLog.max_segments)
-    ? record.eventLog.max_segments
-    : 0;
-
-  for (let segment = maxSegments; segment >= 1; segment -= 1) {
-    history.push(...(await readHistoryFile(sessionEventSegmentPath(record.acpxRecordId, segment))));
-  }
-
-  history.push(...(await readHistoryFile(sessionEventActivePath(record.acpxRecordId))));
-  return history;
-}
-
 function cwdRelativeToHome(cwd: string, home: string): string {
   const relative = path.relative(home, cwd);
   if (relative.length === 0) {
@@ -234,11 +196,35 @@ export async function exportSession(
       updated_at: record.lastUsedAt,
       state: serializeSessionRecordForArchive(record, cwdRelative),
     },
-    history: await readSessionHistory(record),
+    history: await listSessionEvents(record.acpxRecordId, record.eventLog.max_segments),
   };
 
-  await fs.mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-  await fs.writeFile(outputPath, `${JSON.stringify(exported, null, 2)}\n`, "utf8");
+  const target = await resolveExportTarget(outputPath);
+  await writePrivateFile(target, `${JSON.stringify(exported, null, 2)}\n`, {
+    privateDirectory: false,
+  });
+}
+
+async function resolveExportTarget(filePath: string): Promise<string> {
+  for (let hops = 0; hops < 40; hops += 1) {
+    const stat = await fs.lstat(filePath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!stat || stat.isFile()) {
+      return filePath;
+    }
+    if (!stat.isSymbolicLink()) {
+      throw new Error("Session export output must be a regular file");
+    }
+    const target = await fs.readlink(filePath);
+    // Keep raw segments so native parent resolution preserves symlink/.. and
+    // Windows junctions across volumes, including dangling final symlinks.
+    filePath = path.isAbsolute(target) ? target : `${path.dirname(filePath)}${path.sep}${target}`;
+  }
+  throw new Error("Too many symbolic links in session export output");
 }
 
 function normalizeAgentName(agentName: string | undefined): string | undefined {

@@ -1,15 +1,8 @@
-import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
-import { AgentSpawnError } from "../errors.js";
-import { loadPermissionPolicySpec } from "../permission-policy.js";
-import {
-  mergePromptSourceWithText,
-  parsePromptSource,
-  PromptInputValidationError,
-  textPrompt,
-} from "../prompt-content.js";
+import { AcpxOperationalError, AgentSpawnError } from "../errors.js";
+import type { SessionListResult } from "../session/execution/contracts.js";
 import { exportSession } from "../session/export.js";
 import { importSession } from "../session/import.js";
 import {
@@ -34,7 +27,9 @@ import {
   resolveGlobalFlags,
   resolveOutputPolicy,
   resolvePermissionMode,
+  resolvePromptFlags,
   resolveSessionNameFromFlags,
+  resolveSessionsListFlags,
   type ExecFlags,
   type GlobalFlags,
   type SessionsExportFlags,
@@ -46,8 +41,13 @@ import {
   type SessionsPruneFlags,
   type StatusFlags,
 } from "./flags.js";
+import {
+  sessionOptionsFromGlobalFlags,
+  sessionConnectionOptions,
+  resolvePermissionPolicyFromFlags,
+} from "./invocation-options.js";
 import { emitJsonResult } from "./output/json-output.js";
-import type { SessionListResult } from "./session/contracts.js";
+import { readPromptInput } from "./prompt-input.js";
 
 class NoSessionError extends Error {
   constructor(message: string) {
@@ -77,65 +77,6 @@ function loadOutputModule(): Promise<OutputModule> {
 function loadOutputRenderModule(): Promise<OutputRenderModule> {
   outputRenderModulePromise ??= import("./output/render.js");
   return outputRenderModulePromise;
-}
-
-async function readPromptInputFromStdin(): Promise<string> {
-  let data = "";
-  for await (const chunk of process.stdin) {
-    data += String(chunk);
-  }
-  return data;
-}
-
-async function readPrompt(
-  promptParts: string[],
-  filePath: string | undefined,
-  cwd: string,
-): Promise<import("../types.js").PromptInput> {
-  try {
-    if (filePath) {
-      return await readPromptFromFile(filePath, cwd, promptParts);
-    }
-
-    const joined = promptParts.join(" ").trim();
-    if (joined.length > 0) {
-      return textPrompt(joined);
-    }
-
-    if (process.stdin.isTTY) {
-      throw new InvalidArgumentError(
-        "Prompt is required (pass as argument, --file, or pipe via stdin)",
-      );
-    }
-
-    const prompt = parsePromptSource(await readPromptInputFromStdin());
-    if (prompt.length === 0) {
-      throw new InvalidArgumentError("Prompt from stdin is empty");
-    }
-
-    return prompt;
-  } catch (error) {
-    if (error instanceof PromptInputValidationError) {
-      throw new InvalidArgumentError(error.message);
-    }
-    throw error;
-  }
-}
-
-async function readPromptFromFile(
-  filePath: string,
-  cwd: string,
-  promptParts: string[],
-): Promise<import("../types.js").PromptInput> {
-  const source =
-    filePath === "-"
-      ? await readPromptInputFromStdin()
-      : await fs.readFile(path.resolve(cwd, filePath), "utf8");
-  const prompt = mergePromptSourceWithText(source, promptParts.join(" "));
-  if (prompt.length === 0) {
-    throw new InvalidArgumentError("Prompt from --file is empty");
-  }
-  return prompt;
 }
 
 function applyPermissionExitCode(
@@ -183,28 +124,6 @@ function resolveRequestedOutputPolicy(globalFlags: {
 
 type ResolvedAgentInvocation = ReturnType<typeof resolveAgentInvocation>;
 
-function sessionOptionsFromGlobalFlags(
-  globalFlags: GlobalFlags,
-): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
-  return {
-    model: globalFlags.model,
-    allowedTools: globalFlags.allowedTools,
-    maxTurns: globalFlags.maxTurns,
-    systemPrompt: globalFlags.systemPrompt,
-  };
-}
-
-async function resolvePermissionPolicyFromFlags(
-  globalFlags: GlobalFlags,
-): Promise<PermissionPolicy | undefined> {
-  try {
-    return await loadPermissionPolicySpec(globalFlags.permissionPolicy, globalFlags.cwd);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new InvalidArgumentError(`Invalid permission policy: ${message}`);
-  }
-}
-
 function buildSessionStartOptions(params: {
   agent: ResolvedAgentInvocation;
   flags: SessionsNewFlags;
@@ -214,21 +133,14 @@ function buildSessionStartOptions(params: {
   permissionPolicy?: PermissionPolicy;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
+    ...sessionConnectionOptions(params.globalFlags, params.config),
     agentCommand: params.agent.agentCommand,
     agentArgv: params.agent.agentArgv,
     cwd: params.agent.cwd,
     name: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
-    mcpServers: params.config.mcpServers,
     permissionMode: params.permissionMode,
-    nonInteractivePermissions: params.globalFlags.nonInteractivePermissions,
     permissionPolicy: params.permissionPolicy,
-    authCredentials: params.config.auth,
-    authPolicy: params.globalFlags.authPolicy,
-    fs: params.globalFlags.fs,
-    terminal: params.globalFlags.terminal,
-    timeoutMs: params.globalFlags.timeout,
-    verbose: params.globalFlags.verbose,
     sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
     onModelWarning: params.globalFlags.jsonStrict
       ? undefined
@@ -319,11 +231,12 @@ export async function handlePrompt(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  const promptFlags = resolvePromptFlags(flags, command);
   const globalFlags = resolveGlobalFlags(command, config);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
+  const prompt = await readPromptInput(promptFlags.file, promptParts.join(" "), globalFlags.cwd);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const [
     { createOutputFormatter },
@@ -345,35 +258,23 @@ export async function handlePrompt(
 
   await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
   const result = await sendSession({
+    ...sessionConnectionOptions(globalFlags, config),
     sessionId: record.acpxRecordId,
     prompt,
-    mcpServers: config.mcpServers,
     mcpConfigPath: config.mcpConfigPath,
     mcpConfigFingerprint: config.mcpConfigFingerprint,
     permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     permissionPolicy,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    fs: globalFlags.fs,
-    terminal: globalFlags.terminal,
     outputFormatter,
     errorEmissionPolicy: {
       queueErrorAlreadyEmitted: outputPolicy.queueErrorAlreadyEmitted,
     },
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
-    timeoutMs: globalFlags.timeout,
     ttlMs: globalFlags.ttl,
     maxQueueDepth: config.queueMaxDepth,
     promptRetries: globalFlags.promptRetries,
-    verbose: globalFlags.verbose,
-    waitForCompletion: flags.wait !== false,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-      systemPrompt: globalFlags.systemPrompt,
-    },
+    waitForCompletion: promptFlags.wait,
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
   });
 
   if ("queued" in result) {
@@ -397,34 +298,22 @@ export async function handleExec(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
   if (config.disableExec) {
-    const globalFlags = resolveGlobalFlags(command, config);
-    const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
-    if (outputPolicy.format === "json") {
-      process.stdout.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32603,
-            message: "exec subcommand is disabled by configuration (disableExec: true)",
-            data: { acpxCode: "EXEC_DISABLED" },
-          },
-        })}\n`,
-      );
-    } else {
-      process.stderr.write(
-        "Error: exec subcommand is disabled by configuration (disableExec: true)\n",
-      );
-    }
-    process.exitCode = 1;
-    return;
+    throw new AcpxOperationalError(
+      "exec subcommand is disabled by configuration (disableExec: true)",
+      { outputCode: "EXEC_DISABLED", origin: "cli" },
+    );
   }
 
-  const globalFlags = resolveGlobalFlags(command, config);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
+  const prompt = await readPromptInput(
+    resolvePromptFlags(flags, command).file,
+    promptParts.join(" "),
+    globalFlags.cwd,
+  );
   const [{ createOutputFormatter }, { runOnce }] = await Promise.all([
     loadOutputModule(),
     loadSessionModule(),
@@ -435,32 +324,20 @@ export async function handleExec(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
 
   const result = await runOnce({
+    ...sessionConnectionOptions(globalFlags, config),
     agentCommand: agent.agentCommand,
     agentArgv: agent.agentArgv,
     cwd: agent.cwd,
     prompt,
-    mcpServers: config.mcpServers,
     permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
     permissionPolicy,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    fs: globalFlags.fs,
-    terminal: globalFlags.terminal,
     outputFormatter,
     errorEmissionPolicy: {
       queueErrorAlreadyEmitted: outputPolicy.queueErrorAlreadyEmitted,
     },
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
     promptRetries: globalFlags.promptRetries,
-    sessionOptions: {
-      model: globalFlags.model,
-      allowedTools: globalFlags.allowedTools,
-      maxTurns: globalFlags.maxTurns,
-      systemPrompt: globalFlags.systemPrompt,
-    },
+    sessionOptions: sessionOptionsFromGlobalFlags(globalFlags),
     configOptions: flags.configOption,
   });
 
@@ -534,13 +411,17 @@ function printSetConfigOptionResultByFormat(
   },
   format: OutputFormat,
 ): void {
+  const options = result.response?.configOptions;
+  const configOptions = Array.isArray(options)
+    ? options
+    : (result.record.acpx?.config_options ?? []);
   if (
     emitJsonResult(format, {
       action: "config_set",
       configId,
       value,
       resumed: result.resumed,
-      configOptions: result.response.configOptions,
+      configOptions,
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,
@@ -551,7 +432,7 @@ function printSetConfigOptionResultByFormat(
   process.stdout.write(
     format === "quiet"
       ? `${value}\n`
-      : `config set: ${configId}=${value} (${result.response.configOptions.length} options)\n`,
+      : `config set: ${configId}=${value} (${configOptions.length} options)\n`,
   );
 }
 
@@ -602,16 +483,9 @@ export async function handleSetMode(
     resolveSessionNameFromFlags(flags, command),
   );
   const result = await setSessionMode({
+    ...sessionConnectionOptions(globalFlags, config),
     sessionId: record.acpxRecordId,
     modeId,
-    mcpServers: config.mcpServers,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    fs: globalFlags.fs,
-    terminal: globalFlags.terminal,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -640,16 +514,9 @@ export async function handleSetModel(
     resolveSessionNameFromFlags(flags, command),
   );
   const result = await setSessionModel({
+    ...sessionConnectionOptions(globalFlags, config),
     sessionId: record.acpxRecordId,
     modelId,
-    mcpServers: config.mcpServers,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    fs: globalFlags.fs,
-    terminal: globalFlags.terminal,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -684,17 +551,10 @@ export async function handleSetConfigOption(
     resolveSessionNameFromFlags(flags, command),
   );
   const result = await setSessionConfigOption({
+    ...sessionConnectionOptions(globalFlags, config),
     sessionId: record.acpxRecordId,
     configId: resolvedConfigId,
     value,
-    mcpServers: config.mcpServers,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    fs: globalFlags.fs,
-    terminal: globalFlags.terminal,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
   });
 
   if (globalFlags.verbose && result.loadError) {
@@ -717,21 +577,14 @@ async function tryListAgentSessions(
   const { listAgentSessions } = await loadSessionModule();
   try {
     return await listAgentSessions({
+      ...sessionConnectionOptions(globalFlags, config),
       agentCommand: agent.agentCommand,
       agentArgv: agent.agentArgv,
       cwd: agent.cwd,
       cursor: flags.cursor,
       filterCwd: resolveSessionListFilterCwd(flags, agent.cwd),
-      mcpServers: config.mcpServers,
       permissionMode,
-      nonInteractivePermissions: globalFlags.nonInteractivePermissions,
       permissionPolicy,
-      authCredentials: config.auth,
-      authPolicy: globalFlags.authPolicy,
-      fs: globalFlags.fs,
-      terminal: globalFlags.terminal,
-      timeoutMs: globalFlags.timeout,
-      verbose: globalFlags.verbose,
     });
   } catch (error) {
     if (error instanceof AgentSpawnError) {
@@ -747,12 +600,13 @@ export async function handleSessionsList(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  const listFlags = resolveSessionsListFlags(flags, command);
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const filterCwd = resolveSessionListFilterCwd(flags, agent.cwd);
+  const filterCwd = resolveSessionListFilterCwd(listFlags, agent.cwd);
 
-  if (flags.local) {
-    if (flags.cursor) {
+  if (listFlags.local) {
+    if (listFlags.cursor) {
       throw new InvalidArgumentError("--cursor cannot be combined with --local");
     }
     await printLocalSessionsList(agent.agentCommand, filterCwd, globalFlags.format);
@@ -760,12 +614,12 @@ export async function handleSessionsList(
   }
 
   const [result, { printAgentSessionsByFormat }] = await Promise.all([
-    tryListAgentSessions(agent, flags, globalFlags, config),
+    tryListAgentSessions(agent, listFlags, globalFlags, config),
     loadOutputRenderModule(),
   ]);
 
   if (!result || result === "spawn-failed") {
-    if (result !== "spawn-failed" && (flags.cursor || flags.filterCwd)) {
+    if (result !== "spawn-failed" && (listFlags.cursor || listFlags.filterCwd)) {
       throw new Error(
         `Agent command "${agent.agentCommand}" does not advertise sessionCapabilities.list; cannot use agent-side session/list filters`,
       );
@@ -823,12 +677,7 @@ export async function handleSessionsNew(
     name: flags.name,
   });
 
-  if (replaced) {
-    await closeSession(replaced.acpxRecordId);
-    if (globalFlags.verbose) {
-      process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
-    }
-  }
+  const resumesSameRecord = replaced != null && replaced.acpxRecordId === flags.resumeSession;
 
   const created = await createSession(
     buildSessionStartOptions({
@@ -840,6 +689,15 @@ export async function handleSessionsNew(
       permissionPolicy,
     }),
   );
+
+  if (replaced) {
+    if (!resumesSameRecord) {
+      await closeSession(replaced.acpxRecordId);
+    }
+    if (globalFlags.verbose) {
+      process.stderr.write(`[acpx] soft-closed prior session: ${replaced.acpxRecordId}\n`);
+    }
+  }
 
   printCreatedSessionBanner(created, agent.agentName, globalFlags.format, globalFlags.jsonStrict);
 
@@ -894,7 +752,7 @@ function userContentToText(content: SessionUserContent): string {
     return content.Mention.content;
   }
   if ("Image" in content) {
-    return content.Image.source || "[image]";
+    return `[image] ${content.Image.mime_type || "image"}`;
   }
   if ("Audio" in content) {
     return `[audio] ${content.Audio.mime_type || "audio"}`;
@@ -1064,6 +922,33 @@ export async function handleSessionsHistory(
   const record = await findScopedSessionOrThrow(agent, sessionName);
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
+}
+
+export async function handleSessionsWatch(
+  explicitAgentName: string | undefined,
+  flags: { name?: string; cursor?: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const sessionName = resolveSessionNameFromFlags({ session: flags.name }, command);
+  const scope = {
+    agentCommand: agent.agentCommand,
+    cwd: agent.cwd,
+    name: sessionName,
+    readOnly: true,
+  };
+  const record =
+    (await findSession(scope)) ?? (await findSession({ ...scope, includeClosed: true }));
+  if (!record) {
+    throw new Error(missingScopedSessionMessage(agent, sessionName));
+  }
+  const { runSessionWatch } = await import("./session-watch.js");
+  await runSessionWatch(record, {
+    cursor: flags.cursor,
+    policy: resolveRequestedOutputPolicy(globalFlags),
+  });
 }
 
 export async function handleSessionsExport(

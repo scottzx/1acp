@@ -1,10 +1,12 @@
 import type http from "node:http";
 import type net from "node:net";
 import type { Duplex } from "node:stream";
+import { FsSafeError } from "@openclaw/fs-safe";
+import { hasNodeErrorCode } from "@openclaw/fs-safe/path";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { z } from "zod";
 import { createReplayPatch } from "../src/lib/json-patch-plus.js";
 import type {
-  ReplayClientMessage,
   ReplayJsonPatchOperation,
   ReplayProtocol,
   ReplayServerMessage,
@@ -12,9 +14,18 @@ import type {
   ViewerRunsState,
 } from "../src/types.js";
 import type { ViewerRunSource } from "./live-source.js";
+import { RunBundleNotFoundError } from "./run-bundles.js";
 
 const PROTOCOL: ReplayProtocol = "acpx.replay.v1";
 const DEFAULT_POLL_INTERVAL_MS = 50;
+const replayClientMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("hello"), protocol: z.string() }),
+  z.object({ type: z.enum(["subscribe_runs", "unsubscribe_runs", "resync_runs", "ping"]) }),
+  z.object({
+    type: z.enum(["subscribe_run", "unsubscribe_run", "resync_run"]),
+    runId: z.string(),
+  }),
+]);
 
 type ReplayLiveSyncOptions = {
   source: ViewerRunSource;
@@ -24,6 +35,9 @@ type ReplayLiveSyncOptions = {
 type ResourceState<TState> = {
   version: number;
   state: TState | null;
+  pending?: Promise<void>;
+  snapshotRequests: Set<ClientSubscriptionState>;
+  readErrors?: Map<ClientSubscriptionState, string>;
 };
 
 type ResourceDelta<TState> =
@@ -31,18 +45,16 @@ type ResourceDelta<TState> =
   | { kind: "patch"; ops: ReplayJsonPatchOperation[] }
   | { kind: "snapshot"; state: TState };
 
+type SubscriptionState = "pending" | "active";
+
 type ClientSubscriptionState = {
   socket: WebSocket;
-  wantsRuns: boolean;
-  runIds: Set<string>;
+  runsSubscription?: SubscriptionState;
+  runSubscriptions: Map<string, SubscriptionState>;
 };
 
 export type ReplayLiveSyncServer = {
-  handleUpgrade(
-    request: http.IncomingMessage,
-    socket: net.Socket | Duplex,
-    head: Buffer,
-  ): Promise<boolean>;
+  handleUpgrade(request: http.IncomingMessage, socket: net.Socket | Duplex, head: Buffer): boolean;
   close(): Promise<void>;
 };
 
@@ -70,6 +82,7 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
   const runsResource: ResourceState<ViewerRunsState> = {
     version: 0,
     state: null,
+    snapshotRequests: new Set(),
   };
   const runResources = new Map<string, ResourceState<ViewerRunLiveState>>();
   let pollTimer: NodeJS.Timeout | null = null;
@@ -78,8 +91,7 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
   server.on("connection", (socket) => {
     const client: ClientSubscriptionState = {
       socket,
-      wantsRuns: false,
-      runIds: new Set<string>(),
+      runSubscriptions: new Map(),
     };
     clients.add(client);
     sendMessage(socket, {
@@ -88,19 +100,30 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
     });
 
     socket.on("message", (data) => {
-      void handleMessage(client, data);
+      void handleMessage(client, data).catch((error: unknown) => {
+        sendInternalError(socket, error);
+      });
     });
+    socket.on("error", () => socket.terminate());
     socket.on("close", () => {
       clients.delete(client);
+      runsResource.snapshotRequests.delete(client);
+      for (const resource of runResources.values()) {
+        resource.snapshotRequests.delete(client);
+        resource.readErrors?.delete(client);
+      }
       pruneRunResources();
       refreshPollingState();
     });
   });
 
   async function handleMessage(client: ClientSubscriptionState, data: RawData): Promise<void> {
-    let message: ReplayClientMessage;
+    let message: z.infer<typeof replayClientMessageSchema>;
     try {
-      message = JSON.parse(decodeMessage(data)) as ReplayClientMessage;
+      if (!Buffer.isBuffer(data)) {
+        throw new Error("Expected buffered WebSocket data");
+      }
+      message = replayClientMessageSchema.parse(JSON.parse(data.toString()));
     } catch {
       sendMessage(client.socket, {
         type: "error",
@@ -125,135 +148,151 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
         return;
       case "subscribe_runs":
       case "resync_runs":
-        client.wantsRuns = true;
+        client.runsSubscription ??= "pending";
         await sendRunsSnapshot(client);
         refreshPollingState();
         return;
       case "unsubscribe_runs":
-        client.wantsRuns = false;
+        client.runsSubscription = undefined;
+        runsResource.snapshotRequests.delete(client);
         refreshPollingState();
         return;
       case "subscribe_run":
       case "resync_run":
-        client.runIds.add(message.runId);
+        client.runSubscriptions.set(
+          message.runId,
+          client.runSubscriptions.get(message.runId) ?? "pending",
+        );
         await sendRunSnapshot(client, message.runId);
         refreshPollingState();
         return;
       case "unsubscribe_run":
-        client.runIds.delete(message.runId);
+        client.runSubscriptions.delete(message.runId);
+        runResources.get(message.runId)?.snapshotRequests.delete(client);
+        runResources.get(message.runId)?.readErrors?.delete(client);
         pruneRunResources();
         refreshPollingState();
         return;
-      default:
-        sendMessage(client.socket, {
-          type: "error",
-          code: "protocol_error",
-          message: `Unsupported replay viewer message: ${JSON.stringify(message)}`,
-        });
     }
   }
 
   async function sendRunsSnapshot(client: ClientSubscriptionState): Promise<void> {
     try {
-      const resource = await refreshRunsState();
-      sendMessage(client.socket, {
-        type: "runs_snapshot",
-        version: resource.version,
-        state: resource.state,
-      });
+      await refreshRunsState(client);
     } catch (error) {
-      sendInternalError(client.socket, error);
+      if (client.runsSubscription) {
+        sendInternalError(client.socket, error);
+      }
     }
   }
 
   async function sendRunSnapshot(client: ClientSubscriptionState, runId: string): Promise<void> {
     try {
-      const resource = await refreshRunState(runId);
-      sendMessage(client.socket, {
-        type: "run_snapshot",
-        runId,
-        version: resource.version,
-        state: resource.state,
-      });
+      await refreshRunState(runId, client);
     } catch (error) {
-      client.runIds.delete(runId);
-      sendMessage(client.socket, {
-        type: "error",
-        code: "run_not_found",
-        message: error instanceof Error ? error.message : String(error),
-        runId,
-      });
+      reportRunReadError(runId, error, [client]);
+      pruneRunResources();
     }
   }
 
-  async function ensureRunsState(): Promise<{ version: number; state: ViewerRunsState }> {
-    if (runsResource.state == null) {
-      runsResource.state = await source.getRunsState();
-      runsResource.version = 1;
+  function reportRunReadError(
+    runId: string,
+    error: unknown,
+    recipients: Iterable<ClientSubscriptionState>,
+  ): void {
+    const resource = runResources.get(runId);
+    if (!resource) {
+      return;
     }
-    return {
-      version: runsResource.version,
-      state: runsResource.state,
-    };
-  }
-
-  async function refreshRunsState(): Promise<{ version: number; state: ViewerRunsState }> {
-    const nextState = await source.getRunsState();
-
-    if (runsResource.state == null) {
-      runsResource.state = nextState;
-      runsResource.version = 1;
-    } else {
-      const delta = computeResourceDelta(runsResource.state, nextState);
-      if (delta.kind !== "noop") {
-        runsResource.version += 1;
-        runsResource.state = nextState;
+    for (const client of recipients) {
+      if (client.runSubscriptions.has(runId)) {
+        reportSubscribedRunReadError(client, resource, runId, error);
       }
     }
-
-    return {
-      version: runsResource.version,
-      state: runsResource.state,
-    };
   }
 
-  async function ensureRunState(
-    runId: string,
-  ): Promise<{ version: number; state: ViewerRunLiveState }> {
-    const resource = runResources.get(runId) ?? { version: 0, state: null };
-    if (resource.state == null) {
-      resource.state = await source.getRunState(runId);
-      resource.version = 1;
-      runResources.set(runId, resource);
+  function refreshRunsState(snapshotClient?: ClientSubscriptionState): Promise<void> {
+    if (snapshotClient) {
+      runsResource.snapshotRequests.add(snapshotClient);
     }
-    return {
-      version: resource.version,
-      state: resource.state,
-    };
+    return refreshResource(
+      runsResource,
+      () => source.getRunsState(),
+      (state, version, delta, fromVersion) => {
+        for (const client of clients) {
+          if (!client.runsSubscription) {
+            continue;
+          }
+          if (
+            client.runsSubscription === "pending" ||
+            runsResource.snapshotRequests.has(client) ||
+            delta.kind === "snapshot"
+          ) {
+            client.runsSubscription = "active";
+            sendMessage(client.socket, { type: "runs_snapshot", version, state });
+          } else if (delta.kind === "patch") {
+            sendMessage(client.socket, {
+              type: "runs_patch",
+              fromVersion,
+              toVersion: version,
+              ops: delta.ops,
+            });
+          }
+        }
+      },
+    );
   }
 
   async function refreshRunState(
     runId: string,
-  ): Promise<{ version: number; state: ViewerRunLiveState }> {
-    const resource = runResources.get(runId) ?? { version: 0, state: null };
-    const nextState = await source.getRunState(runId);
-
-    if (resource.state == null) {
-      resource.state = nextState;
-      resource.version = 1;
-    } else {
-      const delta = computeResourceDelta(resource.state, nextState);
-      if (delta.kind !== "noop") {
-        resource.version += 1;
-        resource.state = nextState;
+    snapshotClient?: ClientSubscriptionState,
+  ): Promise<void> {
+    const resource: ResourceState<ViewerRunLiveState> = runResources.get(runId) ?? {
+      version: 0,
+      state: null,
+      snapshotRequests: new Set(),
+    };
+    runResources.set(runId, resource);
+    if (snapshotClient) {
+      resource.snapshotRequests.add(snapshotClient);
+    }
+    try {
+      await refreshResource(
+        resource,
+        () => source.getRunState(runId),
+        (state, version, delta, fromVersion) => {
+          if (runResources.get(runId) !== resource) {
+            return;
+          }
+          for (const client of clients) {
+            const subscription = client.runSubscriptions.get(runId);
+            if (!subscription) {
+              continue;
+            }
+            if (
+              subscription === "pending" ||
+              resource.snapshotRequests.has(client) ||
+              delta.kind === "snapshot"
+            ) {
+              client.runSubscriptions.set(runId, "active");
+              sendMessage(client.socket, { type: "run_snapshot", runId, version, state });
+            } else if (delta.kind === "patch") {
+              sendMessage(client.socket, {
+                type: "run_patch",
+                runId,
+                fromVersion,
+                toVersion: version,
+                ops: delta.ops,
+              });
+            }
+          }
+        },
+      );
+    } catch (error) {
+      if (runResources.get(runId) === resource) {
+        throw error;
       }
     }
-
-    runResources.set(runId, resource);
-    return {
-      version: resource.version,
-      state: resource.state,
-    };
   }
 
   function refreshPollingState(): void {
@@ -280,77 +319,29 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
 
     try {
       if (hasRunsSubscribers()) {
-        const resource = await ensureRunsState();
-        const nextState = await source.getRunsState();
-        const delta = computeResourceDelta(resource.state, nextState);
-        if (delta.kind !== "noop") {
-          const fromVersion = runsResource.version;
-          runsResource.version += 1;
-          runsResource.state = nextState;
-          if (delta.kind === "patch") {
-            broadcast((client) => client.wantsRuns, {
-              type: "runs_patch",
-              fromVersion,
-              toVersion: runsResource.version,
-              ops: delta.ops,
-            });
-          } else {
-            broadcast((client) => client.wantsRuns, {
-              type: "runs_snapshot",
-              version: runsResource.version,
-              state: nextState,
-            });
-          }
-        }
+        await refreshRunsState();
       }
 
       for (const runId of getSubscribedRunIds()) {
+        // Earlier reads can outlast another run's terminal error or unsubscribe.
+        if (!hasRunSubscribers(runId)) {
+          continue;
+        }
         try {
-          const resource = await ensureRunState(runId);
-          const nextState = await source.getRunState(runId);
-          const delta = computeResourceDelta(resource.state, nextState);
-          if (delta.kind === "noop") {
-            continue;
-          }
-          const fromVersion = resource.version;
-          resource.version += 1;
-          resource.state = nextState;
-          runResources.set(runId, resource);
-          if (delta.kind === "patch") {
-            broadcast((client) => client.runIds.has(runId), {
-              type: "run_patch",
-              runId,
-              fromVersion,
-              toVersion: resource.version,
-              ops: delta.ops,
-            });
-          } else {
-            broadcast((client) => client.runIds.has(runId), {
-              type: "run_snapshot",
-              runId,
-              version: resource.version,
-              state: nextState,
-            });
-          }
+          await refreshRunState(runId);
         } catch (error) {
-          for (const client of clients) {
-            if (!client.runIds.has(runId)) {
-              continue;
-            }
-            client.runIds.delete(runId);
-            sendMessage(client.socket, {
-              type: "error",
-              code: "run_not_found",
-              message: error instanceof Error ? error.message : String(error),
-              runId,
-            });
-          }
-          runResources.delete(runId);
+          reportRunReadError(runId, error, clients);
         }
       }
 
       pruneRunResources();
       refreshPollingState();
+    } catch (error) {
+      for (const client of clients) {
+        if (client.runsSubscription) {
+          sendInternalError(client.socket, error);
+        }
+      }
     } finally {
       syncing = false;
     }
@@ -365,9 +356,18 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
     }
   }
 
+  function hasRunSubscribers(runId: string): boolean {
+    for (const client of clients) {
+      if (client.runSubscriptions.has(runId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function hasRunsSubscribers(): boolean {
     for (const client of clients) {
-      if (client.wantsRuns) {
+      if (client.runsSubscription) {
         return true;
       }
     }
@@ -377,38 +377,24 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
   function getSubscribedRunIds(): Set<string> {
     const runIds = new Set<string>();
     for (const client of clients) {
-      for (const runId of client.runIds) {
+      for (const runId of client.runSubscriptions.keys()) {
         runIds.add(runId);
       }
     }
     return runIds;
   }
 
-  function broadcast(
-    predicate: (client: ClientSubscriptionState) => boolean,
-    message: ReplayServerMessage,
-  ): void {
-    for (const client of clients) {
-      if (predicate(client)) {
-        sendMessage(client.socket, message);
-      }
-    }
-  }
-
-  async function handleUpgrade(
+  function handleUpgrade(
     request: http.IncomingMessage,
     socket: net.Socket | Duplex,
     head: Buffer,
-  ): Promise<boolean> {
+  ): boolean {
     if (request.url !== "/api/live") {
       return false;
     }
 
-    await new Promise<void>((resolve) => {
-      server.handleUpgrade(request, socket, head, (ws) => {
-        server.emit("connection", ws, request);
-        resolve();
-      });
+    server.handleUpgrade(request, socket, head, (ws) => {
+      server.emit("connection", ws, request);
     });
     return true;
   }
@@ -438,17 +424,80 @@ export function createReplayLiveSyncServer(options: ReplayLiveSyncOptions): Repl
   };
 }
 
-function decodeMessage(data: RawData): string {
-  if (typeof data === "string") {
-    return data;
+function refreshResource<TState extends object>(
+  resource: ResourceState<TState>,
+  read: () => Promise<TState>,
+  publish: (
+    state: TState,
+    version: number,
+    delta: ResourceDelta<TState>,
+    fromVersion: number,
+  ) => void,
+): Promise<void> {
+  if (resource.pending) {
+    return resource.pending;
   }
-  if (data instanceof ArrayBuffer) {
-    return Buffer.from(data).toString("utf8");
+  resource.pending = (async () => {
+    const next = await read();
+    const delta: ResourceDelta<TState> =
+      resource.state === null
+        ? { kind: "snapshot", state: next }
+        : computeResourceDelta(resource.state, next);
+    const fromVersion = resource.version;
+    resource.state = next;
+    if (delta.kind !== "noop") {
+      resource.version += 1;
+    }
+    publish(next, resource.version, delta, fromVersion);
+    resource.snapshotRequests.clear();
+    resource.readErrors?.clear();
+  })().finally(() => {
+    resource.pending = undefined;
+  });
+  return resource.pending;
+}
+
+function reportSubscribedRunReadError(
+  client: ClientSubscriptionState,
+  resource: ResourceState<ViewerRunLiveState>,
+  runId: string,
+  error: unknown,
+): void {
+  if (!isRecoverableRunReadError(error)) {
+    client.runSubscriptions.delete(runId);
+    resource.snapshotRequests.delete(client);
+    resource.readErrors?.delete(client);
+    sendMessage(client.socket, {
+      type: "error",
+      code: "run_not_found",
+      message: "Run bundle not found",
+      runId,
+    });
+    return;
   }
-  if (Array.isArray(data)) {
-    return Buffer.concat(data).toString("utf8");
+
+  resource.snapshotRequests.add(client);
+  resource.readErrors ??= new Map();
+  const message = error instanceof Error ? error.message : String(error);
+  if (resource.readErrors.get(client) !== message) {
+    resource.readErrors.set(client, message);
+    sendMessage(client.socket, { type: "error", code: "internal_error", message, runId });
   }
-  return data.toString("utf8");
+}
+
+function isRecoverableRunReadError(error: unknown): boolean {
+  if (error instanceof RunBundleNotFoundError) {
+    return false;
+  }
+  if (error instanceof FsSafeError) {
+    return ["path-mismatch", "not-found", "read-failed", "timeout"].includes(error.code);
+  }
+  return (
+    error instanceof SyntaxError ||
+    ["EACCES", "EPERM", "ENOENT", "ENOTDIR", "EIO", "EMFILE", "ENFILE", "EBUSY"].some((code) =>
+      hasNodeErrorCode(error, code),
+    )
+  );
 }
 
 function sendMessage(socket: WebSocket, message: ReplayServerMessage): void {

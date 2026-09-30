@@ -1,15 +1,24 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { FsSafeError } from "@openclaw/fs-safe";
 import { WebSocket } from "ws";
-import { createFilesystemRunSource } from "../examples/flows/replay-viewer/server/live-source.js";
+import {
+  createFilesystemRunSource,
+  type ViewerRunSource,
+} from "../examples/flows/replay-viewer/server/live-source.js";
 import {
   computeResourceDelta,
   createReplayLiveSyncServer,
 } from "../examples/flows/replay-viewer/server/live-sync.js";
+import {
+  RunBundleNotFoundError,
+  readRunBundleFile,
+} from "../examples/flows/replay-viewer/server/run-bundles.js";
 import { applyReplayPatch } from "../examples/flows/replay-viewer/src/lib/live-sync.js";
 import {
   buildViewerRunsState,
@@ -27,6 +36,313 @@ import type {
   ViewerRunLiveState,
   ViewerRunsState,
 } from "../examples/flows/replay-viewer/src/types.js";
+import { writePrivateJsonFile } from "../src/state-files.js";
+
+test("replay viewer rejects malformed messages and isolates invalid frames", async () => {
+  const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-admission-"));
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir,
+    livePollIntervalMs: 50,
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  let invalidSocket: WebSocket | undefined;
+  try {
+    await onceOpen(socket);
+    for (const payload of [
+      "null",
+      "{",
+      JSON.stringify({ type: "subscribe_run", runId: 7 }),
+      JSON.stringify({ type: "resync_run" }),
+    ]) {
+      socket.send(payload);
+      const error = await inbox.next((message) => message.type === "error");
+      assert.equal(error.code, "protocol_error");
+    }
+    socket.send(JSON.stringify({ type: "hello", protocol: "unsupported" }));
+    assert.equal(
+      (await inbox.next((message) => message.type === "error")).message,
+      "Unsupported replay protocol.",
+    );
+    socket.send(Buffer.from(JSON.stringify({ type: "ping" })));
+    await inbox.next((message) => message.type === "pong");
+
+    invalidSocket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    await onceOpen(invalidSocket);
+    const closed = once(invalidSocket, "close");
+    invalidSocket.send(Buffer.from([0xff]), { binary: false });
+    await closed;
+    socket.send(JSON.stringify({ type: "ping" }));
+    await inbox.next((message) => message.type === "pong");
+    socket.send(JSON.stringify({ type: "subscribe_runs" }));
+    assert.deepEqual(
+      (await inbox.next((message) => message.type === "runs_snapshot")).state.order,
+      [],
+    );
+  } finally {
+    invalidSocket?.terminate();
+    await closeSocket(socket);
+    await viewer.close();
+    await fs.rm(runsDir, { recursive: true, force: true });
+  }
+});
+
+for (const { resource, overlap } of [
+  { resource: "runs", overlap: false },
+  { resource: "run", overlap: false },
+  { resource: "runs", overlap: true },
+  { resource: "run", overlap: true },
+] as const) {
+  test(`replay viewer publishes ${resource} refreshes to existing subscribers${overlap ? " during polling" : ""}`, async () => {
+    const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-refresh-"));
+    const runId = "shared-run";
+    await writeRunBundle(runsDir, {
+      runId,
+      flowName: "shared-flow",
+      runTitle: "Shared subscriber proof",
+      startedAt: "2026-09-15T00:00:00.000Z",
+      updatedAt: "2026-09-15T00:00:00.000Z",
+      projectedStatus: "running",
+      liveStatus: "running",
+      currentNode: "extract_intent",
+      steps: [],
+    });
+    const filesystem = createFilesystemRunSource(runsDir);
+    const runs = await filesystem.getRunsState();
+    const run = await filesystem.getRunState(runId);
+    let holdNextRead = false;
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let reportRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      reportRead = resolve;
+    });
+    const beforeRead = async () => {
+      if (holdNextRead) {
+        holdNextRead = false;
+        reportRead();
+        await readGate;
+      }
+    };
+    const viewer = await createReplayViewerServer({
+      host: "127.0.0.1",
+      port: 0,
+      runsDir,
+      livePollIntervalMs: overlap ? 50 : 60_000,
+      source: {
+        getRunsState: async () => {
+          await beforeRead();
+          return structuredClone(runs);
+        },
+        getRunState: async () => {
+          await beforeRead();
+          return structuredClone(run);
+        },
+      },
+    });
+    const first = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    const second = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    const firstInbox = createMessageInbox(first);
+    const secondInbox = createMessageInbox(second);
+    const subscription =
+      resource === "runs" ? { type: "subscribe_runs" } : { type: "subscribe_run", runId };
+    try {
+      await Promise.all([onceOpen(first), onceOpen(second)]);
+      first.send(JSON.stringify(subscription));
+      const initial = await firstInbox.next(
+        (message) => message.type === "runs_snapshot" || message.type === "run_snapshot",
+      );
+      if (overlap) {
+        holdNextRead = true;
+        await readStarted;
+      }
+      runs.runsById[runId].status = "completed";
+      run.run.status = "completed";
+      second.send(JSON.stringify(subscription));
+      if (overlap) {
+        second.send(JSON.stringify({ type: "ping" }));
+        await secondInbox.next((message) => message.type === "pong");
+        releaseRead();
+      }
+      const current = await secondInbox.next(
+        (message) =>
+          message.type === "runs_snapshot" ||
+          message.type === "run_snapshot" ||
+          message.type === "runs_patch" ||
+          message.type === "run_patch",
+      );
+      assert(
+        current.type === "runs_snapshot" || current.type === "run_snapshot",
+        "new subscribers need a snapshot before patches",
+      );
+      first.send(JSON.stringify({ type: "ping" }));
+      const update = await firstInbox.next(
+        (message) =>
+          message.type === "runs_patch" || message.type === "run_patch" || message.type === "pong",
+      );
+      assert.notEqual(
+        update.type,
+        "pong",
+        "a peer snapshot must not consume an unpublished version",
+      );
+      assert(update.type === "runs_patch" || update.type === "run_patch");
+      assert.equal(update.fromVersion, initial.version);
+      assert.equal(update.toVersion, current.version);
+      assert.deepEqual(applyReplayPatch(initial.state, update.ops), current.state);
+    } finally {
+      releaseRead();
+      await Promise.all([closeSocket(first), closeSocket(second)]);
+      await viewer.close();
+      await fs.rm(runsDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("replay viewer recovers a subscription whose initial read failed", async () => {
+  let fail = true;
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir: "/synthetic/replay",
+    livePollIntervalMs: 60_000,
+    source: {
+      getRunsState: async () => {
+        if (fail) {
+          fail = false;
+          throw new Error("transient read failure");
+        }
+        return buildViewerRunsState([]);
+      },
+      getRunState: async () => {
+        throw new Error("unexpected selected run read");
+      },
+    },
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  try {
+    await onceOpen(socket);
+    socket.send(JSON.stringify({ type: "subscribe_runs" }));
+    assert.equal((await inbox.next((message) => message.type === "error")).code, "internal_error");
+    socket.send(JSON.stringify({ type: "ping" }));
+    const recovered = await inbox.next(
+      (message) => message.type === "runs_snapshot" || message.type === "pong",
+    );
+    assert.equal(recovered.type, "runs_snapshot", "recovery must establish the missing snapshot");
+  } finally {
+    await closeSocket(socket);
+    await viewer.close();
+  }
+});
+
+test("replay viewer discards refresh work from a disconnected requester", async () => {
+  let reads = 0;
+  let hold = false;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const reading = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir: "/synthetic/replay",
+    livePollIntervalMs: 60_000,
+    source: {
+      getRunsState: async () => {
+        reads += 1;
+        if (hold) {
+          hold = false;
+          started();
+          await gate;
+        }
+        return buildViewerRunsState([]);
+      },
+      getRunState: async () => {
+        throw new Error("unexpected selected run read");
+      },
+    },
+  });
+  const first = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const requester = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const firstInbox = createMessageInbox(first);
+  const requesterInbox = createMessageInbox(requester);
+  try {
+    await Promise.all([onceOpen(first), onceOpen(requester)]);
+    first.send(JSON.stringify({ type: "subscribe_runs" }));
+    await firstInbox.next((message) => message.type === "runs_snapshot");
+    hold = true;
+    requester.send(JSON.stringify({ type: "subscribe_runs" }));
+    await reading;
+    const beforeBurst = reads;
+    for (let index = 0; index < 25; index++) {
+      requester.send(JSON.stringify({ type: "resync_runs" }));
+    }
+    requester.send(JSON.stringify({ type: "ping" }));
+    await requesterInbox.next((message) => message.type === "pong");
+    await closeSocket(requester);
+    release();
+    first.send(JSON.stringify({ type: "ping" }));
+    await firstInbox.next((message) => message.type === "pong");
+    assert.equal(reads, beforeBurst, "disconnected requests must not leave a read backlog");
+  } finally {
+    release();
+    await Promise.all([closeSocket(first), closeSocket(requester)]);
+    await viewer.close();
+  }
+});
+
+test("replay viewer reports polling failures and resumes live run updates", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-poll-error-"));
+  const runsDir = path.join(directory, "runs");
+  const savedRunsDir = path.join(directory, "saved-runs");
+  await fs.mkdir(runsDir);
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir,
+    livePollIntervalMs: 50,
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  try {
+    await onceOpen(socket);
+    socket.send(JSON.stringify({ type: "subscribe_runs" }));
+    const initial = await inbox.next((message) => message.type === "runs_snapshot");
+    await fs.rename(runsDir, savedRunsDir);
+    await fs.writeFile(runsDir, "not a directory");
+    assert.equal((await inbox.next((message) => message.type === "error")).code, "internal_error");
+    await fs.rm(runsDir);
+    await fs.rename(savedRunsDir, runsDir);
+    await writeRunBundle(runsDir, {
+      runId: "recovered",
+      flowName: "synthetic",
+      runTitle: "Recovered synthetic run",
+      startedAt: "2026-09-15T00:00:00.000Z",
+      projectedStatus: "running",
+      liveStatus: "running",
+      updatedAt: "2026-09-15T00:00:00.000Z",
+      currentNode: "first",
+      steps: [],
+    });
+    const update = await inbox.next((message) => message.type === "runs_patch");
+    assert.equal(
+      applyReplayPatch<ViewerRunsState>(initial.state, update.ops).runsById.recovered?.status,
+      "running",
+    );
+  } finally {
+    await closeSocket(socket);
+    await viewer.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("replay viewer streams live sidebar and run patches over websocket", async () => {
   const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-live-"));
@@ -87,12 +403,26 @@ test("replay viewer streams live sidebar and run patches over websocket", async 
       steps: [firstStep, secondStep],
     });
 
-    const runsPatch = await inbox.next(
-      (message): message is Extract<ReplayServerMessage, { type: "runs_patch" }> =>
-        message.type === "runs_patch",
+    let nextRunsState = runsSnapshot.state;
+    let version = runsSnapshot.version;
+    const deadline = Date.now() + 5_000;
+    do {
+      const remainingMs = deadline - Date.now();
+      assert.ok(remainingMs > 0, "Timed out waiting for the live run update");
+      const runsPatch = await inbox.next(
+        (message): message is Extract<ReplayServerMessage, { type: "runs_patch" }> =>
+          message.type === "runs_patch",
+        remainingMs,
+      );
+      assert.equal(runsPatch.fromVersion, version);
+      assert.equal(runsPatch.toVersion, version + 1);
+      nextRunsState = applyReplayPatch<ViewerRunsState>(nextRunsState, runsPatch.ops);
+      version = runsPatch.toVersion;
+    } while (
+      nextRunsState.runsById[runId]?.status !== "waiting" ||
+      nextRunsState.runsById[runId]?.currentNode !== "judge_solution" ||
+      nextRunsState.runsById[runId]?.updatedAt !== "2026-03-31T08:00:10.000Z"
     );
-
-    const nextRunsState = applyReplayPatch<ViewerRunsState>(runsSnapshot.state, runsPatch.ops);
 
     assert.equal(listViewerRuns(nextRunsState)[0]?.status, "waiting");
     assert.equal(listViewerRuns(nextRunsState)[0]?.currentNode, "judge_solution");
@@ -348,6 +678,7 @@ for (const sourceType of ["prompt", "user_message_chunk"] as const) {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as FlowBundledSessionEvent);
+      events[0].direction = "inbound";
       events[0].message = {
         jsonrpc: "2.0",
         method: "session/update",
@@ -488,9 +819,10 @@ async function createReplayViewerServer(options: {
   port: number;
   runsDir: string;
   livePollIntervalMs: number;
+  source?: ViewerRunSource;
 }): Promise<{ baseUrl: string; close(): Promise<void> }> {
   const liveSyncServer = createReplayLiveSyncServer({
-    source: createFilesystemRunSource(options.runsDir),
+    source: options.source ?? createFilesystemRunSource(options.runsDir),
     pollIntervalMs: options.livePollIntervalMs,
   });
   const server = http.createServer((_request, response) => {
@@ -499,11 +831,9 @@ async function createReplayViewerServer(options: {
   });
 
   server.on("upgrade", (request, socket, head) => {
-    void liveSyncServer.handleUpgrade(request, socket, head).then((handled) => {
-      if (!handled) {
-        socket.destroy();
-      }
-    });
+    if (!liveSyncServer.handleUpgrade(request, socket, head)) {
+      socket.destroy();
+    }
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -637,22 +967,19 @@ async function updateRunBundle(
     await fs.readFile(path.join(projectionsDir, "run.json"), "utf8"),
   ) as FlowRunState;
 
-  await fs.writeFile(
-    path.join(projectionsDir, "live.json"),
-    JSON.stringify({
-      runId,
-      flowName: run.flowName,
-      runTitle: run.runTitle,
-      startedAt: run.startedAt,
-      updatedAt: options.updatedAt,
-      status: options.liveStatus,
-      currentNode: options.currentNode,
-      currentAttemptId: options.steps.at(-1)?.attemptId,
-      currentNodeType: options.steps.at(-1)?.nodeType,
-      currentNodeStartedAt: options.steps.at(-1)?.startedAt,
-    } satisfies Partial<FlowRunState>),
-  );
-  await fs.writeFile(path.join(projectionsDir, "steps.json"), JSON.stringify(options.steps));
+  await writePrivateJsonFile(path.join(projectionsDir, "live.json"), {
+    runId,
+    flowName: run.flowName,
+    runTitle: run.runTitle,
+    startedAt: run.startedAt,
+    updatedAt: options.updatedAt,
+    status: options.liveStatus,
+    currentNode: options.currentNode,
+    currentAttemptId: options.steps.at(-1)?.attemptId,
+    currentNodeType: options.steps.at(-1)?.nodeType,
+    currentNodeStartedAt: options.steps.at(-1)?.startedAt,
+  } satisfies Partial<FlowRunState>);
+  await writePrivateJsonFile(path.join(projectionsDir, "steps.json"), options.steps);
 }
 
 function makeFlow(): FlowDefinitionSnapshot {
@@ -905,3 +1232,608 @@ async function appendLiveSessionChunk(
   live.updatedAt = `2026-04-01T08:00:0${seq}.000Z`;
   await fs.writeFile(path.join(projectionsDir, "live.json"), JSON.stringify(live));
 }
+
+async function selectedReadRecoveryFixture() {
+  const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-selected-read-recovery-"));
+  const runId = "selected-recovery";
+  await writeRunBundle(runsDir, {
+    runId,
+    flowName: "selected-recovery",
+    runTitle: "Original title",
+    startedAt: "2026-09-22T00:00:00.000Z",
+    updatedAt: "2026-09-22T00:00:00.000Z",
+    projectedStatus: "running",
+    liveStatus: "running",
+    currentNode: "extract_intent",
+    steps: [],
+  });
+  const current = await createFilesystemRunSource(runsDir).getRunState(runId);
+  return { runsDir, runId, current };
+}
+
+const selectedReadFailures = [
+  {
+    name: "path-mismatch",
+    make: () => new FsSafeError("path-mismatch", "controlled identity mismatch"),
+  },
+  {
+    name: "EACCES",
+    make: () => Object.assign(new Error("controlled read denial"), { code: "EACCES" }),
+  },
+];
+
+for (const failure of selectedReadFailures) {
+  test(`selected-run initial ${failure.name} failure recovers without resubscription`, async () => {
+    const { runsDir, runId, current } = await selectedReadRecoveryFixture();
+    let unavailable = true;
+    let reads = 0;
+    const viewer = await createReplayViewerServer({
+      host: "127.0.0.1",
+      port: 0,
+      runsDir,
+      livePollIntervalMs: 25,
+      source: {
+        getRunsState: async () => {
+          throw new Error("This test subscribes only to the selected run");
+        },
+        getRunState: async (requested) => {
+          assert.equal(requested, runId);
+          reads += 1;
+          if (unavailable) {
+            throw failure.make();
+          }
+          return structuredClone(current);
+        },
+      },
+    });
+    const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    const inbox = createMessageInbox(socket);
+    try {
+      await onceOpen(socket);
+      socket.send(JSON.stringify({ type: "subscribe_run", runId }));
+      const reported = await inbox.next((message) => message.type === "error", 3_000);
+      const failedReads = reads;
+      unavailable = false;
+      // No reconnect, ping, subscribe_run or resync_run after this point.
+      const recovered = await inbox.next((message) => message.type === "run_snapshot", 3_000);
+      assert.equal(reported.code, "internal_error");
+      assert.equal(reported.runId, runId);
+      assert.equal(recovered.runId, runId);
+      assert.deepEqual(recovered.state, current);
+      assert(reads > failedReads, "a retained pending subscription must be polled again");
+      assert.equal(socket.readyState, WebSocket.OPEN);
+    } finally {
+      await closeSocket(socket);
+      await viewer.close();
+      await fs.rm(runsDir, { recursive: true, force: true });
+    }
+  });
+
+  test(`active selected-run ${failure.name} failure preserves its state and version`, async () => {
+    const { runsDir, runId, current } = await selectedReadRecoveryFixture();
+    let unavailable = false;
+    let reads = 0;
+    const viewer = await createReplayViewerServer({
+      host: "127.0.0.1",
+      port: 0,
+      runsDir,
+      livePollIntervalMs: 25,
+      source: {
+        getRunsState: async () => {
+          throw new Error("This test subscribes only to the selected run");
+        },
+        getRunState: async (requested) => {
+          assert.equal(requested, runId);
+          reads += 1;
+          if (unavailable) {
+            throw failure.make();
+          }
+          return structuredClone(current);
+        },
+      },
+    });
+    const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    const inbox = createMessageInbox(socket);
+    try {
+      await onceOpen(socket);
+      socket.send(JSON.stringify({ type: "subscribe_run", runId }));
+      const initial = await inbox.next((message) => message.type === "run_snapshot", 3_000);
+      current.run.runTitle = "Version two";
+      current.manifest.runTitle = "Version two";
+      const advanced = await inbox.next((message) => message.type === "run_patch", 3_000);
+      assert.equal(advanced.fromVersion, initial.version);
+      assert(advanced.toVersion > initial.version);
+      assert.deepEqual(applyReplayPatch(initial.state, advanced.ops), current);
+      const lastGood = structuredClone(current);
+
+      unavailable = true;
+      const reported = await inbox.next((message) => message.type === "error", 3_000);
+      const failedReads = reads;
+      unavailable = false;
+      // Recommended recovery publishes a snapshot even when content is unchanged.
+      const recovered = await inbox.next((message) => message.type === "run_snapshot", 3_000);
+      assert.equal(reported.code, "internal_error");
+      assert.equal(reported.runId, runId);
+      assert.equal(
+        recovered.version,
+        advanced.toVersion,
+        "a failed read must not reset or advance version",
+      );
+      assert.deepEqual(recovered.state, lastGood);
+      assert(reads > failedReads);
+
+      current.run.status = "completed";
+      current.manifest.status = "completed";
+      if (current.live) {
+        current.live.status = "completed";
+      }
+      const later = await inbox.next((message) => message.type === "run_patch", 3_000);
+      assert.equal(later.fromVersion, recovered.version);
+      assert(later.toVersion > recovered.version);
+      assert.deepEqual(applyReplayPatch(recovered.state, later.ops), current);
+      assert.equal(socket.readyState, WebSocket.OPEN);
+    } finally {
+      await closeSocket(socket);
+      await viewer.close();
+      await fs.rm(runsDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("filesystem run source distinguishes missing required inputs from a missing run root", async () => {
+  const { runsDir, runId, current } = await selectedReadRecoveryFixture();
+  const source = createFilesystemRunSource(runsDir);
+  try {
+    for (const relativePath of [
+      "manifest.json",
+      "flow.json",
+      "projections/run.json",
+      "projections/steps.json",
+      "trace.ndjson",
+    ]) {
+      const file = path.join(runsDir, runId, relativePath);
+      const held = `${file}.held`;
+      await fs.rename(file, held);
+      try {
+        await assert.rejects(source.getRunState(runId), (error: unknown) => {
+          assert.equal(error instanceof RunBundleNotFoundError, false, relativePath);
+          assert(error instanceof FsSafeError, relativePath);
+          assert.equal(error.code, "not-found", relativePath);
+          return true;
+        });
+      } finally {
+        await fs.rename(held, file);
+      }
+      assert.deepEqual(await source.getRunState(runId), current);
+    }
+
+    // The live projection is optional, unlike the five required inputs above.
+    await fs.rm(path.join(runsDir, runId, "projections/live.json"));
+    assert.equal((await source.getRunState(runId)).live, null);
+    await assert.rejects(source.getRunState("ordinary-missing"), RunBundleNotFoundError);
+    await assert.rejects(
+      createFilesystemRunSource(path.join(runsDir, "missing-configured-root")).getRunState(runId),
+      RunBundleNotFoundError,
+    );
+  } finally {
+    await fs.rm(runsDir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "run-root absence confirmation preserves contained aliases and rejects outside targets",
+  { skip: process.platform === "win32" },
+  async () => {
+    const { runsDir, runId } = await selectedReadRecoveryFixture();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-boundary-outside-"));
+    try {
+      await fs.symlink(path.join(runsDir, runId), path.join(runsDir, "contained-existing"));
+      assert.deepEqual(
+        await readRunBundleFile(runsDir, "contained-existing", "flow.json"),
+        await readRunBundleFile(runsDir, runId, "flow.json"),
+      );
+      await fs.symlink(
+        path.join(runsDir, "missing-target"),
+        path.join(runsDir, "contained-missing"),
+      );
+      await assert.rejects(
+        readRunBundleFile(runsDir, "contained-missing", "flow.json"),
+        RunBundleNotFoundError,
+      );
+
+      await fs.writeFile(path.join(outside, "flow.json"), "outside sentinel must not be read");
+      await fs.writeFile(path.join(outside, "not-a-directory"), "outside file sentinel");
+      for (const [alias, target] of [
+        ["outside-existing", outside],
+        ["outside-missing", path.join(outside, "missing-directory")],
+        ["outside-file", path.join(outside, "not-a-directory")],
+      ]) {
+        assert.ok(alias);
+        assert.ok(target);
+        await fs.symlink(target, path.join(runsDir, alias));
+        await assert.rejects(readRunBundleFile(runsDir, alias, "flow.json"), (error: unknown) => {
+          assert(error instanceof Error);
+          assert.equal(error instanceof RunBundleNotFoundError, false, alias);
+          return true;
+        });
+      }
+    } finally {
+      await fs.rm(runsDir, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+test("selected-run missing files recover on the same socket with deduplicated warnings and stable versions", async () => {
+  const { runsDir, runId, current } = await selectedReadRecoveryFixture();
+  const source = createFilesystemRunSource(runsDir);
+  const flowFile = path.join(runsDir, runId, "flow.json");
+  await fs.rename(flowFile, `${flowFile}.held`);
+  let failedReads = 0;
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir,
+    livePollIntervalMs: 25,
+    source: {
+      getRunsState: async () => {
+        throw new Error("This test subscribes only to the selected run");
+      },
+      getRunState: async (requested) => {
+        assert.equal(requested, runId);
+        try {
+          return await source.getRunState(requested);
+        } catch (error) {
+          failedReads += 1;
+          throw error;
+        }
+      },
+    },
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  try {
+    await onceOpen(socket);
+    socket.send(JSON.stringify({ type: "subscribe_run", runId }));
+    const initialWarning = await inbox.next((message) => message.type === "error", 3_000);
+    assert.equal(initialWarning.code, "internal_error");
+    assert.equal(initialWarning.runId, runId);
+    await waitForBoundaryCondition(() => failedReads >= 3);
+    await assertBoundaryPong(socket, inbox);
+
+    await fs.rename(`${flowFile}.held`, flowFile);
+    const initial = await inbox.next((message) => message.type === "run_snapshot", 3_000);
+    assert.equal(initial.runId, runId);
+    assert.equal(initial.version, 1);
+    assert.deepEqual(initial.state, current);
+
+    const lastGood = structuredClone(initial.state);
+
+    const failuresBeforeActiveRead = failedReads;
+    await fs.rename(flowFile, `${flowFile}.held`);
+    const activeWarning = await inbox.next((message) => message.type === "error", 3_000);
+    assert.equal(activeWarning.code, "internal_error");
+    assert.equal(activeWarning.runId, runId);
+    assert.equal(activeWarning.message, initialWarning.message, "a new outage must warn again");
+    await waitForBoundaryCondition(() => failedReads >= failuresBeforeActiveRead + 3);
+    await assertBoundaryPong(socket, inbox);
+
+    await fs.rename(`${flowFile}.held`, flowFile);
+    const recovered = await inbox.next((message) => message.type === "run_snapshot", 3_000);
+    assert.equal(recovered.runId, runId);
+    assert.equal(recovered.version, initial.version);
+    assert.deepEqual(recovered.state, lastGood);
+
+    await updateRunBundle(runsDir, runId, {
+      liveStatus: "completed",
+      updatedAt: "2026-09-22T00:00:02.000Z",
+      currentNode: "judge_solution",
+      steps: [],
+    });
+    const later = await inbox.next(
+      (message) => message.type === "run_patch" || message.type === "run_snapshot",
+      3_000,
+    );
+    assert.equal(later.runId, runId);
+    if (later.type === "run_patch") {
+      assert.equal(later.fromVersion, recovered.version);
+      assert.equal(later.toVersion, recovered.version + 1);
+      assert.deepEqual(
+        applyReplayPatch(recovered.state, later.ops),
+        await source.getRunState(runId),
+      );
+    } else {
+      // The atomic update can race a read and use the existing recovery snapshot.
+      assert.equal(later.version, recovered.version + 1);
+      assert.deepEqual(later.state, await source.getRunState(runId));
+    }
+    assert.equal(socket.readyState, WebSocket.OPEN);
+    // No reconnect, resubscribe, or resync was used to recover either failure.
+  } finally {
+    await closeSocket(socket);
+    await viewer.close();
+    await fs.rm(runsDir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "missing and denied run targets share a generic terminal envelope and remain unsubscribed after repair",
+  { skip: process.platform === "win32" },
+  async () => {
+    const { runsDir, runId } = await selectedReadRecoveryFixture();
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-outside-"));
+    await fs.writeFile(path.join(outside, "flow.json"), "outside sentinel must not be read");
+    await fs.writeFile(path.join(outside, "not-a-directory"), "outside file sentinel");
+    const source = createFilesystemRunSource(runsDir);
+    const reads = new Map<string, number>();
+    let witnessReads = 0;
+    const viewer = await createReplayViewerServer({
+      host: "127.0.0.1",
+      port: 0,
+      runsDir,
+      livePollIntervalMs: 25,
+      source: {
+        getRunsState: async () => {
+          throw new Error("This test uses selected-run subscriptions only");
+        },
+        getRunState: async (requested) => {
+          reads.set(requested, (reads.get(requested) ?? 0) + 1);
+          const state = await source.getRunState(requested);
+          if (requested === runId) {
+            witnessReads += 1;
+          }
+          return state;
+        },
+      },
+    });
+    const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    const inbox = createMessageInbox(socket);
+    try {
+      await onceOpen(socket);
+      socket.send(JSON.stringify({ type: "subscribe_run", runId }));
+      await inbox.next((message) => message.type === "run_snapshot", 3_000);
+      const terminalReadCounts = new Map<string, number>();
+      for (const kind of [
+        "missing-root",
+        "outside-existing",
+        "outside-missing",
+        "outside-file",
+        "file-existing",
+        "file-missing",
+      ]) {
+        const requested = `terminal-${kind}`;
+        const entry = path.join(runsDir, requested);
+        if (kind.startsWith("file-")) {
+          await writeBoundaryRun(runsDir, requested);
+          await fs.rm(path.join(entry, "flow.json"));
+          await fs.symlink(
+            path.join(outside, kind === "file-existing" ? "flow.json" : "missing-flow.json"),
+            path.join(entry, "flow.json"),
+          );
+        } else if (kind !== "missing-root") {
+          const target =
+            kind === "outside-existing"
+              ? outside
+              : path.join(
+                  outside,
+                  kind === "outside-missing" ? "missing-directory" : "not-a-directory",
+                );
+          await fs.symlink(target, entry);
+        }
+
+        socket.send(JSON.stringify({ type: "subscribe_run", runId: requested }));
+        const terminal = await inbox.next((message) => message.type === "error", 3_000);
+        assert.deepEqual(terminal, {
+          type: "error",
+          code: "run_not_found",
+          message: "Run bundle not found",
+          runId: requested,
+        });
+        terminalReadCounts.set(requested, reads.get(requested) ?? 0);
+        await fs.rm(entry, { recursive: true, force: true });
+        await writeBoundaryRun(runsDir, requested);
+        assert.equal((await source.getRunState(requested)).run.runId, requested);
+      }
+
+      const witnessBefore = witnessReads;
+      await waitForBoundaryCondition(() => witnessReads >= witnessBefore + 3);
+      for (const [requested, count] of terminalReadCounts) {
+        assert.equal(reads.get(requested), count, `${requested} must remain unsubscribed`);
+      }
+      await assertBoundaryPong(socket, inbox);
+    } finally {
+      await closeSocket(socket);
+      await viewer.close();
+      await fs.rm(runsDir, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const outcome of ["recovered", "still missing"] as const) {
+  test(`unsubscribing a pending ${outcome} filesystem retry does not resurrect the run`, async () => {
+    const { runsDir, runId } = await selectedReadRecoveryFixture();
+    const witnessId = "healthy-witness";
+    await writeBoundaryRun(runsDir, witnessId);
+    const flowFile = path.join(runsDir, runId, "flow.json");
+    await fs.rename(flowFile, `${flowFile}.held`);
+    const source = createFilesystemRunSource(runsDir);
+    let holdRetry = false;
+    let retryHeld = false;
+    let retryFinished = false;
+    let selectedReads = 0;
+    let witnessReads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const viewer = await createReplayViewerServer({
+      host: "127.0.0.1",
+      port: 0,
+      runsDir,
+      livePollIntervalMs: 25,
+      source: {
+        getRunsState: async () => {
+          throw new Error("This test uses selected-run subscriptions only");
+        },
+        getRunState: async (requested) => {
+          const held = requested === runId && holdRetry;
+          if (requested === runId) {
+            selectedReads += 1;
+          }
+          if (held) {
+            holdRetry = false;
+            retryHeld = true;
+            await gate;
+          }
+          try {
+            const state = await source.getRunState(requested);
+            if (requested === witnessId) {
+              witnessReads += 1;
+            }
+            return state;
+          } finally {
+            if (held) {
+              retryFinished = true;
+            }
+          }
+        },
+      },
+    });
+    const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    const inbox = createMessageInbox(socket);
+    try {
+      await onceOpen(socket);
+      socket.send(JSON.stringify({ type: "subscribe_run", runId: witnessId }));
+      await inbox.next((message) => message.type === "run_snapshot", 3_000);
+      socket.send(JSON.stringify({ type: "subscribe_run", runId }));
+      const warning = await inbox.next((message) => message.type === "error", 3_000);
+      assert.equal(warning.code, "internal_error");
+      assert.equal(warning.runId, runId);
+      holdRetry = true;
+      await waitForBoundaryCondition(() => retryHeld);
+      socket.send(JSON.stringify({ type: "unsubscribe_run", runId }));
+      await assertBoundaryPong(socket, inbox);
+      const readsAtUnsubscribe = selectedReads;
+
+      if (outcome === "recovered") {
+        await fs.rename(`${flowFile}.held`, flowFile);
+      }
+      release();
+      await waitForBoundaryCondition(() => retryFinished);
+      if (outcome === "still missing") {
+        await fs.rename(`${flowFile}.held`, flowFile);
+      }
+      const witnessBefore = witnessReads;
+      await waitForBoundaryCondition(() => witnessReads >= witnessBefore + 3);
+      assert.equal(selectedReads, readsAtUnsubscribe);
+      await assertBoundaryPong(socket, inbox);
+    } finally {
+      release();
+      await closeSocket(socket);
+      await viewer.close();
+      await fs.rm(runsDir, { recursive: true, force: true });
+    }
+  });
+}
+
+async function writeBoundaryRun(runsDir: string, runId: string): Promise<void> {
+  await writeRunBundle(runsDir, {
+    runId,
+    flowName: "selected-recovery",
+    runTitle: "Boundary fixture",
+    startedAt: "2026-09-22T00:00:00.000Z",
+    updatedAt: "2026-09-22T00:00:00.000Z",
+    projectedStatus: "running",
+    liveStatus: "running",
+    currentNode: "extract_intent",
+    steps: [],
+  });
+}
+
+async function waitForBoundaryCondition(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (!check()) {
+    assert(Date.now() < deadline, "Timed out waiting for the filesystem read boundary");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function assertBoundaryPong(
+  socket: WebSocket,
+  inbox: ReturnType<typeof createMessageInbox>,
+): Promise<void> {
+  socket.send(JSON.stringify({ type: "ping" }));
+  assert.deepEqual(
+    await inbox.next((message) => message.type !== "ready", 3_000),
+    { type: "pong" },
+    "No duplicate warning, unsolicited snapshot, or patch may precede the pong",
+  );
+}
+
+test("polling skips a terminal subscription removed while another run read is pending", async () => {
+  const { runsDir, runId } = await selectedReadRecoveryFixture();
+  const source = createFilesystemRunSource(runsDir);
+  let targetReads = 0;
+  let witnessReads = 0;
+  let targetStarted = false;
+  let witnessHeld = false;
+  let releaseTarget!: () => void;
+  let releaseWitness!: () => void;
+  const targetGate = new Promise<void>((resolve) => {
+    releaseTarget = resolve;
+  });
+  const witnessGate = new Promise<void>((resolve) => {
+    releaseWitness = resolve;
+  });
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir,
+    livePollIntervalMs: 25,
+    source: {
+      getRunsState: async () => {
+        throw new Error("Only selected runs are subscribed");
+      },
+      getRunState: async (requested) => {
+        if (requested === "missing-poll-target") {
+          targetReads += 1;
+          if (targetReads === 1) {
+            targetStarted = true;
+            await targetGate;
+          }
+        } else if (targetStarted && !witnessHeld) {
+          witnessHeld = true;
+          await witnessGate;
+        }
+        const state = await source.getRunState(requested);
+        witnessReads += 1;
+        return state;
+      },
+    },
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  try {
+    await onceOpen(socket);
+    socket.send(JSON.stringify({ type: "subscribe_run", runId }));
+    await inbox.next((message) => message.type === "run_snapshot", 3_000);
+    socket.send(JSON.stringify({ type: "subscribe_run", runId: "missing-poll-target" }));
+    await waitForBoundaryCondition(() => targetStarted && witnessHeld);
+    releaseTarget();
+    const error = await inbox.next((message) => message.type === "error", 3_000);
+    assert.equal(error.code, "run_not_found");
+    assert.equal(targetReads, 1);
+    const before = witnessReads;
+    releaseWitness();
+    await waitForBoundaryCondition(() => witnessReads >= before + 3);
+    assert.equal(targetReads, 1, "a stale polling list must not recreate an unsubscribed resource");
+    await assertBoundaryPong(socket, inbox);
+  } finally {
+    releaseTarget();
+    releaseWitness();
+    await closeSocket(socket);
+    await viewer.close();
+    await fs.rm(runsDir, { recursive: true, force: true });
+  }
+});

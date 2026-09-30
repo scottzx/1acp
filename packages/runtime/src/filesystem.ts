@@ -8,7 +8,10 @@ import type {
   WriteTextFileRequest,
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
+import { root, type Root } from "@openclaw/fs-safe/root";
+import { assertControlAuthority, type AcpControlAuthority } from "./async-control.js";
 import { PermissionDeniedError, PermissionPromptUnavailableError } from "./errors.js";
+import { sliceReadWindow } from "./file-read-window.js";
 import { promptForPermission } from "./permission-prompt.js";
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "./types.js";
 
@@ -20,7 +23,11 @@ export type FileSystemHandlersOptions = {
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   onOperation?: (operation: ClientOperation) => void;
-  confirmWrite?: (filePath: string, preview: string, sessionId: string) => Promise<boolean>;
+  confirmWrite?: (
+    filePath: string,
+    preview: string,
+    ctx: { sessionId?: string; signal?: AbortSignal },
+  ) => Promise<boolean>;
 };
 
 function nowIso(): string {
@@ -29,7 +36,11 @@ function nowIso(): string {
 
 function isPathInside(rootDir: string, targetPath: string): boolean {
   const relative = path.relative(rootDir, targetPath);
-  return relative.length === 0 || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  if (relative.length === 0) {
+    return true;
+  }
+  // Only a parent traversal (".." or "../x") escapes; names like "..notes" stay inside.
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function isWithinRoot(rootDir: string, targetPath: string): boolean {
@@ -72,7 +83,6 @@ function canonicalizePath(filePath: string): string {
     }
   }
 }
-
 function toWritePreview(content: string): string {
   const normalized = content.replace(/\r\n/g, "\n");
   const lines = normalized.split("\n");
@@ -90,11 +100,16 @@ function toWritePreview(content: string): string {
   return preview;
 }
 
-async function defaultConfirmWrite(filePath: string, preview: string): Promise<boolean> {
+async function defaultConfirmWrite(
+  filePath: string,
+  preview: string,
+  ctx: { sessionId?: string; signal?: AbortSignal },
+): Promise<boolean> {
   return await promptForPermission({
     header: `[permission] Allow write to ${filePath}?`,
     details: preview,
     prompt: "Allow write? (y/N) ",
+    signal: ctx.signal,
   });
 }
 
@@ -104,15 +119,12 @@ function canPromptForPermission(): boolean {
 
 export class FileSystemHandlers {
   private readonly rootDir: string;
+  private workspace?: Promise<Root>;
   private permissionMode: PermissionMode;
   private nonInteractivePermissions: NonInteractivePermissionPolicy;
   private readonly onOperation?: (operation: ClientOperation) => void;
   private readonly usesDefaultConfirmWrite: boolean;
-  private readonly confirmWrite: (
-    filePath: string,
-    preview: string,
-    sessionId: string,
-  ) => Promise<boolean>;
+  private readonly confirmWrite: NonNullable<FileSystemHandlersOptions["confirmWrite"]>;
 
   constructor(options: FileSystemHandlersOptions) {
     this.rootDir = canonicalizePath(path.resolve(options.cwd));
@@ -131,7 +143,11 @@ export class FileSystemHandlers {
     this.nonInteractivePermissions = nonInteractivePermissions ?? "deny";
   }
 
-  async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+  async readTextFile(
+    params: ReadTextFileRequest,
+    authority?: AcpControlAuthority,
+  ): Promise<ReadTextFileResponse> {
+    assertControlAuthority(authority);
     const filePath = this.resolvePathWithinRoot(params.path);
     const summary = `read_text_file: ${filePath}`;
     this.emitOperation({
@@ -147,8 +163,11 @@ export class FileSystemHandlers {
         throw new PermissionDeniedError("Permission denied for fs/read_text_file (--deny-all)");
       }
 
-      const content = await fs.readFile(filePath, "utf8");
-      const sliced = this.sliceContent(content, params.line, params.limit);
+      const content = this.isAgentStatePath(filePath)
+        ? await fs.readFile(filePath, "utf8")
+        : await (await this.getWorkspace()).readText(filePath);
+      assertControlAuthority(authority);
+      const sliced = sliceReadWindow(content, params.line, params.limit);
 
       this.emitOperation({
         method: "fs/read_text_file",
@@ -171,7 +190,11 @@ export class FileSystemHandlers {
     }
   }
 
-  async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+  async writeTextFile(
+    params: WriteTextFileRequest,
+    authority?: AcpControlAuthority,
+  ): Promise<WriteTextFileResponse> {
+    assertControlAuthority(authority);
     const filePath = this.resolvePathWithinRoot(params.path);
     const preview = toWritePreview(params.content);
     const summary = `write_text_file: ${filePath}`;
@@ -185,12 +208,34 @@ export class FileSystemHandlers {
     });
 
     try {
-      if (!(await this.isWriteApproved(filePath, preview, params.sessionId))) {
+      const approved = await this.isWriteApproved(
+        filePath,
+        preview,
+        params.sessionId,
+        authority?.signal,
+      );
+      assertControlAuthority(authority);
+      if (!approved) {
         throw new PermissionDeniedError("Permission denied for fs/write_text_file");
       }
 
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, params.content, "utf8");
+      if (this.isAgentStatePath(filePath)) {
+        assertControlAuthority(authority);
+        await fs.writeFile(filePath, params.content, "utf8");
+      } else {
+        const workspace = await this.getWorkspace();
+        const target = await workspace.resolve(filePath);
+        const file = await workspace.openWritable(target, {
+          mode: 0o666,
+          assertBeforeMutation: () => assertControlAuthority(authority),
+        });
+        try {
+          assertControlAuthority(authority);
+          await file.handle.writeFile(params.content, "utf8");
+        } finally {
+          await file.handle.close();
+        }
+      }
 
       this.emitOperation({
         method: "fs/write_text_file",
@@ -216,7 +261,8 @@ export class FileSystemHandlers {
   private async isWriteApproved(
     filePath: string,
     preview: string,
-    sessionId: string,
+    sessionId?: string,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     if (this.permissionMode === "approve-all") {
       return true;
@@ -231,7 +277,7 @@ export class FileSystemHandlers {
     ) {
       throw new PermissionPromptUnavailableError();
     }
-    return await this.confirmWrite(filePath, preview, sessionId);
+    return await this.confirmWrite(filePath, preview, { sessionId, signal });
   }
 
   private resolvePathWithinRoot(rawPath: string): string {
@@ -240,33 +286,29 @@ export class FileSystemHandlers {
     }
     const resolved = canonicalizePath(path.resolve(rawPath));
     if (!isWithinRoot(this.rootDir, resolved)) {
-      throw new Error(`Path is outside allowed cwd subtree: ${resolved}`);
+      // Report the caller-supplied path, not the canonicalized form.
+      throw new Error(`Path is outside allowed cwd subtree: ${rawPath}`);
     }
-    return resolved;
+    // Preserve symlink/.. traversal for filesystem resolution.
+    return rawPath;
   }
 
-  private sliceContent(
-    content: string,
-    line: number | null | undefined,
-    limit: number | null | undefined,
-  ): string {
-    if (line == null && limit == null) {
-      return content;
-    }
+  /**
+   * True when the path is outside the cwd root but inside one of the agent
+   * state directories (e.g. ~/.grok). Those reads/writes bypass the fs-safe
+   * workspace wrapper, which only accepts paths under the cwd root.
+   */
+  private isAgentStatePath(filePath: string): boolean {
+    const resolved = canonicalizePath(path.resolve(filePath));
+    return !isPathInside(this.rootDir, resolved) && isWithinRoot(this.rootDir, resolved);
+  }
 
-    const lines = content.split("\n");
-    const startLine = line == null ? 1 : Math.max(1, Math.trunc(line));
-    const startIndex = Math.max(0, startLine - 1);
-    const maxLines = limit == null ? undefined : Math.max(0, Math.trunc(limit));
-
-    if (maxLines === 0) {
-      return "";
-    }
-
-    const endIndex =
-      maxLines == null ? lines.length : Math.min(lines.length, startIndex + maxLines);
-
-    return lines.slice(startIndex, endIndex).join("\n");
+  private getWorkspace(): Promise<Root> {
+    return (this.workspace ??= root(this.rootDir, {
+      symlinks: "follow-within-root",
+      hardlinks: "allow",
+      maxBytes: Infinity,
+    }));
   }
 
   private readWindowDetails(

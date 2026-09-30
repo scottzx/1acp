@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import childProcess, { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
 import type { PromptInput } from "../src/prompt-content.js";
 import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
 import {
@@ -13,6 +18,8 @@ import {
   recordPromptSubmission,
   recordSessionUpdate,
 } from "../src/session/conversation-model.js";
+import { parseSessionRecord } from "../src/session/persistence.js";
+import type { SessionRecord } from "../src/types.js";
 import {
   extractAgentMessageChunkText,
   extractJsonRpcId,
@@ -20,7 +27,9 @@ import {
 } from "./jsonrpc-test-helpers.js";
 import { queuePaths } from "./queue-test-helpers.js";
 
-const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+const CLI_PATH = fileURLToPath(
+  new URL(`../src/cli${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url),
+);
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const FLOW_FIXTURE_PATH = fileURLToPath(new URL("./fixtures/flow-branch.flow.js", import.meta.url));
 const FLOW_SHELL_FIXTURE_PATH = fileURLToPath(
@@ -34,6 +43,9 @@ const FLOW_ACP_DISCONNECT_FIXTURE_PATH = fileURLToPath(
 );
 const FLOW_WAIT_FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/flow-wait.flow.js", import.meta.url),
+);
+const FLOW_SESSION_TURN_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-session-turn.flow.js", import.meta.url),
 );
 const FLOW_WORKDIR_FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/flow-workdir.flow.js", import.meta.url),
@@ -61,7 +73,37 @@ type CliRunOptions = {
   cwd?: string;
   stdin?: string;
   env?: NodeJS.ProcessEnv;
+  promptGate?: { directory: string; startupTimeoutMs: number };
 };
+
+const CLI_RETIREMENT_TIMEOUT_MS = 5_000;
+// Only withTempHome consumes a marker; individual children must never clear it.
+const retainedCliHomes = new Set<string>();
+
+type TestOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+async function observeTestOutcome<T>(run: () => Promise<T>): Promise<TestOutcome<T>> {
+  try {
+    return { ok: true, value: await run() };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+function unwrapTestOutcomes<T>(body: TestOutcome<T>, cleanup: TestOutcome<void>): T {
+  if (!body.ok && !cleanup.ok) {
+    throw new AggregateError([body.error, cleanup.error], "Test body and cleanup failed", {
+      cause: body.error,
+    });
+  }
+  if (!body.ok) {
+    throw body.error;
+  }
+  if (!cleanup.ok) {
+    throw cleanup.error;
+  }
+  return body.value;
+}
 
 test("integration: exec echo baseline", async () => {
   await withTempHome(async (homeDir) => {
@@ -77,13 +119,274 @@ test("integration: exec echo baseline", async () => {
   });
 });
 
+for (const format of ["text", "quiet", "json"] as const) {
+  test(`integration: ${format} output survives malformed agent updates`, async () => {
+    await withTempHome(async (homeDir) => {
+      const peerPath = path.join(homeDir, "malformed-agent.mjs");
+      await fs.writeFile(
+        peerPath,
+        `
+import readline from 'node:readline';
+const send = value => process.stdout.write(JSON.stringify({jsonrpc:'2.0', ...value})+'\\n');
+readline.createInterface({input:process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') {
+    send({id:request.id,result:{protocolVersion:1,agentCapabilities:{}}});
+  } else if (request.method === 'session/new') {
+    send({id:request.id,result:{sessionId:'malformed-proof'}});
+  } else if (request.method === 'session/prompt') {
+    for (const update of [
+      {sessionUpdate:'agent_message_chunk'},
+      {sessionUpdate:'agent_thought_chunk',content:null},
+      {sessionUpdate:'agent_message_chunk',content:{type:'text',text:1}},
+      {sessionUpdate:'plan'},
+      {sessionUpdate:'plan',entries:[null]},
+      {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'survived malformed updates'}},
+    ]) send({method:'session/update',params:{sessionId:'malformed-proof',update}});
+    send({id:request.id,result:{stopReason:'end_turn'}});
+  }
+}).on('close', () => process.exit(0));
+`,
+      );
+      const result = await runCli(
+        [
+          "--cwd",
+          homeDir,
+          "--agent",
+          `${JSON.stringify(process.execPath)} ${JSON.stringify(peerPath)}`,
+          "--format",
+          format,
+          "exec",
+          "proof",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /survived malformed updates/);
+      if (format === "json") {
+        const updates = parseJsonRpcOutputLines(result.stdout).filter(
+          (message) => "method" in message && message.method === "session/update",
+        );
+        assert.equal(updates.length, 6);
+        assert.match(result.stdout, /"stopReason":"end_turn"/);
+      } else {
+        assert.doesNotMatch(result.stdout, /\[client\] session\/update/);
+        if (format === "quiet") {
+          assert.equal(result.stdout, "survived malformed updates\n");
+        } else {
+          assert.match(result.stdout, /\[done\] end_turn/);
+        }
+      }
+    });
+  });
+}
+
+for (const completion of ["complete", "timeout", "cancel"] as const) {
+  test(`integration: session turn ownership preserves a live flow during CLI ${completion}`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd);
+      const base = [...baseLoadCapableAgentArgs(cwd), "--format", "json", "--ttl", "1"];
+      const releaseFile = path.join(homeDir, "release-flow-turn");
+      const flow = runCli([...base, "flow", "run", FLOW_SESSION_TURN_FIXTURE_PATH], homeDir, {
+        env: { ACPX_TEST_SESSION_TURN_RELEASE: releaseFile },
+        timeoutMs: 30_000,
+      });
+      let queued: Promise<CliRunResult> | undefined;
+      let name: string | undefined;
+      try {
+        const entry = await waitFor(async () => {
+          const sessionDir = path.join(homeDir, ".acpx", "sessions");
+          for (const file of await fs.readdir(sessionDir)) {
+            if (!file.endsWith(".json") || file === "index.json") {
+              continue;
+            }
+            const record = parseSessionRecord(
+              JSON.parse(await fs.readFile(path.join(sessionDir, file), "utf8")),
+            );
+            if (record?.name?.startsWith("fixture-session-turn")) {
+              return { name: record.name, file, acpxRecordId: record.acpxRecordId };
+            }
+          }
+          return null;
+        }, 5_000);
+        name = entry.name;
+        const recordPath = path.join(homeDir, ".acpx", "sessions", entry.file);
+        await waitFor(async () => {
+          const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as SessionRecord;
+          return record.messages.some(
+            (message) =>
+              typeof message === "object" &&
+              "Agent" in message &&
+              JSON.stringify(message.Agent.content).includes("flow-held"),
+          )
+            ? true
+            : null;
+        }, 5_000);
+        const timeoutArgs = completion === "timeout" ? ["--timeout", "0.2"] : [];
+        queued = runCli(
+          [...base, ...timeoutArgs, "prompt", "-s", name, `echo cli-${completion}`],
+          homeDir,
+        );
+        if (completion === "complete") {
+          await waitFor(
+            async () =>
+              await fs.stat(queuePaths(homeDir, entry.acpxRecordId).lockPath).then(
+                () => true,
+                () => null,
+              ),
+            5_000,
+          );
+          await fs.writeFile(releaseFile, "release");
+        }
+        if (completion === "cancel") {
+          await waitFor(async () => {
+            const cancelled = await runCli([...base, "cancel", "-s", entry.name], homeDir);
+            if (cancelled.code !== 0) {
+              return null;
+            }
+            return (JSON.parse(cancelled.stdout) as { cancelled: boolean }).cancelled ? true : null;
+          }, 5_000);
+        }
+        const queuedResult = await queued;
+        await fs.writeFile(releaseFile, "release");
+        const flowResult = await flow;
+        assert.equal(flowResult.code, 0, flowResult.stderr);
+        const record = await fs.readFile(recordPath, "utf8");
+        assert.match(record, /stream-wait-file done: flow-held/);
+        if (completion === "complete") {
+          assert.equal(queuedResult.code, 0, queuedResult.stderr);
+          assert.match(record, /cli-complete/);
+          const saved = JSON.parse(record) as { last_seq: number };
+          const events = await fs.readFile(recordPath.replace(/\.json$/, ".stream.ndjson"), "utf8");
+          assert.equal(
+            saved.last_seq,
+            events
+              .trim()
+              .split("\n")
+              .map((line) => JSON.parse(line) as unknown)
+              .filter(isAcpJsonRpcMessage).length,
+          );
+        } else {
+          assert.doesNotMatch(record, new RegExp(`cli-${completion}`));
+          if (completion === "timeout") {
+            assert.notEqual(queuedResult.code, 0);
+          } else {
+            assert.equal(queuedResult.code, 0, queuedResult.stderr);
+            assert.equal(queuedResult.stdout, "", "canceled waiters must not send ACP requests");
+          }
+        }
+      } finally {
+        await fs.writeFile(releaseFile, "release");
+        await Promise.allSettled([flow, queued]);
+        if (name) {
+          await runCli([...base, "sessions", "close", name], homeDir);
+        }
+      }
+    });
+  });
+}
+
+for (const launcher of [
+  { name: "cursor-agent", prefix: ["acp"], invalid: [[], ["ACP"]] },
+  {
+    name: "droid",
+    prefix: ["exec", "--output-format", "acp"],
+    invalid: [[], ["exec", "acp"], ["--output-format", "exec", "acp"]],
+  },
+  { name: "uvx", prefix: ["fast-agent-mcp", "acp"], invalid: [[], ["acp", "fast-agent-mcp"]] },
+  { name: "iflow", prefix: ["--experimental-acp"], invalid: [[], ["--acp"]] },
+  {
+    name: "devin",
+    prefix: ["--model", "swe-1-6", "acp"],
+    invalid: [[], ["--model"], ["--acp", "--model"]],
+  },
+  {
+    name: "qodercli",
+    prefix: [
+      "--acp",
+      "--max-turns",
+      "4",
+      "--allowed-tools",
+      "Read,Grep",
+      "--disallowed-tools",
+      "Bash",
+    ],
+    invalid: [[], ["--max-turns", "4"], ["--acp", "--max-turns"], ["--acp", "--allowed-tools="]],
+  },
+] as const) {
+  test(`integration: ${launcher.name} launcher validates and preserves argv`, async () => {
+    await withTempHome(async (homeDir) => {
+      const binDir = path.join(homeDir, "launcher bin");
+      await fs.mkdir(binDir);
+      const argLogPath = path.join(homeDir, "launcher args.jsonl");
+      await writeFakeHarnessAgent(binDir, launcher.name, argLogPath);
+      const env = { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` };
+      const received: string[][] = [];
+      const invoke = async (args: readonly string[]) => {
+        received.push([...args]);
+        const invocation = await configuredHarnessInvocation(homeDir, [launcher.name, ...args]);
+        return await runCli(
+          [
+            "--verbose",
+            "--cwd",
+            homeDir,
+            "--format",
+            "quiet",
+            ...invocation,
+            "exec",
+            "echo launcher-ready",
+          ],
+          homeDir,
+          { env },
+        );
+      };
+
+      const prefixes: readonly string[][] = [
+        [...launcher.prefix],
+        ...(launcher.name === "devin" ? [["--model", "swe-1-6", "--experimental-acp"]] : []),
+        ...(launcher.name === "qodercli"
+          ? [["--acp", "--max-turns=4", "--allowed-tools=Read,Grep", "--disallowed-tools=Bash"]]
+          : []),
+      ];
+      for (const [index, prefix] of prefixes.entries()) {
+        const pidPath = path.join(homeDir, `mock pid with spaces! ${index}.txt`);
+        const result = await invoke([...prefix, "--pid-file", pidPath, "--supports-load-session"]);
+        assert.equal(result.code, 0, result.stderr);
+        assert.equal(result.signal, null);
+        assert.equal(result.stdout.trim(), "launcher-ready");
+        assert.match(await fs.readFile(pidPath, "utf8"), /^\d+\n$/u);
+      }
+
+      for (const invalid of launcher.invalid) {
+        const rejected = await invoke(invalid);
+        assert.equal(rejected.code, 1, JSON.stringify(invalid));
+        assert.equal(rejected.signal, null);
+        assert.equal(rejected.stdout, "");
+        assert.match(rejected.stderr, /(?:Invalid|Missing) .* (?:launcher|ACP)/u);
+      }
+
+      const unknown = await invoke([...launcher.prefix, "--unknown-launcher-option"]);
+      assert.equal(unknown.code, 1);
+      assert.equal(unknown.signal, null);
+      assert.equal(unknown.stdout, "");
+      assert.match(unknown.stderr, /Unknown mock-agent option: --unknown-launcher-option/u);
+      const logged: unknown[] = (await fs.readFile(argLogPath, "utf8"))
+        .trimEnd()
+        .split(/\r?\n/u)
+        .map((line) => JSON.parse(line) as unknown);
+      assert.deepEqual(logged, received, "launcher must preserve each original argument token");
+    });
+  });
+}
+
 test("integration: built-in cursor agent resolves to cursor-agent acp", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-cursor-"));
 
     try {
-      await writeFakeCursorAgent(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "cursor-agent");
 
       const result = await runCli(
         ["--approve-all", "--cwd", cwd, "--format", "quiet", "cursor", "exec", "echo hello"],
@@ -300,36 +603,30 @@ test("integration: flow run executes function and shell actions from --input-fil
 
 test("integration: flow run finalizes interrupted bundles on SIGHUP", async () => {
   await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const cwd = await fs.mkdtemp(path.join(homeDir, "cwd-"));
 
-    try {
-      const child = spawn(
-        process.execPath,
-        [
-          CLI_PATH,
-          ...baseAgentArgs(cwd),
-          "--format",
-          "json",
-          "flow",
-          "run",
-          FLOW_INTERRUPT_FIXTURE_PATH,
-        ],
-        {
-          env: {
-            ...process.env,
-            HOME: homeDir,
-          },
-          cwd,
-          stdio: ["ignore", "pipe", "pipe"],
+    const child = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        ...baseAgentArgs(cwd),
+        "--format",
+        "json",
+        "flow",
+        "run",
+        FLOW_INTERRUPT_FIXTURE_PATH,
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: homeDir,
         },
-      );
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
 
-      let stderr = "";
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
-
+    await withObservedChild(child, homeDir, async (waitForClose) => {
       const outputRoot = path.join(homeDir, ".acpx", "flows", "runs");
       const runDir = await waitForFlowRunDir(outputRoot, "fixture-interrupt");
       await waitFor(async () => {
@@ -341,8 +638,8 @@ test("integration: flow run finalizes interrupted bundles on SIGHUP", async () =
       }, 5_000);
 
       child.kill("SIGHUP");
-      const result = await awaitChildClose(child);
-      assert.equal(result.code, 130, stderr);
+      const result = await waitForClose();
+      assert.equal(result.code, 130, result.stderr);
 
       const finalState = await waitFor(async () => {
         const state = await readFlowRunJson(runDir);
@@ -365,54 +662,53 @@ test("integration: flow run finalizes interrupted bundles on SIGHUP", async () =
       const finalEvent = traceEvents.at(-1);
       assert.equal(finalEvent?.type, "run_failed");
       assert.equal(finalEvent?.payload?.error, "Interrupted");
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+    });
   });
 });
 
 test("integration: flow run fails ACP nodes promptly when the agent disconnects mid-prompt", async () => {
   await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    // One deletion owner covers the CLI's cwd and every gate/run file.
+    const cwd = await fs.mkdtemp(path.join(homeDir, "cwd-"));
+    const directory = await fs.mkdtemp(path.join(homeDir, "disconnect-gate-"));
+    const result = await runCli(
+      [
+        ...baseLoadCapableAgentArgs(cwd),
+        "--format",
+        "json",
+        "flow",
+        "run",
+        FLOW_ACP_DISCONNECT_FIXTURE_PATH,
+      ],
+      homeDir,
+      {
+        cwd,
+        timeoutMs: 5_000,
+        promptGate: { directory, startupTimeoutMs: 15_000 },
+      },
+    );
 
-    try {
-      const result = await runCli(
-        [
-          ...baseLoadCapableAgentArgs(cwd),
-          "--format",
-          "json",
-          "flow",
-          "run",
-          FLOW_ACP_DISCONNECT_FIXTURE_PATH,
-        ],
-        homeDir,
-        {
-          cwd,
-          timeoutMs: 5_000,
-        },
-      );
-
-      const outputRoot = path.join(homeDir, ".acpx", "flows", "runs");
-      const runDir = await waitForFlowRunDir(outputRoot, "fixture-acp-disconnect");
-      assert.notEqual(result.code, 0, result.stdout);
-
-      const finalState = await waitFor(async () => {
-        const state = await readFlowRunJson(runDir).catch(() => null);
-        return state && state.status === "failed" ? state : null;
-      }, 5_000);
-
-      assert.equal(finalState.status, "failed");
-      assert.equal(
-        (finalState.results as Record<string, { outcome?: string }>).slow?.outcome,
-        "failed",
-      );
-      assert.match(
-        (finalState.results as Record<string, { error?: string }>).slow?.error ?? result.stderr,
-        /agent disconnected/i,
-      );
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+    assert.equal(result.signal, null, result.stderr);
+    assert.notEqual(result.code, null, result.stderr);
+    assert.notEqual(result.code, 0, result.stdout);
+    // runCli validates the intended-exit witness inside its owned gated body before returning.
+    // The safety guard's exit 92 cannot satisfy this test through a generic disconnect alone.
+    const outputRoot = path.join(homeDir, ".acpx", "flows", "runs");
+    // After native CLI close, failure publication must already be complete.
+    const runName = (await fs.readdir(outputRoot)).find((entry) =>
+      entry.includes("fixture-acp-disconnect"),
+    );
+    assert.ok(runName, "the closed CLI must already have published its run directory");
+    const finalState = await readFlowRunJson(path.join(outputRoot, runName));
+    assert.equal(finalState.status, "failed");
+    assert.equal(
+      (finalState.results as Record<string, { outcome?: string }>).slow?.outcome,
+      "failed",
+    );
+    assert.match(
+      (finalState.results as Record<string, { error?: string }>).slow?.error ?? result.stderr,
+      /agent disconnected/i,
+    );
   });
 });
 
@@ -665,60 +961,63 @@ function escapeUnsafeCodeChars(value: string): string {
 }
 
 test('integration: flow run resolves "acpx/flows" imports for external flow files', async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-import-"));
-    const flowPath = path.join(flowDir, "external.flow.ts");
+  for (const extension of ["ts", "cts", "mts", "mjs"]) {
+    await withTempHome(async (homeDir) => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+      const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-import-"));
+      const flowPath = path.join(flowDir, `external.flow.${extension}`);
 
-    try {
-      await fs.writeFile(
-        flowPath,
-        [
-          'import { compute, defineFlow } from "acpx/flows";',
-          "",
-          "export default defineFlow({",
-          '  name: "external-flow-import",',
-          '  startAt: "done",',
-          "  nodes: {",
-          "    done: compute({",
-          '      run: () => ({ ok: true, source: "external" }),',
-          "    }),",
-          "  },",
-          "  edges: [],",
-          "});",
-          "",
-        ].join("\n"),
-        "utf8",
-      );
+      try {
+        await fs.writeFile(
+          flowPath,
+          [
+            'import { compute, defineFlow } from "acpx/flows";',
+            "",
+            "export default defineFlow({",
+            '  name: "external-flow-import",',
+            '  startAt: "done",',
+            "  nodes: {",
+            "    done: compute({",
+            '      run: () => ({ ok: true, source: "external" }),',
+            "    }),",
+            "  },",
+            "  edges: [],",
+            "});",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
 
-      const result = await runCli(
-        ["--approve-all", "--cwd", cwd, "--format", "json", "flow", "run", flowPath],
-        homeDir,
-      );
+        const result = await runCli(
+          ["--approve-all", "--cwd", cwd, "--format", "json", "flow", "run", flowPath],
+          homeDir,
+        );
 
-      assert.equal(result.code, 0, result.stderr);
-      const payload = JSON.parse(result.stdout.trim()) as {
-        action?: string;
-        status?: string;
-        outputs?: {
-          done?: {
-            ok?: boolean;
-            source?: string;
+        assert.equal(result.code, 0, `${extension}: ${result.stderr}`);
+        assert.deepEqual(await fs.readdir(flowDir), [path.basename(flowPath)]);
+        const payload = JSON.parse(result.stdout.trim()) as {
+          action?: string;
+          status?: string;
+          outputs?: {
+            done?: {
+              ok?: boolean;
+              source?: string;
+            };
           };
         };
-      };
 
-      assert.equal(payload.action, "flow_run_result");
-      assert.equal(payload.status, "completed");
-      assert.deepEqual(payload.outputs?.done, {
-        ok: true,
-        source: "external",
-      });
-    } finally {
-      await fs.rm(flowDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
+        assert.equal(payload.action, "flow_run_result");
+        assert.equal(payload.status, "completed");
+        assert.deepEqual(payload.outputs?.done, {
+          ok: true,
+          source: "external",
+        });
+      } finally {
+        await fs.rm(flowDir, { recursive: true, force: true });
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 test("integration: flow run supports staged defineFlow assembly in external modules", async () => {
@@ -833,7 +1132,7 @@ test("integration: built-in droid agent resolves to droid exec --output-format a
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-droid-"));
 
     try {
-      await writeFakeDroidAgent(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "droid");
 
       const result = await runCli(
         ["--approve-all", "--cwd", cwd, "--format", "quiet", "droid", "exec", "echo hello"],
@@ -860,7 +1159,7 @@ test("integration: factory-droid alias resolves to droid exec --output-format ac
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-droid-"));
 
     try {
-      await writeFakeDroidAgent(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "droid");
 
       const result = await runCli(
         ["--approve-all", "--cwd", cwd, "--format", "quiet", "factory-droid", "exec", "echo hello"],
@@ -887,7 +1186,7 @@ test("integration: built-in fast-agent resolves to uvx fast-agent-mcp acp", asyn
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-fast-agent-"));
 
     try {
-      await writeFakeUvxFastAgentAcp(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "uvx");
 
       const result = await runCli(
         ["--approve-all", "--cwd", cwd, "--format", "quiet", "fast-agent", "exec", "echo hello"],
@@ -935,124 +1234,33 @@ test("integration: built-in grok-build agent resolves to grok agent stdio", asyn
   });
 });
 
-test("integration: built-in deepseek-build injects its isolated Grok provider profile", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-deepseek-build-"));
-
-    try {
-      await writeFakeDeepSeekBuildAgent(fakeBinDir);
-
-      const result = await runCli(
-        [
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "quiet",
-          "deepseek-build",
-          "exec",
-          "echo hello",
-        ],
-        homeDir,
-        {
-          env: {
-            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
-            DEEPSEEK_API_KEY: "test-auth-token",
-            XAI_API_KEY: "fake",
-          },
-        },
-      );
-
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /hello/);
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+for (const [agent, acpArg] of [
+  ["fx", "acp"],
+  ["junie", "--acp=true"],
+  ["mcode", "acp"],
+  ["pool", "acp"],
+  ["zeroclaw", "acp"],
+] as const) {
+  test(`integration: built-in ${agent} resolves to ${agent} ${acpArg}`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+      const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-native-"));
+      try {
+        await writeFakeNativeAcpAgent(fakeBinDir, agent, acpArg);
+        const result = await runCli(
+          ["--approve-all", "--cwd", cwd, "--format", "quiet", agent, "exec", "echo hello"],
+          homeDir,
+          { env: { PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}` } },
+        );
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /hello/);
+      } finally {
+        await fs.rm(fakeBinDir, { recursive: true, force: true });
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
   });
-});
-
-test("integration: built-in mcode agent resolves to mcode acp", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-mcode-"));
-
-    try {
-      await writeFakeMCodeAgent(fakeBinDir);
-
-      const result = await runCli(
-        ["--approve-all", "--cwd", cwd, "--format", "quiet", "mcode", "exec", "echo hello"],
-        homeDir,
-        {
-          env: {
-            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
-          },
-        },
-      );
-
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /hello/);
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
-});
-
-test("integration: built-in pool agent resolves to pool acp", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-pool-"));
-
-    try {
-      await writeFakePoolAgent(fakeBinDir);
-
-      const result = await runCli(
-        ["--approve-all", "--cwd", cwd, "--format", "quiet", "pool", "exec", "echo hello"],
-        homeDir,
-        {
-          env: {
-            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
-          },
-        },
-      );
-
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /hello/);
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
-});
-
-test("integration: built-in zeroclaw agent resolves to zeroclaw acp", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-zeroclaw-"));
-
-    try {
-      await writeFakeZeroClawAgent(fakeBinDir);
-
-      const result = await runCli(
-        ["--approve-all", "--cwd", cwd, "--format", "quiet", "zeroclaw", "exec", "echo hello"],
-        homeDir,
-        {
-          env: {
-            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
-          },
-        },
-      );
-
-      assert.equal(result.code, 0, result.stderr);
-      assert.match(result.stdout, /hello/);
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
-});
+}
 
 test("integration: built-in iflow agent resolves to iflow --experimental-acp", async () => {
   await withTempHome(async (homeDir) => {
@@ -1060,7 +1268,7 @@ test("integration: built-in iflow agent resolves to iflow --experimental-acp", a
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-iflow-"));
 
     try {
-      await writeFakeIflowAgent(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "iflow");
 
       const result = await runCli(
         ["--approve-all", "--cwd", cwd, "--format", "quiet", "iflow", "exec", "echo hello"],
@@ -1087,7 +1295,7 @@ test("integration: built-in qoder agent resolves to qodercli --acp", async () =>
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-qoder-"));
 
     try {
-      await writeFakeQoderAgent(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "qodercli");
 
       const result = await runCli(
         ["--approve-all", "--cwd", cwd, "--format", "quiet", "qoder", "exec", "echo hello"],
@@ -1115,17 +1323,22 @@ test("integration: qoder session reuse preserves persisted startup flags", async
     const argLogPath = path.join(fakeBinDir, "qoder-args.log");
 
     try {
-      await writeFakeQoderAgent(fakeBinDir, argLogPath);
+      await writeFakeHarnessAgent(fakeBinDir, "qodercli", argLogPath);
       const { createSession } = await import("../src/session/session.js");
-      const { runSessionSetModeDirect } = await import("../src/cli/session/prompt-runner.js");
+      const { runSessionSetModeDirect } = await import("../src/session/execution/prompt-runner.js");
       const previousHome = process.env.HOME;
+      const previousUserProfile = process.env.USERPROFILE;
       const previousPath = process.env.PATH;
       process.env.HOME = homeDir;
+      if (process.platform === "win32") {
+        process.env.USERPROFILE = homeDir;
+      }
       process.env.PATH = `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`;
 
       try {
         const record = await createSession({
           agentCommand: "qodercli --acp",
+          agentArgv: ["qodercli", "--acp"],
           cwd,
           permissionMode: "approve-reads",
           timeoutMs: 10_000,
@@ -1141,44 +1354,38 @@ test("integration: qoder session reuse preserves persisted startup flags", async
           timeoutMs: 10_000,
         });
         assert.equal(result.record.acpxRecordId, record.acpxRecordId);
+        await fs.access(
+          path.join(
+            homeDir,
+            ".acpx",
+            "sessions",
+            `${encodeURIComponent(record.acpxRecordId)}.json`,
+          ),
+        );
       } finally {
         if (previousHome === undefined) {
           delete process.env.HOME;
         } else {
           process.env.HOME = previousHome;
         }
+        if (process.platform === "win32") {
+          if (previousUserProfile === undefined) {
+            delete process.env.USERPROFILE;
+          } else {
+            process.env.USERPROFILE = previousUserProfile;
+          }
+        }
         process.env.PATH = previousPath;
       }
 
-      const argLines = (await fs.readFile(argLogPath, "utf8"))
+      const invocations: unknown[] = (await fs.readFile(argLogPath, "utf8"))
+        .trimEnd()
         .split(/\r?\n/u)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0);
-      assert.equal(
-        argLines.length >= 2,
-        true,
-        `expected at least two qoder invocations:\n${argLines.join("\n")}`,
-      );
-      assert.equal(
-        argLines.some(
-          (line) =>
-            line.includes("--acp") &&
-            line.includes("--max-turns=4") &&
-            line.includes("--allowed-tools=READ,GREP"),
-        ),
-        true,
-        `expected persisted qoder flags in logged invocations:\n${argLines.join("\n")}`,
-      );
-      assert.equal(
-        argLines.slice(-1)[0]?.includes("--allowed-tools=READ,GREP") ?? false,
-        true,
-        `expected reused prompt spawn to preserve allowed-tools:\n${argLines.join("\n")}`,
-      );
-      assert.equal(
-        argLines.slice(-1)[0]?.includes("--max-turns=4") ?? false,
-        true,
-        `expected reused prompt spawn to preserve max-turns:\n${argLines.join("\n")}`,
-      );
+        .map((line) => JSON.parse(line) as unknown);
+      assert.ok(invocations.length >= 2, "expected initial and reused qoder invocations");
+      const expected = ["--acp", "--max-turns=4", "--allowed-tools=READ,GREP"];
+      assert.deepEqual(invocations[0], expected, "initial qoder startup flags");
+      assert.deepEqual(invocations.at(-1), expected, "reused qoder startup flags");
     } finally {
       await fs.rm(fakeBinDir, { recursive: true, force: true });
       await fs.rm(cwd, { recursive: true, force: true });
@@ -1258,6 +1465,27 @@ test("integration: exec --no-terminal disables advertised terminal capability", 
         | undefined;
       assert(initializeRequest, result.stdout);
       assert.equal(initializeRequest.params?.clientCapabilities?.terminal, false);
+      const marker = path.join(cwd, "terminal-ran");
+      const script = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`;
+      const rejected = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--no-terminal",
+          "exec",
+          `terminal ${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+        ],
+        homeDir,
+      );
+      assert.ok(
+        parseJsonRpcOutputLines(rejected.stdout).some(
+          (message) =>
+            isAcpJsonRpcMessage(message) && "error" in message && message.error.code === -32601,
+        ),
+        rejected.stdout,
+      );
+      await assert.rejects(fs.stat(marker), { code: "ENOENT" });
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1290,6 +1518,24 @@ test("integration: exec --no-fs disables advertised filesystem capabilities", as
         readTextFile: false,
         writeTextFile: false,
       });
+      const file = path.join(cwd, "disabled-fs.txt");
+      const contents = "SYNTHETIC_DISABLED_FS_9063";
+      await fs.writeFile(file, contents);
+      for (const prompt of [`read ${file}`, `write ${file} changed`]) {
+        const rejected = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "--no-fs", "exec", prompt],
+          homeDir,
+        );
+        assert.ok(
+          parseJsonRpcOutputLines(rejected.stdout).some(
+            (message) =>
+              isAcpJsonRpcMessage(message) && "error" in message && message.error.code === -32601,
+          ),
+          rejected.stdout,
+        );
+        assert.doesNotMatch(rejected.stdout, new RegExp(contents, "u"));
+        assert.equal(await fs.readFile(file, "utf8"), contents);
+      }
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1395,17 +1641,20 @@ test("integration: exec answers Devin diagnostics extension requests", async () 
     const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
 
     try {
-      await writeFakeDevinAgent(fakeBinDir);
+      await writeFakeHarnessAgent(fakeBinDir, "devin");
+      const invocation =
+        process.platform === "win32"
+          ? await configuredHarnessInvocation(homeDir, ["devin", "--model", "swe-1-6", "acp"])
+          : ["--agent", "devin --model swe-1-6 acp"];
 
       const result = await runCli(
         [
-          "--agent",
-          "devin --model swe-1-6 acp",
           "--approve-all",
           "--cwd",
           cwd,
           "--format",
           "quiet",
+          ...invocation,
           "exec",
           "extension-request _cognition.ai/request_diagnostics hello",
         ],
@@ -1430,73 +1679,76 @@ test("integration: exec answers Devin diagnostics extension requests", async () 
   });
 });
 
-test("integration: Devin ACP launch advertises scoped Windsurf client info", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
+for (const invocation of [
+  {
+    name: process.platform === "win32" ? "configured argv" : "raw command",
+    args: ["--agent", "devin --model swe-1-6 --acp"],
+    argv: ["devin", "--model", "swe-1-6", "--acp"],
+  },
+  { name: "built-in shortcut", args: ["devin"] },
+]) {
+  test(`integration: Devin ${invocation.name} advertises scoped Windsurf client info`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+      const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-devin-"));
 
-    try {
-      await writeFakeDevinAgent(fakeBinDir);
+      try {
+        await writeFakeHarnessAgent(fakeBinDir, "devin");
+        const args =
+          process.platform === "win32" && invocation.argv
+            ? await configuredHarnessInvocation(homeDir, invocation.argv)
+            : invocation.args;
 
-      const result = await runCli(
-        [
-          "--agent",
-          "devin --model swe-1-6 --acp",
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "exec",
-          "echo hello",
-        ],
-        homeDir,
-        {
-          env: {
-            ACPX_DEVIN_WINDSURF_VERSION: "9.9.9-test",
-            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        const result = await runCli(
+          ["--approve-all", "--cwd", cwd, "--format", "json", ...args, "exec", "echo hello"],
+          homeDir,
+          {
+            env: {
+              ACPX_DEVIN_WINDSURF_VERSION: "9.9.9-test",
+              PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+            },
           },
-        },
-      );
-      assert.equal(result.code, 0, result.stderr);
+        );
+        assert.equal(result.code, 0, result.stderr);
 
-      const payloads = parseJsonRpcOutputLines(result.stdout);
-      const initializeRequest = payloads.find((payload) => payload.method === "initialize") as
-        | {
-            params?: {
-              clientCapabilities?: {
-                _meta?: Record<string, unknown> | null;
-                elicitation?: unknown;
-                fs?: { readTextFile?: unknown; writeTextFile?: unknown };
-                terminal?: unknown;
+        const payloads = parseJsonRpcOutputLines(result.stdout);
+        const initializeRequest = payloads.find((payload) => payload.method === "initialize") as
+          | {
+              params?: {
+                clientCapabilities?: {
+                  _meta?: Record<string, unknown> | null;
+                  elicitation?: unknown;
+                  fs?: { readTextFile?: unknown; writeTextFile?: unknown };
+                  terminal?: unknown;
+                };
+                clientInfo?: {
+                  name?: unknown;
+                  version?: unknown;
+                };
               };
-              clientInfo?: {
-                name?: unknown;
-                version?: unknown;
-              };
-            };
-          }
-        | undefined;
-      assert(initializeRequest, result.stdout);
-      assert.deepEqual(initializeRequest.params?.clientInfo, {
-        name: "windsurf",
-        version: "9.9.9-test",
-      });
-      assert.equal(initializeRequest.params?.clientCapabilities?.terminal, true);
-      assert.deepEqual(initializeRequest.params?.clientCapabilities?.fs, {
-        readTextFile: true,
-        writeTextFile: true,
-      });
-      assert.deepEqual(initializeRequest.params?.clientCapabilities?._meta, {
-        "cognition.ai/requestDiagnostics": true,
-      });
-      assert.equal(initializeRequest.params?.clientCapabilities?.elicitation, undefined);
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+            }
+          | undefined;
+        assert(initializeRequest, result.stdout);
+        assert.deepEqual(initializeRequest.params?.clientInfo, {
+          name: "windsurf",
+          version: "9.9.9-test",
+        });
+        assert.equal(initializeRequest.params?.clientCapabilities?.terminal, true);
+        assert.deepEqual(initializeRequest.params?.clientCapabilities?.fs, {
+          readTextFile: true,
+          writeTextFile: true,
+        });
+        assert.deepEqual(initializeRequest.params?.clientCapabilities?._meta, {
+          "cognition.ai/requestDiagnostics": true,
+        });
+        assert.equal(initializeRequest.params?.clientCapabilities?.elicitation, undefined);
+      } finally {
+        await fs.rm(fakeBinDir, { recursive: true, force: true });
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
   });
-});
+}
 
 test("integration: exec --model sets the advertised model config option", async () => {
   await withTempHome(async (homeDir) => {
@@ -1723,62 +1975,115 @@ test("integration: exec --model rejects models not advertised by the agent", asy
   });
 });
 
-test("integration: Claude ACP prompt forwards saved model missing from reconnect advertisement", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-claude-"));
-
-    try {
+for (const reconnect of ["load", "resume"] as const) {
+  test(`integration: Claude ACP prompt forwards saved model missing from session/${reconnect} advertisement`, async () => {
+    await withTempHome(async (homeDir) => {
+      const fakeBinDir = path.join(homeDir, "bin");
+      await fs.mkdir(fakeBinDir);
       const fakeClaude = await writeFakeClaudeAgent(fakeBinDir);
-      const modelAgentCommand = `${JSON.stringify(fakeClaude)} --supports-load-session --advertise-models --omit-reconnect-model gpt-5.4`;
-      const created = await runCli(
-        [
-          "--agent",
-          modelAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--model",
-          "gpt-5.4",
-          "sessions",
-          "new",
-        ],
-        homeDir,
-      );
-      assert.equal(created.code, 0, created.stderr);
+      const modelAgentCommand = `${JSON.stringify(fakeClaude)} --supports-${reconnect}-session --advertise-models --omit-reconnect-model gpt-5.4`;
+      const base = ["--agent", modelAgentCommand, "--approve-all", "--cwd", homeDir];
+      let sessionCreated = false;
 
-      const result = await runCli(
-        [
-          "--agent",
-          modelAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "--model",
-          "gpt-5.4",
-          "prompt",
-          "echo hello",
-        ],
-        homeDir,
-      );
-      assert.equal(result.code, 0, result.stderr);
+      const body = await observeTestOutcome(async () => {
+        const created = await runCli(
+          [...base, "--format", "json", "--model", "gpt-5.4", "sessions", "new"],
+          homeDir,
+        );
+        assert.equal(created.code, 0, created.stderr);
+        sessionCreated = true;
+        const { acpxSessionId } = JSON.parse(created.stdout.trim()) as { acpxSessionId: string };
+        assert.equal(typeof acpxSessionId, "string");
 
-      const payloads = parseJsonRpcOutputLines(result.stdout);
-      const setModelRequest = payloads.find(
-        (payload) =>
-          payload.method === "session/set_config_option" &&
-          (payload.params as { configId?: unknown } | undefined)?.configId === "model",
-      ) as { params?: { configId?: string; value?: string } } | undefined;
-      assert(setModelRequest, "expected model session config despite stale advertisement");
-      assert.equal(setModelRequest.params?.value, "gpt-5.4");
-    } finally {
-      await fs.rm(fakeBinDir, { recursive: true, force: true });
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+        const result = await runCli([...base, "--format", "json", "prompt", "echo hello"], homeDir);
+        assert.equal(result.code, 0, result.stderr);
+        const payloads = parseJsonRpcOutputLines(result.stdout);
+        const reconnectRequests = payloads.filter(
+          (payload) =>
+            payload.method === `session/${reconnect}` && extractJsonRpcId(payload) !== undefined,
+        );
+        assert.equal(reconnectRequests.length, 1, "expected the saved session to reconnect once");
+        const reconnectRequest = reconnectRequests[0];
+        assert.equal(
+          (reconnectRequest.params as { sessionId?: string } | undefined)?.sessionId,
+          acpxSessionId,
+        );
+        assert.equal(
+          payloads.some((payload) => payload.method === "session/new"),
+          false,
+        );
+
+        const reconnectResponseIndex = payloads.findIndex(
+          (payload) =>
+            extractJsonRpcId(payload) === extractJsonRpcId(reconnectRequest) &&
+            !Object.hasOwn(payload, "method") &&
+            !Object.hasOwn(payload, "error") &&
+            Object.hasOwn(payload, "result"),
+        );
+        assert(reconnectResponseIndex >= 0, `expected a successful session/${reconnect} response`);
+        const reconnectResult = payloads[reconnectResponseIndex].result as {
+          configOptions?: Array<{
+            id?: string;
+            type?: string;
+            options?: Array<{ value?: string }>;
+          }>;
+        };
+        const modelConfig = reconnectResult.configOptions?.find((option) => option.id === "model");
+        assert.equal(modelConfig?.type, "select");
+        assert.deepEqual(
+          modelConfig?.options?.map((option) => option.value),
+          ["default-model", "fast-model", "smart-model", "gpt-5.2"],
+          `session/${reconnect} advertisement must omit the saved gpt-5.4 model`,
+        );
+
+        const setModelIndex = payloads.findIndex(
+          (payload) =>
+            payload.method === "session/set_config_option" &&
+            (payload.params as { configId?: unknown } | undefined)?.configId === "model",
+        );
+        assert(setModelIndex > reconnectResponseIndex, "expected model replay after reconnect");
+        const setModelRequest = payloads[setModelIndex];
+        assert.deepEqual(setModelRequest.params, {
+          sessionId: acpxSessionId,
+          configId: "model",
+          value: "gpt-5.4",
+        });
+        const setModelRequestId = extractJsonRpcId(setModelRequest);
+        assert.notEqual(setModelRequestId, undefined);
+        const setModelResponseIndex = payloads.findIndex(
+          (payload) =>
+            extractJsonRpcId(payload) === setModelRequestId &&
+            !Object.hasOwn(payload, "method") &&
+            !Object.hasOwn(payload, "error") &&
+            Object.hasOwn(payload, "result"),
+        );
+        assert(
+          setModelResponseIndex > setModelIndex,
+          "expected the adapter to accept model replay",
+        );
+        const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+        assert(promptIndex > setModelResponseIndex, "expected prompt after accepted model replay");
+        assert.equal(
+          payloads.some((payload) => extractAgentMessageChunkText(payload) === "hello"),
+          true,
+        );
+      });
+
+      const cleanup = await observeTestOutcome(async () => {
+        if (sessionCreated) {
+          const closed = await runCli([...base, "sessions", "close"], homeDir, {
+            timeoutMs: 10_000,
+          });
+          assert.equal(closed.code, 0, closed.stderr);
+        }
+      });
+      if (!cleanup.ok) {
+        retainedCliHomes.add(homeDir);
+      }
+      unwrapTestOutcomes(body, cleanup);
+    });
   });
-});
+}
 
 test("integration: prompt --model updates existing session model before prompt", async () => {
   await withTempHome(async (homeDir) => {
@@ -2109,7 +2414,7 @@ test("integration: set model rejects with clear error on ACP invalid params", as
           cwd,
           "set",
           "model",
-          "bad-model",
+          "fast-model",
         ],
         homeDir,
       );
@@ -2122,54 +2427,72 @@ test("integration: set model rejects with clear error on ACP invalid params", as
 });
 
 test("integration: status shows model after session creation with --model", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+  for (const reportedModel of ["smart-model", "fast-model"]) {
+    await withTempHome(async (homeDir) => {
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+      const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models --report-model-as ${reportedModel}`;
 
-    try {
-      // Create session with --model
-      const created = await runCli(
-        [
-          "--agent",
-          modelAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--model",
-          "smart-model",
-          "sessions",
-          "new",
-        ],
-        homeDir,
-      );
-      assert.equal(created.code, 0, created.stderr);
+      try {
+        const created = await runCli(
+          [
+            "--agent",
+            modelAgentCommand,
+            "--approve-all",
+            "--cwd",
+            cwd,
+            "--format",
+            "json",
+            "--model",
+            "smart-model",
+            "sessions",
+            "new",
+          ],
+          homeDir,
+        );
+        assert.equal(created.code, 0, created.stderr);
+        const { acpxRecordId } = JSON.parse(created.stdout) as { acpxRecordId: string };
+        const saved = JSON.parse(
+          await fs.readFile(
+            path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`),
+            "utf8",
+          ),
+        ) as { acpx?: { session_options?: { model?: string } } };
+        assert.equal(saved.acpx?.session_options?.model, "smart-model");
 
-      // Check status JSON
-      const status = await runCli(
-        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "--format", "json", "status"],
-        homeDir,
-      );
-      assert.equal(status.code, 0, status.stderr);
+        const status = await runCli(
+          [
+            "--agent",
+            modelAgentCommand,
+            "--approve-all",
+            "--cwd",
+            cwd,
+            "--format",
+            "json",
+            "status",
+          ],
+          homeDir,
+        );
+        assert.equal(status.code, 0, status.stderr);
 
-      const statusPayload = JSON.parse(status.stdout.trim()) as {
-        model?: string;
-        mode?: string;
-        availableModels?: string[];
-      };
-      assert.equal(statusPayload.model, "smart-model");
-      assert(Array.isArray(statusPayload.availableModels), "expected availableModels array");
+        const statusPayload = JSON.parse(status.stdout.trim()) as {
+          model?: string;
+          mode?: string;
+          availableModels?: string[];
+        };
+        assert.equal(statusPayload.model, reportedModel);
+        assert(Array.isArray(statusPayload.availableModels), "expected availableModels array");
 
-      // Check status text
-      const statusText = await runCli(
-        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "status"],
-        homeDir,
-      );
-      assert.equal(statusText.code, 0, statusText.stderr);
-      assert.match(statusText.stdout, /model: smart-model/);
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
+        const statusText = await runCli(
+          ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "status"],
+          homeDir,
+        );
+        assert.equal(statusText.code, 0, statusText.stderr);
+        assert.ok(statusText.stdout.includes(`model: ${reportedModel}`));
+      } finally {
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 test("integration: status shows updated model after set model", async () => {
@@ -2490,61 +2813,72 @@ test("integration: perf report tolerates malformed lines and keeps role and gaug
 });
 
 test("integration: perf metrics capture preserves SIGTERM termination semantics", async () => {
-  const metricsPath = path.join(os.tmpdir(), `acpx-perf-signal-${Date.now()}.ndjson`);
-
-  try {
-    const result = await new Promise<CliRunResult>((resolve, reject) => {
-      const child = spawn(
-        process.execPath,
+  await withTempHome(async (homeDir) => {
+    const metricsPath = path.join(homeDir, "metrics.ndjson");
+    const readyMessage = "perf-metrics-ready\n";
+    const child = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
         [
-          "--input-type=module",
-          "--eval",
-          [
-            "import { installPerfMetricsCapture } from './dist-test/src/perf-metrics-capture.js';",
-            "import { recordPerfDuration } from './dist-test/src/perf-metrics.js';",
-            `installPerfMetricsCapture({ filePath: ${JSON.stringify(metricsPath)} });`,
-            "recordPerfDuration('signal.test', 1);",
-            "setInterval(() => {}, 1000);",
-          ].join(" "),
-        ],
-        {
-          cwd: process.cwd(),
-          env: process.env,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
+          "import { installPerfMetricsCapture } from './dist-test/src/perf-metrics-capture.js';",
+          "import { recordPerfDuration } from './dist-test/src/perf-metrics.js';",
+          `installPerfMetricsCapture({ filePath: ${JSON.stringify(metricsPath)} });`,
+          "recordPerfDuration('signal.test', 1);",
+          "setInterval(() => {}, 1000);",
+          `process.stdout.write(${JSON.stringify(readyMessage)});`,
+        ].join(" "),
+      ],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
 
-      let stdout = "";
-      let stderr = "";
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
+    await withObservedChild(child, homeDir, async (waitForClose) => {
+      let removeReadinessListeners = () => {};
+      const ready = new Promise<void>((resolve, reject) => {
+        let stdout = "";
+        const onData = (chunk: string) => {
+          stdout += chunk;
+          if (stdout.includes(readyMessage)) {
+            resolve();
+          }
+        };
+        const onError = (error: unknown) => reject(error);
+        const onClose = (code: number | null, signal: NodeJS.Signals | null) =>
+          reject(
+            new Error(`Metrics fixture closed before readiness (code=${code}, signal=${signal})`),
+          );
+        child.stdout.on("data", onData);
+        child.once("error", onError);
+        child.once("close", onClose);
+        removeReadinessListeners = () => {
+          child.stdout.off("data", onData);
+          child.off("error", onError);
+          child.off("close", onClose);
+        };
       });
-      child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
+      try {
+        await withinCliDeadline(
+          10_000,
+          () => new Error("Metrics fixture readiness timed out after 10000ms"),
+          () => ready,
+        );
+      } finally {
+        removeReadinessListeners();
+      }
 
-      child.once("error", reject);
-      setTimeout(() => {
-        child.kill("SIGTERM");
-      }, 500);
-      child.once("close", (code, signal) => {
-        resolve({
-          code,
-          signal,
-          stdout,
-          stderr,
-        });
-      });
+      child.kill("SIGTERM");
+      const result = await waitForClose();
+      assert.ok(result.stdout.includes(readyMessage), "fixture must be ready before signaling");
+      assert.equal(result.code === 143 || result.signal === "SIGTERM", true);
+      const records = await readPerfRecords(metricsPath);
+      assert.equal(records.length >= 1, true);
     });
-
-    assert.equal(result.code === 143 || result.signal === "SIGTERM", true);
-    const records = await readPerfRecords(metricsPath);
-    assert.equal(records.length >= 1, true);
-  } finally {
-    await fs.rm(metricsPath, { force: true });
-  }
+  });
 });
 
 test("integration: configured mcpServers are sent to session/new and session/load", async () => {
@@ -2764,8 +3098,11 @@ test("integration: prompt reconnect uses session/resume when advertised", async 
       assert.equal(created.code, 0, created.stderr);
       const createdPayload = JSON.parse(created.stdout.trim()) as {
         acpxRecordId?: string;
+        acpxSessionId?: string;
       };
       assert.equal(typeof createdPayload.acpxRecordId, "string");
+      assert.equal(typeof createdPayload.acpxSessionId, "string");
+      assert.notEqual(createdPayload.acpxRecordId, createdPayload.acpxSessionId);
 
       const prompt = await runCli(
         [...resumeAgentArgs, "--format", "json", "prompt", "echo resume-method"],
@@ -2780,7 +3117,7 @@ test("integration: prompt reconnect uses session/resume when advertised", async 
       assert(resumeRequest, `expected session/resume request in output:\n${prompt.stdout}`);
       assert.equal(
         (resumeRequest.params as { sessionId?: unknown } | undefined)?.sessionId,
-        createdPayload.acpxRecordId,
+        createdPayload.acpxSessionId,
       );
       assert.equal(
         messages.some(
@@ -3467,6 +3804,33 @@ test("integration: fs/read_text_file through mock agent", async () => {
   });
 });
 
+test("integration: missing file reads return the ACP resource-not-found error", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const readPath = path.join(cwd, "missing.txt");
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--json-strict", "exec", `read ${readPath}`],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const messages = parseJsonRpcOutputLines(result.stdout);
+      const request = messages.find((message) => message.method === "fs/read_text_file");
+      assert.ok(request);
+      const response = messages.find((message) => message.id === request.id && "error" in message);
+      const uri = pathToFileURL(readPath).href;
+      assert.deepEqual(response?.error, {
+        code: -32002,
+        message: `Resource not found: ${uri}`,
+        data: { uri },
+      });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: --suppress-reads hides read file body in text format", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -3566,9 +3930,54 @@ test("integration: fs/write_text_file through mock agent", async () => {
 
 test("integration: fs/read_text_file outside cwd is denied", async () => {
   await withTempHome(async (homeDir) => {
-    const result = await runCli([...baseExecArgs("/tmp"), "read /etc/hostname"], homeDir);
-    assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout.toLowerCase(), /error:/);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-fs-boundary-"));
+    const cwd = path.join(root, "workspace");
+    const insidePath = path.join(cwd, "inside.txt");
+    const outsidePath = path.join(root, "outside.txt");
+    const insideSentinel = "allowed inside read sentinel";
+    const outsideSentinel = "forbidden outside read sentinel";
+
+    try {
+      await fs.mkdir(cwd);
+      await fs.writeFile(insidePath, insideSentinel, "utf8");
+      await fs.writeFile(outsidePath, outsideSentinel, "utf8");
+      assert.equal(await fs.readFile(outsidePath, "utf8"), outsideSentinel);
+
+      for (const readPath of [insidePath, outsidePath]) {
+        const result = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "--json-strict", "exec", `read ${readPath}`],
+          homeDir,
+        );
+        assert.equal(result.code, 0, result.stderr);
+        const messages = parseJsonRpcOutputLines(result.stdout);
+        const requestIndex = messages.findIndex(
+          (message) => message.method === "fs/read_text_file",
+        );
+        const request = messages[requestIndex];
+        assert.ok(request);
+        assert.equal((request.params as { path?: unknown })?.path, readPath);
+        const requestId = extractJsonRpcId(request);
+        assert.notEqual(requestId, undefined);
+        // Client and agent request IDs can overlap before this read request.
+        const response = messages
+          .slice(requestIndex + 1)
+          .find(
+            (message) => message.id === requestId && ("result" in message || "error" in message),
+          );
+        if (readPath === insidePath) {
+          assert.deepEqual(response?.result, { content: insideSentinel });
+        } else {
+          assert.ok(!result.stdout.includes(outsideSentinel), result.stdout);
+          assert.deepEqual(response?.error, {
+            code: -32603,
+            message: "Internal error",
+            data: { details: `Path is outside allowed cwd subtree: ${path.resolve(outsidePath)}` },
+          });
+        }
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -3589,7 +3998,6 @@ test("integration: terminal lifecycle create/output/wait/release", async () => {
 
 test("integration: terminal kill leaves no orphan sleep process", async (t) => {
   await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const sleepSeconds = 4137;
     let before: Set<number>;
     try {
@@ -3602,7 +4010,8 @@ test("integration: terminal kill leaves no orphan sleep process", async (t) => {
       throw error;
     }
 
-    try {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const body = await observeTestOutcome(async () => {
       const result = await runCli(
         [...baseExecArgs(cwd), `kill-terminal sleep ${sleepSeconds}`],
         homeDir,
@@ -3611,17 +4020,37 @@ test("integration: terminal kill leaves no orphan sleep process", async (t) => {
         },
       );
       assert.equal(result.code, 0, result.stderr);
-      try {
-        await assertNoNewSleepProcesses(before, sleepSeconds);
-      } catch (error) {
-        if (isProcessListUnavailable(error)) {
-          t.skip("process listing unavailable");
-          return;
+      assert.match(result.stdout, /^killed terminal\r?$/m);
+      const exitStatus = result.stdout.match(
+        /^exit: (null|-?\d+) signal: (null|SIG[A-Z0-9]+)\r?$/m,
+      );
+      assert.ok(exitStatus, result.stdout);
+      assert.ok(
+        exitStatus[1] !== "null" || exitStatus[2] !== "null",
+        "terminal kill must report a completed exit status",
+      );
+    });
+    let processListUnavailable = false;
+    const cleanup = await observeTestOutcome(async () => {
+      const processes = await observeTestOutcome(async () => {
+        try {
+          await assertNoNewSleepProcesses(before, sleepSeconds);
+        } catch (error) {
+          if (body.ok && isProcessListUnavailable(error)) {
+            processListUnavailable = true;
+            return;
+          }
+          throw error;
         }
-        throw error;
-      }
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
+      });
+      const directory = await observeTestOutcome(async () => {
+        await fs.rm(cwd, { recursive: true, force: true });
+      });
+      unwrapTestOutcomes(processes, directory);
+    });
+    unwrapTestOutcomes(body, cleanup);
+    if (processListUnavailable) {
+      t.skip("process listing unavailable");
     }
   });
 });
@@ -3823,9 +4252,12 @@ test("integration: prompt recovers when loadSession fails on empty session witho
       assert.equal(created.code, 0, created.stderr);
       const createdEvent = JSON.parse(created.stdout.trim()) as {
         acpxRecordId?: string;
+        acpxSessionId?: string;
       };
       const originalSessionId = createdEvent.acpxRecordId;
+      const originalAcpSessionId = createdEvent.acpxSessionId;
       assert.equal(typeof originalSessionId, "string");
+      assert.equal(typeof originalAcpSessionId, "string");
 
       const prompt = await runCli(
         [
@@ -3870,7 +4302,7 @@ test("integration: prompt recovers when loadSession fails on empty session witho
         messages?: unknown[];
       };
 
-      assert.notEqual(storedRecord.acp_session_id, originalSessionId);
+      assert.notEqual(storedRecord.acp_session_id, originalAcpSessionId);
       const messages = Array.isArray(storedRecord.messages) ? storedRecord.messages : [];
       assert.equal(
         messages.some(
@@ -3903,70 +4335,101 @@ test("integration: prompt recovers when loadSession fails on empty session witho
   });
 });
 
-test("integration: prompt retries stop after partial prompt output", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+for (const command of ["prompt", "exec"]) {
+  for (const prompt of ["partial-retryable-error", "late-retryable-error"]) {
+    test(`integration: ${command} stops retries after ${prompt}`, async () => {
+      await withTempHome(async (homeDir) => {
+        const cwd = path.join(homeDir, "workspace");
+        await fs.mkdir(cwd);
+        try {
+          if (command === "prompt") {
+            const created = await runCli([...baseAgentArgs(cwd), "sessions", "new"], homeDir);
+            assert.equal(created.code, 0, created.stderr);
+          }
+          const result = await runCli(
+            [...baseAgentArgs(cwd), "--format", "json", "--prompt-retries", "1", command, prompt],
+            homeDir,
+          );
+          assert.equal(result.code, 1, result.stderr);
+          assert.equal(
+            result.stderr.includes("retrying in"),
+            command === "exec" && prompt === "late-retryable-error",
+            result.stderr,
+          );
+          const payloads = parseJsonRpcOutputLines(result.stdout);
+          const errorIndex = payloads.findIndex((payload) => Object.hasOwn(payload, "error"));
+          const updateIndex = payloads.findIndex(
+            (payload) => extractAgentMessageChunkText(payload) === "partial update",
+          );
+          assert.ok(errorIndex >= 0, result.stdout);
+          assert.equal(updateIndex > errorIndex, prompt === "late-retryable-error", result.stdout);
+          assert.equal(
+            payloads.filter((payload) => payload.method === "session/prompt").length,
+            1,
+            result.stdout,
+          );
+          assert.equal(
+            payloads.filter((payload) => extractAgentMessageChunkText(payload) === "partial update")
+              .length,
+            1,
+            result.stdout,
+          );
+        } finally {
+          if (command === "prompt") {
+            await runCli([...baseAgentArgs(cwd), "sessions", "close"], homeDir);
+          }
+        }
+      });
+    });
+  }
+}
 
-    try {
-      const created = await runCli([...baseAgentArgs(cwd), "sessions", "new"], homeDir);
-      assert.equal(created.code, 0, created.stderr);
-
-      const result = await runCli(
-        [
-          ...baseAgentArgs(cwd),
-          "--format",
-          "json",
-          "--prompt-retries",
-          "1",
-          "prompt",
-          "partial-retryable-error",
-        ],
-        homeDir,
-      );
-      assert.notEqual(result.code, 0, result.stderr);
-      assert.equal(result.stderr.includes("retrying in"), false, result.stderr);
-
-      const payloads = parseJsonRpcOutputLines(result.stdout);
-      const partialUpdates = payloads.filter(
-        (payload) => extractAgentMessageChunkText(payload) === "partial update",
-      );
-      assert.equal(partialUpdates.length, 1, result.stdout);
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+for (const command of ["exec", "prompt"] as const) {
+  const prompt = "partial-retryable-error";
+  test(`integration: quiet ${command} preserves text after ${prompt}`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd);
+      let warmText = "";
+      try {
+        if (command === "prompt") {
+          const created = await runCli([...baseAgentArgs(cwd), "sessions", "new"], homeDir);
+          assert.equal(created.code, 0, created.stderr);
+          const warm = await runCli(
+            [...baseAgentArgs(cwd), "--format", "quiet", "prompt", "echo warm"],
+            homeDir,
+          );
+          assert.equal(warm.code, 0, warm.stderr);
+          assert.match(warm.stdout, /warm/);
+          warmText = warm.stdout;
+        }
+        const result = await runCli(
+          [...baseAgentArgs(cwd), "--format", "quiet", "--prompt-retries", "0", command, prompt],
+          homeDir,
+        );
+        assert.equal(result.code, 1, result.stderr);
+        assert.equal(result.stdout, "partial update\n");
+        const detail = command === "prompt" ? " QUEUE_RUNTIME_PROMPT_FAILED" : "";
+        assert.equal(result.stderr, `[acpx] error: RUNTIME${detail} Internal error\n`);
+        if (command === "prompt") {
+          const closed = await runCli([...baseAgentArgs(cwd), "sessions", "close"], homeDir);
+          assert.equal(closed.code, 0, closed.stderr);
+          const replay = await runCli(
+            [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "watch"],
+            homeDir,
+          );
+          assert.equal(replay.code, 0, replay.stderr);
+          assert.equal(replay.stdout, `${warmText}partial update\n`);
+          assert.equal(replay.stderr, "");
+        }
+      } finally {
+        if (command === "prompt") {
+          await runCli([...baseAgentArgs(cwd), "sessions", "close"], homeDir);
+        }
+      }
+    });
   });
-});
-
-test("integration: exec retries stop after partial prompt output", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-
-    try {
-      const result = await runCli(
-        [
-          ...baseAgentArgs(cwd),
-          "--format",
-          "json",
-          "--prompt-retries",
-          "1",
-          "exec",
-          "partial-retryable-error",
-        ],
-        homeDir,
-      );
-      assert.equal(result.code, 1, result.stderr);
-      assert.equal(result.stderr.includes("retrying in"), false, result.stderr);
-
-      const payloads = parseJsonRpcOutputLines(result.stdout);
-      const partialUpdates = payloads.filter(
-        (payload) => extractAgentMessageChunkText(payload) === "partial update",
-      );
-      assert.equal(partialUpdates.length, 1, result.stdout);
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
-  });
-});
+}
 
 test("integration: prompt recovers when loadSession returns not found without emitting load error", async () => {
   await withTempHome(async (homeDir) => {
@@ -3991,9 +4454,12 @@ test("integration: prompt recovers when loadSession returns not found without em
       assert.equal(created.code, 0, created.stderr);
       const createdEvent = JSON.parse(created.stdout.trim()) as {
         acpxRecordId?: string;
+        acpxSessionId?: string;
       };
       const originalSessionId = createdEvent.acpxRecordId;
+      const originalAcpSessionId = createdEvent.acpxSessionId;
       assert.equal(typeof originalSessionId, "string");
+      assert.equal(typeof originalAcpSessionId, "string");
 
       const prompt = await runCli(
         [
@@ -4037,7 +4503,7 @@ test("integration: prompt recovers when loadSession returns not found without em
       const storedRecord = JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
         acp_session_id?: string;
       };
-      assert.notEqual(storedRecord.acp_session_id, originalSessionId);
+      assert.notEqual(storedRecord.acp_session_id, originalAcpSessionId);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -4159,7 +4625,14 @@ test("integration: cancel yields cancelled stopReason without queue error", asyn
 
       const promptChild = spawn(
         process.execPath,
-        [CLI_PATH, ...baseAgentArgs(cwd), "--format", "json", "prompt", "sleep 5000"],
+        [
+          CLI_PATH,
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "prompt",
+          "stream-sleep 5000 cancellation-ready",
+        ],
         {
           env: {
             ...process.env,
@@ -4170,30 +4643,33 @@ test("integration: cancel yields cancelled stopReason without queue error", asyn
       );
 
       try {
-        const doneEventPromise = waitForPromptDoneEvent(promptChild, 20_000, "prompt");
-
-        let cancelled = false;
-        for (let attempt = 0; attempt < 80; attempt += 1) {
-          const cancelResult = await runCli(
-            [...baseAgentArgs(cwd), "--format", "json", "cancel"],
-            homeDir,
-          );
-          assert.equal(cancelResult.code, 0, cancelResult.stderr);
-
-          const payload = JSON.parse(cancelResult.stdout.trim()) as {
-            action?: string;
-            cancelled?: boolean;
-          };
-          assert.equal(payload.action, "cancel_result");
-          cancelled = payload.cancelled === true;
-          if (cancelled) {
-            break;
+        let markReady!: () => void;
+        const ready = new Promise<void>((resolve) => {
+          markReady = resolve;
+        });
+        const doneEventPromise = waitForPromptCompletion(promptChild, 20_000, "prompt", (event) => {
+          if (extractAgentMessageChunkText(event) === "cancellation-ready") {
+            markReady();
           }
+        });
+        await Promise.race([
+          ready,
+          doneEventPromise.then(() => {
+            throw new Error("Prompt finished before readiness");
+          }),
+        ]);
 
-          await sleep(100);
-        }
-
-        assert.equal(cancelled, true, "cancel command never reached active queue owner");
+        const cancelResult = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "cancel"],
+          homeDir,
+        );
+        assert.equal(cancelResult.code, 0, cancelResult.stderr);
+        const payload = JSON.parse(cancelResult.stdout.trim()) as {
+          action?: string;
+          cancelled?: boolean;
+        };
+        assert.equal(payload.action, "cancel_result");
+        assert.equal(payload.cancelled, true, "cancel command must reach the admitted prompt");
 
         const promptResult = await doneEventPromise;
         assert.equal(
@@ -4350,118 +4826,110 @@ test("integration: prompt --no-wait is processed by the detached queue owner", a
 
 test("integration: sessions history shows in-flight prompt after prompt starts", async () => {
   await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const cwd = await fs.mkdtemp(path.join(homeDir, "cwd-"));
 
-    try {
-      const created = await runCli(
-        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
-        homeDir,
-      );
-      assert.equal(created.code, 0, created.stderr);
+    const created = await runCli(
+      [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
 
-      const promptChild = spawn(
-        process.execPath,
-        [CLI_PATH, ...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
-        {
-          env: {
-            ...process.env,
-            HOME: homeDir,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
+    const promptChild = spawn(
+      process.execPath,
+      [CLI_PATH, ...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
+      {
+        env: {
+          ...process.env,
+          HOME: homeDir,
         },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    const promptClosed = new Promise<void>((resolve) => {
+      promptChild.once("close", () => resolve());
+    });
+
+    await withObservedChild(promptChild, homeDir, async (waitForClose) => {
+      const history = await waitFor(async () => {
+        const result = await runCli(
+          [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "history"],
+          homeDir,
+        );
+        assert.equal(result.code, 0, result.stderr);
+        return result.stdout.includes("sleep 1500") ? result.stdout : null;
+      }, 5_000);
+
+      assert.match(history, /sleep 1500/);
+      assert.doesNotMatch(history, /No history/);
+
+      // Exercise delayed consumption after the real child and its pipes have closed.
+      await withinCliDeadline(
+        15_000,
+        () => new Error("History prompt did not close"),
+        () => promptClosed,
       );
-
-      try {
-        const history = await waitFor(async () => {
-          const result = await runCli(
-            [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "history"],
-            homeDir,
-          );
-          assert.equal(result.code, 0, result.stderr);
-          return result.stdout.includes("sleep 1500") ? result.stdout : null;
-        }, 5_000);
-
-        assert.match(history, /sleep 1500/);
-        assert.doesNotMatch(history, /No history/);
-
-        const promptResult = await awaitChildClose(promptChild);
-        assert.equal(promptResult.code, 0, promptResult.stderr);
-        assert.match(promptResult.stdout, /slept 1500ms/);
-      } finally {
-        if (promptChild.exitCode == null && promptChild.signalCode == null) {
-          promptChild.kill("SIGKILL");
-          await awaitChildClose(promptChild).catch(() => {});
-        }
-      }
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+      const promptResult = await waitForClose();
+      assert.equal(promptResult.code, 0, promptResult.stderr);
+      assert.match(promptResult.stdout, /slept 1500ms/);
+    });
   });
 });
 
 test("integration: sessions read shows assistant updates before the prompt finishes", async () => {
   await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const cwd = await fs.mkdtemp(path.join(homeDir, "cwd-"));
 
-    try {
-      const created = await runCli(
-        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
-        homeDir,
-      );
-      assert.equal(created.code, 0, created.stderr);
+    const created = await runCli(
+      [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
 
-      const promptChild = spawn(
-        process.execPath,
-        [
-          CLI_PATH,
-          ...baseAgentArgs(cwd),
-          "--format",
-          "quiet",
-          "prompt",
-          "stream-sleep 2500 foreground-live-update",
-        ],
-        {
-          env: {
-            ...process.env,
-            HOME: homeDir,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
+    const promptChild = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        ...baseAgentArgs(cwd),
+        "--format",
+        "quiet",
+        "prompt",
+        "stream-sleep 2500 foreground-live-update",
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: homeDir,
         },
-      );
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
 
-      try {
-        const history = await waitFor(async () => {
-          const result = await runCli(
-            [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
-            homeDir,
-          );
-          assert.equal(result.code, 0, result.stderr);
-          const payload = JSON.parse(result.stdout.trim()) as {
-            entries?: Array<{ role?: string; textPreview?: string }>;
-          };
-          const assistantEntry = payload.entries?.find(
-            (entry) =>
-              entry.role === "assistant" && entry.textPreview?.includes("foreground-live-update"),
-          );
-          return assistantEntry ? result.stdout : null;
-        }, 5_000);
+    await withObservedChild(promptChild, homeDir, async (waitForClose) => {
+      const history = await waitFor(async () => {
+        const result = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
+          homeDir,
+        );
+        assert.equal(result.code, 0, result.stderr);
+        const payload = JSON.parse(result.stdout.trim()) as {
+          entries?: Array<{ role?: string; textPreview?: string }>;
+        };
+        const assistantEntry = payload.entries?.find(
+          (entry) =>
+            entry.role === "assistant" && entry.textPreview?.includes("foreground-live-update"),
+        );
+        return assistantEntry ? result.stdout : null;
+      }, 5_000);
 
-        assert.equal(promptChild.exitCode, null, "prompt should still be running");
-        assert.match(history, /foreground-live-update/);
-        assert.doesNotMatch(history, /stream-sleep done/);
+      assert.equal(promptChild.exitCode, null, "prompt should still be running");
+      assert.match(history, /foreground-live-update/);
+      assert.doesNotMatch(history, /stream-sleep done/);
 
-        const promptResult = await awaitChildClose(promptChild);
-        assert.equal(promptResult.code, 0, promptResult.stderr);
-        assert.match(promptResult.stdout, /stream-sleep done: foreground-live-update/);
-      } finally {
-        if (promptChild.exitCode == null && promptChild.signalCode == null) {
-          promptChild.kill("SIGKILL");
-          await awaitChildClose(promptChild).catch(() => {});
-        }
-      }
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+      const promptResult = await waitForClose();
+      assert.equal(promptResult.code, 0, promptResult.stderr);
+      assert.match(promptResult.stdout, /stream-sleep done: foreground-live-update/);
+    });
   });
 });
 
@@ -4531,86 +4999,74 @@ test("integration: --no-wait stdin prompt checkpoints live assistant updates", a
 
 test("integration: sessions close stays closed after live checkpoints", async () => {
   await withTempHome(async (homeDir) => {
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const cwd = await fs.mkdtemp(path.join(homeDir, "cwd-"));
 
-    try {
-      const created = await runCli(
-        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+    const created = await runCli(
+      [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const createdPayload = JSON.parse(created.stdout.trim()) as {
+      acpxRecordId?: string;
+    };
+    const sessionId = createdPayload.acpxRecordId;
+    assert.equal(typeof sessionId, "string");
+
+    const promptChild = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        ...baseAgentArgs(cwd),
+        "--format",
+        "quiet",
+        "prompt",
+        "stream-sleep 5000 close-live-update",
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: homeDir,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    await withObservedChild(promptChild, homeDir, async (waitForClose) => {
+      await waitFor(async () => {
+        const result = await runCli(
+          [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
+          homeDir,
+        );
+        assert.equal(result.code, 0, result.stderr);
+        const payload = JSON.parse(result.stdout.trim()) as {
+          entries?: Array<{ role?: string; textPreview?: string }>;
+        };
+        const assistantEntry = payload.entries?.find(
+          (entry) => entry.role === "assistant" && entry.textPreview?.includes("close-live-update"),
+        );
+        return assistantEntry ? true : null;
+      }, 5_000);
+
+      const closed = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
         homeDir,
       );
-      assert.equal(created.code, 0, created.stderr);
-      const createdPayload = JSON.parse(created.stdout.trim()) as {
-        acpxRecordId?: string;
-      };
-      const sessionId = createdPayload.acpxRecordId;
-      assert.equal(typeof sessionId, "string");
+      assert.equal(closed.code, 0, closed.stderr);
+      await waitForClose();
 
-      const promptChild = spawn(
-        process.execPath,
-        [
-          CLI_PATH,
-          ...baseAgentArgs(cwd),
-          "--format",
-          "quiet",
-          "prompt",
-          "stream-sleep 5000 close-live-update",
-        ],
-        {
-          env: {
-            ...process.env,
-            HOME: homeDir,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
-        },
+      const recordPath = path.join(
+        homeDir,
+        ".acpx",
+        "sessions",
+        `${encodeURIComponent(sessionId as string)}.json`,
       );
-
-      try {
-        await waitFor(async () => {
-          const result = await runCli(
-            [...baseAgentArgs(cwd), "--format", "json", "sessions", "read"],
-            homeDir,
-          );
-          assert.equal(result.code, 0, result.stderr);
-          const payload = JSON.parse(result.stdout.trim()) as {
-            entries?: Array<{ role?: string; textPreview?: string }>;
-          };
-          const assistantEntry = payload.entries?.find(
-            (entry) =>
-              entry.role === "assistant" && entry.textPreview?.includes("close-live-update"),
-          );
-          return assistantEntry ? true : null;
-        }, 5_000);
-
-        const closed = await runCli(
-          [...baseAgentArgs(cwd), "--format", "json", "sessions", "close"],
-          homeDir,
-        );
-        assert.equal(closed.code, 0, closed.stderr);
-        if (promptChild.exitCode == null && promptChild.signalCode == null) {
-          await awaitChildClose(promptChild).catch(() => {});
-        }
-
-        const recordPath = path.join(
-          homeDir,
-          ".acpx",
-          "sessions",
-          `${encodeURIComponent(sessionId as string)}.json`,
-        );
-        const storedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
-          closed?: boolean;
-          closed_at?: string;
-        };
-        assert.equal(storedRecord.closed, true);
-        assert.equal(typeof storedRecord.closed_at, "string");
-      } finally {
-        if (promptChild.exitCode == null && promptChild.signalCode == null) {
-          promptChild.kill("SIGKILL");
-          await awaitChildClose(promptChild).catch(() => {});
-        }
-      }
-    } finally {
-      await fs.rm(cwd, { recursive: true, force: true });
-    }
+      const storedRecord = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+        closed?: boolean;
+        closed_at?: string;
+      };
+      assert.equal(storedRecord.closed, true);
+      assert.equal(typeof storedRecord.closed_at, "string");
+    });
   });
 });
 
@@ -4710,6 +5166,435 @@ test("integration: session remains resumable after queue owner exits and agent h
   });
 });
 
+for (const format of ["text", "quiet", "json"]) {
+  test(`integration: exec reports an agent disconnect in ${format} output`, async () => {
+    await withTempHome(async (homeDir) => {
+      const result = await runCli(
+        [...baseAgentArgs(homeDir), "--format", format, "exec", "disconnect-after-output"],
+        homeDir,
+      );
+      assert.equal(result.code, 1);
+      assert.match(result.stdout, /partial /);
+      assert.match(`${result.stdout}\n${result.stderr}`, /ACP agent disconnected during request/);
+      assert.equal(
+        (`${result.stdout}\n${result.stderr}`.match(/ACP agent disconnected during request/g) ?? [])
+          .length,
+        1,
+      );
+    });
+  });
+}
+
+for (const connection of ["load", "resume"]) {
+  for (const scenario of [
+    { operation: "new", scope: "same" },
+    { operation: "new", scope: "other" },
+    { operation: "ensure", scope: "other" },
+  ]) {
+    for (const fails of [false, true]) {
+      test(`integration: ${scenario.operation} same-ID ${connection} retires its ${scenario.scope}-scope warm owner (fails: ${fails})`, async () => {
+        await withTempHome(async (homeDir) => {
+          const nativeId = "same-resume-warm";
+          let recordId = nativeId;
+          const destination = scenario.scope === "same" ? homeDir : path.join(homeDir, "other");
+          await fs.mkdir(destination, { recursive: true });
+          const name = scenario.scope === "same" ? undefined : "moved";
+          const creationName = name === undefined ? [] : ["--name", name];
+          const promptName = name === undefined ? [] : ["-s", name];
+          const base = (cwd: string) => [
+            "--agent",
+            `${MOCK_AGENT_COMMAND} --supports-${connection}-session --advertise-models`,
+            "--cwd",
+            cwd,
+            "--ttl",
+            "60",
+            "--format",
+            "json",
+          ];
+          let recordPath = path.join(homeDir, ".acpx", "sessions", `${recordId}.json`);
+          const readRecord = async () => {
+            const record = parseSessionRecord(JSON.parse(await fs.readFile(recordPath, "utf8")));
+            assert.ok(record);
+            return record;
+          };
+          const ownedPids = new Set<number>();
+          const rememberOwner = async () => {
+            const owner = await readQueueOwnerLock(homeDir, recordId);
+            const record = await readRecord();
+            assert.ok(record.pid);
+            ownedPids.add(owner.pid);
+            ownedPids.add(record.pid);
+            return record;
+          };
+          const body = await observeTestOutcome(async () => {
+            const created = await runCli(
+              [...base(homeDir), "sessions", "new", "--resume-session", recordId],
+              homeDir,
+            );
+            assert.equal(created.code, 0, JSON.stringify(created));
+            recordId = (JSON.parse(created.stdout) as { acpxRecordId: string }).acpxRecordId;
+            recordPath = path.join(homeDir, ".acpx", "sessions", `${recordId}.json`);
+            const warm = await runCli([...base(homeDir), "prompt", "echo warm-owner"], homeDir);
+            assert.equal(warm.code, 0, JSON.stringify(warm));
+            const before = await rememberOwner();
+            const replacement = await runCli(
+              [
+                ...base(destination),
+                ...(fails ? ["--model", "missing-model"] : []),
+                "sessions",
+                scenario.operation,
+                ...creationName,
+                "--resume-session",
+                recordId,
+              ],
+              homeDir,
+            );
+            assert.equal(replacement.code, fails ? 1 : 0, JSON.stringify(replacement));
+            for (const pid of ownedPids) {
+              assert.equal(await waitForPidExit(pid, 5_000), true, `prior process ${pid} survived`);
+            }
+            const after = await readRecord();
+            assert.equal(after.acpxRecordId, recordId);
+            assert.equal(after.acpSessionId, nativeId);
+            assert.equal(after.closed, fails);
+            assert.equal(after.pid, undefined);
+            assert.equal(after.cwd, fails ? before.cwd : destination);
+            assert.equal(after.name, fails ? before.name : name);
+            if (fails) {
+              assert.match(replacement.stdout, /did not advertise that model/);
+              assert.deepEqual(after.messages, before.messages);
+            }
+            const prompt = await runCli(
+              [...base(destination), "prompt", ...promptName, "echo replacement-owner"],
+              homeDir,
+            );
+            assert.equal(prompt.code, fails ? 4 : 0, JSON.stringify(prompt));
+            if (!fails) {
+              await rememberOwner();
+              assert.match(prompt.stdout, /replacement-owner/);
+            }
+          });
+          const cleanup = await observeTestOutcome(async () => {
+            // Failure can leave the old scope closed; success moves the same ID.
+            // Read the actual current scope instead of assuming the requested one.
+            const current = await readRecord();
+            await runCli(
+              [
+                ...base(current.cwd),
+                "sessions",
+                "close",
+                ...(current.name === undefined ? [] : [current.name]),
+              ],
+              homeDir,
+            );
+            for (const pid of ownedPids) {
+              assert.equal(await waitForPidExit(pid, 5_000), true, `cleanup left process ${pid}`);
+            }
+          });
+          if (!cleanup.ok) {
+            retainedCliHomes.add(homeDir);
+          }
+          unwrapTestOutcomes(body, cleanup);
+        });
+      });
+    }
+  }
+}
+
+test("integration: a failed replacement keeps the previous session open", async () => {
+  await withTempHome(async (homeDir) => {
+    const base = [
+      "--agent",
+      `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`,
+      "--cwd",
+      homeDir,
+    ];
+    const created = await runCli([...base, "--format", "json", "sessions", "new"], homeDir);
+    assert.equal(created.code, 0, JSON.stringify(created));
+    const { acpxRecordId } = JSON.parse(created.stdout) as { acpxRecordId: string };
+    try {
+      const failed = await runCli(
+        [...base, "--model", "missing-model", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(failed.code, 1);
+      assert.match(failed.stderr, /did not advertise that model/);
+      const stored = parseSessionRecord(
+        JSON.parse(
+          await fs.readFile(
+            path.join(homeDir, ".acpx", "sessions", `${acpxRecordId}.json`),
+            "utf8",
+          ),
+        ),
+      );
+      assert.ok(stored);
+      assert.equal(stored.closed, false);
+      const prompt = await runCli(
+        [...base, "--format", "quiet", "prompt", "echo retained"],
+        homeDir,
+      );
+      assert.equal(prompt.code, 0, prompt.stderr);
+      assert.equal(prompt.stdout.trim(), "retained");
+    } finally {
+      await runCli([...base, "sessions", "close"], homeDir);
+    }
+  });
+});
+
+test("integration: a warm owner does not reapply its startup model to later turns", async () => {
+  await withTempHome(async (homeDir) => {
+    const base = [
+      "--agent",
+      `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`,
+      "--cwd",
+      homeDir,
+      "--ttl",
+      "60",
+    ];
+    const created = await runCli([...base, "sessions", "new"], homeDir);
+    assert.equal(created.code, 0, JSON.stringify(created));
+    try {
+      const first = await runCli(
+        [...base, "--model", "fast-model", "prompt", "echo first"],
+        homeDir,
+      );
+      assert.equal(first.code, 0, first.stderr);
+      const selected = await runCli([...base, "set", "model", "smart-model"], homeDir);
+      assert.equal(selected.code, 0, selected.stderr);
+      const next = await runCli([...base, "--format", "json", "prompt", "echo second"], homeDir);
+      assert.equal(next.code, 0, next.stderr);
+      assert.equal(
+        parseJsonRpcOutputLines(next.stdout).filter(
+          (message) => message.method === "session/set_config_option",
+        ).length,
+        0,
+      );
+      const current = await runCli([...base, "--format", "json", "status"], homeDir);
+      assert.equal((JSON.parse(current.stdout) as { model: string }).model, "smart-model");
+    } finally {
+      await runCli([...base, "sessions", "close"], homeDir);
+    }
+  });
+});
+
+for (const [firstApproved, operation] of [
+  [false, "permission"],
+  [true, "permission"],
+  [false, "write"],
+] as const) {
+  test(`integration: warm-owner permission accounting is per turn (${operation}, first approved: ${firstApproved})`, async () => {
+    await withTempHome(async (homeDir) => {
+      const base = [
+        "--agent",
+        LOAD_CAPABLE_MOCK_AGENT_COMMAND,
+        "--cwd",
+        homeDir,
+        "--ttl",
+        "60",
+        "--format",
+        "quiet",
+      ];
+      const created = await runCli([...base, "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, JSON.stringify(created));
+      try {
+        for (const approved of [firstApproved, !firstApproved, firstApproved]) {
+          const result = await runCli(
+            [
+              ...base,
+              approved ? "--approve-all" : "--deny-all",
+              "prompt",
+              operation === "write"
+                ? `write ${path.join(homeDir, "write.txt")} synthetic`
+                : "permission edit synthetic",
+            ],
+            homeDir,
+          );
+          assert.equal(result.code, approved ? 0 : 5, JSON.stringify(result));
+        }
+      } finally {
+        await runCli([...base, "sessions", "close"], homeDir);
+      }
+    });
+  });
+}
+
+test("integration: empty accepted config replies preserve controls across set, prompt, and reconnect", async () => {
+  await withTempHome(async (homeDir) => {
+    const base = [
+      "--agent",
+      `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models --omit-set-config-options`,
+      "--cwd",
+      homeDir,
+      "--ttl",
+      "60",
+      "--format",
+      "json",
+    ];
+    const created = await runCli([...base, "--model", "fast-model", "sessions", "new"], homeDir);
+    assert.equal(created.code, 0, JSON.stringify(created));
+    const { acpxRecordId } = JSON.parse(created.stdout) as { acpxRecordId: string };
+    try {
+      const selected = await runCli([...base, "set", "reasoning_effort", "high"], homeDir);
+      assert.equal(selected.code, 0, JSON.stringify(selected));
+      const resumed = await runCli([...base, "prompt", "echo reconnected"], homeDir);
+      assert.equal(resumed.code, 0, JSON.stringify(resumed));
+      const warmSet = await runCli([...base, "set", "reasoning_effort", "high"], homeDir);
+      assert.equal(warmSet.code, 0, JSON.stringify(warmSet));
+      for (const model of ["smart-model", "fast-model"]) {
+        const prompt = await runCli(
+          [...base, "--model", model, "prompt", "echo retained"],
+          homeDir,
+        );
+        assert.equal(prompt.code, 0, prompt.stderr);
+      }
+      const stored = parseSessionRecord(
+        JSON.parse(
+          await fs.readFile(
+            path.join(homeDir, ".acpx", "sessions", `${acpxRecordId}.json`),
+            "utf8",
+          ),
+        ),
+      );
+      assert.ok(stored);
+      assert.equal(stored.acpx?.current_model_id, "fast-model");
+      assert.equal(stored.acpx?.model_control, "config_option");
+      assert.equal(
+        stored.acpx?.config_options?.find((option) => option.id === "model")?.currentValue,
+        "fast-model",
+      );
+      assert.equal(
+        stored.acpx?.config_options?.find((option) => option.id === "reasoning_effort")
+          ?.currentValue,
+        "high",
+      );
+    } finally {
+      await runCli([...base, "sessions", "close"], homeDir);
+    }
+  });
+});
+
+for (const order of ["before", "after"]) {
+  test(`integration: fallback preserves opposite-direction RPC IDs (${order})`, async () => {
+    await withTempHome(async (homeDir) => {
+      const peer = fileURLToPath(new URL("./fixtures/load-id-collision-agent.js", import.meta.url));
+      const base = [
+        "--agent",
+        `node ${JSON.stringify(peer)} ${order}`,
+        "--cwd",
+        homeDir,
+        "--approve-all",
+        "--format",
+        "json",
+      ];
+      await fs.writeFile(path.join(homeDir, "collision.txt"), "synthetic collision content");
+      const created = await runCli([...base, "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, JSON.stringify(created));
+      try {
+        const result = await runCli([...base, "prompt", "synthetic"], homeDir);
+        assert.equal(result.code, 0, result.stderr);
+        const messages = parseJsonRpcOutputLines(result.stdout);
+        assert.equal(
+          messages.some((message) => message.method === "session/load"),
+          false,
+        );
+        assert.equal(
+          messages.some(
+            (message) =>
+              (message.error as { message?: string } | undefined)?.message === "Resource not found",
+          ),
+          false,
+        );
+        const request = messages.find((message) => message.method === "fs/read_text_file");
+        assert.ok(request);
+        assert.ok(
+          messages.some(
+            (message) =>
+              message.id === request.id &&
+              (message.result as { content?: string } | undefined)?.content ===
+                "synthetic collision content",
+          ),
+        );
+      } finally {
+        await runCli([...base, "sessions", "close"], homeDir);
+      }
+    });
+  });
+}
+
+for (const connection of ["load", "resume"]) {
+  for (const override of [false, true]) {
+    test(`integration: warm-owner ${connection} metadata follows the current model after agent restart (override: ${override})`, async () => {
+      await withTempHome(async (homeDir) => {
+        const base = [
+          "--agent",
+          `${MOCK_AGENT_COMMAND} --supports-${connection}-session --advertise-models`,
+          "--cwd",
+          homeDir,
+          "--ttl",
+          "60",
+          "--format",
+          "json",
+        ];
+        const created = await runCli(
+          [...base, "--model", "fast-model", "sessions", "new"],
+          homeDir,
+        );
+        assert.equal(created.code, 0, JSON.stringify(created));
+        const { acpxRecordId } = JSON.parse(created.stdout) as { acpxRecordId: string };
+        try {
+          const first = await runCli(
+            [...base, "--model", "fast-model", "prompt", "echo first"],
+            homeDir,
+          );
+          assert.equal(first.code, 0, JSON.stringify(first));
+          const selected = await runCli([...base, "set", "model", "smart-model"], homeDir);
+          assert.equal(selected.code, 0, JSON.stringify(selected));
+          const { lockPath } = queuePaths(homeDir, acpxRecordId);
+          const ownerBefore = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid: number };
+          const record = parseSessionRecord(
+            JSON.parse(
+              await fs.readFile(
+                path.join(homeDir, ".acpx", "sessions", `${acpxRecordId}.json`),
+                "utf8",
+              ),
+            ),
+          );
+          assert.ok(record?.pid);
+          process.kill(record.pid, "SIGKILL");
+          assert.equal(await waitForPidExit(record.pid, 5_000), true);
+          const next = await runCli(
+            [
+              ...base,
+              ...(override ? ["--model", "default-model"] : []),
+              "prompt",
+              "echo reconnected",
+            ],
+            homeDir,
+          );
+          assert.equal(next.code, 0, JSON.stringify(next));
+          const reconnect = parseJsonRpcOutputLines(next.stdout).find(
+            (message) => message.method === `session/${connection}`,
+          );
+          assert.ok(reconnect, next.stdout);
+          assert.partialDeepStrictEqual(reconnect.params, {
+            _meta: {
+              claudeCode: { options: { model: override ? "default-model" : "smart-model" } },
+            },
+          });
+          const ownerAfter = JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid: number };
+          assert.equal(
+            ownerAfter.pid,
+            ownerBefore.pid,
+            "the queue owner must survive the adapter restart",
+          );
+        } finally {
+          await runCli([...base, "sessions", "close"], homeDir);
+        }
+      });
+    });
+  }
+}
+
 function baseAgentArgs(cwd: string): string[] {
   return ["--agent", MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd];
 }
@@ -4722,68 +5607,44 @@ function baseExecArgs(cwd: string): string[] {
   return [...baseAgentArgs(cwd), "--format", "quiet", "exec"];
 }
 
-async function writeFakeCursorAgent(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "cursor-agent.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        'if "%~1"=="acp" shift',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
+async function configuredHarnessInvocation(
+  homeDir: string,
+  argv: readonly string[],
+): Promise<string[]> {
+  const configDir = path.join(homeDir, ".acpx");
+  await fs.mkdir(configDir, { recursive: true });
   await fs.writeFile(
-    path.join(binDir, "cursor-agent"),
-    [
-      "#!/bin/sh",
-      'if [ "$1" = "acp" ]; then',
-      "  shift",
-      "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
+    path.join(configDir, "config.json"),
+    JSON.stringify({ agents: { "launcher-fixture": { argv } } }),
+    "utf8",
   );
+  return ["launcher-fixture"];
 }
 
-async function writeFakeDroidAgent(binDir: string): Promise<void> {
+async function writeFakeHarnessAgent(
+  binDir: string,
+  name: "cursor-agent" | "droid" | "devin" | "uvx" | "iflow" | "qodercli",
+  argLogPath = "",
+): Promise<void> {
+  const launcher = fileURLToPath(new URL("./fixtures/harness-launcher.js", import.meta.url));
   if (process.platform === "win32") {
     await fs.writeFile(
-      path.join(binDir, "droid.cmd"),
+      path.join(binDir, `${name}.cmd`),
       [
         "@echo off",
-        "setlocal",
-        'if /I "%~1"=="exec" shift',
-        'if /I "%~1"=="--output-format" shift',
-        'if /I "%~1"=="acp" shift',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
+        "setlocal DisableDelayedExpansion",
+        `"${process.execPath}" "${launcher}" "${name}" "${argLogPath}" %*`,
         "",
       ].join("\r\n"),
-      { encoding: "utf8" },
+      "utf8",
     );
     return;
   }
-
   await fs.writeFile(
-    path.join(binDir, "droid"),
+    path.join(binDir, name),
     [
       "#!/bin/sh",
-      'if [ "$1" = "exec" ]; then',
-      "  shift",
-      "fi",
-      'if [ "$1" = "--output-format" ]; then',
-      "  shift",
-      "fi",
-      'if [ "$1" = "acp" ]; then',
-      "  shift",
-      "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      `exec "${process.execPath}" "${launcher}" "${name}" "${argLogPath}" "$@"`,
       "",
     ].join("\n"),
     { encoding: "utf8", mode: 0o755 },
@@ -4808,115 +5669,6 @@ async function writeFakeClaudeAgent(binDir: string): Promise<string> {
     { encoding: "utf8", mode: 0o755 },
   );
   return binPath;
-}
-
-async function writeFakeDevinAgent(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "devin.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        ":shift_known",
-        'if "%~1"=="--model" shift & shift & goto shift_known',
-        'if "%~1"=="acp" shift & goto shift_known',
-        'if "%~1"=="--acp" shift & goto shift_known',
-        'if "%~1"=="--experimental-acp" shift & goto shift_known',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "devin"),
-    [
-      "#!/bin/sh",
-      'while [ "$#" -gt 0 ]; do',
-      '  case "$1" in',
-      "    --model)",
-      "      shift",
-      '      [ "$#" -gt 0 ] && shift',
-      "      ;;",
-      "    acp|--acp|--experimental-acp)",
-      "      shift",
-      "      ;;",
-      "    *)",
-      "      break",
-      "      ;;",
-      "  esac",
-      "done",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
-}
-
-async function writeFakeUvxFastAgentAcp(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "uvx.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        'if "%~1"=="fast-agent-mcp" shift',
-        'if "%~1"=="acp" shift',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "uvx"),
-    [
-      "#!/bin/sh",
-      'if [ "$1" = "fast-agent-mcp" ]; then',
-      "  shift",
-      "fi",
-      'if [ "$1" = "acp" ]; then',
-      "  shift",
-      "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
-}
-
-async function writeFakeIflowAgent(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "iflow.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        'if "%~1"=="--experimental-acp" shift',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "iflow"),
-    [
-      "#!/bin/sh",
-      'if [ "$1" = "--experimental-acp" ]; then',
-      "  shift",
-      "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
 }
 
 async function writeFakeGrokBuildAgent(binDir: string): Promise<void> {
@@ -4954,62 +5706,18 @@ async function writeFakeGrokBuildAgent(binDir: string): Promise<void> {
   );
 }
 
-async function writeFakeDeepSeekBuildAgent(binDir: string): Promise<void> {
+async function writeFakeNativeAcpAgent(
+  binDir: string,
+  agent: string,
+  acpArg: string,
+): Promise<void> {
   if (process.platform === "win32") {
     await fs.writeFile(
-      path.join(binDir, "grok.cmd"),
+      path.join(binDir, `${agent}.cmd`),
       [
         "@echo off",
         "setlocal",
-        'if not "%~1"=="agent" exit /b 2',
-        'if not "%~2"=="--model" exit /b 2',
-        'if not "%~3"=="deepseek-v4-flash" exit /b 2',
-        'if not "%~4"=="stdio" exit /b 2',
-        'if not "%GROK_XAI_API_BASE_URL%"=="https://api.deepseek.com" exit /b 3',
-        'if not "%GROK_MODELS_BASE_URL%"=="https://api.deepseek.com" exit /b 3',
-        'if not "%GROK_MODELS_LIST_URL%"=="https://api.deepseek.com/models" exit /b 3',
-        'if not "%GROK_DEFAULT_MODEL%"=="deepseek-v4-flash" exit /b 3',
-        'if not "%XAI_API_KEY%"=="test-auth-token" exit /b 3',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %5 %6 %7 %8 %9`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "grok"),
-    [
-      "#!/bin/sh",
-      '[ "$1" = "agent" ] || exit 2',
-      '[ "$2" = "--model" ] || exit 2',
-      '[ "$3" = "deepseek-v4-flash" ] || exit 2',
-      '[ "$4" = "stdio" ] || exit 2',
-      '[ "$GROK_XAI_API_BASE_URL" = "https://api.deepseek.com" ] || exit 3',
-      '[ "$GROK_MODELS_BASE_URL" = "https://api.deepseek.com" ] || exit 3',
-      '[ "$GROK_MODELS_LIST_URL" = "https://api.deepseek.com/models" ] || exit 3',
-      '[ "$GROK_DEFAULT_MODEL" = "deepseek-v4-flash" ] || exit 3',
-      '[ "$XAI_API_KEY" = "test-auth-token" ] || exit 3',
-      "shift",
-      "shift",
-      "shift",
-      "shift",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
-}
-
-async function writeFakeMCodeAgent(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "mcode.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        'if not "%~1"=="acp" exit /b 2',
+        `if not "%~1"=="${acpArg}" exit /b 2`,
         `"${process.execPath}" "${MOCK_AGENT_PATH}" %2 %3 %4 %5 %6 %7 %8 %9`,
         "",
       ].join("\r\n"),
@@ -5017,133 +5725,16 @@ async function writeFakeMCodeAgent(binDir: string): Promise<void> {
     );
     return;
   }
-
   await fs.writeFile(
-    path.join(binDir, "mcode"),
+    path.join(binDir, agent),
     [
       "#!/bin/sh",
-      'if [ "$1" = "acp" ]; then',
+      `if [ "$1" = "${acpArg}" ]; then`,
       "  shift",
       "else",
-      '  echo "unexpected mcode command: $*" 1>&2',
+      `  echo "unexpected ${agent} command: $*" 1>&2`,
       "  exit 2",
       "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
-}
-
-async function writeFakePoolAgent(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "pool.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        'if not "%~1"=="acp" exit /b 2',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %2 %3 %4 %5 %6 %7 %8 %9`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "pool"),
-    [
-      "#!/bin/sh",
-      'if [ "$1" = "acp" ]; then',
-      "  shift",
-      "else",
-      '  echo "unexpected pool command: $*" 1>&2',
-      "  exit 2",
-      "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
-}
-
-async function writeFakeZeroClawAgent(binDir: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "zeroclaw.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        'if not "%~1"=="acp" exit /b 2',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %2 %3 %4 %5 %6 %7 %8 %9`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "zeroclaw"),
-    [
-      "#!/bin/sh",
-      'if [ "$1" = "acp" ]; then',
-      "  shift",
-      "else",
-      '  echo "unexpected zeroclaw command: $*" 1>&2',
-      "  exit 2",
-      "fi",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
-      "",
-    ].join("\n"),
-    { encoding: "utf8", mode: 0o755 },
-  );
-}
-
-async function writeFakeQoderAgent(binDir: string, argLogPath?: string): Promise<void> {
-  if (process.platform === "win32") {
-    await fs.writeFile(
-      path.join(binDir, "qodercli.cmd"),
-      [
-        "@echo off",
-        "setlocal",
-        ...(argLogPath ? [`echo %*>> "${argLogPath}"`] : []),
-        ":shift_known",
-        'if "%~1"=="--acp" shift & goto shift_known',
-        'if /I "%~1"=="--max-turns" shift & shift & goto shift_known',
-        'if /I "%~1"=="--allowed-tools" shift & shift & goto shift_known',
-        'if /I "%~1"=="--disallowed-tools" shift & shift & goto shift_known',
-        'echo %~1 | findstr /B /C:"--max-turns=" >nul && shift & goto shift_known',
-        'echo %~1 | findstr /B /C:"--allowed-tools=" >nul && shift & goto shift_known',
-        'echo %~1 | findstr /B /C:"--disallowed-tools=" >nul && shift & goto shift_known',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
-        "",
-      ].join("\r\n"),
-      { encoding: "utf8" },
-    );
-    return;
-  }
-
-  await fs.writeFile(
-    path.join(binDir, "qodercli"),
-    [
-      "#!/bin/sh",
-      ...(argLogPath ? [`printf '%s\\n' "$*" >> ${JSON.stringify(argLogPath)}`] : []),
-      'while [ "$#" -gt 0 ]; do',
-      '  case "$1" in',
-      "    --acp|--max-turns=*|--allowed-tools=*|--disallowed-tools=*)",
-      "      shift",
-      "      ;;",
-      "    --max-turns|--allowed-tools|--disallowed-tools)",
-      "      shift",
-      '      [ "$#" -gt 0 ] && shift',
-      "      ;;",
-      "    *)",
-      "      break",
-      "      ;;",
-      "  esac",
-      "done",
       `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
       "",
     ].join("\n"),
@@ -5153,10 +5744,54 @@ async function writeFakeQoderAgent(binDir: string, argLogPath?: string): Promise
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-home-"));
-  try {
-    await run(tempHome);
-  } finally {
+  const body = await observeTestOutcome(() => run(tempHome));
+  const cleanup = await observeTestOutcome(async () => {
+    if (retainedCliHomes.delete(tempHome)) {
+      throw new Error(
+        `Retained test HOME because owned CLI or fixture cleanup was not proved: ${tempHome}`,
+      );
+    }
     await fs.rm(tempHome, { recursive: true, force: true });
+  });
+  unwrapTestOutcomes(body, cleanup);
+}
+
+// A timer is a failure boundary, never a substitute for joining close.
+async function withinCliDeadline<T>(
+  timeoutMs: number,
+  timeoutError: () => Error,
+  run: () => Promise<T>,
+): Promise<T> {
+  const deadline = performance.now() + timeoutMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(timeoutError()), timeoutMs);
+  });
+  try {
+    const value = await Promise.race([run(), expired]);
+    if (performance.now() >= deadline) {
+      throw timeoutError();
+    }
+    return value;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function waitForDisconnectPrompt(directory: string, signal: AbortSignal): Promise<void> {
+  const readyPath = path.join(directory, "ready");
+  for (;;) {
+    signal.throwIfAborted();
+    try {
+      if (fsSync.readFileSync(readyPath, "utf8") === "ready\n") {
+        return;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+    await delay(20, undefined, { signal });
   }
 }
 
@@ -5206,76 +5841,242 @@ async function runCliWithEntry(
   homeDir: string,
   options: CliRunOptions = {},
 ): Promise<CliRunResult> {
-  return await new Promise<CliRunResult>((resolve, reject) => {
-    const child = spawn(process.execPath, [entryPath, ...args], {
-      env: {
-        ...process.env,
-        HOME: homeDir,
-        ...options.env,
-      },
-      cwd: options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timeoutMs = options.timeoutMs ?? 15_000;
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`CLI timed out after ${timeoutMs}ms: acpx ${args.join(" ")}`));
-    }, timeoutMs);
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-
-    if (options.stdin != null) {
-      child.stdin.end(options.stdin);
-    } else {
-      child.stdin.end();
-    }
-
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      resolve({
-        code,
-        signal,
-        stdout,
-        stderr,
-      });
-    });
+  let stdout = "";
+  let stderr = "";
+  let didClose = false;
+  let gateReady = false;
+  const childErrors: unknown[] = [];
+  const gate = options.promptGate;
+  const child = childProcess.spawn(process.execPath, [entryPath, ...args], {
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      ...(process.platform === "win32" ? { USERPROFILE: homeDir } : {}),
+      ...options.env,
+      ...(gate ? { ACPX_TEST_DISCONNECT_GATE: gate.directory } : {}),
+    },
+    cwd: options.cwd,
+    stdio: ["pipe", "pipe", "pipe"],
   });
-}
 
-async function awaitChildClose(child: ReturnType<typeof spawn>): Promise<CliRunResult> {
-  return await new Promise<CliRunResult>((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", reject);
+  // Observe once, before stdin work, readiness waits, timers, or kill requests.
+  const closed = new Promise<CliRunResult>((resolve) => {
     child.once("close", (code, signal) => {
+      didClose = true;
       resolve({ code, signal, stdout, stderr });
     });
   });
+  const failed = new Promise<{ ok: false; error: unknown }>((resolve) => {
+    child.on("error", (error: unknown) => {
+      childErrors.push(error);
+      resolve({ ok: false, error });
+    });
+  });
+  const outcome = Promise.race([closed.then((value) => ({ ok: true as const, value })), failed]);
+  const result = async (): Promise<CliRunResult> => {
+    const settled = await outcome;
+    if (!settled.ok) {
+      throw settled.error;
+    }
+    return settled.value;
+  };
+  const diagnostic = (message: string): Error =>
+    new Error(`${message}: acpx ${args.join(" ")}\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  const body = await observeTestOutcome(async () => {
+    child.stdin.end(options.stdin);
+    if (gate) {
+      const readiness = new AbortController();
+      try {
+        await withinCliDeadline(
+          gate.startupTimeoutMs,
+          () => diagnostic(`CLI prompt readiness timed out after ${gate.startupTimeoutMs}ms`),
+          async () => {
+            await Promise.race([
+              waitForDisconnectPrompt(gate.directory, readiness.signal),
+              result().then((early) => {
+                throw diagnostic(
+                  `CLI closed before prompt readiness (code=${early.code}, signal=${early.signal})`,
+                );
+              }),
+            ]);
+          },
+        );
+        gateReady = true;
+      } finally {
+        readiness.abort();
+      }
+    }
+
+    const timeoutMs = options.timeoutMs ?? 15_000;
+    return await withinCliDeadline(
+      timeoutMs,
+      () => diagnostic(`CLI timed out after ${timeoutMs}ms`),
+      async () => {
+        // The outcome timer is already armed; there is no asynchronous marker writer to leak.
+        if (gate) {
+          if (childErrors.length > 0) {
+            throw childErrors[0];
+          }
+          if (didClose) {
+            throw diagnostic("CLI closed before disconnect release");
+          }
+          fsSync.writeFileSync(path.join(gate.directory, "release"), "release\n", { flag: "wx" });
+        }
+        const completed = await result();
+        if (gate) {
+          // Validate inside the owned body: absence can mean this fixture writer is still live.
+          const witness = fsSync.readFileSync(path.join(gate.directory, "disconnect-exit"), "utf8");
+          if (witness !== "91\n") {
+            throw diagnostic("CLI closed without the fixture's intended disconnect witness");
+          }
+        }
+        return completed;
+      },
+    );
+  });
+
+  const cleanup = await observeTestOutcome(async () => {
+    const failures: unknown[] = [];
+    if (gate && (!gateReady || !body.ok)) {
+      // On rescue, the fixture could still publish readiness or its intended-exit witness.
+      retainedCliHomes.add(homeDir);
+    }
+    if (gate && !body.ok) {
+      try {
+        fsSync.writeFileSync(path.join(gate.directory, "release"), "release\n");
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (!didClose) {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      try {
+        // Native exit fields only avoid a redundant signal; they never skip this close join.
+        await withinCliDeadline(
+          CLI_RETIREMENT_TIMEOUT_MS,
+          () => diagnostic(`CLI close was not observed within ${CLI_RETIREMENT_TIMEOUT_MS}ms`),
+          () => closed,
+        );
+      } catch (error) {
+        retainedCliHomes.add(homeDir);
+        failures.push(error);
+      }
+    }
+    for (const error of childErrors) {
+      // An emitted kill/spawn error is independent cleanup evidence unless already primary.
+      if ((body.ok || error !== body.error) && !failures.includes(error)) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `CLI cleanup failed; HOME: ${homeDir}`, {
+        cause: failures[0],
+      });
+    }
+  });
+  return unwrapTestOutcomes(body, cleanup);
+}
+
+async function withObservedChild(
+  child: ReturnType<typeof spawn>,
+  homeDir: string,
+  run: (waitForClose: (timeoutMs?: number) => Promise<CliRunResult>) => Promise<void>,
+): Promise<void> {
+  let stdout = "";
+  let stderr = "";
+  let didClose = false;
+  const childErrors: unknown[] = [];
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr?.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  // Keep the close receipt independent from errors so cleanup can always join it.
+  const closed = new Promise<CliRunResult>((resolve) => {
+    child.once("close", (code, signal) => {
+      didClose = true;
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+  const failed = new Promise<TestOutcome<never>>((resolve) => {
+    child.on("error", (error: unknown) => {
+      childErrors.push(error);
+      resolve({ ok: false, error });
+    });
+  });
+  const outcome = Promise.race([closed.then((value) => ({ ok: true as const, value })), failed]);
+  const diagnostic = (message: string): Error =>
+    new Error(`${message} (pid=${child.pid})\nstdout:\n${stdout}\nstderr:\n${stderr}`);
+  const body = await observeTestOutcome(() =>
+    run(async (timeoutMs = 15_000) =>
+      withinCliDeadline(
+        timeoutMs,
+        () => diagnostic(`Direct CLI timed out after ${timeoutMs}ms`),
+        async () => {
+          const result = await outcome;
+          if (!result.ok) {
+            throw result.error;
+          }
+          return result.value;
+        },
+      ),
+    ),
+  );
+  const cleanup = await observeTestOutcome(async () => {
+    const failures: unknown[] = [];
+    if (!didClose) {
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill("SIGKILL");
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      try {
+        await withinCliDeadline(
+          CLI_RETIREMENT_TIMEOUT_MS,
+          () =>
+            diagnostic(`Direct CLI close was not observed within ${CLI_RETIREMENT_TIMEOUT_MS}ms`),
+          () => closed,
+        );
+      } catch (error) {
+        if (!didClose) {
+          retainedCliHomes.add(homeDir);
+        }
+        failures.push(error);
+      }
+    }
+    for (const error of childErrors) {
+      if ((body.ok || error !== body.error) && !failures.includes(error)) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `Direct CLI cleanup failed; HOME: ${homeDir}`, {
+        cause: failures[0],
+      });
+    }
+  });
+  unwrapTestOutcomes(body, cleanup);
 }
 
 async function runPerfReport(filePath: string): Promise<CliRunResult> {
@@ -5394,16 +6195,18 @@ type PromptDoneResult = {
   stderr: string;
 };
 
-async function waitForPromptDoneEvent(
+async function waitForPromptCompletion(
   child: ReturnType<typeof spawn>,
   timeoutMs: number,
   label: string,
+  onEvent?: (event: PromptEvent) => void,
 ): Promise<PromptDoneResult> {
   return await new Promise<PromptDoneResult>((resolve, reject) => {
     let stdout = "";
     let stderr = "";
     let lineBuffer = "";
     const events: PromptEvent[] = [];
+    let promptDone = false;
     let settled = false;
 
     const finish = (run: () => void) => {
@@ -5440,14 +6243,9 @@ async function waitForPromptDoneEvent(
       }
 
       events.push(event);
+      onEvent?.(event);
       if (event.result?.stopReason) {
-        finish(() => {
-          resolve({
-            events,
-            stdout,
-            stderr,
-          });
-        });
+        promptDone = true;
       }
     };
 
@@ -5487,9 +6285,13 @@ async function waitForPromptDoneEvent(
         return;
       }
       finish(() => {
+        if (promptDone && code === 0 && signal === null) {
+          resolve({ events, stdout, stderr });
+          return;
+        }
         reject(
           new Error(
-            `${label} exited before done event (code=${code}, signal=${signal})\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+            `${label} exited without clean prompt completion (code=${code}, signal=${signal})\nstdout:\n${stdout}\nstderr:\n${stderr}`,
           ),
         );
       });
@@ -6019,4 +6821,332 @@ test("runPromptTurn: existing agent reply still allows post-success drain", asyn
   assert.equal(result.source, "rpc");
   assert.equal(result.stopReason, "end_turn");
   assert.deepEqual(calls, ["prompt", "drain"]);
+});
+
+type NativeProofOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+async function nativeProofOutcome<T>(run: () => Promise<T>): Promise<NativeProofOutcome<T>> {
+  try {
+    return { ok: true, value: await run() };
+  } catch (error) {
+    return { ok: false, error };
+  }
+}
+
+function finishNativeProof(failures: unknown[]): void {
+  if (failures.length === 1) {
+    throw failures[0];
+  }
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "Native proof and cleanup failures", { cause: failures[0] });
+  }
+}
+
+test("integration helper native: timeout rejection follows the spawned child's close", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const entry = path.join(homeDir, "held-native-entry.mjs");
+    // No descendants, provider, shell, or filesystem writer. The helper must time out first.
+    await fs.writeFile(entry, "setTimeout(() => process.exit(0), 10_000);\n", "utf8");
+    const launches: Array<{
+      child: ChildProcess;
+      matches: boolean;
+      closed: Promise<void>;
+      didClose: () => boolean;
+      errors: unknown[];
+    }> = [];
+    const events: string[] = [];
+    const failures: unknown[] = [];
+    const originalSpawn = childProcess.spawn;
+
+    try {
+      const hook = t.mock.method(childProcess, "spawn", ((
+        ...args: Parameters<typeof childProcess.spawn>
+      ) => {
+        const child = originalSpawn(...args);
+        let sawClose = false;
+        const errors: unknown[] = [];
+        // This observer is installed before the wrapper returns the real child to runCli.
+        const closed = new Promise<void>((resolve) => {
+          child.once("close", () => {
+            sawClose = true;
+            events.push("close");
+            resolve();
+          });
+        });
+        child.on("error", (error: unknown) => errors.push(error));
+        const argv = args[1];
+        launches.push({
+          child,
+          matches:
+            args[0] === process.execPath &&
+            Array.isArray(argv) &&
+            argv[0] === entry &&
+            args[2]?.env?.HOME === homeDir,
+          closed,
+          didClose: () => sawClose,
+          errors,
+        });
+        events.push("spawn");
+        return child;
+      }) as typeof childProcess.spawn);
+
+      let running: Promise<CliRunResult>;
+      try {
+        // Baseline runCli uses named ESM spawn; the candidate may use the default export.
+        syncBuiltinESMExports();
+        running = runCliWithEntry(entry, [], homeDir, { timeoutMs: 100, cwd: homeDir });
+      } finally {
+        // Both inspected helpers spawn before their first await. Restore before waiting.
+        hook.mock.restore();
+        syncBuiltinESMExports();
+      }
+
+      const result = await running.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => {
+          // Sample in the rejection observer, not after the proof's rescue cleanup.
+          const closedAtRejection = launches.map((launch) => launch.didClose());
+          events.push("helper-rejected");
+          return { ok: false as const, error, closedAtRejection };
+        },
+      );
+      assert.equal(launches.length, 1, "the synchronous seam must capture exactly one child");
+      assert.equal(launches[0]?.matches, true, "captured launch must match this entry and HOME");
+      assert.equal(result.ok, false, "the finite held entry must hit the helper's short timeout");
+      if (result.ok) {
+        throw new Error("Expected the actual helper timeout rejection");
+      }
+      assert.ok(result.error instanceof Error);
+      assert.match(result.error.message, /CLI timed out after 100ms/);
+      assert.deepEqual(
+        result.closedAtRejection,
+        [true],
+        `helper rejected before native child/PIPE close: ${events.join(" -> ")}`,
+      );
+    } catch (error) {
+      failures.push(error);
+    } finally {
+      // This is INSIDE withTempHome's callback, including the expected baseline failure.
+      // Never race this join against a timeout that can return to baseline's unconditional rm.
+      for (const launch of launches) {
+        try {
+          launch.child.stdout?.resume();
+          launch.child.stderr?.resume();
+          if (
+            !launch.didClose() &&
+            launch.child.exitCode === null &&
+            launch.child.signalCode === null &&
+            !launch.child.killed
+          ) {
+            launch.child.kill("SIGKILL");
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+        // Resolve-only close includes stdio completion. Exit fields/kill state only avoid
+        // redundant signaling above; they never bypass this original launch-time promise.
+        await launch.closed;
+        for (const error of launch.errors) {
+          if (!failures.includes(error)) {
+            failures.push(error);
+          }
+        }
+      }
+    }
+    finishNativeProof(failures);
+  });
+});
+
+test("integration helper native: HOME removal preserves body and EIO failures", async (t) => {
+  const failures: unknown[] = [];
+  for (const bodyError of [Object.freeze(new Error("synthetic body failure")), undefined]) {
+    const originalRm = fs.rm;
+    const cleanupError = Object.assign(new Error("synthetic HOME removal failure"), {
+      code: "EIO",
+    });
+    let ownedHome: string | undefined;
+    let restoreRm = () => {};
+    let intercepted = 0;
+
+    try {
+      const outcome = await nativeProofOutcome(() =>
+        withTempHome(async (homeDir) => {
+          ownedHome = homeDir;
+          const hook = t.mock.method(fs, "rm", async (...args: Parameters<typeof fs.rm>) => {
+            if (args[0] === homeDir) {
+              intercepted += 1;
+              throw cleanupError;
+            }
+            return await originalRm(...args);
+          });
+          restoreRm = () => hook.mock.restore();
+          throw bodyError;
+        }),
+      );
+      assert.equal(intercepted, 1, "inject EIO only at this real temporary HOME's removal");
+      assert.equal(outcome.ok, false);
+      if (outcome.ok) {
+        throw new Error("Body and HOME cleanup must both fail");
+      }
+      assert.ok(outcome.error instanceof AggregateError);
+      assert.equal(outcome.error.errors.length, 2);
+      assert.equal(outcome.error.errors[0], bodyError);
+      assert.equal(outcome.error.errors[1], cleanupError);
+    } catch (error) {
+      failures.push(error);
+    } finally {
+      restoreRm();
+      if (ownedHome !== undefined) {
+        // Restore first, then remove only the exact directory returned to this test.
+        const cleanup = await nativeProofOutcome(() =>
+          originalRm(ownedHome!, { recursive: true, force: true }),
+        );
+        if (!cleanup.ok) {
+          failures.push(cleanup.error);
+        }
+      }
+    }
+  }
+  finishNativeProof(failures);
+});
+
+test("integration helper native: direct child preserves output consumed after close", async () => {
+  await withTempHome(async (homeDir) => {
+    const child = spawn(
+      process.execPath,
+      ["-e", 'process.stdout.write("direct-out\\n"); process.stderr.write("direct-err\\n");'],
+      { env: { ...process.env, HOME: homeDir }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const closed = new Promise<void>((resolve) => {
+      child.once("close", () => resolve());
+    });
+    await withObservedChild(child, homeDir, async (waitForClose) => {
+      await withinCliDeadline(
+        5_000,
+        () => new Error("Native output child did not close"),
+        () => closed,
+      );
+      const result = await waitForClose();
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.signal, null);
+      assert.equal(result.stdout, "direct-out\n");
+      assert.equal(result.stderr, "direct-err\n");
+    });
+  });
+});
+
+test("integration helper native: direct child timeout joins close before rejection", async () => {
+  await withTempHome(async (homeDir) => {
+    const child = spawn(
+      process.execPath,
+      ["-e", 'process.stdout.write("ready\\n"); setTimeout(() => {}, 10_000)'],
+      {
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const ready = new Promise<void>((resolve) => {
+      child.stdout.once("data", () => resolve());
+    });
+    let didClose = false;
+    const closed = new Promise<void>((resolve) => {
+      child.once("close", () => {
+        didClose = true;
+        resolve();
+      });
+    });
+    const body = await observeTestOutcome(async () => {
+      await assert.rejects(
+        withObservedChild(child, homeDir, async (waitForClose) => {
+          await withinCliDeadline(
+            5_000,
+            () => new Error("Native child did not start"),
+            () => ready,
+          );
+          await waitForClose(100);
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, /Direct CLI timed out after 100ms/);
+          assert.equal(didClose, true, "rejection must follow the original child's close");
+          return true;
+        },
+      );
+    });
+    const cleanup = await observeTestOutcome(async () => {
+      if (!didClose && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await withinCliDeadline(
+        5_000,
+        () => new Error("Native timeout child cleanup did not close"),
+        () => closed,
+      );
+    });
+    unwrapTestOutcomes(body, cleanup);
+  });
+});
+
+test("integration helper native: direct child preserves body and kill failures", async (t) => {
+  await withTempHome(async (homeDir) => {
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        'process.stdin.resume(); process.stdin.on("end", () => process.exit(0)); process.stdout.write("ready\\n");',
+      ],
+      { env: { ...process.env, HOME: homeDir }, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    const ready = new Promise<void>((resolve) => {
+      child.stdout.once("data", () => resolve());
+    });
+    let didClose = false;
+    const closed = new Promise<void>((resolve) => {
+      child.once("close", () => {
+        didClose = true;
+        resolve();
+      });
+    });
+    const bodyError = new Error("synthetic direct body failure");
+    const killError = new Error("synthetic direct kill failure");
+    const hook = t.mock.method(child, "kill", () => {
+      child.stdin.end();
+      throw killError;
+    });
+    const body = await observeTestOutcome(async () => {
+      await assert.rejects(
+        withObservedChild(child, homeDir, async () => {
+          await withinCliDeadline(
+            5_000,
+            () => new Error("Native child did not start"),
+            () => ready,
+          );
+          throw bodyError;
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof AggregateError);
+          assert.equal(error.errors[0], bodyError);
+          const cleanupError: unknown = error.errors[1];
+          assert.ok(cleanupError instanceof AggregateError);
+          assert.deepEqual(cleanupError.errors, [killError]);
+          assert.equal(hook.mock.callCount(), 1);
+          assert.equal(didClose, true, "failed kill must still join natural close");
+          assert.equal(retainedCliHomes.has(homeDir), false);
+          return true;
+        },
+      );
+    });
+    hook.mock.restore();
+    const cleanup = await observeTestOutcome(async () => {
+      if (!didClose && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await withinCliDeadline(
+        5_000,
+        () => new Error("Native kill-error child cleanup did not close"),
+        () => closed,
+      );
+    });
+    unwrapTestOutcomes(body, cleanup);
+  });
 });

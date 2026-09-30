@@ -1,12 +1,15 @@
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
-import { withInterrupt } from "../../async-control.js";
+import {
+  assertControlAuthority,
+  withInterrupt,
+  type AcpControlAuthority,
+} from "../../async-control.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
-  AcpPermissionDecision,
-  AcpPermissionRequest,
+  AcpPermissionHandler,
   AcpElicitationMode,
   AuthPolicy,
   McpServer,
@@ -50,10 +53,7 @@ export type WithConnectedSessionOptions<T> = {
   permissionMode?: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
-  onPermissionRequest?: (
-    req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
-  ) => Promise<AcpPermissionDecision | undefined>;
+  onPermissionRequest?: AcpPermissionHandler;
   onAskUserQuestion?: ConstructorParameters<typeof AcpClient>[0]["onAskUserQuestion"];
   onExitPlanMode?: ConstructorParameters<typeof AcpClient>[0]["onExitPlanMode"];
   authCredentials?: Record<string, string>;
@@ -62,8 +62,10 @@ export type WithConnectedSessionOptions<T> = {
   terminal?: boolean;
   elicitationModes?: readonly AcpElicitationMode[];
   resumePolicy?: SessionResumePolicy;
+  replacingMode?: true;
   replacingConfigOption?: ConnectAndLoadSessionOptions["replacingConfigOption"];
   timeoutMs?: number;
+  authority?: AcpControlAuthority;
   verbose?: boolean;
   onClientAvailable?: (controller: FullConnectedSessionController) => void;
   onClientClosed?: () => void;
@@ -98,7 +100,12 @@ function createActiveSessionController(params: {
       return response;
     },
     setSessionConfigOption: async (configId: string, value: string) => {
-      return await params.client.setSessionConfigOption(getActiveSessionId(), configId, value);
+      return await params.client.setSessionConfigOption(
+        getActiveSessionId(),
+        configId,
+        value,
+        advertisedModelState(params.record.acpx),
+      );
     },
   };
 }
@@ -107,6 +114,7 @@ export async function withConnectedSession<T>(
   options: WithConnectedSessionOptions<T>,
 ): Promise<WithConnectedSessionResult<T>> {
   const record = await options.loadRecord(options.sessionRecordId);
+  assertControlAuthority(options.authority);
   const clientOptions: ConstructorParameters<typeof AcpClient>[0] = {
     agentCommand: record.agentCommand,
     agentArgv: record.agentArgv,
@@ -142,7 +150,9 @@ export async function withConnectedSession<T>(
           client,
           record,
           resumePolicy: options.resumePolicy,
+          replacingMode: options.replacingMode,
           replacingConfigOption: options.replacingConfigOption,
+          authority: options.authority,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
           activeController,
@@ -156,6 +166,7 @@ export async function withConnectedSession<T>(
           },
         });
 
+        assertControlAuthority(options.authority);
         const value = await options.run({
           record,
           client,

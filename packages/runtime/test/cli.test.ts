@@ -28,7 +28,9 @@ import {
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
 
-const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+const CLI_PATH = fileURLToPath(
+  new URL(`../src/cli${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url),
+);
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 function readPackageVersionForTest(): string {
   const candidates = [
@@ -134,6 +136,180 @@ test("config commands accept command-local --format json", async () => {
     const initPayload = JSON.parse(init.stdout.trim()) as Record<string, unknown>;
     assert.equal(initPayload.created, true);
     assert.equal(typeof initPayload.path, "string");
+  });
+});
+
+test("bootstrap uses the final cwd and MCP config across repeated flag spellings", async (t) => {
+  for (const firstInline of [false, true]) {
+    for (const lastInline of [false, true]) {
+      await t.test(`first inline=${firstInline}, last inline=${lastInline}`, async () => {
+        await withTempHome(async (homeDir) => {
+          const first = path.join(homeDir, "first");
+          const last = path.join(homeDir, "last");
+          await fs.mkdir(first);
+          await fs.mkdir(last);
+          await fs.writeFile(
+            path.join(first, ".acpxrc.json"),
+            '{"defaultPermissions":"approve-all"}',
+          );
+          await fs.writeFile(path.join(last, ".acpxrc.json"), '{"defaultPermissions":"deny-all"}');
+          await fs.writeFile(path.join(last, "job.json"), '{"mcpServers":[]}');
+          const flag = (name: string, value: string, inline: boolean) =>
+            inline ? [`${name}=${value}`] : [name, value];
+          const result = await runCli(
+            [
+              ...flag("--cwd", first, firstInline),
+              ...flag("--mcp-config", "missing.json", firstInline),
+              ...flag("--mcp-config", "job.json", lastInline),
+              ...flag("--cwd", last, lastInline),
+              "--format",
+              "json",
+              "config",
+              "show",
+            ],
+            homeDir,
+          );
+          assert.equal(result.code, 0, result.stderr);
+          const shown = JSON.parse(result.stdout) as {
+            defaultPermissions: string;
+            paths: { project: string; mcp: string };
+          };
+          assert.equal(shown.defaultPermissions, "deny-all");
+          assert.equal(shown.paths.project, path.join(last, ".acpxrc.json"));
+          assert.equal(shown.paths.mcp, path.join(last, "job.json"));
+        });
+      });
+    }
+  }
+});
+
+test("bootstrap applies the final cwd permission policy to actual agent writes", async () => {
+  await withTempHome(async (homeDir) => {
+    const first = path.join(homeDir, "first");
+    const last = path.join(homeDir, "last");
+    await fs.mkdir(first);
+    await fs.mkdir(last);
+    const agents = { fixture: { argv: [process.execPath, MOCK_AGENT_PATH] } };
+    await fs.writeFile(
+      path.join(first, ".acpxrc.json"),
+      JSON.stringify({ agents, defaultPermissions: "approve-all" }),
+    );
+    await fs.writeFile(
+      path.join(last, ".acpxrc.json"),
+      JSON.stringify({ agents, defaultPermissions: "deny-all" }),
+    );
+    const target = path.join(last, "sentinel.txt");
+    const result = await runCli(
+      [
+        "--cwd",
+        first,
+        `--cwd=${last}`,
+        "--format",
+        "json",
+        "fixture",
+        "exec",
+        `write ${target} denied`,
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 5, result.stdout + result.stderr);
+    await assert.rejects(fs.access(target), { code: "ENOENT" });
+  });
+});
+
+test("bootstrap preserves empty and whitespace cwd values and skips other flag values", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, " workspace ");
+    await fs.mkdir(cwd);
+    await fs.writeFile(path.join(cwd, ".acpxrc.json"), '{"defaultPermissions":"deny-all"}');
+    for (const args of [
+      ["--cwd", homeDir, "--cwd="],
+      ["--system-prompt", "--cwd", "--cwd", cwd],
+      ["--system-prompt", "--", `--cwd=${cwd}`],
+    ]) {
+      const result = await runCli([...args, "--format", "json", "config", "show"], homeDir, {
+        cwd,
+      });
+      assert.equal(result.code, 0, result.stderr);
+      const shown = JSON.parse(result.stdout) as {
+        defaultPermissions: string;
+        paths: { project: string };
+      };
+      assert.equal(shown.defaultPermissions, "deny-all");
+      assert.equal(
+        await fs.realpath(shown.paths.project),
+        await fs.realpath(path.join(cwd, ".acpxrc.json")),
+      );
+    }
+  });
+});
+
+test("bootstrap errors respect explicit output formats", async (t) => {
+  for (const failure of ["global-json", "project-json", "typed", "mcp"]) {
+    for (const format of ["text", "json", "strict", "quiet"]) {
+      await t.test(`${failure} with ${format}`, async () => {
+        await withTempHome(async (homeDir) => {
+          const cwd = path.join(homeDir, "workspace");
+          await fs.mkdir(cwd);
+          const extra: string[] = [];
+          if (failure === "global-json") {
+            await fs.mkdir(path.join(homeDir, ".acpx"));
+            await fs.writeFile(path.join(homeDir, ".acpx", "config.json"), "{");
+          } else if (failure === "mcp") {
+            extra.push("--mcp-config", "missing.json");
+          } else {
+            await fs.writeFile(
+              path.join(cwd, ".acpxrc.json"),
+              failure === "typed" ? '{"timeout":0}' : "{",
+            );
+          }
+          const flags =
+            format === "strict" ? ["--format", "json", "--json-strict"] : ["--format", format];
+          const result = await runCli(
+            ["--cwd", cwd, ...extra, ...flags, "config", "show"],
+            homeDir,
+          );
+          assert.equal(result.code, 1);
+          if (format === "json" || format === "strict") {
+            const error = parseSingleAcpErrorLine(result.stdout);
+            assert.equal(error.data?.acpxCode, "RUNTIME");
+            assert.equal(error.data?.origin, "cli");
+            assert.equal(result.stderr, "");
+          } else {
+            assert.equal(result.stdout, "");
+            assert.doesNotMatch(result.stderr, /\n\s+at |Node\.js v/u);
+            assert.match(result.stderr, /config|MCP|Invalid JSON/u);
+            if (format === "quiet") {
+              assert.match(result.stderr, /^\[acpx\] error: RUNTIME .+\n$/u);
+            }
+          }
+        });
+      });
+    }
+  }
+});
+
+test("bootstrap keeps version independent of config and applies loaded output defaults", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd);
+    const configPath = path.join(cwd, ".acpxrc.json");
+    await fs.writeFile(configPath, "{");
+    const version = await runCli(["--cwd", cwd, "--format", "quiet", "--version"], homeDir);
+    assert.equal(version.code, 0, version.stderr);
+    assert.equal(version.stdout.trim(), PACKAGE_VERSION);
+    for (const format of ["json", "quiet"]) {
+      await fs.writeFile(configPath, JSON.stringify({ format }));
+      const result = await runCli(["--cwd", cwd, "codex", "hello"], homeDir);
+      assert.equal(result.code, 4);
+      if (format === "json") {
+        assert.equal(parseSingleAcpErrorLine(result.stdout).data?.acpxCode, "NO_SESSION");
+        assert.equal(result.stderr, "");
+      } else {
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, /^\[acpx\] error: NO_SESSION /u);
+      }
+    }
   });
 });
 
@@ -309,6 +485,76 @@ test("CLI resolves unknown subcommand names as raw agent commands", async () => 
   });
 });
 
+test("CLI finds claude sessions saved under the previous built-in command", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const previousCommand = "npx -y @agentclientprotocol/claude-agent-acp@^0.76.0";
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "saved-before-upgrade",
+      acpSessionId: "saved-before-upgrade",
+      agentCommand: previousCommand,
+      agentArgv: ["npx", "-y", "@agentclientprotocol/claude-agent-acp@^0.76.0"],
+      cwd,
+      closed: false,
+    });
+
+    for (const agentArgs of [["claude"], ["--agent", previousCommand]]) {
+      const result = await runCli(
+        ["--cwd", cwd, "--format", "json", ...agentArgs, "sessions", "show"],
+        homeDir,
+      );
+
+      assert.equal(result.code, 0, `${agentArgs.join(" ")}\n${result.stderr}`);
+      const shown = JSON.parse(result.stdout) as { acpxRecordId?: string; agentCommand?: string };
+      assert.equal(shown.acpxRecordId, "saved-before-upgrade");
+      assert.equal(shown.agentCommand, AGENT_REGISTRY.claude);
+    }
+  });
+});
+
+test("CLI selects the most recently used of colliding upgraded and current claude sessions", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const previousCommand = "npx -y @agentclientprotocol/claude-agent-acp@^0.60.0";
+    const records = [
+      ["older-upgraded", previousCommand, "2026-01-01T00:00:00.000Z"],
+      ["newer-current", AGENT_REGISTRY.claude, "2026-01-02T00:00:00.000Z"],
+    ] as const;
+    for (const [id, agentCommand, lastUsedAt] of records) {
+      await writeSessionRecord(homeDir, {
+        acpxRecordId: id,
+        acpSessionId: id,
+        agentCommand,
+        cwd,
+        lastUsedAt,
+        closed: false,
+      });
+    }
+
+    for (const agentArgs of [["claude"], ["--agent", previousCommand]]) {
+      const shown = await runCli(
+        ["--cwd", cwd, "--format", "json", ...agentArgs, "sessions", "show"],
+        homeDir,
+      );
+      assert.equal(shown.code, 0, shown.stderr);
+      assert.equal(
+        (JSON.parse(shown.stdout) as { acpxRecordId?: string }).acpxRecordId,
+        "newer-current",
+      );
+
+      const listed = await runCli(
+        ["--cwd", cwd, "--format", "quiet", ...agentArgs, "sessions", "list", "--local"],
+        homeDir,
+      );
+      assert.equal(listed.code, 0, listed.stderr);
+      assert.match(listed.stdout, /older-upgraded/);
+      assert.match(listed.stdout, /newer-current/);
+    }
+  });
+});
+
 test("CLI resolves unknown raw agent commands after newer global flags", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -392,6 +638,17 @@ test(
   },
 );
 
+test("help commands render usage without submitting a prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    for (const args of [["help"], ["help", "sessions"], ["help", "codex"]]) {
+      const result = await runCli(args, homeDir);
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /Usage: acpx/);
+      assert.equal(result.stderr, "");
+    }
+  });
+});
+
 test("global passthrough flags are present in help output", async () => {
   await withTempHome(async (homeDir) => {
     const result = await runCli(["--help"], homeDir);
@@ -470,6 +727,45 @@ test("flow run command is present in help output", async () => {
   });
 });
 
+for (const capability of ["--supports-load-session", "--supports-resume-session"]) {
+  test(`sessions new keeps the same resumed record open via ${capability}`, async () => {
+    await withTempHome(async (homeDir) => {
+      let resumeId = "same-resume";
+      const base = [
+        "--agent",
+        `${MOCK_AGENT_COMMAND} ${capability}`,
+        "--cwd",
+        homeDir,
+        "--format",
+        "json",
+      ];
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await runCli(
+          [...base, "sessions", "new", "--resume-session", resumeId],
+          homeDir,
+          { timeoutMs: 10_000 },
+        );
+        assert.equal(result.code, 0, result.stderr);
+        const createdId = (JSON.parse(result.stdout) as { acpxRecordId: string }).acpxRecordId;
+        if (attempt > 0) {
+          assert.equal(createdId, resumeId);
+        }
+        resumeId = createdId;
+        const stored = JSON.parse(
+          await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${resumeId}.json`), "utf8"),
+        ) as { closed: boolean; acp_session_id: string };
+        assert.equal(stored.closed, false, `resume attempt ${attempt + 1}`);
+        assert.equal(stored.acp_session_id, "same-resume");
+      }
+      const prompted = await runCli([...base, "--ttl", "0", "prompt", "hello"], homeDir, {
+        timeoutMs: 10_000,
+      });
+      assert.equal(prompted.code, 0, prompted.stderr);
+      assert.match(prompted.stdout, /hello/);
+    });
+  });
+}
+
 test("sessions new --resume-session loads ACP session and stores resumed ids", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -517,7 +813,8 @@ test("sessions new --resume-session loads ACP session and stores resumed ids", a
     };
     assert.equal(payload.action, "session_ensured");
     assert.equal(payload.created, true);
-    assert.equal(payload.acpxRecordId, resumeSessionId);
+    assert.ok(typeof payload.acpxRecordId === "string");
+    assert.notEqual(payload.acpxRecordId, resumeSessionId);
     assert.equal(payload.acpxSessionId, resumeSessionId);
     assert.equal(payload.agentSessionId, "resumed-runtime-session");
 
@@ -525,7 +822,7 @@ test("sessions new --resume-session loads ACP session and stores resumed ids", a
       homeDir,
       ".acpx",
       "sessions",
-      `${encodeURIComponent(resumeSessionId)}.json`,
+      `${encodeURIComponent(payload.acpxRecordId)}.json`,
     );
     const storedRecord = JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
       acp_session_id?: unknown;
@@ -731,7 +1028,8 @@ test("sessions ensure --resume-session loads ACP session when creating missing s
       agentSessionId?: unknown;
     };
     assert.equal(payload.created, true);
-    assert.equal(payload.acpxRecordId, resumeSessionId);
+    assert.ok(typeof payload.acpxRecordId === "string");
+    assert.notEqual(payload.acpxRecordId, resumeSessionId);
     assert.equal(payload.acpxSessionId, resumeSessionId);
     assert.equal(payload.agentSessionId, "resumed-runtime-session");
   });
@@ -790,34 +1088,42 @@ test("sessions ensure exits even when agent ignores SIGTERM", async () => {
   });
 });
 
-test("sessions ensure resolves existing session by directory walk", async () => {
-  await withTempHome(async (homeDir) => {
-    const root = path.join(homeDir, "workspace");
-    const child = path.join(root, "packages", "app");
-    await fs.mkdir(child, { recursive: true });
-    await fs.mkdir(path.join(root, ".git"), { recursive: true });
+for (const layout of ["directory", "gitfile", "dotdot-child"] as const) {
+  test(`sessions ensure resolves existing session by directory walk (${layout})`, async () => {
+    await withTempHome(async (homeDir) => {
+      const root = path.join(homeDir, "workspace");
+      const child = path.join(root, layout === "dotdot-child" ? "..cache" : "packages", "app");
+      await fs.mkdir(child, { recursive: true });
+      if (layout === "gitfile") {
+        const metadata = path.join(homeDir, "metadata");
+        await fs.mkdir(metadata);
+        await fs.writeFile(path.join(root, ".git"), `gitdir: ${metadata}\n`);
+      } else {
+        await fs.mkdir(path.join(root, ".git"));
+      }
 
-    await writeSessionRecord(homeDir, {
-      acpxRecordId: "parent-session",
-      acpSessionId: "parent-session",
-      agentCommand: AGENT_REGISTRY.codex,
-      cwd: root,
-      createdAt: "2026-01-01T00:00:00.000Z",
-      lastUsedAt: "2026-01-01T00:00:00.000Z",
-      closed: false,
+      await writeSessionRecord(homeDir, {
+        acpxRecordId: "parent-session",
+        acpSessionId: "parent-session",
+        agentCommand: MOCK_AGENT_COMMAND,
+        cwd: root,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastUsedAt: "2026-01-01T00:00:00.000Z",
+        closed: false,
+      });
+
+      const result = await runCli(
+        ["--agent", MOCK_AGENT_COMMAND, "--cwd", child, "--format", "json", "sessions", "ensure"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+      assert.equal(payload.acpxRecordId, "parent-session");
+      assert.equal(payload.action, "session_ensured");
+      assert.equal(payload.created, false);
     });
-
-    const result = await runCli(
-      ["--cwd", child, "--format", "json", "codex", "sessions", "ensure"],
-      homeDir,
-    );
-    assert.equal(result.code, 0, result.stderr);
-    const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-    assert.equal(payload.acpxRecordId, "parent-session");
-    assert.equal(payload.action, "session_ensured");
-    assert.equal(payload.created, false);
   });
-});
+}
 
 test("sessions and status surface agentSessionId for codex and claude in JSON mode", async () => {
   await withTempHome(async (homeDir) => {
@@ -1129,7 +1435,7 @@ test("codex set model passes the requested model through unchanged", async () =>
   });
 });
 
-test("set-mode load fallback failure does not persist the fresh session id to disk", async () => {
+test("saved mode replay failure during a config change preserves the original session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -1165,7 +1471,7 @@ test("set-mode load fallback failure does not persist the fresh session id to di
     });
 
     const result = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "set-mode", "plan"],
+      ["--cwd", cwd, "--format", "json", "codex", "set", "reasoning_effort", "high"],
       homeDir,
     );
     assert.equal(result.code, 1, result.stderr);
@@ -1189,6 +1495,87 @@ test("set-mode load fallback failure does not persist the fresh session id to di
     assert.equal(storedRecord.acpx?.desired_mode_id, "plan");
   });
 });
+
+for (const rejected of [false, true]) {
+  test(`explicit mode replacement ${rejected ? "rejects only the requested mode" : "replaces a retired mode"} after fresh fallback`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      const markers = path.join(homeDir, "markers");
+      await fs.mkdir(cwd);
+      await fs.mkdir(markers);
+      await fs.mkdir(path.join(homeDir, ".acpx"));
+      const peer = fileURLToPath(new URL("./fixtures/control-authority-agent.js", import.meta.url));
+      await fs.writeFile(
+        path.join(homeDir, ".acpx", "config.json"),
+        JSON.stringify({
+          agents: { fixture: { argv: [process.execPath, peer, markers, "config"] } },
+        }),
+      );
+      for (const name of ["no-load", "received.jsonl", "effects.jsonl"]) {
+        await fs.writeFile(path.join(markers, name), "");
+      }
+      const invoke = (args: string[]) =>
+        runCli(["--cwd", cwd, "--timeout", "5", "--format", "json", "fixture", ...args], homeDir, {
+          timeoutMs: 15_000,
+        });
+      for (const args of [
+        ["sessions", "new", "--name", "proof"],
+        ["set-mode", "-s", "proof", "plan"],
+        ["set", "-s", "proof", "model", "first-model"],
+        ["set", "-s", "proof", "effort", "high"],
+      ]) {
+        const result = await invoke(args);
+        assert.equal(result.code, 0, result.stderr);
+      }
+      try {
+        const beforeResult = await invoke(["sessions", "show", "proof"]);
+        assert.equal(beforeResult.code, 0, beforeResult.stderr);
+        const before = JSON.parse(beforeResult.stdout) as SessionRecord;
+        assert.equal(before.acpx?.desired_mode_id, "plan");
+        assert.equal(before.acpx?.session_options?.model, "first-model");
+        assert.equal(before.acpx?.desired_config_options?.effort, "high");
+        for (const name of ["received.jsonl", "effects.jsonl", "retired-plan"]) {
+          await fs.writeFile(path.join(markers, name), "");
+        }
+        if (rejected) {
+          await fs.writeFile(path.join(markers, "reject-auto"), "");
+        }
+        const result = await invoke(["set-mode", "-s", "proof", "auto"]);
+        assert.equal(result.code, rejected ? 1 : 0, result.stderr);
+        if (rejected) {
+          const error = parseSingleAcpErrorLine(result.stdout);
+          assert.equal(error.code, -32602);
+          assert.equal(error.data?.modeId, "auto");
+        }
+        const readControls = async (name: string) =>
+          (await fs.readFile(path.join(markers, name), "utf8"))
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line): unknown => JSON.parse(line));
+        const siblings = [
+          { sequence: 1, method: "session/set_config_option", value: "first-model" },
+          { sequence: 2, method: "session/set_config_option", value: "high" },
+        ];
+        const requested = { sequence: 3, method: "session/set_mode", value: "auto" };
+        assert.deepEqual(await readControls("received.jsonl"), [...siblings, requested]);
+        assert.deepEqual(
+          await readControls("effects.jsonl"),
+          rejected ? siblings : [...siblings, requested],
+        );
+        const shown = await invoke(["sessions", "show", "proof"]);
+        assert.equal(shown.code, 0, shown.stderr);
+        const record = JSON.parse(shown.stdout) as SessionRecord;
+        assert.equal(record.acpx?.desired_mode_id, rejected ? "plan" : "auto");
+        assert.equal(record.acpx?.session_options?.model, "first-model");
+        assert.equal(record.acpx?.desired_config_options?.effort, "high");
+      } finally {
+        const closed = await invoke(["sessions", "close", "proof"]);
+        assert.equal(closed.code, 0, closed.stderr);
+      }
+    });
+  });
+}
 
 test("set-mode surfaces actionable guidance when agent rejects session/set_mode params", async () => {
   await withTempHome(async (homeDir) => {
@@ -2356,6 +2743,56 @@ test("sessions history prints stored history entries", async () => {
   });
 });
 
+test("sessions history previews image content compactly without dumping base64", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const largeBase64 = "A".repeat(4096);
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: "image-history-session",
+      acpSessionId: "image-history-session",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:10:00.000Z",
+      closed: false,
+      title: null,
+      messages: [
+        {
+          User: {
+            id: "user-image-prompt",
+            content: [
+              { Text: "inspect screenshot" },
+              {
+                Image: {
+                  source: largeBase64,
+                },
+              },
+              { Image: { source: largeBase64, mime_type: "image/png" } },
+            ],
+          },
+        },
+        {
+          Agent: {
+            content: [{ Text: "received image" }],
+            tool_results: {},
+          },
+        },
+      ],
+      updated_at: "2026-01-01T00:02:00.000Z",
+      cumulative_token_usage: {},
+      request_token_usage: {},
+    });
+
+    const result = await runCli(["--cwd", cwd, "codex", "sessions", "history"], homeDir);
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.doesNotMatch(result.stdout, new RegExp(largeBase64));
+    assert.match(result.stdout, /\[image\] image \[image\] image\/png/);
+  });
+});
+
 test("sessions import --cwd overrides the destination cwd without replacing global cwd", async () => {
   await withTempHome(async (homeDir) => {
     const sourceCwd = path.join(homeDir, "source");
@@ -2776,6 +3213,76 @@ test("config defaults are loaded from global and project config files", async ()
   });
 });
 
+test("CLI rejects blank raw-agent overrides before reading input or launching its default", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const configDir = path.join(homeDir, ".acpx");
+    const pidFile = path.join(homeDir, "adapter.pid");
+    await fs.mkdir(cwd);
+    await fs.mkdir(configDir);
+    await fs.writeFile(
+      path.join(configDir, "config.json"),
+      JSON.stringify({
+        defaultAgent: "fixture",
+        agents: {
+          fixture: { argv: [process.execPath, MOCK_AGENT_PATH, "--pid-file", pidFile] },
+        },
+      }),
+    );
+    const cases = [
+      {
+        agent: ["--agent", ""],
+        json: false,
+        command: ["sessions", "list", "--local"],
+      },
+      {
+        agent: ["--agent="],
+        json: true,
+        command: ["exec", "--file", path.join(cwd, "missing-prompt.txt")],
+      },
+      {
+        agent: ["--agent", " \t"],
+        json: false,
+        command: ["exec", "echo must-not-run"],
+      },
+      {
+        agent: ["--agent= \t"],
+        json: true,
+        command: ["sessions", "list", "--local"],
+      },
+    ];
+    for (const entry of cases) {
+      const output = entry.json ? ["--format", "json", "--json-strict"] : ["--format", "quiet"];
+      const result = await runCli(
+        ["--cwd", cwd, ...output, ...entry.agent, ...entry.command],
+        homeDir,
+        { timeoutMs: 10_000 },
+      );
+      assert.equal(result.code, 2, result.stdout + result.stderr);
+      if (entry.json) {
+        const error = parseSingleAcpErrorLine(result.stdout);
+        assert.equal(error.data?.acpxCode, "USAGE");
+        assert.match(error.message ?? "", /agent.*empty/iu);
+        assert.equal(result.stderr, "");
+      } else {
+        assert.equal(result.stdout, "");
+        assert.match(result.stderr, /^\[acpx\] error: USAGE [^\n]*agent[^\n]*empty[^\n]*\n$/iu);
+      }
+      await assert.rejects(fs.access(pidFile), { code: "ENOENT" });
+      assert.deepEqual(await fs.readdir(configDir), ["config.json"]);
+    }
+
+    const control = await runCli(
+      ["--cwd", cwd, "--format", "quiet", "exec", "echo default-control"],
+      homeDir,
+      { timeoutMs: 10_000 },
+    );
+    assert.equal(control.code, 0, control.stderr);
+    assert.equal(control.stdout.trim(), "default-control");
+    await fs.access(pidFile);
+  });
+});
+
 test("exec subcommand is blocked when disableExec is true", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -2804,40 +3311,63 @@ test("exec subcommand is blocked when disableExec is true", async () => {
   });
 });
 
-test("exec subcommand is blocked in json format when disableExec is true", async () => {
-  await withTempHome(async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
-
-    await fs.writeFile(
-      path.join(homeDir, ".acpx", "config.json"),
-      `${JSON.stringify(
-        {
+for (const mode of ["json", "strict", "quiet", "config-quiet"] as const) {
+  test(`disabled exec preserves ${mode} diagnostics before reading prompt input`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      const configDir = path.join(homeDir, ".acpx");
+      const pidFile = path.join(homeDir, "adapter.pid");
+      await fs.mkdir(cwd);
+      await fs.mkdir(configDir);
+      await fs.writeFile(
+        path.join(configDir, "config.json"),
+        JSON.stringify({
           disableExec: true,
+          format: mode === "config-quiet" ? "quiet" : "text",
           agents: {
-            codex: { command: MOCK_AGENT_COMMAND },
+            codex: { argv: [process.execPath, MOCK_AGENT_PATH, "--pid-file", pidFile] },
           },
-        },
-        null,
-        2,
-      )}\n`,
-      "utf8",
-    );
-
-    const result = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "exec", "hello"],
-      homeDir,
-    );
-
-    assert.equal(result.code, 1);
-    const payload = JSON.parse(result.stdout.trim()) as {
-      error?: { code?: number; data?: { acpxCode?: string } };
-    };
-    assert.equal(payload.error?.code, -32603);
-    assert.equal(payload.error?.data?.acpxCode, "EXEC_DISABLED");
+        }),
+      );
+      const flags =
+        mode === "strict"
+          ? ["--format", "json", "--json-strict"]
+          : mode === "config-quiet"
+            ? []
+            : ["--format", mode];
+      const keepStdinOpen = mode === "config-quiet";
+      const file = keepStdinOpen ? "-" : path.join(cwd, "missing-prompt.txt");
+      const result = await runCli(
+        ["--cwd", cwd, ...flags, "codex", "exec", "--file", file],
+        homeDir,
+        { keepStdinOpen, timeoutMs: 10_000 },
+      );
+      const message = "exec subcommand is disabled by configuration (disableExec: true)";
+      assert.equal(result.code, 1, result.stdout + result.stderr);
+      if (mode === "json" || mode === "strict") {
+        const lines = result.stdout.trimEnd().split(/\r?\n/u);
+        assert.equal(lines.length, 1);
+        const payload = JSON.parse(lines[0]) as {
+          jsonrpc?: string;
+          id?: unknown;
+          error?: ParsedAcpError;
+        };
+        assert.equal(payload.jsonrpc, "2.0");
+        assert.equal(payload.id, null);
+        assert.equal(payload.error?.code, -32603);
+        assert.equal(payload.error?.message, message);
+        assert.equal(payload.error?.data?.acpxCode, "EXEC_DISABLED");
+        assert.equal(payload.error?.data?.origin, "cli");
+        assert.equal(result.stderr, "");
+      } else {
+        assert.equal(result.stdout, "");
+        assert.equal(result.stderr, `[acpx] error: EXEC_DISABLED ${message}\n`);
+      }
+      await assert.rejects(fs.access(pidFile), { code: "ENOENT" });
+      assert.deepEqual(await fs.readdir(configDir), ["config.json"]);
+    });
   });
-});
+}
 
 test("exec subcommand works when disableExec is false", async () => {
   await withTempHome(async (homeDir) => {
@@ -2881,6 +3411,7 @@ async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<vo
 
 type CliRunOptions = {
   stdin?: string;
+  keepStdinOpen?: boolean;
   cwd?: string;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
@@ -2944,10 +3475,10 @@ async function runCli(
       stderr += chunk;
     });
 
-    if (options.stdin != null) {
+    if (!options.keepStdinOpen) {
       child.stdin.end(options.stdin);
-    } else {
-      child.stdin.end();
+    } else if (options.stdin != null) {
+      child.stdin.write(options.stdin);
     }
 
     let timedOut = false;

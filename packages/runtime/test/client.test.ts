@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, type Readable, type Writable } from "node:stream";
 import test, { type TestContext } from "node:test";
-import type {
-  AnyMessage,
-  RequestPermissionRequest,
-  RequestPermissionResponse,
+import {
+  methods,
+  type AnyMessage,
+  type ClientConnection,
+  type ClientCapabilities,
+  type InitializeResponse,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
 import {
   AcpClient,
@@ -28,7 +33,10 @@ import {
   PermissionPromptUnavailableError,
   UnsupportedPromptContentError,
 } from "../src/errors.js";
+import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
+import { createSessionConversation } from "../src/session/conversation-model.js";
 import type { AcpProcessStarted } from "../src/types.js";
+import { withMockedReadline, withTtyState } from "./tty-test-helpers.js";
 
 test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
   for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
@@ -44,10 +52,6 @@ test("parseAcpJsonMessageLine preserves object-shaped protocol values", () => {
 });
 
 type ClientInternals = {
-  resolveAgentLaunchPlan?: () => Promise<{
-    args: string[];
-    spawnOptions: { env: NodeJS.ProcessEnv };
-  }>;
   createTappedStream?: (base: {
     readable: ReadableStream<AnyMessage>;
     writable: WritableStream<AnyMessage>;
@@ -61,7 +65,8 @@ type ClientInternals = {
       writable: WritableStream<AnyMessage>;
     },
     launch: { devinAcp: boolean },
-  ) => unknown;
+    capabilities: ClientCapabilities,
+  ) => ClientConnection;
   selectAuthMethod?: (methods: Array<{ id: string }>) =>
     | {
         methodId: string;
@@ -69,8 +74,13 @@ type ClientInternals = {
         source: "env" | "config";
       }
     | undefined;
+  resolveAgentLaunchPlan?: () => Promise<{
+    spawnOptions: { env: Record<string, string | undefined> };
+  }>;
   authenticateIfRequired?: (
-    connection: { authenticate: (params: { methodId: string }) => Promise<void> },
+    connection: {
+      agent: { request: (method: string, params: { methodId: string }) => Promise<void> };
+    },
     methods: Array<{ id: string }>,
   ) => Promise<void>;
   handlePermissionRequest?: (
@@ -102,6 +112,7 @@ type ClientInternals = {
   handleSessionUpdate?: (notification: { sessionId: string }) => Promise<void>;
   waitForSessionUpdateDrain?: (idleMs: number, timeoutMs: number) => Promise<void>;
   recordAgentExit?: (
+    child: ClientInternals["agent"],
     reason: "process_exit" | "process_close" | "pipe_close" | "connection_close",
     exitCode: number | null,
     signal: NodeJS.Signals | null,
@@ -126,6 +137,7 @@ type ClientInternals = {
   };
   terminalManager?: {
     shutdown: () => Promise<void>;
+    waitForTerminalExit?: (params: { sessionId: string; terminalId: string }) => Promise<unknown>;
     createTerminal?: (params: {
       sessionId: string;
       command: string;
@@ -154,19 +166,7 @@ type ClientInternals = {
     | undefined;
   cancellingSessionIds: Set<string>;
   promptPermissionFailures: Map<string, PermissionPromptUnavailableError>;
-  initResult?: {
-    agentCapabilities?: {
-      promptCapabilities?: {
-        image?: boolean;
-        audio?: boolean;
-        embeddedContext?: boolean;
-      };
-      sessionCapabilities?: {
-        close?: Record<string, never>;
-        list?: Record<string, never>;
-      };
-    };
-  };
+  initResult?: Partial<InitializeResponse>;
   loadedSessionId?: string;
   lastKnownPid?: number;
   agentStartedAt?: string;
@@ -290,8 +290,11 @@ test("AcpClient prefers env auth credentials over config credentials", async () 
       let authenticatedMethod: string | undefined;
       await internals.authenticateIfRequired?.(
         {
-          authenticate: async ({ methodId }: { methodId: string }) => {
-            authenticatedMethod = methodId;
+          agent: {
+            request: async (method: string, { methodId }: { methodId: string }) => {
+              assert.equal(method, "authenticate");
+              authenticatedMethod = methodId;
+            },
           },
         },
         [{ id: "api-token" }],
@@ -318,8 +321,11 @@ test("AcpClient ignores ambient normalized provider env vars for auth selection"
       let authenticatedMethod: string | undefined;
       await internals.authenticateIfRequired?.(
         {
-          authenticate: async ({ methodId }: { methodId: string }) => {
-            authenticatedMethod = methodId;
+          agent: {
+            request: async (method: string, { methodId }: { methodId: string }) => {
+              assert.equal(method, "authenticate");
+              authenticatedMethod = methodId;
+            },
           },
         },
         [{ id: "openai-api-key" }],
@@ -350,8 +356,11 @@ test("AcpClient uses XAI_API_KEY for Grok Build xai.api_key auth", async () => {
       let authenticatedMethod: string | undefined;
       await internals.authenticateIfRequired?.(
         {
-          authenticate: async ({ methodId }: { methodId: string }) => {
-            authenticatedMethod = methodId;
+          agent: {
+            request: async (method: string, { methodId }: { methodId: string }) => {
+              assert.equal(method, "authenticate");
+              authenticatedMethod = methodId;
+            },
           },
         },
         [{ id: "xai.api_key" }],
@@ -397,180 +406,17 @@ test("AcpClient selects Grok Build cached_token as agent-managed auth", async ()
       let authenticatedMethod: string | undefined;
       await internals.authenticateIfRequired?.(
         {
-          authenticate: async ({ methodId }: { methodId: string }) => {
-            authenticatedMethod = methodId;
+          agent: {
+            request: async (method: string, { methodId }: { methodId: string }) => {
+              assert.equal(method, "authenticate");
+              authenticatedMethod = methodId;
+            },
           },
         },
         [{ id: "cached_token" }],
       );
 
       assert.equal(authenticatedMethod, "cached_token");
-    },
-  );
-});
-
-test("AcpClient injects the isolated DeepSeek provider profile into Grok Build", async () => {
-  await withEnv(
-    {
-      DEEPSEEK_API_KEY: "sample",
-      XAI_API_KEY: "fake",
-      OPENAI_API_KEY: "placeholder",
-      GROK_XAI_API_BASE_URL: "https://xai.example.test",
-      GROK_MODELS_BASE_URL: "https://models.example.test",
-      GROK_MODELS_LIST_URL: "https://models.example.test/list",
-      GROK_DEFAULT_MODEL: "ambient-model",
-      GROK_CODE_XAI_API_KEY: "test-token-placeholder",
-    },
-    async () => {
-      const client = makeClient({
-        agentCommand: "grok agent --model deepseek-v4-flash stdio",
-        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
-        sessionOptions: {
-          env: {
-            DEEPSEEK_API_KEY: "test-auth-token",
-          },
-        },
-      });
-
-      const launch = await asInternals(client).resolveAgentLaunchPlan?.();
-      assert.ok(launch);
-      assert.deepEqual(launch.args, ["agent", "--model", "deepseek-v4-flash", "stdio"]);
-      assert.equal(launch.spawnOptions.env.DEEPSEEK_API_KEY, "test-auth-token");
-      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "test-auth-token");
-      assert.equal(launch.spawnOptions.env.GROK_XAI_API_BASE_URL, "https://api.deepseek.com");
-      assert.equal(launch.spawnOptions.env.GROK_MODELS_BASE_URL, "https://api.deepseek.com");
-      assert.equal(launch.spawnOptions.env.GROK_MODELS_LIST_URL, "https://api.deepseek.com/models");
-      assert.equal(launch.spawnOptions.env.GROK_DEFAULT_MODEL, "deepseek-v4-flash");
-      assert.equal(launch.spawnOptions.env.GROK_CODE_XAI_API_KEY, undefined);
-    },
-  );
-});
-
-test("AcpClient requires DEEPSEEK_API_KEY instead of falling back to other provider keys", async () => {
-  await withTempHome(async () => {
-    await withEnv(
-      {
-        DEEPSEEK_API_KEY: undefined,
-        XAI_API_KEY: "fake",
-        OPENAI_API_KEY: "placeholder",
-      },
-      async () => {
-        const client = makeClient({
-          agentCommand: "grok agent --model deepseek-v4-flash stdio",
-          agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
-        });
-
-        await assert.rejects(
-          async () => await asInternals(client).resolveAgentLaunchPlan?.(),
-          (error: unknown) =>
-            error instanceof AuthPolicyError &&
-            error.message.includes("DEEPSEEK_API_KEY") &&
-            error.detailCode === "AUTH_REQUIRED",
-        );
-      },
-    );
-  });
-});
-
-test("AcpClient uses transient DeepSeek credentials and ignores providers.json", async () => {
-  await withTempHome(async (homeDir) => {
-    const providersDir = path.join(homeDir, ".1agents");
-    await fs.mkdir(providersDir, { recursive: true });
-    await fs.writeFile(
-      path.join(providersDir, "providers.json"),
-      JSON.stringify({
-        active_provider_id: "other-provider",
-        providers: [
-          { id: "other-provider", api_key: "fake" },
-          { id: "deepseek-api", api_key: "test-auth-token" },
-        ],
-      }),
-      { encoding: "utf8", mode: 0o600 },
-    );
-
-    await withEnv({ DEEPSEEK_API_KEY: undefined }, async () => {
-      const client = makeClient({
-        agentCommand: "grok agent --model deepseek-v4-flash stdio",
-        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
-        authCredentials: { "xai.api_key": "transient-auth-token" },
-      });
-      const internals = asInternals(client);
-      const launch = await internals.resolveAgentLaunchPlan?.();
-
-      assert.ok(launch);
-      assert.equal(launch.spawnOptions.env.DEEPSEEK_API_KEY, "transient-auth-token");
-      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "transient-auth-token");
-      assert.deepEqual(internals.selectAuthMethod?.([{ id: "xai.api_key" }]), {
-        methodId: "xai.api_key",
-        credential: "transient-auth-token",
-        source: "config",
-      });
-    });
-  });
-});
-
-test("AcpClient treats a malformed providers file as a missing DeepSeek key", async () => {
-  await withTempHome(async (homeDir) => {
-    const providersDir = path.join(homeDir, ".1agents");
-    await fs.mkdir(providersDir, { recursive: true });
-    await fs.writeFile(path.join(providersDir, "providers.json"), "{", "utf8");
-
-    await withEnv({ DEEPSEEK_API_KEY: undefined }, async () => {
-      const client = makeClient({
-        agentCommand: "grok agent --model deepseek-v4-flash stdio",
-        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
-      });
-
-      await assert.rejects(
-        async () => await asInternals(client).resolveAgentLaunchPlan?.(),
-        (error: unknown) =>
-          error instanceof AuthPolicyError && error.detailCode === "AUTH_REQUIRED",
-      );
-    });
-  });
-});
-
-test("AcpClient rejects an explicitly blank session DeepSeek key", async () => {
-  await withEnv({ DEEPSEEK_API_KEY: "sample" }, async () => {
-    const client = makeClient({
-      agentCommand: "grok agent --model deepseek-v4-flash stdio",
-      agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
-      sessionOptions: {
-        env: {
-          DEEPSEEK_API_KEY: "   ",
-        },
-      },
-    });
-
-    await assert.rejects(
-      async () => await asInternals(client).resolveAgentLaunchPlan?.(),
-      (error: unknown) => error instanceof AuthPolicyError && error.detailCode === "AUTH_REQUIRED",
-    );
-    assert.equal(asInternals(client).selectAuthMethod?.([{ id: "xai.api_key" }]), undefined);
-  });
-});
-
-test("AcpClient authenticates DeepSeek with its key and never selects Grok cached_token", async () => {
-  await withEnv(
-    {
-      DEEPSEEK_API_KEY: "test-auth-token",
-      XAI_API_KEY: "fake",
-      ACPX_AUTH_XAI_API_KEY: undefined,
-      ACPX_AUTH_CACHED_TOKEN: undefined,
-    },
-    async () => {
-      const client = makeClient({
-        agentCommand: "grok agent --model deepseek-v4-flash stdio",
-        agentArgv: ["grok", "agent", "--model", "deepseek-v4-flash", "stdio"],
-      });
-      const internals = asInternals(client);
-
-      assert.deepEqual(internals.selectAuthMethod?.([{ id: "xai.api_key" }]), {
-        methodId: "xai.api_key",
-        credential: "test-auth-token",
-        source: "env",
-      });
-      assert.equal(internals.selectAuthMethod?.([{ id: "cached_token" }]), undefined);
     },
   );
 });
@@ -583,13 +429,64 @@ test("AcpClient authenticateIfRequired throws when auth policy is fail and crede
     async () =>
       await internals.authenticateIfRequired?.(
         {
-          authenticate: async () => {},
+          agent: { request: async () => {} },
         },
         [{ id: "api-token" }],
       ),
     AuthPolicyError,
   );
 });
+
+for (const agentName of ["antigravity-acp", "custom-agent"]) {
+  for (const toolCallId of ["interaction_question", "ordinary-tool"]) {
+    test(`AcpClient handles ${agentName} ${toolCallId} without inventing user answers`, async (t) => {
+      let hostCalls = 0;
+      const fixture = createClientFixture(t, {
+        client: {
+          permissionMode: "approve-all",
+          onPermissionRequest: async () => {
+            hostCalls += 1;
+            return { outcome: "allow_once" };
+          },
+        },
+      });
+      const internals = asInternals(fixture.client);
+      internals.initResult = { agentInfo: { name: agentName, version: "1.1.1" } };
+      const prompt = fixture.prompt("question-session", "Continue");
+      const promptRequest = await fixture.message(0);
+      await fixture.send({
+        jsonrpc: "2.0",
+        id: "question",
+        method: "session/request_permission",
+        params: {
+          sessionId: "question-session",
+          toolCall: { toolCallId, title: "Choose a deployment target", kind: "other" },
+          options: [
+            { optionId: "production", name: "Production", kind: "allow_once" },
+            { optionId: "staging", name: "Staging", kind: "allow_once" },
+          ],
+        },
+      });
+      const message = await fixture.message(1);
+      assert("result" in message);
+      const response = message.result as RequestPermissionResponse;
+      const isQuestion = agentName === "antigravity-acp" && toolCallId.startsWith("interaction_");
+      assert.deepEqual(
+        response.outcome,
+        isQuestion ? { outcome: "cancelled" } : { outcome: "selected", optionId: "production" },
+      );
+      if (isQuestion) {
+        assert.equal(hostCalls, 0);
+        await fixture.reply(promptRequest);
+        await assert.rejects(prompt, /requested a user answer/);
+      } else {
+        assert.equal(hostCalls, 1);
+        await fixture.reply(promptRequest);
+        assert.equal((await prompt).stopReason, "end_turn");
+      }
+    });
+  }
+}
 
 test("AcpClient handlePermissionRequest short-circuits cancels and tracks unavailable prompts", async () => {
   const client = makeClient({
@@ -756,6 +653,130 @@ test("AcpClient onPermissionRequest decision short-circuits the mode-based resol
   });
 });
 
+for (const scenario of [
+  { name: "mode denial", ids: ["cancel", "decline"], expected: "decline" },
+  {
+    name: "automatic approval",
+    ids: ["cancel", "decline"],
+    expected: "allow",
+    mode: "approve-all" as const,
+  },
+  {
+    name: "noninteractive denial",
+    ids: ["cancel", "decline"],
+    expected: "decline",
+    mode: "approve-reads" as const,
+  },
+  {
+    name: "permission policy denial",
+    ids: ["cancel", "decline"],
+    expected: "decline",
+    mode: "approve-all" as const,
+    policy: { defaultAction: "deny" as const },
+  },
+  {
+    name: "permission-profile refusal",
+    ids: ["cancel", "reject_permissions"],
+    expected: "reject_permissions",
+  },
+  { name: "already ordered denial", ids: ["decline", "cancel"], expected: "decline" },
+  {
+    name: "host denial",
+    ids: ["cancel", "decline"],
+    expected: "decline",
+    host: "reject_once" as const,
+  },
+  { name: "abort-only refusal", ids: ["cancel"], expected: "cancel", notice: true },
+  {
+    name: "host denial despite a throwing notice observer",
+    ids: ["cancel"],
+    expected: "cancel",
+    mode: "approve-all" as const,
+    host: "reject_once" as const,
+    notice: true,
+    throwNotice: true,
+  },
+  {
+    name: "mode denial despite a throwing notice observer",
+    ids: ["cancel"],
+    expected: "cancel",
+    notice: true,
+    throwNotice: true,
+  },
+  { name: "missing refusal", ids: [], notice: true },
+  { name: "explicit host cancellation", ids: ["cancel", "decline"], host: "cancel" as const },
+  {
+    name: "unrelated adapter",
+    ids: ["cancel", "decline"],
+    expected: "cancel",
+    agent: "unrelated-adapter",
+  },
+]) {
+  test(`AcpClient routes Codex permission ${scenario.name} through ACP`, async (t) => {
+    const notices: string[] = [];
+    const fixture = createClientFixture(t, {
+      client: {
+        permissionMode: scenario.mode ?? "deny-all",
+        permissionPolicy: scenario.policy,
+        onClientOperation: (operation) => {
+          notices.push(operation.summary);
+          if (scenario.throwNotice) {
+            throw new Error("synthetic notice observer failure");
+          }
+        },
+        onPermissionRequest: scenario.host
+          ? async (request) => {
+              assert.deepEqual(
+                request.raw.options.map((option) => option.optionId),
+                ["allow", ...scenario.ids],
+              );
+              return { outcome: scenario.host };
+            }
+          : undefined,
+      },
+    });
+    asInternals(fixture.client).initResult = {
+      agentInfo: { name: scenario.agent ?? "@agentclientprotocol/codex-acp", version: "1.12.0" },
+    };
+    const request: RequestPermissionRequest = {
+      sessionId: "synthetic-permission",
+      toolCall: { toolCallId: "synthetic-call", title: "synthetic operation", kind: "execute" },
+      options: [
+        { optionId: "allow", name: "Allow", kind: "allow_once" },
+        ...scenario.ids.map((optionId) => ({
+          optionId,
+          name: optionId,
+          kind: "reject_once" as const,
+        })),
+      ],
+    };
+    await fixture.send({
+      jsonrpc: "2.0",
+      id: "permission",
+      method: "session/request_permission",
+      params: request,
+    });
+    const message = await fixture.message(0);
+    assert("result" in message);
+    const response = message.result as RequestPermissionResponse;
+    assert.equal(fixture.client.getPermissionStats().requested, 1);
+    assert.deepEqual(
+      response.outcome,
+      scenario.expected
+        ? { outcome: "selected", optionId: scenario.expected }
+        : { outcome: "cancelled" },
+    );
+    if (scenario.notice) {
+      assert.equal(notices.length, 1);
+      assert.match(notices[0], /cancel.*turn/i);
+      assert.match(JSON.stringify(response._meta), /permissionNotice/);
+    } else {
+      assert.deepEqual(notices, []);
+      assert.equal(response._meta, undefined);
+    }
+  });
+}
+
 test("AcpClient onPermissionRequest returning undefined falls through to mode-based resolver", async () => {
   let callbackInvocations = 0;
   const client = makeClient({
@@ -808,15 +829,18 @@ test("AcpClient onPermissionRequest throws fall through to mode-based resolver",
   assert.equal(callbackInvocations, 1);
 });
 
-test("AcpClient onPermissionRequest receives an AbortSignal that fires on session cancel", async () => {
+test("AcpClient onPermissionRequest receives an AbortSignal that fires on session cancel", async (t) => {
   let observedSignal: AbortSignal | undefined;
-  const client = makeClient({
-    permissionMode: "approve-all",
-    onPermissionRequest: async (_req, ctx) => {
-      observedSignal = ctx.signal;
-      return { outcome: "allow_once" };
+  const fixture = createClientFixture(t, {
+    client: {
+      permissionMode: "approve-all",
+      onPermissionRequest: async (_req, ctx) => {
+        observedSignal = ctx.signal;
+        return { outcome: "allow_once" };
+      },
     },
   });
+  const { client } = fixture;
 
   await asInternals(client).handlePermissionRequest?.(
     makePermissionRequest("session-cb-4", "edit"),
@@ -825,12 +849,11 @@ test("AcpClient onPermissionRequest receives an AbortSignal that fires on sessio
   assert(observedSignal instanceof AbortSignal);
   assert.equal(observedSignal?.aborted, false);
 
-  asInternals(client).connection = { cancel: async () => {} };
   await client.cancel("session-cb-4");
   assert.equal(observedSignal?.aborted, true);
 });
 
-test("AcpClient onPermissionRequest cancels a late decision after session cancel", async () => {
+test("AcpClient onPermissionRequest cancels a late decision after session cancel", async (t) => {
   let resolveDecision!: (decision: { outcome: "allow_once" }) => void;
   const decisionPromise = new Promise<{ outcome: "allow_once" }>((resolve) => {
     resolveDecision = resolve;
@@ -841,16 +864,18 @@ test("AcpClient onPermissionRequest cancels a late decision after session cancel
   });
   let observedSignal: AbortSignal | undefined;
 
-  const client = makeClient({
-    permissionMode: "approve-all",
-    onPermissionRequest: async (_req, ctx) => {
-      observedSignal = ctx.signal;
-      callbackStarted();
-      return await decisionPromise;
+  const fixture = createClientFixture(t, {
+    client: {
+      permissionMode: "approve-all",
+      onPermissionRequest: async (_req, ctx) => {
+        observedSignal = ctx.signal;
+        callbackStarted();
+        return await decisionPromise;
+      },
     },
   });
+  const { client } = fixture;
   const internals = asInternals(client);
-  internals.connection = { cancel: async () => {} };
 
   const responsePromise = internals.handlePermissionRequest?.(
     makePermissionRequest("session-cb-5", "edit"),
@@ -876,23 +901,25 @@ test("AcpClient onPermissionRequest cancels a late decision after session cancel
   });
 });
 
-test("AcpClient onPermissionRequest treats abort rejections as cancelled", async () => {
+test("AcpClient onPermissionRequest treats abort rejections as cancelled", async (t) => {
   let callbackStarted!: () => void;
   const callbackStartedPromise = new Promise<void>((resolve) => {
     callbackStarted = resolve;
   });
 
-  const client = makeClient({
-    permissionMode: "approve-all",
-    onPermissionRequest: async (_req, ctx) => {
-      callbackStarted();
-      await new Promise<never>((_resolve, reject) => {
-        ctx.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-      });
+  const fixture = createClientFixture(t, {
+    client: {
+      permissionMode: "approve-all",
+      onPermissionRequest: async (_req, ctx) => {
+        callbackStarted();
+        await new Promise<never>((_resolve, reject) => {
+          ctx.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
     },
   });
+  const { client } = fixture;
   const internals = asInternals(client);
-  internals.connection = { cancel: async () => {} };
 
   const responsePromise = internals.handlePermissionRequest?.(
     makePermissionRequest("session-cb-6", "edit"),
@@ -971,68 +998,89 @@ test("AcpClient client-method permission errors update permission stats", async 
   assert(noted instanceof PermissionPromptUnavailableError);
 });
 
-test("AcpClient createSession forwards claudeCode options in _meta", async () => {
-  const cwd = path.resolve("/tmp/acpx-client-meta");
-  const client = makeClient({
-    sessionOptions: {
-      model: "sonnet",
-      allowedTools: ["Read", "Grep"],
-      maxTurns: 12,
+for (const scenario of [
+  {
+    name: "AcpClient createSession forwards claudeCode options in _meta",
+    options: { sessionOptions: { model: "sonnet", allowedTools: ["Read", "Grep"], maxTurns: 12 } },
+    meta: {
+      claudeCode: { options: { model: "sonnet", allowedTools: ["Read", "Grep"], maxTurns: 12 } },
     },
+  },
+  {
+    name: "AcpClient creates built-in Claude sessions without user settings by default",
+    options: { agentCommand: "npx -y @agentclientprotocol/claude-agent-acp" },
+    meta: { claudeCode: { options: { settingSources: ["project", "local"] } } },
+  },
+  {
+    name: "AcpClient createSession forwards systemPrompt string in _meta",
+    options: { sessionOptions: { systemPrompt: "you are an obsidian assistant" } },
+    meta: { systemPrompt: "you are an obsidian assistant" },
+  },
+  {
+    name: "AcpClient createSession forwards systemPrompt append in _meta alongside claudeCode options",
+    options: {
+      sessionOptions: { model: "sonnet", systemPrompt: { append: "always speak in spanish" } },
+    },
+    meta: {
+      claudeCode: { options: { model: "sonnet" } },
+      systemPrompt: { append: "always speak in spanish" },
+    },
+  },
+  {
+    name: "AcpClient createSession forwards codex model metadata without setting it explicitly",
+    options: {
+      agentCommand: "npx -y @agentclientprotocol/codex-acp",
+      sessionOptions: { model: "GPT-5-2" },
+    },
+    meta: { claudeCode: { options: { model: "GPT-5-2" } } },
+  },
+]) {
+  test(scenario.name, async (t) => {
+    const fixture = createClientFixture(t, { client: scenario.options });
+    const cwd = path.resolve("/tmp/acpx-client-meta");
+    const pending = fixture.track(fixture.client.createSession(cwd));
+    const request = await fixture.message(0);
+    assert("method" in request);
+    assert.equal(request.method, "session/new");
+    assert.deepEqual(request.params, { cwd, mcpServers: [], _meta: scenario.meta });
+    await fixture.reply(request, { sessionId: "session-meta" });
+    assert.equal((await pending).sessionId, "session-meta");
+    assert.equal(fixture.messages.length, 1, "session creation must not send a model control");
   });
+}
 
-  let capturedParams: Record<string, unknown> | undefined;
-  asInternals(client).connection = {
-    newSession: async (params: Record<string, unknown>) => {
-      capturedParams = params;
-      return { sessionId: "session-123" };
-    },
-  };
-
-  const result = await client.createSession("/tmp/acpx-client-meta");
-  assert.equal(result.sessionId, "session-123");
-  assert.deepEqual(capturedParams, {
-    cwd,
-    mcpServers: [],
-    _meta: {
-      claudeCode: {
-        options: {
-          model: "sonnet",
-          allowedTools: ["Read", "Grep"],
-          maxTurns: 12,
-        },
+for (const method of ["load", "resume"] as const) {
+  test(`AcpClient ${method} preserves Claude setting isolation and session metadata`, async (t) => {
+    const fixture = createClientFixture(t, {
+      client: {
+        agentCommand: "npx -y @agentclientprotocol/claude-agent-acp",
+        sessionOptions: { allowedTools: ["Read"], maxTurns: 5, systemPrompt: "synthetic" },
       },
-    },
-  });
-});
-
-test("AcpClient creates built-in Claude sessions without user settings by default", async () => {
-  const cwd = path.resolve("/tmp/acpx-client-claude-settings");
-  const client = makeClient({
-    agentCommand: "npx -y @agentclientprotocol/claude-agent-acp",
-  });
-
-  let capturedParams: Record<string, unknown> | undefined;
-  asInternals(client).connection = {
-    newSession: async (params: Record<string, unknown>) => {
-      capturedParams = params;
-      return { sessionId: "session-claude-settings" };
-    },
-  };
-
-  await client.createSession("/tmp/acpx-client-claude-settings");
-  assert.deepEqual(capturedParams, {
-    cwd,
-    mcpServers: [],
-    _meta: {
-      claudeCode: {
-        options: {
-          settingSources: ["project", "local"],
+    });
+    const cwd = path.resolve("/tmp/acpx-client-meta");
+    const pending = fixture.track(
+      method === "load"
+        ? fixture.client.loadSession("session-meta", cwd)
+        : fixture.client.resumeSession("session-meta", cwd),
+    );
+    const request = await fixture.message(0);
+    assert("method" in request);
+    assert.equal(request.method, `session/${method}`);
+    assert.deepEqual(request.params, {
+      sessionId: "session-meta",
+      cwd,
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { settingSources: ["project", "local"], allowedTools: ["Read"], maxTurns: 5 },
         },
+        systemPrompt: "synthetic",
       },
-    },
+    });
+    await fixture.reply(request, {});
+    await pending;
   });
-});
+}
 
 test("resolveClaudeCodeSettingSources includes user settings only when explicitly enabled", () => {
   assert.deepEqual(resolveClaudeCodeSettingSources({}), ["project", "local"]);
@@ -1047,458 +1095,206 @@ test("resolveClaudeCodeSettingSources includes user settings only when explicitl
   ]);
 });
 
-test("AcpClient createSession forwards systemPrompt string in _meta", async () => {
-  const cwd = path.resolve("/tmp/acpx-client-system-prompt");
-  const client = makeClient({
-    sessionOptions: {
-      systemPrompt: "you are an obsidian assistant",
+for (const scenario of [
+  {
+    name: "AcpClient setSessionModel uses the model session config option",
+    client: {},
+    model: "GPT-5-2",
+    control: {
+      configId: "model",
+      currentModelId: "GPT-5-2",
+      availableModels: [{ modelId: "GPT-5-2", name: "GPT-5-2" }],
     },
-  });
-
-  let capturedParams: Record<string, unknown> | undefined;
-  asInternals(client).connection = {
-    newSession: async (params: Record<string, unknown>) => {
-      capturedParams = params;
-      return { sessionId: "session-sp-string" };
+    expected: "GPT-5-2",
+  },
+  {
+    name: "AcpClient setSessionModel honors an advertised custom config id",
+    client: {},
+    model: "GPT-5-2",
+    control: {
+      configId: "llm",
+      currentModelId: "GPT-5-2",
+      availableModels: [{ modelId: "GPT-5-2", name: "GPT-5-2" }],
     },
-  };
-
-  await client.createSession("/tmp/acpx-client-system-prompt");
-  assert.deepEqual(capturedParams, {
-    cwd,
-    mcpServers: [],
-    _meta: {
-      systemPrompt: "you are an obsidian assistant",
+    expected: "GPT-5-2",
+  },
+  {
+    name: "AcpClient normalizes a Cursor model alias to its unique advertised id",
+    client: { agentCommand: "cursor-agent acp" },
+    model: "composer-2.5",
+    control: {
+      configId: "model",
+      currentModelId: "composer-2.5[fast=false]",
+      availableModels: [{ modelId: "composer-2.5[fast=false]", name: "Composer 2.5" }],
     },
-  });
-});
-
-test("AcpClient createSession forwards systemPrompt append in _meta alongside claudeCode options", async () => {
-  const cwd = path.resolve("/tmp/acpx-client-system-prompt-append");
-  const client = makeClient({
-    sessionOptions: {
-      model: "sonnet",
-      systemPrompt: { append: "always speak in spanish" },
-    },
-  });
-
-  let capturedParams: Record<string, unknown> | undefined;
-  asInternals(client).connection = {
-    newSession: async (params: Record<string, unknown>) => {
-      capturedParams = params;
-      return { sessionId: "session-sp-append" };
-    },
-  };
-
-  await client.createSession("/tmp/acpx-client-system-prompt-append");
-  assert.deepEqual(capturedParams, {
-    cwd,
-    mcpServers: [],
-    _meta: {
-      claudeCode: {
-        options: {
-          model: "sonnet",
-        },
-      },
-      systemPrompt: { append: "always speak in spanish" },
-    },
-  });
-});
-
-test("AcpClient createSession forwards codex model metadata without setting it explicitly", async () => {
-  const cwd = path.resolve("/tmp/acpx-client-codex-model");
-  const client = makeClient({
-    agentCommand: "npx -y @agentclientprotocol/codex-acp",
-    sessionOptions: {
-      model: "GPT-5-2",
-    },
-  });
-
-  let capturedNewSessionParams: Record<string, unknown> | undefined;
-  let setConfigCalled = false;
-  asInternals(client).connection = {
-    newSession: async (params: Record<string, unknown>) => {
-      capturedNewSessionParams = params;
-      return { sessionId: "session-456" };
-    },
-    setSessionConfigOption: async () => {
-      setConfigCalled = true;
-      return { configOptions: [] };
-    },
-  };
-
-  const result = await client.createSession("/tmp/acpx-client-codex-model");
-  assert.equal(result.sessionId, "session-456");
-  assert.deepEqual(capturedNewSessionParams, {
-    cwd,
-    mcpServers: [],
-    _meta: {
-      claudeCode: {
-        options: {
-          model: "GPT-5-2",
-        },
-      },
-    },
-  });
-  assert.equal(setConfigCalled, false);
-});
-
-test("AcpClient exposes and enforces Grok Build permission modes through ACP", async () => {
-  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-grok-mode-"));
-  const permissionRequests: RequestPermissionRequest[] = [];
-  const client = makeClient({
-    agentCommand: "grok agent stdio",
-    cwd,
-    onPermissionRequest: async (request) => {
-      permissionRequests.push(request.raw);
-      return request.inferredKind === "execute"
-        ? { outcome: "reject_once" }
-        : { outcome: "allow_once" };
-    },
-  });
-  let forwardedModeCalls = 0;
-  asInternals(client).connection = {
-    newSession: async () => ({ sessionId: "grok-session" }),
-    setSessionMode: async () => {
-      forwardedModeCalls += 1;
-      return {};
-    },
-  };
-
-  try {
-    const created = await client.createSession(cwd);
-    assert.deepEqual(created.configOptions, [
-      {
-        id: "mode",
-        name: "Permission Mode",
-        category: "mode",
-        type: "select",
-        currentValue: "acceptEdits",
-        options: [
-          { value: "default", name: "Ask" },
-          { value: "acceptEdits", name: "Accept Edits" },
-          { value: "auto", name: "Auto" },
-          { value: "plan", name: "Plan" },
-          { value: "dontAsk", name: "Deny" },
-          { value: "bypassPermissions", name: "Always Approve" },
-        ],
-      },
-    ]);
-    assert.equal(created.configOptionsPresent, true);
-
-    const filePath = path.join(cwd, "grok-mode.txt");
-    // Default acceptEdits auto-allows file writes without asking the host.
-    await asInternals(client).handleWriteTextFile?.({
-      sessionId: created.sessionId,
-      path: filePath,
-      content: "approved",
-    });
-    assert.equal(permissionRequests.length, 0);
-    assert.equal(await fs.readFile(filePath, "utf8"), "approved");
-
-    // Execute still prompts under acceptEdits.
-    await assert.rejects(
-      async () =>
-        await asInternals(client).handleCreateTerminal?.({
-          sessionId: created.sessionId,
-          command: "pwd",
-        }),
-      PermissionDeniedError,
+    expected: "composer-2.5[fast=false]",
+  },
+]) {
+  test(scenario.name, async (t) => {
+    const fixture = createClientFixture(t, { client: scenario.client });
+    const pending = fixture.track(
+      fixture.client.setSessionModel("session-456", scenario.model, scenario.control),
     );
-    assert.equal(permissionRequests.length, 1);
-    assert.equal(permissionRequests[0]?.toolCall.kind, "execute");
-
-    // Ask mode (default) routes edits through the host callback.
-    // setSessionMode must forward to the agent (not only the local cache).
-    await client.setSessionMode(created.sessionId, "default");
-    assert.equal(forwardedModeCalls, 1);
-    await asInternals(client).handleWriteTextFile?.({
-      sessionId: created.sessionId,
-      path: filePath,
-      content: "asked edit",
+    const request = await fixture.message(0);
+    assert("method" in request);
+    assert.equal(request.method, "session/set_config_option");
+    assert.deepEqual(request.params, {
+      sessionId: "session-456",
+      configId: scenario.control.configId,
+      value: scenario.expected,
     });
-    assert.equal(permissionRequests.length, 2);
-    assert.equal(permissionRequests[1]?.toolCall.kind, "edit");
-    assert.equal(await fs.readFile(filePath, "utf8"), "asked edit");
-
-    await client.setSessionMode(created.sessionId, "acceptEdits");
-    assert.equal(forwardedModeCalls, 2);
-    await asInternals(client).handleWriteTextFile?.({
-      sessionId: created.sessionId,
-      path: filePath,
-      content: "accepted edit",
-    });
-    assert.equal(permissionRequests.length, 2);
-    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
-
-    // plan: deny writes/execute (read-only) without host prompt.
-    await client.setSessionMode(created.sessionId, "plan");
-    assert.equal(forwardedModeCalls, 3);
-    await assert.rejects(
-      async () =>
-        await asInternals(client).handleWriteTextFile?.({
-          sessionId: created.sessionId,
-          path: filePath,
-          content: "plan blocked",
-        }),
-      PermissionDeniedError,
-    );
-    assert.equal(permissionRequests.length, 2);
-    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
-
-    await client.setSessionMode(created.sessionId, "dontAsk");
-    assert.equal(forwardedModeCalls, 4);
-    await assert.rejects(
-      async () =>
-        await asInternals(client).handleWriteTextFile?.({
-          sessionId: created.sessionId,
-          path: filePath,
-          content: "denied",
-        }),
-      PermissionDeniedError,
-    );
-    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
-  } finally {
-    await client.close();
-    await fs.rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("AcpClient leaves plan mode after ExitPlanMode approved", async () => {
-  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-grok-exit-plan-"));
-  const client = makeClient({
-    agentCommand: "grok agent stdio",
-    cwd,
-    onExitPlanMode: async () => ({ outcome: "approved" }),
+    await fixture.reply(request, { configOptions: [] });
+    await pending;
   });
-  asInternals(client).connection = {
-    newSession: async () => ({ sessionId: "grok-exit-plan" }),
-    setSessionMode: async () => ({}),
-  };
-
-  try {
-    const created = await client.createSession(cwd);
-    await client.setSessionMode(created.sessionId, "plan");
-
-    const filePath = path.join(cwd, "after-plan.txt");
-    await assert.rejects(
-      async () =>
-        await asInternals(client).handleWriteTextFile?.({
-          sessionId: created.sessionId,
-          path: filePath,
-          content: "blocked",
-        }),
-      PermissionDeniedError,
-    );
-
-    const internals = asInternals(client) as ClientInternals & {
-      handleGrokExitPlanMode?: (params: Record<string, unknown>) => Promise<{ outcome: string }>;
-    };
-    const response = await internals.handleGrokExitPlanMode?.({
-      sessionId: created.sessionId,
-      toolCallId: "tc-exit-1",
-      planContent: "# ship it",
-    });
-    assert.deepEqual(response, { outcome: "approved" });
-
-    // approved → acceptEdits: file writes skip the host prompt again
-    await asInternals(client).handleWriteTextFile?.({
-      sessionId: created.sessionId,
-      path: filePath,
-      content: "implemented",
-    });
-    assert.equal(await fs.readFile(filePath, "utf8"), "implemented");
-  } finally {
-    await client.close();
-    await fs.rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("AcpClient setSessionModel uses the model session config option", async () => {
-  const client = makeClient();
-
-  let capturedSetConfigParams:
-    | {
-        sessionId: string;
-        configId: string;
-        value: string;
-      }
-    | undefined;
-  asInternals(client).connection = {
-    setSessionConfigOption: async (params: {
-      sessionId: string;
-      configId: string;
-      value: string;
-    }) => {
-      capturedSetConfigParams = params;
-      return { configOptions: [] };
-    },
-  };
-
-  await client.setSessionModel("session-456", "GPT-5-2", { configId: "model" });
-  assert.deepEqual(capturedSetConfigParams, {
-    sessionId: "session-456",
-    configId: "model",
-    value: "GPT-5-2",
-  });
-});
-
-test("AcpClient setSessionModel honors an advertised custom config id", async () => {
-  const client = makeClient();
-
-  let capturedConfigId: string | undefined;
-  asInternals(client).connection = {
-    setSessionConfigOption: async (params: { configId: string }) => {
-      capturedConfigId = params.configId;
-      return { configOptions: [] };
-    },
-  };
-
-  await client.setSessionModel("session-456", "GPT-5-2", { configId: "llm" });
-  assert.equal(capturedConfigId, "llm");
-});
-
-test("AcpClient normalizes a Cursor model alias to its unique advertised id", async () => {
-  const client = makeClient({ agentCommand: "cursor-agent acp" });
-  let capturedValue: string | undefined;
-  asInternals(client).connection = {
-    setSessionConfigOption: async (params: { value: string }) => {
-      capturedValue = params.value;
-      return { configOptions: [] };
-    },
-  };
-
-  await client.setSessionModel("session-456", "composer-2.5", {
-    configId: "model",
-    availableModels: [{ modelId: "composer-2.5[fast=false]", name: "Composer 2.5" }],
-  });
-  assert.equal(capturedValue, "composer-2.5[fast=false]");
-});
+}
 
 test("AcpClient setSessionModel rejects sessions without advertised model control", async () => {
   const client = makeClient();
-  asInternals(client).connection = {};
 
   await assert.rejects(
-    async () => await client.setSessionModel("session-456", "GPT-5-2"),
+    async () => await client.setSessionModel("session-456", "GPT-5-2", undefined),
     /did not advertise a model config option or legacy session\/set_model support/,
   );
 });
 
-test("AcpClient setSessionModel preserves explicitly advertised legacy model control", async () => {
-  const client = makeClient();
-  let capturedLegacyParams: Record<string, unknown> | undefined;
-  asInternals(client).connection = {
-    newSession: async () => ({
-      sessionId: "legacy-session",
-      models: {
-        currentModelId: "default-model",
-        availableModels: [
-          { modelId: "default-model", name: "Default Model" },
-          { modelId: "alternate-model", name: "Alternate Model" },
-        ],
+for (const control of ["model", "config"] as const) {
+  test(`AcpClient ${control} control preserves authority failures before model validation`, async (t) => {
+    const fixture = createClientFixture(t);
+    const failure = new Error("model authority revoked");
+    const models = {
+      configId: "model",
+      currentModelId: "known-model",
+      availableModels: [{ modelId: "known-model", name: "Known model" }],
+    };
+    for (const authority of [
+      { signal: AbortSignal.abort(failure) },
+      {
+        assertActive: () => {
+          throw failure;
+        },
       },
-    }),
-    extMethod: async (method: string, params: Record<string, unknown>) => {
-      assert.equal(method, "session/set_model");
-      capturedLegacyParams = params;
-      return {};
-    },
-  };
-
-  const result = await client.createSession("/tmp/acpx-client-legacy-model");
-  assert.equal(result.models?.configId, undefined);
-  await client.setSessionModel(result.sessionId, "alternate-model");
-  assert.deepEqual(capturedLegacyParams, {
-    sessionId: "legacy-session",
-    modelId: "alternate-model",
+    ]) {
+      await assert.rejects(
+        control === "model"
+          ? fixture.client.setSessionModel("session-456", "unknown-model", models, authority)
+          : fixture.client.setSessionConfigOption(
+              "session-456",
+              "model",
+              "unknown-model",
+              models,
+              authority,
+            ),
+        (error: unknown) => error === failure,
+      );
+      assert.equal(fixture.messages.length, 0);
+    }
   });
+}
+
+test("AcpClient setSessionModel preserves explicitly advertised legacy model control", async (t) => {
+  const fixture = createClientFixture(t);
+  const created = fixture.track(fixture.client.createSession("/tmp/acpx-client-legacy-model"));
+  const createRequest = await fixture.message(0);
+  assert("method" in createRequest);
+  assert.equal(createRequest.method, "session/new");
+  await fixture.reply(createRequest, {
+    sessionId: "legacy-session",
+    models: {
+      currentModelId: "default-model",
+      availableModels: [
+        { modelId: "default-model", name: "Default Model" },
+        { modelId: "alternate-model", name: "Alternate Model" },
+      ],
+    },
+  });
+  const result = await created;
+  assert.equal(result.models?.configId, undefined);
+  const changed = fixture.track(
+    fixture.client.setSessionModel(result.sessionId, "alternate-model", result.models),
+  );
+  const request = await fixture.message(1);
+  assert("method" in request);
+  assert.equal(request.method, "session/set_model");
+  assert.deepEqual(request.params, { sessionId: "legacy-session", modelId: "alternate-model" });
+  await fixture.reply(request, {});
+  await changed;
 });
 
-test("AcpClient treats explicit null config options as an empty snapshot", async () => {
-  const client = makeClient();
-  asInternals(client).connection = {
-    loadSession: async () => ({ configOptions: null }),
-  };
-
-  const result = await client.loadSession("session-null-config", "/tmp/acpx-null-config");
-  assert.equal(result.configOptionsPresent, true);
-  assert.deepEqual(result.configOptions, []);
+test("AcpClient ignores malformed config snapshots instead of withdrawing the catalog", async (t) => {
+  const fixture = createClientFixture(t);
+  const pending = fixture.track(
+    fixture.client.loadSession("session-null-config", "/tmp/acpx-null-config"),
+  );
+  const request = await fixture.message(0);
+  assert("method" in request);
+  assert.equal(request.method, "session/load");
+  await fixture.reply(request, { configOptions: null });
+  const result = await pending;
+  assert.equal(result.configOptionsPresent, false);
+  assert.equal(result.configOptions, undefined);
   assert.equal(result.models, undefined);
 });
 
-test("AcpClient closes sessions through session/close and clears the loaded session id", async () => {
-  const client = makeClient();
-  const internals = asInternals(client);
-  let capturedCloseSessionParams: { sessionId: string } | undefined;
-  internals.initResult = {
-    agentCapabilities: {
-      sessionCapabilities: {
-        close: {},
-      },
-    },
-  };
-  internals.loadedSessionId = "session-close-1";
-  internals.connection = {
-    closeSession: async (params: { sessionId: string }) => {
-      capturedCloseSessionParams = params;
-      return {};
-    },
-  };
-
-  assert.equal(client.supportsCloseSession(), true);
-  await client.closeSession("session-close-1");
-
-  assert.deepEqual(capturedCloseSessionParams, {
-    sessionId: "session-close-1",
+for (const response of [
+  null,
+  { configOptions: null },
+  { configOptions: 5 },
+  { configOptions: "oops" },
+  { configOptions: {} },
+]) {
+  test(`AcpClient normalizes a malformed config acknowledgement for queue transport: ${JSON.stringify(response)}`, async (t) => {
+    const fixture = createClientFixture(t);
+    const pending = fixture.track(
+      fixture.client.setSessionConfigOption("session-config", "effort", "high", undefined),
+    );
+    const request = await fixture.message(0);
+    await fixture.reply(request, response as unknown as Record<string, unknown>);
+    assert.deepEqual(await pending, {});
   });
+}
+
+test("AcpClient closes sessions through session/close and clears the loaded session id", async (t) => {
+  const fixture = createClientFixture(t);
+  const { client } = fixture;
+  const internals = asInternals(client);
+  internals.initResult = { agentCapabilities: { sessionCapabilities: { close: {} } } };
+  internals.loadedSessionId = "session-close-1";
+  assert.equal(client.supportsCloseSession(), true);
+  const pending = fixture.track(client.closeSession("session-close-1"));
+  const request = await fixture.message(0);
+  assert("method" in request);
+  assert.equal(request.method, "session/close");
+  assert.deepEqual(request.params, { sessionId: "session-close-1" });
+  await fixture.reply(request, {});
+  await pending;
   assert.equal(internals.loadedSessionId, undefined);
 });
 
-test("AcpClient lists agent sessions through session/list", async () => {
-  const client = makeClient();
-  const internals = asInternals(client);
-  let capturedListSessionsParams:
-    | {
-        cwd?: string | null;
-        cursor?: string | null;
-      }
-    | undefined;
-  internals.initResult = {
-    agentCapabilities: {
-      sessionCapabilities: {
-        list: {},
-      },
-    },
-  };
-  internals.connection = {
-    listSessions: async (params: { cwd?: string | null; cursor?: string | null }) => {
-      capturedListSessionsParams = params;
-      return {
-        sessions: [
-          {
-            sessionId: "agent-session-1",
-            cwd: "/tmp/acpx-client-list",
-            title: "Agent session",
-            updatedAt: "2026-05-21T00:00:00.000Z",
-            _meta: { messageCount: 3 },
-          },
-        ],
-        nextCursor: "cursor-2",
-      };
-    },
-  };
-
+test("AcpClient lists agent sessions through session/list", async (t) => {
+  const fixture = createClientFixture(t);
+  const { client } = fixture;
+  asInternals(client).initResult = { agentCapabilities: { sessionCapabilities: { list: {} } } };
   assert.equal(client.supportsListSessions(), true);
-  const result = await client.listSessions({
-    cwd: "/tmp/acpx-client-list",
-    cursor: "cursor-1",
+  const pending = fixture.track(
+    client.listSessions({ cwd: "/tmp/acpx-client-list", cursor: "cursor-1" }),
+  );
+  const request = await fixture.message(0);
+  assert("method" in request);
+  assert.equal(request.method, "session/list");
+  assert.deepEqual(request.params, { cwd: "/tmp/acpx-client-list", cursor: "cursor-1" });
+  await fixture.reply(request, {
+    sessions: [
+      {
+        sessionId: "agent-session-1",
+        cwd: "/tmp/acpx-client-list",
+        title: "Agent session",
+        updatedAt: "2026-05-21T00:00:00.000Z",
+        _meta: { messageCount: 3 },
+      },
+    ],
+    nextCursor: "cursor-2",
   });
-
-  assert.deepEqual(capturedListSessionsParams, {
-    cwd: "/tmp/acpx-client-list",
-    cursor: "cursor-1",
-  });
+  const result = await pending;
   assert.equal(result.nextCursor, "cursor-2");
   assert.equal(result.sessions[0]?.sessionId, "agent-session-1");
   assert.deepEqual(result.sessions[0]?._meta, { messageCount: 3 });
@@ -1531,29 +1327,6 @@ test("AcpClient session update handling drains queued callbacks and swallows han
   assert.deepEqual(notifications, ["good", "bad"]);
 });
 
-test("AcpClient buffers session updates with no handler, then flushes on setEventHandlers", async () => {
-  const client = makeClient(); // constructed without an onSessionUpdate handler
-  const internals = asInternals(client);
-
-  // A notification that arrives before any consumer (the adapter's initial
-  // available_commands_update after newSession) must be buffered, not lost.
-  await internals.handleSessionUpdate?.({ sessionId: "early" });
-
-  const received: string[] = [];
-  client.setEventHandlers({
-    onSessionUpdate: (n) => {
-      received.push((n as { sessionId: string }).sessionId);
-    },
-  });
-  // Installing the handler replays the buffered notification.
-  assert.deepEqual(received, ["early"]);
-
-  // Later notifications dispatch directly (buffer already drained).
-  await internals.handleSessionUpdate?.({ sessionId: "later" });
-  await internals.waitForSessionUpdateDrain?.(0, 100);
-  assert.deepEqual(received, ["early", "later"]);
-});
-
 test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt state", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1578,8 +1351,8 @@ test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt stat
   assert.equal(await client.requestCancelActivePrompt(), true);
   assert.equal(cancelledSessionId, "session-3");
 
-  internals.recordAgentExit?.("process_exit", 1, "SIGTERM");
-  internals.recordAgentExit?.("pipe_close", 0, null);
+  internals.recordAgentExit?.(internals.agent, "process_exit", 1, "SIGTERM");
+  internals.recordAgentExit?.(internals.agent, "pipe_close", 0, null);
   const snapshot = client.getAgentLifecycleSnapshot();
   assert.equal(snapshot.pid, 4321);
   assert.equal(snapshot.startedAt, "2026-01-01T00:00:00.000Z");
@@ -1595,7 +1368,7 @@ test(
   "AcpClient coalesces cancellation until the active prompt finishes",
   { timeout: 5_000 },
   async (t) => {
-    const fixture = createCancellationFixture(t);
+    const fixture = createClientFixture(t);
     const { client } = fixture;
     const first = fixture.prompt("session-cancel", "first");
     await fixture.message(0);
@@ -1642,7 +1415,7 @@ test(
   { timeout: 5_000 },
   async (t) => {
     let permissionSignal: AbortSignal | undefined;
-    const fixture = createCancellationFixture(t, {
+    const fixture = createClientFixture(t, {
       client: {
         onPermissionRequest: async (_request, { signal }) => {
           permissionSignal = signal;
@@ -1682,7 +1455,7 @@ test(
   { timeout: 5_000 },
   async (t) => {
     const reentered: Array<Promise<boolean>> = [];
-    const fixture = createCancellationFixture(t, {
+    const fixture = createClientFixture(t, {
       client: {
         onPermissionRequest: async (_request, { signal }) => {
           signal.addEventListener(
@@ -1726,7 +1499,7 @@ test(
   "AcpClient queues cancellation before an abort listener starts the next prompt",
   { timeout: 5_000 },
   async (t) => {
-    const fixture = createCancellationFixture(t);
+    const fixture = createClientFixture(t);
     const { client } = fixture;
     const first = fixture.prompt("session-next", "first");
     await fixture.message(0);
@@ -1760,7 +1533,7 @@ test(
   async (t) => {
     const releaseSecondWrite = createDeferred<void>();
     let promptsWritten = 0;
-    const fixture = createCancellationFixture(t, {
+    const fixture = createClientFixture(t, {
       async write(message) {
         if ("method" in message && message.method === "session/prompt" && ++promptsWritten === 2) {
           await releaseSecondWrite.promise;
@@ -1807,22 +1580,21 @@ test(
   async (t) => {
     const attempt = createDeferred<void>();
     const called = createDeferred<void>();
-    const fixture = createCancellationFixture(t, { release: () => attempt.resolve() });
+    const fixture = createClientFixture(t, { release: () => attempt.resolve() });
     const { client } = fixture;
     const prompt = fixture.prompt("session-retry", "hello");
     await fixture.message(0);
-    const connection = asInternals(client).connection as {
-      cancel: (params: { sessionId: string }) => Promise<void>;
-    };
-    const sendCancel = connection.cancel;
+    const { agent } = fixture.connection;
+    const sendCancel = agent.notify.bind(agent);
     let calls = 0;
-    connection.cancel = (params) => {
+    agent.notify = (method: string, params?: unknown) => {
+      assert.equal(method, "session/cancel");
       calls += 1;
       if (calls === 1) {
         called.resolve();
         return attempt.promise;
       }
-      return sendCancel(params);
+      return sendCancel(method, params);
     };
     const failure = new Error("cancel was not enqueued");
     const results = fixture.track(
@@ -1855,7 +1627,7 @@ test(
     const oldAttempt = createDeferred<void>();
     const oldCalled = createDeferred<void>();
     const releaseNewSend = createDeferred<void>();
-    const fixture = createCancellationFixture(t, {
+    const fixture = createClientFixture(t, {
       async write(message) {
         if ("method" in message && message.method === "session/cancel") {
           await releaseNewSend.promise;
@@ -1869,18 +1641,17 @@ test(
     const { client } = fixture;
     const first = fixture.prompt("session-isolation", "first");
     await fixture.message(0);
-    const connection = asInternals(client).connection as {
-      cancel: (params: { sessionId: string }) => Promise<void>;
-    };
-    const sendCancel = connection.cancel;
+    const { agent } = fixture.connection;
+    const sendCancel = agent.notify.bind(agent);
     let calls = 0;
-    connection.cancel = (params) => {
+    agent.notify = (method: string, params?: unknown) => {
+      assert.equal(method, "session/cancel");
       calls += 1;
       if (calls === 1) {
         oldCalled.resolve();
         return oldAttempt.promise;
       }
-      return sendCancel(params);
+      return sendCancel(method, params);
     };
     const oldResult = fixture.track(Promise.allSettled([client.requestCancelActivePrompt()]));
     await oldCalled.promise;
@@ -1913,7 +1684,7 @@ for (const mode of ["same-session-live", "same-session-cancelled", "different-se
     { timeout: 5_000 },
     async (t) => {
       const signals: AbortSignal[] = [];
-      const fixture = createCancellationFixture(t, {
+      const fixture = createClientFixture(t, {
         client: {
           onPermissionRequest: async (_request, { signal }) => {
             signals.push(signal);
@@ -1930,6 +1701,7 @@ for (const mode of ["same-session-live", "same-session-cancelled", "different-se
       const secondRequest = await fixture.message(1);
       await fixture.permission(nextSession);
       assert.equal(signals.length, 2);
+      assert.equal(signals[0]?.aborted, mode !== "different-session");
       if (mode === "same-session-cancelled") {
         await client.cancel(nextSession);
       }
@@ -1943,7 +1715,7 @@ for (const mode of ["same-session-live", "same-session-cancelled", "different-se
         assert.equal(signals.length, 2);
       } else {
         assert.equal(signals[1]?.aborted, false);
-        assert.equal(signals[0]?.aborted, mode === "different-session");
+        assert.equal(signals[0]?.aborted, true);
         await client.cancel(nextSession);
         assert.equal(signals[1]?.aborted, true);
       }
@@ -1964,7 +1736,7 @@ for (const completion of ["older", "newer"]) {
     async (t) => {
       const permissionEntered = createDeferred<AbortSignal>();
       const releasePermission = createDeferred<void>();
-      const fixture = createCancellationFixture(t, {
+      const fixture = createClientFixture(t, {
         client: {
           onPermissionRequest: async (_request, { signal }) => {
             permissionEntered.resolve(signal);
@@ -2010,7 +1782,7 @@ for (const phase of ["cancel", "settle"]) {
     { timeout: 5_000 },
     async (t) => {
       const signals: AbortSignal[] = [];
-      const fixture = createCancellationFixture(t, {
+      const fixture = createClientFixture(t, {
         client: {
           onPermissionRequest: async (_request, { signal }) => {
             signals.push(signal);
@@ -2081,18 +1853,27 @@ test("AcpClient reports prompt readiness only after the transport accepts the re
   });
 
   let readinessCalls = 0;
-  const prompt = client.prompt("session-write-ready", "hello", () => {
-    readinessCalls += 1;
-    requestWritten.resolve();
-  });
+  let active = true;
+  const prompt = client.prompt(
+    "session-write-ready",
+    "hello",
+    () => {
+      readinessCalls += 1;
+      requestWritten.resolve();
+    },
+    undefined,
+    undefined,
+    { assertActive: () => assert.ok(active, "prompt admission revoked") },
+  );
   const request = await writeEntered.promise;
 
   assert.equal(readinessCalls, 0);
   releaseWrite.resolve();
   await requestWritten.promise;
   assert.equal(readinessCalls, 1);
+  active = false;
 
-  await writeAgentMessage(agentToClient.writable, promptResponseFor(request));
+  await writeAgentMessage(agentToClient.writable, responseFor(request));
   assert.deepEqual(await prompt, { stopReason: "end_turn" });
 });
 
@@ -2139,7 +1920,7 @@ test("AcpClient keeps accepted prompts alive when the readiness observer throws"
     throw new Error("observer failed");
   });
   const request = await writeEntered.promise;
-  await writeAgentMessage(agentToClient.writable, promptResponseFor(request));
+  await writeAgentMessage(agentToClient.writable, responseFor(request));
 
   assert.deepEqual(await prompt, { stopReason: "end_turn" });
 });
@@ -2188,15 +1969,88 @@ test("AcpClient keeps a queued prompt unready until its own transport write succ
   const secondRequest = await secondWriteEntered.promise;
   assert.equal(secondReadinessCalls, 0);
 
-  await writeAgentMessage(agentToClient.writable, promptResponseFor(firstRequest));
+  await writeAgentMessage(agentToClient.writable, responseFor(firstRequest));
   releaseSecondWrite.resolve();
   await secondRequestWritten.promise;
   assert.equal(secondReadinessCalls, 1);
-  await writeAgentMessage(agentToClient.writable, promptResponseFor(secondRequest));
+  await writeAgentMessage(agentToClient.writable, responseFor(secondRequest));
 
   assert.deepEqual(await firstPrompt, { stopReason: "end_turn" });
   assert.deepEqual(await secondPrompt, { stopReason: "end_turn" });
 });
+
+for (const outcome of ["revoked", "aborted", "active"] as const) {
+  test(
+    `AcpClient checks ${outcome} prompt authority after the SDK write queue`,
+    { timeout: 5_000 },
+    async (t) => {
+      const releaseWrite = createDeferred<void>();
+      const requestWritten = createDeferred<void>();
+      const fixture = createClientFixture(t, {
+        release: () => releaseWrite.resolve(),
+        async write(message) {
+          if ("method" in message && message.method === "session/cancel") {
+            await releaseWrite.promise;
+          } else {
+            await fixture.reply(message);
+          }
+        },
+      });
+      const blockedWrite = fixture.track(fixture.client.cancel("write-barrier"));
+      await fixture.message(0);
+      const error = new Error("prompt admission revoked while queued for writing");
+      const controller = new AbortController();
+      let active = true;
+      let readinessCalls = 0;
+      const pending = fixture.track(
+        fixture.client.prompt(
+          "queued-authority",
+          "guarded prompt",
+          () => {
+            readinessCalls += 1;
+            requestWritten.resolve();
+          },
+          undefined,
+          undefined,
+          {
+            signal: controller.signal,
+            assertActive: () => {
+              if (!active) {
+                throw error;
+              }
+            },
+          },
+        ),
+      );
+      // Drain dispatch microtasks while the prior transport write remains held.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (outcome === "revoked") {
+        active = false;
+      } else if (outcome === "aborted") {
+        controller.abort(error);
+      }
+      releaseWrite.resolve();
+      await blockedWrite;
+      const failure = await pending.then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+      assert.equal(failure, outcome === "active" ? undefined : error);
+      if (outcome === "active") {
+        await requestWritten.promise;
+      }
+      assert.equal(readinessCalls, outcome === "active" ? 1 : 0);
+      assert.deepEqual(
+        fixture.messages.map((message) => ("method" in message ? message.method : undefined)),
+        outcome === "active" ? ["session/cancel", "session/prompt"] : ["session/cancel"],
+      );
+      assert.equal(fixture.client.hasActivePrompt(), false);
+      if (outcome === "revoked") {
+        assert.equal(controller.signal.aborted, false);
+      }
+    },
+  );
+}
 
 test("AcpClient rejects rich prompt content not advertised by promptCapabilities", async () => {
   const client = makeClient();
@@ -2210,9 +2064,11 @@ test("AcpClient rejects rich prompt content not advertised by promptCapabilities
     },
   };
   internals.connection = {
-    prompt: async () => {
-      promptCalled = true;
-      return { stopReason: "end_turn" };
+    agent: {
+      request: async () => {
+        promptCalled = true;
+        return { stopReason: "end_turn" };
+      },
     },
   };
 
@@ -2240,9 +2096,11 @@ test("AcpClient sends audio prompts when the agent advertises audio support", as
     },
   };
   internals.connection = {
-    prompt: async (params: { prompt: unknown }) => {
-      capturedPrompt = params.prompt;
-      return { stopReason: "end_turn" };
+    agent: {
+      request: async (_method: string, params: { prompt: unknown }) => {
+        capturedPrompt = params.prompt;
+        return { stopReason: "end_turn" };
+      },
     },
   };
 
@@ -2262,7 +2120,7 @@ test("AcpClient does not infer prompt readiness from connection promise creation
   });
   let reported = false;
   internals.connection = {
-    prompt: () => promptResponse,
+    agent: { request: () => promptResponse },
   };
 
   const pending = client.prompt("session-start", "hello", () => {
@@ -2282,8 +2140,10 @@ test("AcpClient does not report prompt readiness when request creation throws", 
   const internals = asInternals(client);
   let reported = false;
   internals.connection = {
-    prompt: () => {
-      throw new Error("request creation failed");
+    agent: {
+      request: () => {
+        throw new Error("request creation failed");
+      },
     },
   };
 
@@ -2304,7 +2164,7 @@ test("AcpClient does not report prompt readiness when the connection is already 
   const failure = new Error("ACP connection closed");
   internals.connection = {
     signal: AbortSignal.abort(failure),
-    prompt: () => Promise.reject(failure),
+    agent: { request: () => Promise.reject(failure) },
   };
 
   await assert.rejects(
@@ -2323,16 +2183,18 @@ test("AcpClient does not submit a prompt after agent exit settles the queued req
   let promptCalls = 0;
   let reported = false;
   internals.connection = {
-    prompt: async () => {
-      promptCalls += 1;
-      return { stopReason: "end_turn" as const };
+    agent: {
+      request: async () => {
+        promptCalls += 1;
+        return { stopReason: "end_turn" as const };
+      },
     },
   };
 
   const pending = client.prompt("session-exited-before-start", "hello", () => {
     reported = true;
   });
-  internals.recordAgentExit?.("connection_close", null, null);
+  internals.recordAgentExit?.(internals.agent, "connection_close", null, null);
 
   await assert.rejects(pending, AgentDisconnectedError);
   await Promise.resolve();
@@ -2347,9 +2209,11 @@ test("AcpClient does not report prompt readiness when the connection closes duri
   let reported = false;
   internals.connection = {
     signal: connection.signal,
-    prompt: () => {
-      connection.abort(new Error("closed after request creation began"));
-      return Promise.resolve({ stopReason: "end_turn" });
+    agent: {
+      request: () => {
+        connection.abort(new Error("closed after request creation began"));
+        return Promise.resolve({ stopReason: "end_turn" });
+      },
     },
   };
 
@@ -2365,11 +2229,11 @@ test("AcpClient prompt rejects when the agent disconnects mid-prompt", async () 
   const internals = asInternals(client);
 
   internals.connection = {
-    prompt: async () => await new Promise(() => {}),
+    agent: { request: async () => await new Promise(() => {}) },
   };
 
   const pending = client.prompt("session-5", "sleep 60000");
-  internals.recordAgentExit?.("connection_close", null, null);
+  internals.recordAgentExit?.(internals.agent, "connection_close", null, null);
 
   const result = await Promise.race([
     pending.then(
@@ -2650,15 +2514,18 @@ test("AcpClient rejects when the agent exits during successful spawned admission
   assert.deepEqual(observed, ["spawned:start", "spawned:end", "exit"]);
 });
 
-test("AcpClient reports an exit recorded before lifecycle observers attach", async () => {
+test("AcpClient reports a prior launch exit without invalidating the current launch", async (t) => {
   const observed: Array<{ exitCode: number | null; signal: NodeJS.Signals | null }> = [];
   const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [process.execPath, path.join(process.cwd(), "dist-test", "test", "mock-agent.js")],
     processLifecycle: {
       onExit: ({ exitCode, signal }) => {
         observed.push({ exitCode, signal });
       },
     },
   });
+  t.after(async () => await client.close());
   const child = spawn(process.execPath, ["--eval", "process.exit(17)"], {
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -2667,6 +2534,7 @@ test("AcpClient reports an exit recorded before lifecycle observers attach", asy
     child.once("exit", () => resolve());
   });
   assert.equal(child.exitCode, 17);
+  await client.start();
 
   const startedProcess: AcpProcessStarted = Object.freeze({
     launchId: "already-exited-launch",
@@ -2682,6 +2550,8 @@ test("AcpClient reports an exit recorded before lifecycle observers attach", asy
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.deepEqual(observed, [{ exitCode: 17, signal: null }]);
+  assert.equal(client.getAgentLifecycleSnapshot().lastExit, undefined);
+  assert.equal(client.getAgentLifecycleSnapshot().running, true);
 });
 
 test("AcpClient start fails fast when the agent exits during initialize", async () => {
@@ -2704,6 +2574,57 @@ test("AcpClient start fails fast when the agent exits during initialize", async 
     },
   );
   assert(Date.now() - startedAt < 2_000);
+});
+
+test("AcpClient shares in-flight cleanup across concurrent close calls", async () => {
+  const client = makeClient();
+  const entered = createDeferred<void>();
+  const release = createDeferred<void>();
+  let shutdowns = 0;
+  asInternals(client).terminalManager = {
+    shutdown: async () => {
+      shutdowns += 1;
+      entered.resolve();
+      await release.promise;
+    },
+  };
+  const first = client.close();
+  await entered.promise;
+  const second = client.close();
+  try {
+    assert.equal(first, second);
+    assert.equal(shutdowns, 1);
+  } finally {
+    release.resolve();
+    await Promise.all([first, second]);
+  }
+});
+
+test("AcpClient close cancels a start waiting for earlier cleanup", async () => {
+  let launches = 0;
+  const client = makeClient({
+    processLifecycle: {
+      onBeforeSpawn: () => {
+        launches += 1;
+        throw new Error("queued start reached spawn after close");
+      },
+    },
+  });
+  const entered = createDeferred<void>();
+  const release = createDeferred<void>();
+  asInternals(client).terminalManager = {
+    shutdown: async () => {
+      entered.resolve();
+      await release.promise;
+    },
+  };
+  const retiring = client.close();
+  await entered.promise;
+  const starting = assert.rejects(client.start(), /closed while the agent was starting/);
+  const closing = client.close();
+  release.resolve();
+  await Promise.all([retiring, starting, closing]);
+  assert.equal(launches, 0);
 });
 
 test("AcpClient close resets in-memory state and shuts down terminal manager", async () => {
@@ -2744,7 +2665,7 @@ test("AcpClient close resets in-memory state and shuts down terminal manager", a
       unrefCalls += 1;
     },
   };
-  internals.connection = { closed: false };
+  internals.connection = { close: () => {} };
   internals.activePrompt = {
     sessionId: "session-4",
     promise: new Promise(() => {}),
@@ -2772,6 +2693,542 @@ test("AcpClient close resets in-memory state and shuts down terminal manager", a
   assert.equal(internals.suppressReplaySessionUpdateMessages, false);
   assert.equal(internals.closing, true);
 });
+
+for (const fallback of ["host", "mode"] as const) {
+  for (const newerPlainTurn of [false, true]) {
+    test(`unowned permission requests cannot bypass a turn handler through ${fallback} (newer plain turn: ${newerPlainTurn})`, async (t) => {
+      const calls: string[] = [];
+      const fixture = createClientFixture(t, {
+        client: {
+          permissionMode: fallback === "host" ? "deny-all" : "approve-all",
+          ...(fallback === "host"
+            ? {
+                onPermissionRequest: async () => {
+                  calls.push("runtime");
+                  return { outcome: "allow_once" as const };
+                },
+              }
+            : {}),
+        },
+      });
+      const prompt = fixture.track(
+        fixture.client.prompt("owned-session", "hello", undefined, undefined, async () => {
+          calls.push("turn");
+          return { outcome: "reject_once" };
+        }),
+      );
+      const request = await fixture.message(0);
+      const newer = newerPlainTurn ? fixture.prompt("plain-session", "hello") : undefined;
+      const newerRequest = newer ? await fixture.message(1) : undefined;
+      await fixture.send({
+        jsonrpc: "2.0",
+        id: "unowned",
+        method: "session/request_permission",
+        params: makePermissionRequest("unknown-session", "edit"),
+      });
+      const response = await fixture.response("unowned");
+      assert("result" in response);
+      assert.deepEqual(response.result, { outcome: { outcome: "cancelled" } });
+      assert.deepEqual(calls, []);
+      if (newerRequest) {
+        await fixture.send({
+          jsonrpc: "2.0",
+          id: "known-plain",
+          method: "session/request_permission",
+          params: makePermissionRequest("plain-session", "edit"),
+        });
+        const known = await fixture.response("known-plain");
+        assert("result" in known);
+        assert.deepEqual(known.result, { outcome: { outcome: "selected", optionId: "allow" } });
+        await fixture.reply(newerRequest);
+        await newer;
+        await fixture.send({
+          jsonrpc: "2.0",
+          id: "still-unowned",
+          method: "session/request_permission",
+          params: makePermissionRequest("unknown-session", "edit"),
+        });
+        const stillUnowned = await fixture.response("still-unowned");
+        assert("result" in stillUnowned);
+        assert.deepEqual(stillUnowned.result, { outcome: { outcome: "cancelled" } });
+      }
+      await fixture.reply(request);
+      await prompt;
+      await fixture.send({
+        jsonrpc: "2.0",
+        id: "outside-prompt",
+        method: "session/request_permission",
+        params: makePermissionRequest("unknown-session", "edit"),
+      });
+      const outside = await fixture.response("outside-prompt");
+      assert("result" in outside);
+      assert.deepEqual(outside.result, { outcome: { outcome: "selected", optionId: "allow" } });
+    });
+  }
+}
+
+test(
+  "a timed-out prompt cannot retire a same-session successor's permission owner",
+  { timeout: 10_000 },
+  async (t) => {
+    const startTimeout = createDeferred<void>();
+    const permissionEntered = createDeferred<AbortSignal>();
+    const releasePermission = createDeferred<void>();
+    const fixture = createClientFixture(t, {
+      client: {
+        permissionMode: "deny-all",
+        onPermissionRequest: async (_request, { signal }) => {
+          permissionEntered.resolve(signal);
+          await releasePermission.promise;
+          return { outcome: "allow_once" };
+        },
+      },
+      release: () => {
+        startTimeout.resolve();
+        releasePermission.resolve();
+      },
+    });
+    const first = fixture.track(
+      runPromptTurn({
+        client: fixture.client,
+        sessionId: "same-session",
+        prompt: "old",
+        timeoutMs: 5,
+        conversation: createSessionConversation(),
+        onPromptStarted: () => startTimeout.promise,
+      }),
+    );
+    const firstRequest = await fixture.message(0);
+    const second = fixture.prompt("same-session", "successor");
+    const secondRequest = await fixture.message(1);
+    await fixture.send({
+      jsonrpc: "2.0",
+      id: "successor-permission",
+      method: "session/request_permission",
+      params: makePermissionRequest("same-session", "edit"),
+    });
+    const signal = await permissionEntered.promise;
+    startTimeout.resolve();
+    await assert.rejects(first, /Timed out/u);
+    assert.equal(signal.aborted, false);
+    releasePermission.resolve();
+    const response = await fixture.response("successor-permission");
+    assert("result" in response);
+    assert.deepEqual(response.result, { outcome: { outcome: "selected", optionId: "allow" } });
+    await fixture.reply(firstRequest, { stopReason: "cancelled" });
+    await fixture.reply(secondRequest);
+    await second;
+  },
+);
+
+test("pending session permissions use their own turn handler behind another active session", async (t) => {
+  const calls: string[] = [];
+  const fixture = createClientFixture(t);
+  const first = fixture.track(
+    fixture.client.prompt("first-session", "hello", undefined, undefined, async () => {
+      calls.push("first");
+      return { outcome: "allow_once" };
+    }),
+  );
+  const firstRequest = await fixture.message(0);
+  const second = fixture.track(
+    fixture.client.prompt("second-session", "hello", undefined, undefined, async () => {
+      calls.push("second");
+      return { outcome: "reject_once" };
+    }),
+  );
+  const secondRequest = await fixture.message(1);
+  await fixture.send({
+    jsonrpc: "2.0",
+    id: "first-permission",
+    method: "session/request_permission",
+    params: makePermissionRequest("first-session", "edit"),
+  });
+  const response = await fixture.response("first-permission");
+  assert("result" in response);
+  assert.deepEqual(response.result, { outcome: { outcome: "selected", optionId: "allow" } });
+  assert.deepEqual(calls, ["first"]);
+  await fixture.reply(firstRequest);
+  await fixture.reply(secondRequest);
+  await Promise.all([first, second]);
+});
+
+const delegatedRequestScenarios: Array<{
+  name: string;
+  operation: "permission" | "write" | "terminal";
+  client?: Partial<ConstructorParameters<typeof AcpClient>[0]>;
+}> = [
+  { name: "permission", operation: "permission" },
+  {
+    name: "permission after empty host result",
+    operation: "permission",
+    client: { onPermissionRequest: async () => undefined },
+  },
+  {
+    name: "permission after host error",
+    operation: "permission",
+    client: {
+      onPermissionRequest: async () => {
+        throw new Error("synthetic host failure");
+      },
+    },
+  },
+  {
+    name: "escalated permission",
+    operation: "permission",
+    client: { permissionPolicy: { escalate: ["edit"] } },
+  },
+  { name: "write", operation: "write" },
+  { name: "terminal", operation: "terminal" },
+];
+
+for (const scenario of delegatedRequestScenarios) {
+  const { operation } = scenario;
+  for (const phase of ["cancel", "settle", "request-cancel"] as const) {
+    test(
+      `delegated ${scenario.name} requests cannot outlive prompt ${phase}`,
+      { timeout: 10_000 },
+      async (t) => {
+        const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-delegated-lifetime-"));
+        const question = pendingPermissionQuestion();
+        const { entered, answer } = question;
+        const fixture = createClientFixture(t, {
+          client: { cwd, permissionMode: "approve-reads", ...scenario.client },
+          release: () => answer.resolve("n"),
+        });
+        try {
+          await withTtyState({ stdin: true, stderr: true }, async () => {
+            await withMockedReadline(question.createInterface, async () => {
+              const sessionId = "session-lifetime";
+              const marker = path.join(cwd, "late-effect.txt");
+              const prompt = fixture.prompt(sessionId, "request a synthetic operation");
+              const promptRequest = await fixture.message(0);
+              const request = delegatedOperationRequest(operation, sessionId, marker);
+              await fixture.send(request);
+              await entered.promise;
+              if (phase === "cancel") {
+                await fixture.client.cancel(sessionId);
+              }
+              if (phase === "request-cancel") {
+                await fixture.send({
+                  jsonrpc: "2.0",
+                  method: "$/cancel_request",
+                  params: { requestId: "delegated-operation" },
+                });
+              } else {
+                await fixture.reply(promptRequest, {
+                  stopReason: phase === "cancel" ? "cancelled" : "end_turn",
+                });
+                await prompt;
+              }
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              const closedBeforeLateAnswer = question.isClosed();
+              answer.resolve("y");
+              const response = await fixture.response("delegated-operation");
+              if (operation === "terminal" && "result" in response) {
+                const terminalId = (response.result as { terminalId?: string }).terminalId;
+                if (terminalId) {
+                  await asInternals(fixture.client).terminalManager?.waitForTerminalExit?.({
+                    sessionId,
+                    terminalId,
+                  });
+                }
+              }
+              assert.equal(closedBeforeLateAnswer, true, "retiring the turn closes its question");
+              if (operation === "permission") {
+                assert("result" in response);
+                assert.deepEqual(response.result, { outcome: { outcome: "cancelled" } });
+                assert.equal(fixture.client.getPermissionStats().approved, 0);
+              } else {
+                assert("error" in response, "retired operations must return a cancellation error");
+                await assert.rejects(fs.access(marker), { code: "ENOENT" });
+              }
+              if (phase === "request-cancel") {
+                await fixture.send({
+                  jsonrpc: "2.0",
+                  id: "still-active",
+                  method: "session/request_permission",
+                  params: makePermissionRequest(sessionId, "read"),
+                });
+                const next = await fixture.response("still-active");
+                assert("result" in next);
+                assert.deepEqual(next.result, {
+                  outcome: { outcome: "selected", optionId: "allow" },
+                });
+                await fixture.reply(promptRequest);
+                await prompt;
+              }
+            });
+          });
+        } finally {
+          answer.resolve("n");
+          await fixture.client.close();
+          await fs.rm(cwd, { recursive: true, force: true });
+        }
+      },
+    );
+  }
+}
+
+function delegatedOperationRequest(
+  operation: "permission" | "write" | "terminal",
+  sessionId: string,
+  marker: string,
+): AnyMessage {
+  if (operation === "permission") {
+    return {
+      jsonrpc: "2.0",
+      id: "delegated-operation",
+      method: "session/request_permission",
+      params: makePermissionRequest(sessionId, "edit"),
+    };
+  }
+  return {
+    jsonrpc: "2.0",
+    id: "delegated-operation",
+    method: operation === "write" ? "fs/write_text_file" : "terminal/create",
+    params:
+      operation === "write"
+        ? { sessionId, path: marker, content: "late write" }
+        : {
+            sessionId,
+            command: process.execPath,
+            args: [
+              "-e",
+              "require('node:fs').writeFileSync(process.argv[1], 'late terminal')",
+              marker,
+            ],
+          },
+  };
+}
+
+function pendingPermissionQuestion() {
+  const entered = createDeferred<void>();
+  const answer = createDeferred<string>();
+  let closed = false;
+  return {
+    entered,
+    answer,
+    isClosed: () => closed,
+    createInterface: () => ({
+      question: async (_prompt: string, options?: { signal?: AbortSignal }) => {
+        entered.resolve();
+        const aborted = createDeferred<string>();
+        const onAbort = () => aborted.reject(options?.signal?.reason);
+        options?.signal?.addEventListener("abort", onAbort, { once: true });
+        try {
+          return await Promise.race([answer.promise, aborted.promise]);
+        } finally {
+          options?.signal?.removeEventListener("abort", onAbort);
+        }
+      },
+      close: () => {
+        closed = true;
+      },
+    }),
+  };
+}
+
+test(
+  "expired runtime prompts do not invoke late elicitation handlers",
+  { timeout: 10_000 },
+  async (t) => {
+    let calls = 0;
+    const fixture = createClientFixture(t, { client: { elicitationModes: ["form"] } });
+    const turn = fixture.track(
+      runPromptTurn({
+        client: fixture.client,
+        sessionId: "expired-session",
+        prompt: "hello",
+        timeoutMs: 5,
+        conversation: createSessionConversation(),
+        onElicitation: async () => {
+          calls += 1;
+          return { action: "accept", content: { answer: "late" } };
+        },
+      }),
+    );
+    const request = await fixture.message(0);
+    await assert.rejects(turn, /Timed out/u);
+    await fixture.send({
+      jsonrpc: "2.0",
+      id: "late-elicitation",
+      method: methods.client.elicitation.create,
+      params: {
+        mode: "form",
+        sessionId: "expired-session",
+        message: "Late question",
+        requestedSchema: { type: "object", properties: { answer: { type: "string" } } },
+      },
+    });
+    const response = await fixture.response("late-elicitation");
+    assert("result" in response);
+    assert.equal((response.result as { action?: string }).action, "cancel");
+    assert.equal(calls, 0);
+    await fixture.reply(request, { stopReason: "cancelled" });
+  },
+);
+
+test(
+  "changing an admitted prompt's host guard does not revoke future tool or file permission",
+  { timeout: 10_000 },
+  async (t) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-admitted-authority-"));
+    const fixture = createClientFixture(t, { client: { cwd, permissionMode: "approve-all" } });
+    let active = true;
+    const written = createDeferred<void>();
+    const prompt = fixture.track(
+      fixture.client.prompt(
+        "admitted-session",
+        "hello",
+        () => written.resolve(),
+        undefined,
+        undefined,
+        { assertActive: () => assert(active, "admission revoked") },
+      ),
+    );
+    try {
+      const request = await fixture.message(0);
+      await written.promise;
+      active = false;
+      await fixture.send({
+        jsonrpc: "2.0",
+        id: "admitted-permission",
+        method: "session/request_permission",
+        params: makePermissionRequest("admitted-session", "edit"),
+      });
+      const permission = await fixture.response("admitted-permission");
+      assert("result" in permission);
+      assert.deepEqual(permission.result, { outcome: { outcome: "selected", optionId: "allow" } });
+      const file = path.join(cwd, "admitted.txt");
+      await fixture.send({
+        jsonrpc: "2.0",
+        id: "admitted-write",
+        method: "fs/write_text_file",
+        params: { sessionId: "admitted-session", path: file, content: "still admitted" },
+      });
+      assert("result" in (await fixture.response("admitted-write")));
+      assert.equal(await fs.readFile(file, "utf8"), "still admitted");
+      await fixture.reply(request);
+      await prompt;
+    } finally {
+      await fixture.client.close();
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "client close revokes permission questions before awaiting terminal cleanup",
+  { timeout: 10_000 },
+  async (t) => {
+    const question = pendingPermissionQuestion();
+    const shutdownEntered = createDeferred<void>();
+    const releaseShutdown = createDeferred<void>();
+    const fixture = createClientFixture(t, {
+      client: { permissionMode: "approve-reads" },
+      release: () => {
+        question.answer.resolve("n");
+        releaseShutdown.resolve();
+      },
+    });
+    const terminals = asInternals(fixture.client).terminalManager;
+    assert(terminals);
+    const shutdown = terminals.shutdown.bind(terminals);
+    terminals.shutdown = async () => {
+      shutdownEntered.resolve();
+      await releaseShutdown.promise;
+      await shutdown();
+    };
+    await withTtyState({ stdin: true, stderr: true }, async () => {
+      await withMockedReadline(question.createInterface, async () => {
+        const prompt = fixture.prompt("closing-session", "hello");
+        await fixture.message(0);
+        await fixture.send({
+          jsonrpc: "2.0",
+          id: "closing-permission",
+          method: "session/request_permission",
+          params: makePermissionRequest("closing-session", "edit"),
+        });
+        await question.entered.promise;
+        const closing = fixture.track(fixture.client.close());
+        try {
+          await shutdownEntered.promise;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          const closedBeforeLateAnswer = question.isClosed();
+          question.answer.resolve("y");
+          const response = await fixture.response("closing-permission");
+          assert.equal(closedBeforeLateAnswer, true);
+          assert("result" in response);
+          assert.deepEqual(response.result, { outcome: { outcome: "cancelled" } });
+        } finally {
+          question.answer.resolve("n");
+          releaseShutdown.resolve();
+          await closing;
+          await Promise.allSettled([prompt]);
+        }
+      });
+    });
+  },
+);
+
+test(
+  "runtime timeout revokes pending permission before draining late updates",
+  { timeout: 10_000 },
+  async (t) => {
+    const question = pendingPermissionQuestion();
+    const drainEntered = createDeferred<void>();
+    const releaseDrain = createDeferred<void>();
+    const fixture = createClientFixture(t, {
+      client: { permissionMode: "approve-reads" },
+      release: () => {
+        question.answer.resolve("n");
+        releaseDrain.resolve();
+      },
+    });
+    fixture.client.waitForSessionUpdatesIdle = async () => {
+      drainEntered.resolve();
+      await releaseDrain.promise;
+    };
+    await withTtyState({ stdin: true, stderr: true }, async () => {
+      await withMockedReadline(question.createInterface, async () => {
+        const turn = fixture.track(
+          runPromptTurn({
+            client: fixture.client,
+            sessionId: "timeout-session",
+            prompt: "hello",
+            timeoutMs: 5,
+            conversation: createSessionConversation(),
+            promptMessageId: "synthetic-prompt",
+            onPromptStarted: () => question.entered.promise,
+          }),
+        );
+        const promptRequest = await fixture.message(0);
+        await fixture.send({
+          jsonrpc: "2.0",
+          id: "timeout-permission",
+          method: "session/request_permission",
+          params: makePermissionRequest("timeout-session", "edit"),
+        });
+        try {
+          await drainEntered.promise;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          const closedBeforeLateAnswer = question.isClosed();
+          question.answer.resolve("y");
+          const response = await fixture.response("timeout-permission");
+          assert.equal(closedBeforeLateAnswer, true);
+          assert("result" in response);
+          assert.deepEqual(response.result, { outcome: { outcome: "cancelled" } });
+        } finally {
+          question.answer.resolve("n");
+          releaseDrain.resolve();
+          await assert.rejects(turn, /Timed out/u);
+          await fixture.reply(promptRequest, { stopReason: "cancelled" });
+        }
+      });
+    });
+  },
+);
 
 function makeClient(
   overrides: Partial<ConstructorParameters<typeof AcpClient>[0]> = {},
@@ -2804,7 +3261,7 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-function createCancellationFixture(
+function createClientFixture(
   t: TestContext,
   options: {
     client?: Partial<ConstructorParameters<typeof AcpClient>[0]>;
@@ -2823,7 +3280,7 @@ function createCancellationFixture(
     void operation.catch(() => {});
     return operation;
   }
-  connectClientToStream(client, {
+  const connection = connectClientToStream(client, {
     readable: incoming.readable,
     writable: new WritableStream<AnyMessage>({
       async write(value) {
@@ -2845,9 +3302,21 @@ function createCancellationFixture(
   });
   return {
     client,
+    connection,
     messages,
     message,
+    async response(id: string) {
+      for (let index = 0; ; index += 1) {
+        const value = await message(index);
+        if ("id" in value && value.id === id && !("method" in value)) {
+          return value;
+        }
+      }
+    },
     track,
+    send(value: AnyMessage) {
+      return writeAgentMessage(incoming.writable, value);
+    },
     prompt(sessionId: string, text: string) {
       return track(client.prompt(sessionId, text));
     },
@@ -2856,8 +3325,8 @@ function createCancellationFixture(
       assert(handler);
       return track(handler.call(client, makePermissionRequest(sessionId, "edit")));
     },
-    reply(request: AnyMessage) {
-      return writeAgentMessage(incoming.writable, promptResponseFor(request));
+    reply(request: AnyMessage, result?: Record<string, unknown>) {
+      return writeAgentMessage(incoming.writable, responseFor(request, result));
     },
   };
 }
@@ -2868,21 +3337,32 @@ function connectClientToStream(
     readable: ReadableStream<AnyMessage>;
     writable: WritableStream<AnyMessage>;
   },
-): void {
+): ClientConnection {
   const internals = asInternals(client);
   const tapped = internals.createTappedStream?.(base);
   assert(tapped);
-  const connection = internals.createConnection?.(tapped, { devinAcp: false });
+  const connection = internals.createConnection?.(
+    tapped,
+    { devinAcp: false },
+    {
+      fs: { readTextFile: true, writeTextFile: true },
+      terminal: true,
+    },
+  );
   assert(connection);
   internals.connection = connection;
+  return connection;
 }
 
-function promptResponseFor(request: AnyMessage): AnyMessage {
+function responseFor(
+  request: AnyMessage,
+  result: Record<string, unknown> = { stopReason: "end_turn" },
+): AnyMessage {
   assert("id" in request);
   return {
     jsonrpc: "2.0",
     id: request.id,
-    result: { stopReason: "end_turn" },
+    result,
   };
 }
 
@@ -2951,15 +3431,6 @@ async function withEnv(
   }
 }
 
-async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-client-home-"));
-  try {
-    await withEnv({ HOME: homeDir }, async () => await run(homeDir));
-  } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
-}
-
 async function withTty(
   stdinIsTty: boolean,
   stderrIsTty: boolean,
@@ -2996,3 +3467,394 @@ function restoreDescriptor(
     delete (target as Record<string, unknown>)[key];
   }
 }
+
+test("host permission decisions release their abort listeners after settlement", async () => {
+  let signal: AbortSignal | undefined;
+  const client = makeClient({
+    onPermissionRequest: async (_request, context) => {
+      signal = context.signal;
+      return { outcome: "allow_once" };
+    },
+  });
+  for (let index = 0; index < 3; index++) {
+    await asInternals(client).handlePermissionRequest?.(
+      makePermissionRequest("idle-permissions", "edit"),
+    );
+  }
+  assert.ok(signal);
+  assert.equal(getEventListeners(signal, "abort").length, 0);
+});
+
+const consoleOverlapScenarios = [
+  {
+    name: "start-order completion",
+    completionOrder: [0, 1],
+    rejectFirst: false,
+    replaceLogger: false,
+    secondSuppressed: true,
+  },
+  {
+    name: "reverse-order completion",
+    completionOrder: [1, 0],
+    rejectFirst: false,
+    replaceLogger: false,
+    secondSuppressed: true,
+  },
+  {
+    name: "a rejected first prompt",
+    completionOrder: [0, 1],
+    rejectFirst: true,
+    replaceLogger: false,
+    secondSuppressed: true,
+  },
+  {
+    name: "host logger replacement beside an unsuppressed client",
+    completionOrder: [0, 1],
+    rejectFirst: false,
+    replaceLogger: true,
+    secondSuppressed: false,
+  },
+] as const;
+
+for (const scenario of consoleOverlapScenarios) {
+  test(
+    `overlapping ACP prompts preserve host console ownership with ${scenario.name}`,
+    { timeout: 5_000 },
+    async (t) => {
+      const originalLogger = console.error;
+      const logged: Array<{ logger: string; args: unknown[] }> = [];
+      const expectedLogs: Array<{ logger: string; args: unknown[] }> = [];
+      const identities: Array<{
+        phase: string;
+        actual: typeof console.error;
+        expected: typeof console.error;
+      }> = [];
+      const hostLogger = (...args: unknown[]) => {
+        logged.push({ logger: "host", args });
+      };
+      const replacementLogger = (...args: unknown[]) => {
+        logged.push({ logger: "replacement", args });
+      };
+      let expectedLogger = hostLogger;
+      let loggerLabel = "host";
+      const payload = { source: "embedding host" };
+      const probeHostLogger = (phase: string) => {
+        identities.push({ phase, actual: console.error, expected: expectedLogger });
+        // This is a host diagnostic, even when its text resembles an old SDK message.
+        const args = ["Error handling request", phase, payload];
+        expectedLogs.push({ logger: loggerLabel, args });
+        console.error(...args);
+      };
+      const fixtures = [
+        createClientFixture(t, { client: { suppressSdkConsoleErrors: true } }),
+        createClientFixture(t, {
+          client: { suppressSdkConsoleErrors: scenario.secondSuppressed },
+        }),
+      ];
+      const pending: Array<Promise<unknown>> = [];
+      console.error = hostLogger;
+      try {
+        const outcomes = fixtures.map((fixture, index) => {
+          const prompt = fixture.prompt(`console-session-${index}`, "synthetic overlap");
+          pending.push(prompt);
+          return prompt.then(
+            (value) => ({ ok: true as const, value }),
+            (error: unknown) => ({ ok: false as const, error }),
+          );
+        });
+        const requests = await Promise.all(fixtures.map((fixture) => fixture.message(0)));
+        probeHostLogger("both prompts active");
+        if (scenario.replaceLogger) {
+          console.error = replacementLogger;
+          expectedLogger = replacementLogger;
+          loggerLabel = "replacement";
+          probeHostLogger("host replaced its logger");
+        }
+        for (const [position, index] of scenario.completionOrder.entries()) {
+          const fixture = fixtures[index];
+          const request = requests[index];
+          assert(fixture && request && "id" in request);
+          if (scenario.rejectFirst && index === 0) {
+            await fixture.send({
+              jsonrpc: "2.0",
+              id: request.id,
+              error: { code: -32000, message: "synthetic prompt failure" },
+            });
+          } else {
+            await fixture.reply(request);
+          }
+          await outcomes[index];
+          probeHostLogger(position === 0 ? "one prompt remains" : "both prompts settled");
+        }
+        const results = await Promise.all(outcomes);
+        for (const [index, result] of results.entries()) {
+          if (scenario.rejectFirst && index === 0) {
+            assert.equal(result.ok, false);
+            if (!result.ok) {
+              assert(result.error instanceof Error);
+              assert.match(result.error.message, /synthetic prompt failure/u);
+              assert.equal((result.error as Error & { code?: number }).code, -32000);
+            }
+          } else {
+            assert.equal(result.ok, true);
+            if (result.ok) {
+              assert.equal(result.value.stopReason, "end_turn");
+            }
+          }
+        }
+        for (const identity of identities) {
+          assert.equal(identity.actual, identity.expected, identity.phase);
+        }
+        assert.deepEqual(logged, expectedLogs);
+        assert.equal(console.error, expectedLogger);
+      } finally {
+        // Settle prompt finalizers before restoring the test's host logger, even
+        // when an assertion fails on the old overlapping-wrapper implementation.
+        try {
+          await Promise.allSettled(fixtures.map((fixture) => fixture.client.close()));
+          await Promise.allSettled(pending);
+        } finally {
+          console.error = originalLogger;
+        }
+      }
+    },
+  );
+}
+
+test("AcpClient exposes and enforces Grok Build permission modes through ACP", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-grok-mode-"));
+  const permissionRequests: RequestPermissionRequest[] = [];
+  const client = makeClient({
+    agentCommand: "grok agent stdio",
+    cwd,
+    onPermissionRequest: async (request) => {
+      permissionRequests.push(request.raw);
+      return request.inferredKind === "execute"
+        ? { outcome: "reject_once" }
+        : { outcome: "allow_once" };
+    },
+  });
+  let forwardedModeCalls = 0;
+  asInternals(client).connection = {
+    agent: {
+      request: async (method: string) => {
+        if (method === "session/new") {
+          return { sessionId: "grok-session" };
+        }
+        if (method === "session/set_mode") {
+          forwardedModeCalls += 1;
+          return {};
+        }
+        return {};
+      },
+    },
+    close: async () => {},
+  };
+
+  try {
+    const created = await client.createSession(cwd);
+    assert.deepEqual(created.configOptions, [
+      {
+        id: "mode",
+        name: "Permission Mode",
+        category: "mode",
+        type: "select",
+        currentValue: "acceptEdits",
+        options: [
+          { value: "default", name: "Ask" },
+          { value: "acceptEdits", name: "Accept Edits" },
+          { value: "auto", name: "Auto" },
+          { value: "plan", name: "Plan" },
+          { value: "dontAsk", name: "Deny" },
+          { value: "bypassPermissions", name: "Always Approve" },
+        ],
+      },
+    ]);
+    assert.equal(created.configOptionsPresent, true);
+
+    const filePath = path.join(cwd, "grok-mode.txt");
+    // Default acceptEdits auto-allows file writes without asking the host.
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "approved",
+    });
+    assert.equal(permissionRequests.length, 0);
+    assert.equal(await fs.readFile(filePath, "utf8"), "approved");
+
+    // Execute still prompts under acceptEdits.
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleCreateTerminal?.({
+          sessionId: created.sessionId,
+          command: "pwd",
+        }),
+      PermissionDeniedError,
+    );
+    assert.equal(permissionRequests.length, 1);
+    assert.equal(permissionRequests[0]?.toolCall.kind, "execute");
+
+    // Ask mode (default) routes edits through the host callback.
+    // setSessionMode must forward to the agent (not only the local cache).
+    await client.setSessionMode(created.sessionId, "default");
+    assert.equal(forwardedModeCalls, 1);
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "asked edit",
+    });
+    assert.equal(permissionRequests.length, 2);
+    assert.equal(permissionRequests[1]?.toolCall.kind, "edit");
+    assert.equal(await fs.readFile(filePath, "utf8"), "asked edit");
+
+    await client.setSessionMode(created.sessionId, "acceptEdits");
+    assert.equal(forwardedModeCalls, 2);
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "accepted edit",
+    });
+    assert.equal(permissionRequests.length, 2);
+    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
+
+    // plan: deny writes/execute (read-only) without host prompt.
+    await client.setSessionMode(created.sessionId, "plan");
+    assert.equal(forwardedModeCalls, 3);
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleWriteTextFile?.({
+          sessionId: created.sessionId,
+          path: filePath,
+          content: "plan blocked",
+        }),
+      PermissionDeniedError,
+    );
+    assert.equal(permissionRequests.length, 2);
+    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
+
+    await client.setSessionMode(created.sessionId, "dontAsk");
+    assert.equal(forwardedModeCalls, 4);
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleWriteTextFile?.({
+          sessionId: created.sessionId,
+          path: filePath,
+          content: "denied",
+        }),
+      PermissionDeniedError,
+    );
+    assert.equal(await fs.readFile(filePath, "utf8"), "accepted edit");
+  } finally {
+    await client.close();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("AcpClient leaves plan mode after ExitPlanMode approved", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-grok-exit-plan-"));
+  const client = makeClient({
+    agentCommand: "grok agent stdio",
+    cwd,
+    onExitPlanMode: async () => ({ outcome: "approved" }),
+  });
+  asInternals(client).connection = {
+    agent: {
+      request: async (method: string) => {
+        if (method === "session/new") {
+          return { sessionId: "grok-exit-plan" };
+        }
+        if (method === "session/set_mode") {
+          return {};
+        }
+        return {};
+      },
+    },
+    close: async () => {},
+  };
+
+  try {
+    const created = await client.createSession(cwd);
+    await client.setSessionMode(created.sessionId, "plan");
+
+    const filePath = path.join(cwd, "after-plan.txt");
+    await assert.rejects(
+      async () =>
+        await asInternals(client).handleWriteTextFile?.({
+          sessionId: created.sessionId,
+          path: filePath,
+          content: "blocked",
+        }),
+      PermissionDeniedError,
+    );
+
+    const internals = asInternals(client) as ClientInternals & {
+      handleGrokExitPlanMode?: (params: Record<string, unknown>) => Promise<{ outcome: string }>;
+    };
+    const response = await internals.handleGrokExitPlanMode?.({
+      sessionId: created.sessionId,
+      toolCallId: "tc-exit-1",
+      planContent: "# ship it",
+    });
+    assert.deepEqual(response, { outcome: "approved" });
+
+    // approved → acceptEdits: file writes skip the host prompt again
+    await asInternals(client).handleWriteTextFile?.({
+      sessionId: created.sessionId,
+      path: filePath,
+      content: "implemented",
+    });
+    assert.equal(await fs.readFile(filePath, "utf8"), "implemented");
+  } finally {
+    await client.close();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("AcpClient buffers session updates with no handler, then flushes on setEventHandlers", async () => {
+  const client = makeClient(); // constructed without an onSessionUpdate handler
+  const internals = asInternals(client);
+
+  // A notification that arrives before any consumer (the adapter's initial
+  // available_commands_update after newSession) must be buffered, not lost.
+  await internals.handleSessionUpdate?.({ sessionId: "early" });
+
+  const received: string[] = [];
+  client.setEventHandlers({
+    onSessionUpdate: (n) => {
+      received.push((n as { sessionId: string }).sessionId);
+    },
+  });
+  // Installing the handler replays the buffered notification.
+  assert.deepEqual(received, ["early"]);
+
+  // Later notifications dispatch directly (buffer already drained).
+  await internals.handleSessionUpdate?.({ sessionId: "later" });
+  await internals.waitForSessionUpdateDrain?.(0, 100);
+  assert.deepEqual(received, ["early", "later"]);
+});
+
+test("AcpClient uses transient auth credentials for Grok Build", async () => {
+  await withEnv(
+    {
+      XAI_API_KEY: undefined,
+      ACPX_AUTH_XAI_API_KEY: undefined,
+    },
+    async () => {
+      const client = makeClient({
+        agentCommand: "grok agent stdio",
+        agentArgv: ["grok", "agent", "stdio"],
+        authCredentials: { "xai.api_key": "transient-auth-token" },
+      });
+      const internals = asInternals(client);
+      const launch = await internals.resolveAgentLaunchPlan?.();
+
+      assert.ok(launch);
+      assert.equal(launch.spawnOptions.env.XAI_API_KEY, "transient-auth-token");
+      assert.deepEqual(internals.selectAuthMethod?.([{ id: "xai.api_key" }]), {
+        methodId: "xai.api_key",
+        credential: "transient-auth-token",
+        source: "config",
+      });
+    },
+  );
+});

@@ -4,12 +4,15 @@ export type LiveSessionCheckpointOptions = {
   save: () => Promise<void>;
   intervalMs?: number;
   onError?: (error: unknown) => void;
+  /** Called after each successful save so hosts can react to persisted updates. */
+  onPersisted?: () => void;
 };
 
 export class LiveSessionCheckpoint {
   private readonly save: () => Promise<void>;
   private readonly intervalMs: number;
   private readonly onError: ((error: unknown) => void) | undefined;
+  private readonly onPersisted: (() => void) | undefined;
   private dirty = false;
   private flushing: Promise<void> | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -18,6 +21,7 @@ export class LiveSessionCheckpoint {
     this.save = options.save;
     this.intervalMs = options.intervalMs ?? DEFAULT_LIVE_CHECKPOINT_INTERVAL_MS;
     this.onError = options.onError;
+    this.onPersisted = options.onPersisted;
   }
 
   request(): void {
@@ -64,7 +68,13 @@ export class LiveSessionCheckpoint {
   private async flushDirty(): Promise<void> {
     while (this.dirty) {
       this.dirty = false;
-      await this.save();
+      try {
+        await this.save();
+        this.onPersisted?.();
+      } catch (error) {
+        this.dirty = true;
+        throw error;
+      }
     }
   }
 }

@@ -1,14 +1,8 @@
 import { isClaudeAcpCommand, isCursorAcpCommand } from "./agent-command.js";
 import { splitCommandLine } from "./client-process.js";
+import { modelStateFromConfigOptions, type SessionModelState } from "./model-config-state.js";
 
-export type SessionModelState = {
-  configId?: string;
-  currentModelId: string;
-  availableModels: Array<{
-    modelId: string;
-    name: string;
-  }>;
-};
+export { modelStateFromConfigOptions, type SessionModelState } from "./model-config-state.js";
 
 type AdvertisedModelIds = Pick<SessionModelState, "availableModels">;
 
@@ -33,11 +27,19 @@ export type RequestedModelUnsupportedReason = (typeof REQUESTED_MODEL_UNSUPPORTE
 export class RequestedModelUnsupportedError extends Error {
   readonly code = REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE;
   readonly reason: RequestedModelUnsupportedReason;
+  readonly ambiguous?: true;
 
-  constructor(message: string, reason: RequestedModelUnsupportedReason) {
+  constructor(
+    message: string,
+    reason: RequestedModelUnsupportedReason,
+    details?: { ambiguous?: true },
+  ) {
     super(message);
     this.name = "RequestedModelUnsupportedError";
     this.reason = reason;
+    if (details?.ambiguous) {
+      this.ambiguous = true;
+    }
   }
 }
 
@@ -73,105 +75,6 @@ export function supportsLegacyClaudeCodeModelMetadata(agentCommand: string | und
   }
   const { command, args } = splitCommandLine(agentCommand);
   return isClaudeAcpCommand(command, args);
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  return value as Record<string, unknown>;
-}
-
-type AvailableModel = SessionModelState["availableModels"][number];
-
-function parseAvailableModel(value: unknown): AvailableModel | undefined {
-  const option = asRecord(value);
-  if (!option || typeof option.value !== "string" || typeof option.name !== "string") {
-    return undefined;
-  }
-  return { modelId: option.value, name: option.name };
-}
-
-function parseAvailableModelGroup(value: unknown): AvailableModel[] | undefined {
-  const group = asRecord(value);
-  if (
-    !group ||
-    typeof group.group !== "string" ||
-    typeof group.name !== "string" ||
-    !Array.isArray(group.options)
-  ) {
-    return undefined;
-  }
-  const models = group.options.map((option) => parseAvailableModel(option));
-  return models.every((model): model is AvailableModel => model !== undefined) ? models : undefined;
-}
-
-function parseAvailableModels(value: unknown): AvailableModel[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const directModels = value.map((option) => parseAvailableModel(option));
-  if (directModels.every((model): model is AvailableModel => model !== undefined)) {
-    return directModels;
-  }
-  const groupedModels = value.map((group) => parseAvailableModelGroup(group));
-  return groupedModels.every((models): models is AvailableModel[] => models !== undefined)
-    ? groupedModels.flat()
-    : undefined;
-}
-
-function isModelSelectOption(option: Record<string, unknown>): boolean {
-  return option.type === "select" && (option.category === "model" || option.id === "model");
-}
-
-function parseModelConfigOption(option: Record<string, unknown>): SessionModelState | undefined {
-  if (
-    !isModelSelectOption(option) ||
-    typeof option.id !== "string" ||
-    typeof option.currentValue !== "string"
-  ) {
-    return undefined;
-  }
-  const availableModels = parseAvailableModels(option.options);
-  return availableModels
-    ? {
-        configId: option.id,
-        currentModelId: option.currentValue,
-        availableModels,
-      }
-    : undefined;
-}
-
-function modelConfigPriority(option: Record<string, unknown>): number {
-  if (option.category !== "model") {
-    return 0;
-  }
-  return option.id === "model" ? 2 : 1;
-}
-
-export function modelStateFromConfigOptions(configOptions: unknown): SessionModelState | undefined {
-  if (!Array.isArray(configOptions)) {
-    return undefined;
-  }
-
-  let selected: SessionModelState | undefined;
-  let selectedPriority = -1;
-  for (const value of configOptions) {
-    const option = asRecord(value);
-    if (!option) {
-      continue;
-    }
-    const models = parseModelConfigOption(option);
-    if (!models) {
-      continue;
-    }
-    const priority = modelConfigPriority(option);
-    if (priority > selectedPriority) {
-      selected = models;
-      selectedPriority = priority;
-    }
-  }
-  return selected;
 }
 
 export function modelStateFromLegacyResponse(response: unknown): SessionModelState | undefined {
@@ -236,7 +139,30 @@ export function resolveRequestedModelId(params: {
   const candidates = params.models.availableModels
     .map((model) => model.modelId)
     .filter((modelId) => modelId.startsWith(`${params.requestedModel}[`));
+  if (candidates.length > 1) {
+    throw new RequestedModelUnsupportedError(
+      `Cannot select model "${params.requestedModel}": multiple advertised Cursor models match (${candidates.join(", ")}). Use an exact advertised model ID.`,
+      "unadvertised-model",
+      { ambiguous: true },
+    );
+  }
   return candidates.length === 1 ? candidates[0] : params.requestedModel;
+}
+
+export function resolveRequestedConfigOption(params: {
+  configId: string;
+  value: string;
+  models: SessionModelState | undefined;
+  agentCommand?: string;
+}): { modelConfigId: string | undefined; resolvedValue: string } {
+  const modelConfigId = params.models?.configId;
+  return {
+    modelConfigId,
+    resolvedValue:
+      modelConfigId === params.configId
+        ? resolveRequestedModelId({ ...params, requestedModel: params.value })
+        : params.value,
+  };
 }
 
 function isCursorAcpCommandForModelAlias(agentCommand: string | undefined): boolean {

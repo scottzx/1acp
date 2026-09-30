@@ -18,11 +18,16 @@ acpx compare <agent>... '<prompt>'
 acpx compare <agent>... -- prompt words after the delimiter
 acpx compare <agent>... --file ./prompt.md
 acpx compare <agent>... -f ./prompt.md
+acpx compare pi openclaw --file ./prompt.md -- 'Focus on cancellation behavior'
 ```
 
 The final positional argument is treated as the prompt unless `--file` is
 provided. When you use `--`, every token after the delimiter is joined into the
 prompt.
+
+With a prompt file, delimiter text is appended to the file's prompt blocks.
+An empty delimiter preserves every preceding agent and reads the prompt from
+the file or stdin.
 
 ## Options
 
@@ -50,6 +55,30 @@ Command-local options:
 | `-f, --file <path>`    | Read prompt text from a file. |
 | `--prompt-file <path>` | Alias for `--file`.           |
 
+`--json` also selects JSON diagnostics for configuration and prompt-input failures.
+It works with top-level `--json-strict` and forces JSON even when another valid
+`--format` value is supplied. Without `--json`, an explicit top-level format takes
+precedence over a command-local format, which otherwise takes precedence over the
+configured default. Strict mode still rejects `--verbose`.
+
+`--cwd` may appear before or after `compare`. An explicit command-local value
+takes precedence over the top-level value. That workspace supplies the project
+configuration, agent definitions and permission defaults, and anchors relative
+prompt files, permission-policy files and top-level MCP configuration paths.
+
+Conflicting permission modes fail the invocation before prompt or policy input is
+read. Permission counters include observed decisions on failed runs. A known
+permission failure reports `permission_denied`; a genuine runtime failure remains
+`error` even if a permission request was denied earlier. Completed runs with any
+denied or cancelled request still report `permission_denied`.
+
+## Interruption
+
+SIGINT, SIGTERM and SIGHUP during execution cancel the active run and wait for
+its cleanup. Remaining agents are skipped, the summary contains only attempted
+runs, and acpx exits with code `130`. Ordinary agent errors and per-agent
+timeouts remain individual results and allow subsequent agents to run.
+
 ## Output
 
 Text output includes one row per agent:
@@ -66,6 +95,11 @@ Text output includes one row per agent:
 | `stop_reason`   | ACP `session/prompt` stop reason, such as `end_turn`.        |
 | `final_message` | First 200 characters of assistant text output.               |
 | `error`         | Error preview for failed runs.                               |
+
+Token counts use explicitly reported input, output, and total fields from the
+latest `usage_update`. Context occupancy (`used`) and capacity (`size`) are not
+token totals. Missing counts appear as `-` in text output and `null` in JSON;
+a missing total is not calculated from input and output counts.
 
 `--format json` emits an array of rows:
 

@@ -110,12 +110,6 @@ export type SessionsPruneFlags = {
   includeHistory?: boolean;
 };
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 function stringOption(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
@@ -422,21 +416,42 @@ export function resolveSessionNameFromFlags(
   // Commander parses options on the parent command when flags appear before the
   // subcommand (e.g. `acpx codex -s foo cancel`). Use optsWithGlobals() so
   // subcommands can still access those values.
-  const allOpts = asRecord(
-    (command as unknown as { optsWithGlobals?: () => unknown }).optsWithGlobals?.(),
-  );
-  const globalSession = parseOptionalSessionName(allOpts?.session);
-  if (globalSession !== undefined) {
-    return globalSession;
-  }
-
-  const parentOpts = asRecord(command.parent?.opts?.());
-  return parseOptionalSessionName(parentOpts?.session);
+  const allOpts = command.optsWithGlobals<Record<string, unknown>>();
+  return parseOptionalSessionName(allOpts.session);
 }
 
 function parseOptionalSessionName(value: unknown): string | undefined {
   const session = stringOption(value);
   return session === undefined ? undefined : parseSessionName(session);
+}
+
+function resolveCommandOption(command: Command, key: string, fallback: unknown): unknown {
+  // Explicit child values win; a child's --no-wait default must not hide a parent flag.
+  for (let current: Command | null = command; current; current = current.parent) {
+    if (current.getOptionValueSource(key) === "cli") {
+      return current.opts<Record<string, unknown>>()[key];
+    }
+  }
+  return fallback;
+}
+
+export function resolvePromptFlags(flags: PromptFlags, command: Command): PromptFlags {
+  return {
+    ...flags,
+    file: stringOption(resolveCommandOption(command, "file", flags.file)),
+    wait: resolveCommandOption(command, "wait", flags.wait) !== false,
+  };
+}
+
+export function resolveSessionsListFlags(
+  flags: SessionsListFlags,
+  command: Command,
+): SessionsListFlags {
+  return {
+    cursor: stringOption(resolveCommandOption(command, "cursor", flags.cursor)),
+    filterCwd: stringOption(resolveCommandOption(command, "filterCwd", flags.filterCwd)),
+    local: resolveCommandOption(command, "local", flags.local) === true,
+  };
 }
 
 export function addPromptInputOption(command: Command): Command {
@@ -452,14 +467,16 @@ export function addExecConfigOption(command: Command): Command {
 }
 
 export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig): GlobalFlags {
-  const opts = asRecord(command.optsWithGlobals()) ?? {};
-  const format = parseOutputFormat(stringOption(opts.format) ?? config.format ?? "text");
+  const opts = command.optsWithGlobals<Record<string, unknown>>();
+  const format = parseOutputFormat(
+    opts.json === true ? "json" : (stringOption(opts.format) ?? config.format ?? "text"),
+  );
   const jsonStrict = opts.jsonStrict === true;
   const verbose = opts.verbose === true;
   assertOutputFlagCompatibility(format, jsonStrict, verbose);
 
   return {
-    agent: stringOption(opts.agent),
+    agent: resolveAgentOverride(stringOption(opts.agent)),
     cwd: resolveCwdOption(opts.cwd),
     authPolicy: resolveAuthPolicy(opts.authPolicy, config),
     nonInteractivePermissions: resolveNonInteractivePermissions(
@@ -470,7 +487,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     jsonStrict,
     suppressReads: opts.suppressReads === true,
     fs: resolveCapabilityOption(opts.fs),
-    terminal: resolveTerminalOption(opts.terminal),
+    terminal: resolveCapabilityOption(opts.terminal),
     timeout: resolveTimeoutOption(opts.timeout, config),
     ttl: resolveTtlOption(opts.ttl, config),
     verbose,
@@ -520,10 +537,6 @@ function resolveCapabilityOption(value: unknown): boolean | undefined {
   return value === false ? false : undefined;
 }
 
-function resolveTerminalOption(value: unknown): boolean | undefined {
-  return resolveCapabilityOption(value);
-}
-
 function resolveTimeoutOption(value: unknown, config: ResolvedAcpxConfig): number | undefined {
   return numberOption(value) ?? config.timeoutMs;
 }
@@ -551,6 +564,10 @@ function resolveModelOption(value: unknown): string | undefined {
   return model === undefined ? undefined : parseNonEmptyValue("Model", model);
 }
 
+function resolveAgentOverride(value: string | undefined): string | undefined {
+  return value === undefined ? undefined : parseNonEmptyValue("Agent command", value);
+}
+
 export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): OutputPolicy {
   return {
     format,
@@ -572,8 +589,8 @@ export function resolveAgentInvocation(
   agentArgv?: string[];
   cwd: string;
 } {
-  const override = globalFlags.agent?.trim();
-  if (override && explicitAgentName) {
+  const override = resolveAgentOverride(globalFlags.agent);
+  if (override !== undefined && explicitAgentName !== undefined) {
     throw new InvalidArgumentError("Do not combine positional agent with --agent override");
   }
 
@@ -592,12 +609,16 @@ function resolveInvocationCommand(
   override: string | undefined,
   config: ResolvedAcpxConfig,
 ): { agentCommand: string; agentArgv?: string[] } {
-  if (override) {
+  if (override !== undefined) {
     return { agentCommand: override };
   }
   const normalizedAgentName = normalizeAgentName(agentName);
-  const configuredAgent =
-    config.agents[normalizedAgentName] ?? config.agents[resolveCanonicalAgentName(agentName)];
+  const canonicalAgentName = resolveCanonicalAgentName(agentName);
+  const configuredAgent = Object.hasOwn(config.agents, normalizedAgentName)
+    ? config.agents[normalizedAgentName]
+    : Object.hasOwn(config.agents, canonicalAgentName)
+      ? config.agents[canonicalAgentName]
+      : undefined;
   if (configuredAgent) {
     return {
       agentCommand: configuredAgent.command,

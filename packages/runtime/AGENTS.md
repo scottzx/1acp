@@ -23,9 +23,9 @@ instead of expanding this file into a full technical spec.
 - Default branch: `main`
 - Runtime: Node.js `>=22.13.0`
 - Source builds: Node.js `^22.22.1 || ^24.11.0 || >=26.0.0` (lint-staged sets the Node 22 minimum; tsdown excludes Node 25).
-- Package manager: `pnpm@11.26.0` (CI reads the pin from `package.json`).
+- Package manager: `pnpm@11.27.1` (CI reads the pin from `package.json`).
 - Clean Node 22 setups can have stale Corepack signing keys; install pnpm
-  with `npm install -g pnpm@11.26.0` if `corepack prepare` fails.
+  with `npm install -g pnpm@11.27.1` if `corepack prepare` fails.
 
 ## Product Direction
 
@@ -83,6 +83,10 @@ npx acpx@latest --help
 2. Use `pnpm run dev -- ...` for quick manual checks.
 3. Run the smallest relevant validation command while iterating.
 4. Before opening or updating a PR, run the full checks for the scope you changed.
+
+Full checks include the vendored Autoreview Python tests. Activate a Python 3.14
+virtual environment and install `requirements-autoreview.txt` as described in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#development).
 
 ## Slophammer Policy
 
@@ -166,11 +170,12 @@ Harness documentation synchronization policy:
 - `pnpm run build` — build the distributable CLI
 - `pnpm run test` — local test run without coverage gate
 - `pnpm run test:coverage` — CI-equivalent test run with coverage thresholds
+- `pnpm run test:autoreview` — vendored Autoreview unit tests with Python 3.14
 - `pnpm run typecheck` — TypeScript typecheck
 - `pnpm run lint` — source linting plus persisted-key casing checks
 - `pnpm run format:check` — formatting check
 - `pnpm run mutate` — Stryker mutation check for the configured target
-- `pnpm run check` — format, typecheck, lint, build, and coverage tests
+- `pnpm run check` — format, typecheck, lint, build, coverage, and Autoreview tests
 - `pnpm run check:docs` — docs format and markdown lint
 - `pnpm run perf:report` — performance reporting helper
 
@@ -199,7 +204,7 @@ Harness documentation synchronization policy:
   other AI-assistance tags. If AI assistance should be disclosed, put that in
   the PR description instead.
 - For non-trivial local code changes, run
-  `.agents/skills/autoreview/scripts/autoreview` until no accepted/actionable
+  `.agents/skills/autoreview/scripts/autoreview --max-priority P2` until no accepted/actionable
   findings remain before final handoff or merge. Use commit mode for already
   landed main commits and branch mode for branch or PR work.
 - Local `codex review --base ...` runs in this repo can legitimately take up to
@@ -289,21 +294,27 @@ CI lives in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
   - `pnpm run build`
   - `pnpm run mutate`
   - `pnpm run test:coverage`
+  - `pnpm run test:autoreview`
 - CI installs dependencies with `pnpm install --frozen-lockfile`
 - CI uses Node 24 by default; tests run on Node 22, 24, and 26, with coverage on Node 22.
 - The build job also typechecks and builds the replay viewer.
+- The Autoreview job uses Python 3.14 and `requirements-autoreview.txt`.
 - Mutation tests run the existing CLI flag suite directly through `tsx`, without rebuilding the test tree for each mutant.
 
 ## Release / CD
 
 Release automation lives in [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-- Releases run when a `vX.Y.Z` tag is pushed
+- Releases run when Stable creates an authorized `vX.Y.Z` tag
 - The workflow installs dependencies with `pnpm install --frozen-lockfile`
 - It validates `package.json` release metadata before publishing
 - It validates that the tag matches `package.json` version and that the tagged commit is on `main`
 - It runs `pnpm run lint`, `pnpm run typecheck`, and `pnpm run build`
-- It publishes directly to npm with trusted publishing and provenance
+- The build job packages the release without publishing authority
+- The publish job requires the `stable-release` environment gate and publishes
+  the verified build artifact to npm with trusted publishing and provenance
+- Release requests go through Stable; maintainers with permission to merge to
+  `main` can authorize the exact version and commit
 
 The release workflow currently requires these `package.json` values:
 
@@ -328,8 +339,8 @@ Do not change release metadata or publishing behavior casually.
 - [`src/acp/client.ts`](src/acp/client.ts) — ACP client integration
 - [`src/cli/config.ts`](src/cli/config.ts) — config loading and defaults
 - [`src/agent-registry.ts`](src/agent-registry.ts) — built-in agent names and commands
-- [`src/cli/session/runtime.ts`](src/cli/session/runtime.ts) and [`src/cli/session/`](src/cli/session) — CLI session lifecycle and runtime behavior
-- [`src/cli/queue/ipc.ts`](src/cli/queue/ipc.ts) and [`src/cli/queue/ipc-server.ts`](src/cli/queue/ipc-server.ts) — queue IPC behavior
+- [`src/session/execution/runtime.ts`](src/session/execution/runtime.ts) and [`src/session/execution/`](src/session/execution) — shared session lifecycle and runtime behavior
+- [`src/session/queue/ipc.ts`](src/session/queue/ipc.ts) and [`src/session/queue/ipc-server.ts`](src/session/queue/ipc-server.ts) — queue IPC behavior
 - [`test/integration.test.ts`](test/integration.test.ts) — end-to-end CLI expectations
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — CI behavior
 - [`.github/workflows/release.yml`](.github/workflows/release.yml) — release workflow

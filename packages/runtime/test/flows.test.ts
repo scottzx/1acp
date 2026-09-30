@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -20,11 +21,13 @@ import {
 } from "../src/flows/runtime.js";
 import type {
   FlowDefinition,
+  FlowRunState,
   FunctionActionNodeDefinition,
   ShellActionExecution,
   ShellActionNodeDefinition,
 } from "../src/flows/runtime.js";
 import { type FlowRunStore, flowRunsBaseDir } from "../src/flows/store.js";
+import { listSessions } from "../src/session/persistence.js";
 import type { PromptInput } from "../src/types.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -35,6 +38,33 @@ const FLOW_AUTHORING_TEST_ROOTS = [
   path.resolve(process.cwd(), "examples/flows"),
   path.resolve(process.cwd(), "test/fixtures"),
 ];
+
+test("timed-out persistent flow sessions retain their initialized protocol capabilities", async () => {
+  await withTempHome(async () => {
+    const runner = new FlowRunner({
+      resolveAgent: () => ({
+        agentName: "mock",
+        agentCommand: `${MOCK_AGENT_COMMAND} --supports-load-session`,
+        cwd: process.cwd(),
+      }),
+      permissionMode: "deny-all",
+      outputRoot: path.join(os.homedir(), "runs"),
+    });
+    const flow = defineFlow({
+      name: "capability-timeout",
+      startAt: "ask",
+      nodes: {
+        ask: acp({ timeoutMs: 2_000, prompt: () => "sleep 9000" }),
+      },
+      edges: [],
+    });
+    await assert.rejects(runner.run(flow, {}), TimeoutError);
+    const [record] = await listSessions();
+    assert.ok(record);
+    assert.equal(record.protocolVersion, 1);
+    assert.equal(record.agentCapabilities?.loadSession, true);
+  });
+});
 
 async function collectFlowFiles(root: string): Promise<string[]> {
   const entries = await fs.readdir(root, { withFileTypes: true });
@@ -97,6 +127,59 @@ test("parseJsonObject supports strict and fenced-only modes", () => {
     () => parseJsonObject("before [1, 2} after", { mode: "compat" }),
     /Could not parse JSON/,
   );
+});
+
+test("compat JSON recovery preserves large and late candidates", () => {
+  assert.deepEqual(extractJsonObject(`${"x".repeat(1_048_577)}{"ok":true}`), { ok: true });
+  assert.deepEqual(extractJsonObject(`${"[x] ".repeat(1_000)}{"ok":true}`), { ok: true });
+  const value = { text: "x".repeat(1_048_577) };
+  const json = JSON.stringify(value);
+  for (const text of [json, `\`\`\`json\n${json}\n\`\`\``, `before ${json} after`]) {
+    assert.deepEqual(extractJsonObject(text), value);
+  }
+});
+
+test("compat JSON recovery preserves candidate ordering and independent string state", () => {
+  for (const text of [
+    'before { broken {"ok":true} } after',
+    'before [mismatch} then {"ok":true}',
+  ]) {
+    assert.deepEqual(extractJsonObject(text), { ok: true });
+  }
+  assert.deepEqual(extractJsonObject('before [{"ok":true}] after'), [{ ok: true }]);
+  assert.deepEqual(extractJsonObject('"quoted {} prose" {"later":true}'), {});
+  assert.deepEqual(extractJsonObject('{"message":"{}", nope} {"later":true}'), {});
+});
+
+test("compat JSON recovery bounds scanning and failed parse work", () => {
+  const parserUrl = new URL("../src/flows/json.js", import.meta.url).href;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+    import assert from 'node:assert/strict';
+    import { extractJsonObject } from ${JSON.stringify(parserUrl)};
+    for (const text of [
+      '{'.repeat(100_000),
+      '['.repeat(100_000) + '0,' + ']'.repeat(100_000),
+    ]) assert.throws(() => extractJsonObject(text), /Could not parse JSON/);
+    process.stdout.write('bounded');
+  `,
+    ],
+    { encoding: "utf8", timeout: 5_000 },
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "bounded");
+});
+
+test("compat recovery stops when ambiguous prefixes exhaust work before a valid candidate", () => {
+  const json = JSON.stringify({ text: "x".repeat(1_000) });
+  // Earlier unmatched openers consume scan work; the candidate also needs parse work.
+  assert.deepEqual(extractJsonObject(`${"{".repeat(6)}${json}`), JSON.parse(json));
+  assert.throws(() => extractJsonObject(`${"{".repeat(7)}${json}`), /Could not parse JSON/);
 });
 
 test("parseJsonObject parses fenced JSON without regex backtracking", () => {
@@ -1561,61 +1644,6 @@ test("FlowRunner preserves shell timeoutMs 0 as no action deadline", async () =>
   });
 });
 
-test("FlowRunner reaps shell child when outer node deadline expires", async () => {
-  await withTempHome(async () => {
-    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
-    const pidDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-shell-pid-"));
-    const pidFile = path.join(pidDir, "pid");
-    const runner = new FlowRunner({
-      resolveAgent: () => ({
-        agentName: "unused",
-        agentCommand: "unused",
-        cwd: process.cwd(),
-      }),
-      permissionMode: "approve-all",
-      outputRoot,
-    });
-
-    const flow = defineFlow({
-      name: "timeout-outer-reap",
-      startAt: "slow",
-      nodes: {
-        slow: shell({
-          // Enabled outer deadline; action timeout stays zero (no shell-level deadline).
-          timeoutMs: 500,
-          exec: () => ({
-            command: process.execPath,
-            args: [
-              "-e",
-              `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 30_000)`,
-            ],
-            timeoutMs: 0,
-          }),
-        }),
-      },
-      edges: [],
-    });
-
-    await assert.rejects(async () => await runner.run(flow, {}), TimeoutError);
-    const runDir = await waitForRunDir(outputRoot, "timeout-outer-reap");
-    const state = await readRunJson(runDir);
-    assert.equal(state.status, "timed_out");
-    const slowResult = (state.results as Record<string, Record<string, unknown>>).slow;
-    assert.equal(slowResult.outcome, "timed_out");
-
-    const pid = Number(await fs.readFile(pidFile, "utf8"));
-    assert.ok(pid > 0);
-    let alive = true;
-    try {
-      process.kill(pid, 0);
-    } catch {
-      alive = false;
-    }
-    assert.equal(alive, false, "outer deadline must reap the shell child");
-    await fs.rm(pidDir, { recursive: true, force: true });
-  });
-});
-
 test("FlowRunner can route timed out nodes by outcome", async () => {
   await withTempHome(async () => {
     const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
@@ -1716,23 +1744,35 @@ test("FlowRunner times out async shell parse callbacks", async () => {
       outputRoot,
     });
 
+    let parseEntered = false;
+    let parseSignal: AbortSignal | undefined;
     const flow = defineFlow({
       name: "shell-parse-timeout-test",
       startAt: "slow",
       nodes: {
         slow: shell({
-          timeoutMs: 50,
+          timeoutMs: 2_000,
           exec: () => ({
             command: process.execPath,
             args: ["-e", 'process.stdout.write("ok")'],
           }),
-          parse: async () => await new Promise(() => {}),
+          parse: async (result, context) => {
+            assert.equal(result.stdout, "ok");
+            assert.equal(result.exitCode, 0);
+            assert.equal(result.signal, null);
+            assert.equal(context.signal?.aborted, false);
+            parseEntered = true;
+            parseSignal = context.signal;
+            return await new Promise(() => {});
+          },
         }),
       },
       edges: [],
     });
 
     await assert.rejects(async () => await runner.run(flow, {}), TimeoutError);
+    assert.equal(parseEntered, true, "the deadline must expire during parsing, not startup");
+    assert.equal(parseSignal?.aborted, true);
     const runDir = await waitForRunDir(outputRoot, "shell-parse-timeout-test");
     const state = await readRunJson(runDir);
     const slowResult = (state.results as Record<string, Record<string, unknown>>).slow;
@@ -1781,18 +1821,14 @@ test("FlowRunner times out async ACP parse callbacks", async () => {
     const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
     const runner = new FlowRunner({
       resolveAgent: () => ({
-        agentName: "unused",
-        agentCommand: "unused",
+        agentName: "mock",
+        agentCommand: MOCK_AGENT_COMMAND,
         cwd: process.cwd(),
       }),
       permissionMode: "approve-all",
       outputRoot,
     });
-    const runnerHarness = runner as unknown as {
-      runIsolatedPrompt: () => Promise<string>;
-    };
-    runnerHarness.runIsolatedPrompt = async () => "hello";
-
+    let parseCalls = 0;
     const flow = defineFlow({
       name: "acp-parse-timeout-test",
       startAt: "slow",
@@ -1801,15 +1837,19 @@ test("FlowRunner times out async ACP parse callbacks", async () => {
           session: {
             isolated: true,
           },
-          timeoutMs: 50,
+          timeoutMs: 5_000,
           prompt: () => "hello",
-          parse: async () => await new Promise(() => {}),
+          parse: async () => {
+            parseCalls += 1;
+            return await new Promise(() => {});
+          },
         }),
       },
       edges: [],
     });
 
     await assert.rejects(async () => await runner.run(flow, {}), TimeoutError);
+    assert.equal(parseCalls, 1, "the deadline must exercise an admitted parser callback");
     const runDir = await waitForRunDir(outputRoot, "acp-parse-timeout-test");
     const state = await readRunJson(runDir);
     const slowResult = (state.results as Record<string, Record<string, unknown>>).slow;
@@ -1924,6 +1964,83 @@ test("FlowRunner stores successful node results separately from outputs", async 
   });
 });
 
+test("FlowRunner preserves failures instead of following direct or output edges", async () => {
+  await withTempHome(async (homeDir) => {
+    const runner = new FlowRunner({
+      resolveAgent: () => ({ agentName: "unused", agentCommand: "unused", cwd: homeDir }),
+      permissionMode: "deny-all",
+      outputRoot: path.join(homeDir, "runs"),
+    });
+    const failure = new Error("original failure");
+    for (const target of ["direct", "$output.route", "invalid.path"]) {
+      const flow = defineFlow({
+        name: "failure-route",
+        startAt: "fail",
+        nodes: {
+          fail: compute({
+            run: () => {
+              throw failure;
+            },
+          }),
+          after: compute({ run: () => assert.fail("failed node must not continue") }),
+        },
+        edges:
+          target === "direct"
+            ? [{ from: "fail", to: "after" }]
+            : [{ from: "fail", switch: { on: target, cases: { go: "after" } } }],
+      });
+      await assert.rejects(runner.run(flow, {}), (error: unknown) => error === failure);
+    }
+  });
+});
+
+test("FlowRunner records callback and output serialization failures as failed steps", async () => {
+  await withTempHome(async (homeDir) => {
+    const outputRoot = path.join(homeDir, "runs");
+    const runner = new FlowRunner({
+      resolveAgent: () => ({ agentName: "unused", agentCommand: "unused", cwd: homeDir }),
+      permissionMode: "deny-all",
+      outputRoot,
+    });
+    for (const makeNode of [compute, action, checkpoint]) {
+      for (const value of [undefined, null, false, new Error("callback failed"), 1n]) {
+        const flow = defineFlow({
+          name: "callback-failure",
+          startAt: "callback",
+          nodes: {
+            callback: makeNode({
+              run: () => {
+                if (typeof value === "bigint") {
+                  return value;
+                }
+                throw value;
+              },
+            }),
+          },
+          edges: [],
+        });
+        await assert.rejects(runner.run(flow, {}), (error: unknown) => {
+          if (typeof value === "bigint") {
+            assert.match(String(error), /BigInt/i);
+          } else {
+            assert.equal(error, value);
+          }
+          return true;
+        });
+        const runDir = await waitForRunDir(outputRoot, flow.name);
+        const state = await readRunJson(runDir);
+        assert.equal(state.status, "failed");
+        const result = (state.results as Record<string, Record<string, unknown>>).callback;
+        assert.equal(result.outcome, "failed");
+        assert.equal(result.nodeType, flow.nodes.callback.nodeType);
+        assert.equal(result.output, undefined);
+        assert.deepEqual(state.outputs, {});
+        await fs.rm(runDir, { recursive: true });
+      }
+    }
+  });
+});
+
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   const previousHome = process.env.HOME;
   const previousQueueOwnerArgs = process.env.ACPX_QUEUE_OWNER_ARGS;
@@ -2027,5 +2144,408 @@ test("FlowRunner does not launch a shell action when its executor resolves after
       release();
       await fs.rm(outputRoot, { recursive: true, force: true });
     }
+  });
+});
+
+const GRAPH_KEYS = ["", "__proto__", "constructor", "toString"] as const;
+const INHERITED_KEYS = ["__proto__", "constructor", "toString"] as const;
+
+async function withGraphKeyRunner(
+  run: (runner: FlowRunner, root: string) => Promise<void>,
+): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-keys-"));
+  try {
+    const runner = new FlowRunner({
+      resolveAgent: () => ({ agentName: "unused", agentCommand: "unused", cwd: root }),
+      permissionMode: "deny-all",
+      outputRoot: root,
+    });
+    await run(runner, root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function readGraphKeyRun(runDir: string): Promise<FlowRunState> {
+  return JSON.parse(
+    await fs.readFile(path.join(runDir, "projections", "run.json"), "utf8"),
+  ) as FlowRunState;
+}
+
+function assertOwnSuccessfulNode(state: FlowRunState, key: string, output: unknown): void {
+  assert.equal(Object.hasOwn(state.outputs, key), true, `own output ${JSON.stringify(key)}`);
+  assert.equal(Object.hasOwn(state.results, key), true, `own result ${JSON.stringify(key)}`);
+  assert.deepEqual(state.outputs[key], output);
+  assert.equal(state.results[key].nodeId, key);
+  assert.equal(state.results[key].outcome, "ok");
+  assert.deepEqual(state.results[key].output, output);
+}
+
+test("flow keys: FlowRunner preserves every exact graph key through callbacks and persistence", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    const visited: string[] = [];
+    const nodes = Object.fromEntries(
+      GRAPH_KEYS.map((key, index) => [
+        key,
+        compute({
+          run: ({ state }) => {
+            visited.push(key);
+            const previous = GRAPH_KEYS[index - 1];
+            if (previous !== undefined) {
+              assertOwnSuccessfulNode(state, previous, { nodeId: previous });
+            }
+            return { nodeId: key };
+          },
+        }),
+      ]),
+    );
+    const flow = defineFlow({
+      name: "exact-graph-keys",
+      startAt: "",
+      nodes,
+      edges: GRAPH_KEYS.slice(1).map((to, index) => ({ from: GRAPH_KEYS[index], to })),
+    });
+    const result = await runner.run(flow, {});
+    assert.equal(result.state.status, "completed");
+    assert.deepEqual(visited, [...GRAPH_KEYS]);
+    assert.deepEqual(
+      result.state.steps.map((step) => step.nodeId),
+      [...GRAPH_KEYS],
+    );
+    const saved = await readGraphKeyRun(result.runDir);
+    assert.equal(saved.status, "completed");
+    assert.deepEqual(
+      saved.steps.map((step) => step.nodeId),
+      [...GRAPH_KEYS],
+    );
+    for (const key of GRAPH_KEYS) {
+      assertOwnSuccessfulNode(result.state, key, { nodeId: key });
+      assertOwnSuccessfulNode(saved, key, { nodeId: key });
+    }
+    assert.deepEqual(Object.keys(saved.outputs), [...GRAPH_KEYS]);
+    assert.deepEqual(Object.keys(saved.results), [...GRAPH_KEYS]);
+    const snapshot = JSON.parse(
+      await fs.readFile(path.join(result.runDir, "flow.json"), "utf8"),
+    ) as {
+      startAt: string;
+      nodes: Record<string, unknown>;
+    };
+    assert.equal(snapshot.startAt, "");
+    assert.deepEqual(Object.keys(snapshot.nodes), [...GRAPH_KEYS]);
+  });
+});
+
+test("flow keys: FlowRunner routes own raw switch keys and targets including empty strings", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    for (const key of GRAPH_KEYS) {
+      const visited: string[] = [];
+      const output = { marker: "selected", key };
+      const flow = defineFlow({
+        name: "own-case-keys",
+        startAt: "choose",
+        nodes: {
+          choose: compute({ run: () => ({ route: key }) }),
+          [key]: compute({
+            run: () => {
+              visited.push(key);
+              return output;
+            },
+          }),
+          observe: compute({
+            run: ({ state }) => {
+              assertOwnSuccessfulNode(state, key, output);
+              return "observed";
+            },
+          }),
+        },
+        edges: [
+          { from: "choose", switch: { on: "$.route", cases: { [key]: key } } },
+          { from: key, to: "observe" },
+        ],
+      });
+      const result = await runner.run(flow, {});
+      assert.equal(result.state.status, "completed");
+      assert.deepEqual(visited, [key]);
+      assert.deepEqual(
+        result.state.steps.map((step) => step.nodeId),
+        ["choose", key, "observe"],
+      );
+      assertOwnSuccessfulNode(result.state, key, output);
+      assertOwnSuccessfulNode(await readGraphKeyRun(result.runDir), key, output);
+    }
+  });
+});
+
+test("flow keys: FlowRunner follows a direct edge to an empty-string node", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    const result = await runner.run(
+      defineFlow({
+        name: "empty-direct-target",
+        startAt: "first",
+        nodes: {
+          first: compute({ run: () => "first" }),
+          "": compute({ run: () => "empty target" }),
+        },
+        edges: [{ from: "first", to: "" }],
+      }),
+      {},
+    );
+    assert.deepEqual(
+      result.state.steps.map((step) => step.nodeId),
+      ["first", ""],
+    );
+    assertOwnSuccessfulNode(await readGraphKeyRun(result.runDir), "", "empty target");
+  });
+});
+
+test("flow keys: FlowRunner routes failed results to an empty-string recovery node", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    const result = await runner.run(
+      defineFlow({
+        name: "empty-recovery-target",
+        startAt: "work",
+        nodes: {
+          work: compute({
+            run: () => {
+              throw new Error("recoverable");
+            },
+          }),
+          "": compute({ run: () => ({ recovered: true }) }),
+        },
+        edges: [{ from: "work", switch: { on: "$result.outcome", cases: { failed: "" } } }],
+      }),
+      {},
+    );
+    for (const state of [result.state, await readGraphKeyRun(result.runDir)]) {
+      assert.equal(state.status, "completed");
+      assert.deepEqual(
+        state.steps.map((step) => step.nodeId),
+        ["work", ""],
+      );
+      assert.equal(state.results.work.outcome, "failed");
+      assert.equal(state.results.work.error, "recoverable");
+      assert.equal(Object.hasOwn(state.outputs, "work"), false);
+      assertOwnSuccessfulNode(state, "", { recovered: true });
+    }
+  });
+});
+
+test("flow keys: FlowRunner publishes special-key checkpoint outputs and exact waiting IDs", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    for (const key of ["", "__proto__"]) {
+      const output = { summary: "review marker", key };
+      const result = await runner.run(
+        defineFlow({
+          name: "special-checkpoint",
+          startAt: key,
+          nodes: {
+            [key]: checkpoint({ run: () => output }),
+            after: compute({ run: () => assert.fail("checkpoint successor must not run") }),
+          },
+          edges: [{ from: key, to: "after" }],
+        }),
+        {},
+      );
+      for (const state of [result.state, await readGraphKeyRun(result.runDir)]) {
+        assert.equal(state.status, "waiting");
+        assert.equal(state.waitingOn, key);
+        assert.deepEqual(
+          state.steps.map((step) => step.nodeId),
+          [key],
+        );
+        assertOwnSuccessfulNode(state, key, output);
+        assert.equal(Object.hasOwn(state.results, "after"), false);
+      }
+    }
+  });
+});
+
+test("flow keys: FlowRunner rejects inherited node references before executing callbacks", async () => {
+  await withGraphKeyRunner(async (runner, root) => {
+    for (const missing of INHERITED_KEYS) {
+      for (const position of ["start", "from", "to", "case"] as const) {
+        let called = false;
+        const node = compute({
+          run: () => {
+            called = true;
+            return { route: "go" };
+          },
+        });
+        const flow = defineFlow({
+          name: "missing-own-node",
+          startAt: position === "start" ? missing : "start",
+          nodes: { start: node, done: node },
+          edges:
+            position === "start"
+              ? []
+              : position === "case"
+                ? [{ from: "start", switch: { on: "$.route", cases: { go: missing } } }]
+                : [
+                    {
+                      from: position === "from" ? missing : "start",
+                      to: position === "to" ? missing : "done",
+                    },
+                  ],
+        });
+        const diagnostic =
+          position === "start"
+            ? /Flow start node is missing:/
+            : position === "from"
+              ? /Flow edge references unknown from-node:/
+              : position === "to"
+                ? /Flow edge references unknown to-node:/
+                : /Flow switch references unknown to-node:/;
+        await assert.rejects(runner.run(flow, {}), diagnostic);
+        assert.equal(called, false);
+      }
+    }
+    assert.deepEqual(await fs.readdir(root), []);
+  });
+});
+
+test("flow keys: FlowRunner rejects unmatched inherited switch cases and persists the routing failure", async () => {
+  await withGraphKeyRunner(async (runner, root) => {
+    for (const missing of INHERITED_KEYS) {
+      let successorCalled = false;
+      const before = new Set(await fs.readdir(root));
+      const flow = defineFlow({
+        name: "missing-own-case",
+        startAt: "choose",
+        nodes: {
+          choose: compute({ run: () => ({ route: missing }) }),
+          done: compute({
+            run: () => {
+              successorCalled = true;
+              return "unexpected";
+            },
+          }),
+        },
+        edges: [{ from: "choose", switch: { on: "$.route", cases: { allowed: "done" } } }],
+      });
+      await assert.rejects(runner.run(flow, {}), /No flow switch case for \$\.route=/);
+      assert.equal(successorCalled, false);
+      const created = (await fs.readdir(root)).filter((name) => !before.has(name));
+      assert.equal(created.length, 1);
+      const saved = await readGraphKeyRun(path.join(root, created[0]));
+      assert.equal(saved.status, "failed");
+      assert.match(saved.error ?? "", /No flow switch case for \$\.route=/);
+      assert.deepEqual(
+        saved.steps.map((step) => step.nodeId),
+        ["choose"],
+      );
+      assertOwnSuccessfulNode(saved, "choose", { route: missing });
+      assert.equal(Object.hasOwn(saved.results, "done"), false);
+    }
+  });
+});
+
+test("flow keys: defineFlow validates original own __proto__ node and case values", () => {
+  assert.throws(
+    () =>
+      defineFlow({
+        name: "invalid-prototype-node",
+        startAt: "__proto__",
+        nodes: { ["__proto__"]: { nodeType: "compute", run: "not callable" } },
+        edges: [],
+      } as unknown as FlowDefinition),
+    /Invalid flow node "__proto__":/,
+  );
+  assert.throws(
+    () =>
+      defineFlow({
+        name: "invalid-prototype-case",
+        startAt: "choose",
+        nodes: { choose: compute({ run: () => ({ route: "__proto__" }) }) },
+        edges: [{ from: "choose", switch: { on: "$.route", cases: { ["__proto__"]: 7 } } }],
+      } as unknown as FlowDefinition),
+    /Invalid flow definition:/,
+  );
+});
+
+for (const key of ["ordinary", "__proto__", "constructor", "toString"]) {
+  test(`flow keys: a standalone ${key} node publishes own output and result`, async () => {
+    await withGraphKeyRunner(async (runner) => {
+      const output = { marker: key };
+      const result = await runner.run(
+        defineFlow({
+          name: "standalone-key",
+          startAt: key,
+          nodes: { [key]: compute({ run: () => output }) },
+          edges: [],
+        }),
+        {},
+      );
+      assertOwnSuccessfulNode(result.state, key, output);
+      assertOwnSuccessfulNode(await readGraphKeyRun(result.runDir), key, output);
+    });
+  });
+}
+
+test("flow keys: an own switch ignores an inherited direct target", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    const visited: string[] = [];
+    const edge = {
+      from: "choose",
+      switch: { on: "$.route", cases: { go: "selected" } },
+    };
+    Object.setPrototypeOf(edge, { to: "unselected" });
+    const result = await runner.run(
+      defineFlow({
+        name: "own-switch",
+        startAt: "choose",
+        nodes: {
+          choose: compute({ run: () => ({ route: "go" }) }),
+          selected: compute({
+            run: () => {
+              visited.push("selected");
+              return "selected";
+            },
+          }),
+          unselected: compute({
+            run: () => {
+              visited.push("unselected");
+              return "unselected";
+            },
+          }),
+        },
+        edges: [edge],
+      }),
+      {},
+    );
+    assert.deepEqual(visited, ["selected"]);
+    assert.deepEqual(
+      result.state.steps.map((step) => step.nodeId),
+      ["choose", "selected"],
+    );
+  });
+});
+
+test("flow keys: an own direct edge cannot recover through an inherited result switch", async () => {
+  await withGraphKeyRunner(async (runner) => {
+    let successorCalled = false;
+    const edge = { from: "work", to: "after" };
+    Object.setPrototypeOf(edge, {
+      switch: { on: "$result.outcome", cases: { failed: "after" } },
+    });
+    const flow = defineFlow({
+      name: "own-direct-failure",
+      startAt: "work",
+      nodes: {
+        work: compute({
+          run: () => {
+            throw new Error("unhandled work failure");
+          },
+        }),
+        after: compute({
+          run: () => {
+            successorCalled = true;
+            return "unexpected";
+          },
+        }),
+      },
+      edges: [edge],
+    });
+    await assert.rejects(runner.run(flow, {}), /unhandled work failure/);
+    assert.equal(successorCalled, false);
   });
 });

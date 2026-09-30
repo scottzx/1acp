@@ -39,6 +39,11 @@ export type AcpPermissionDecision =
   | { outcome: "reject_always" }
   | { outcome: "cancel" };
 
+export type AcpPermissionHandler = (
+  request: AcpPermissionRequest,
+  context: { signal: AbortSignal },
+) => Promise<AcpPermissionDecision | undefined>;
+
 export const ACP_ELICITATION_MODES = ["form", "url"] as const;
 export type AcpElicitationMode = (typeof ACP_ELICITATION_MODES)[number];
 export type AcpElicitationRequest = CreateElicitationRequest;
@@ -128,6 +133,7 @@ export const OUTPUT_ERROR_CODES = [
   "TIMEOUT",
   "PERMISSION_DENIED",
   "PERMISSION_PROMPT_UNAVAILABLE",
+  "EXEC_DISABLED",
   "RUNTIME",
   "USAGE",
 ] as const;
@@ -169,6 +175,7 @@ export type PermissionStats = {
 };
 
 export type ClientOperationMethod =
+  | "session/request_permission"
   | "fs/read_text_file"
   | "fs/write_text_file"
   | "terminal/create"
@@ -227,7 +234,7 @@ export type OutputErrorEmissionPolicy = {
 
 export interface OutputFormatter {
   setContext(context: OutputFormatterContext): void;
-  onAcpMessage(message: AcpJsonRpcMessage): void;
+  onAcpMessage(message: AcpJsonRpcMessage, direction?: AcpMessageDirection): void;
   onError(params: {
     code: OutputErrorCode;
     detailCode?: string;
@@ -318,10 +325,7 @@ export type AcpClientOptions = {
   onSessionUpdate?: (notification: SessionNotification) => void;
   onClientOperation?: (operation: ClientOperation) => void;
   onPermissionEscalation?: (event: PermissionEscalationEvent) => void;
-  onPermissionRequest?: (
-    req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
-  ) => Promise<AcpPermissionDecision | undefined>;
+  onPermissionRequest?: AcpPermissionHandler;
   /**
    * Host-driven handler for Grok Build's `_x.ai/ask_user_question` extension.
    * Return a wire response, a bare answers map, or undefined to fall through
@@ -345,6 +349,7 @@ export type AcpClientOptions = {
 export const SESSION_RECORD_SCHEMA = "acpx.session.v1" as const;
 export type SessionMessageImage = {
   source: string;
+  mime_type?: string;
   size?: {
     width: number;
     height: number;
@@ -485,6 +490,7 @@ export type SessionAcpxState = {
   desired_config_options?: Record<string, string>;
   current_model_id?: string;
   available_models?: string[];
+  available_model_names?: Record<string, string>;
   model_control?: "config_option" | "legacy_set_model";
   available_commands?: SessionAvailableCommand[];
   config_options?: SessionConfigOption[];

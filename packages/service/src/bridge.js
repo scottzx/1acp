@@ -44,7 +44,7 @@ const META_UPDATE_TAGS = new Set([
   "session_info_update",
 ]);
 
-// Background-task completion reminders: the grok/deepseek runtime does not
+// Background-task completion reminders: the grok runtime does not
 // emit structured `background_task` session updates. Instead, when a task
 // finishes it wakes the session with an out-of-turn `user_message_chunk`
 // whose text carries a `<system-reminder>` block:

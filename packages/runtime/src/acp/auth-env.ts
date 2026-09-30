@@ -121,21 +121,13 @@ function promotePrefixedAuthEnvironment(env: NodeJS.ProcessEnv): Set<string> {
 
     protectEnvKey(protectedKeys, key);
     protectEnvKey(protectedKeys, normalized);
-    if (env[normalized] == null) {
-      env[normalized] = value;
-    }
+    assignIfMissing(env, normalized, value);
   }
   return protectedKeys;
 }
 
 function baseAgentEnvironment(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/local/share:/opt/homebrew/bin",
-    HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || "",
-    HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || "",
-    NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || "",
-  };
+  return { ...process.env };
 }
 
 function validateAgentProcessEnv(agentProcessEnv: Record<string, string> | undefined): void {
@@ -199,7 +191,12 @@ function assignSessionEnv(env: NodeJS.ProcessEnv, key: string, value: string): v
       delete env[existingKey];
     }
   }
-  env[key] = value;
+  Object.defineProperty(env, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
 }
 
 function addAuthCredentialEnvKeys(
@@ -231,8 +228,8 @@ function assignAuthCredentialEnv(
     return;
   }
 
-  if (!methodId.includes("=") && !methodId.includes("\u0000") && env[methodId] == null) {
-    env[methodId] = credential;
+  if (!methodId.includes("=") && !methodId.includes("\u0000")) {
+    assignIfMissing(env, methodId, credential);
   }
 
   const normalized = toEnvToken(methodId);
@@ -243,9 +240,21 @@ function assignAuthCredentialEnv(
 }
 
 function assignIfMissing(env: NodeJS.ProcessEnv, key: string, value: string): void {
-  if (env[key] == null) {
-    env[key] = value;
+  if (env[key] != null) {
+    return;
   }
+
+  const normalizedKey = protectedEnvKey(key);
+  if (
+    process.platform === "win32" &&
+    Object.entries(env).some(
+      ([existingKey, existingValue]) =>
+        existingValue != null && protectedEnvKey(existingKey) === normalizedKey,
+    )
+  ) {
+    return;
+  }
+  env[key] = value;
 }
 
 export function resolveConfiguredAuthCredential(
