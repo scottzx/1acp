@@ -11,13 +11,25 @@ export function verifyPublishedArchive(archive, dist) {
 }
 
 /** After publishing, confirm the registry copy resolves the declared dependency. */
-export function verifyRegistryState(name, version, dependency, range, runView = (args) => execFileSync('npm', args, { encoding: 'utf8' })) {
-  const view = JSON.parse(runView(['view', `${name}@${version}`, 'dependencies', '--json']));
-  const resolved = view?.[dependency];
-  if (resolved !== range) {
-    throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved ?? 'missing'}; expected ${range}`);
+export async function verifyRegistryState(name, version, dependency, range, runView = (args) => execFileSync('npm', args, { encoding: 'utf8' }), { attempts = 30, delayMs = 10_000 } = {}) {
+  let resolved;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const view = JSON.parse(runView(['view', `${name}@${version}`, 'dependencies', '--json']));
+      resolved = view?.[dependency];
+      if (resolved === range) {
+        console.log(`registry ok: ${name}@${version} -> ${dependency}@${resolved}`);
+        return;
+      }
+      if (resolved === undefined) throw new Error(`Registry ${name}@${version} does not list ${dependency} (missing); expected ${range}`);
+      throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved}; expected ${range}`);
+    } catch (error) {
+      // npm registry reads lag writes by a couple of minutes right after publish.
+      if (attempt === attempts || !/E404|No match found/i.test(String(error.message))) throw error;
+      console.log(`registry read for ${name}@${version} not propagated yet (attempt ${attempt}/${attempts}); retrying in ${delayMs / 1000}s`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
   }
-  console.log(`registry ok: ${name}@${version} -> ${dependency}@${resolved}`);
 }
 
 const EXPECTED_DEPENDENCIES = {
@@ -47,7 +59,7 @@ async function publishPackages() {
       throw new Error(`Registry check failed for ${name}: HTTP ${response.status}`);
     }
     const [dependency, range] = EXPECTED_DEPENDENCIES[directory];
-    verifyRegistryState(name, version, dependency, range);
+    await verifyRegistryState(name, version, dependency, range);
     const tag = `${name.split('/').at(-1)}-v${version}`;
     const remote = execFileSync('git', ['ls-remote', '--tags', 'origin', `refs/tags/${tag}`], { encoding: 'utf8' }).trim();
     if (!remote) {
