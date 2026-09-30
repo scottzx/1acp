@@ -104,6 +104,10 @@
 - 发布门禁：`.github/workflows/ci.yml` 打 tarball + **manifest 断言**（pack 出来的 package.json 里 name/version/依赖范围逐项核对）→ `release.yml`（workflow_dispatch）顺序发布，幂等（已发布版本做 integrity 比对后跳过），发布后 `npm view` 验证注册表依赖范围。
 - dsh-plugin 构建依赖 DSH 平台类型：本地 `pnpm link:dsh /path/to/DSH`；CI checkout 固定 ref 的 DSH 仓库自建。注意 **`pnpm install` 会清掉 node_modules 里的类型 symlink，每次 install 后要重新 link**。
 - CI 装 autoreview 的 Python 依赖时**不要用 `pip install --user`**：`test:autoreview` 以 `python -I` 运行，隔离模式排除 user site-packages，Pillow 装进 `~/.local` 后测试看不见（症状：`ModuleNotFoundError: PIL` × N + 走 "requires Pillow" 兜底路径的断言失败）。照上游写法 `python -m pip install -r requirements-autoreview.txt` 即可。
+- 发布后**post-publish 验证必须直连 `https://registry.npmjs.org`**（`fetch` 而非 `npm view`），因为 runner 用户的 `.npmrc` 镜像可能缓存 npmjs 写入数分钟，retry 跑满也无法穿透。让 CI 的 `setup-node registry-url` 把 publish 直连 npmjs 同样不足以让 `npm view` 走官方——`execFileSync` 继承环境变量里的 `.npmrc`。当前实现：`fetcher = (name, version, dep) => fetch(\`https://registry.npmjs.org/${name}/${version}\`).then(d => d.dependencies?.[dep])`。
+- npm 写后读一致性：**官方 registry 的写后读延迟可达 5–15 分钟**（不是镜像层缓存），需要 retry ≥ 60 次 × 15s 才能稳定等到 `dependencies` 字段出现。当前 `verifyRegistryState` 默认 `{ attempts: 60, delayMs: 15_000 }`（15 分钟上限）。
+- `publishConfig.provenance: true` 与 `actions/setup-node@v4` 的 OIDC 自动签名会**冲突**——npm publish 在 sigstore 二次签名时挂死，子进程不退出，tarball 已上传但 workflow 看不到 publish 成功的 stdout。**改为不在 manifest 里声明 provenance**，完全交给 setup-node + `id-token: write` permission（runtime 0.16.0 没声明照样有 SLSA attestation）。
+- `verifyPublishedArchive`（已发布版本 integrity 比对）在 npm 重打包后**几乎必触发**（mtime / gzip 顺序漂移）。降级为 warning：注册表才是真相，已发布的就接受，仅 warning，不阻断流程。
 - 发布前本地演练：三包 pack → `tar -xOf <tgz> package/package.json` 核对依赖 → 临时目录 npm install tarball 验证 bin/exports/依赖链全解析。
 
 ## 六、快速参考
