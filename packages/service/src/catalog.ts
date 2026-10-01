@@ -3,7 +3,7 @@ import { accessSync, closeSync, constants, openSync, readSync, readFileSync, sta
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
-import { createAgentRegistry } from '@scottzx/1acp/runtime';
+import { createAgentRegistry } from '@1agents/acp-service/runtime';
 import { catalogDescriptors } from './catalog-descriptors.js';
 
 export interface DiscoveryOptions {
@@ -31,7 +31,7 @@ export interface AgentStatus {
 
 const registry = createAgentRegistry();
 const require = createRequire(import.meta.url);
-const runtimeRoot = dirname(require.resolve('@scottzx/1acp/package.json'));
+const runtimeRoot = dirname(dirname(require.resolve('@1agents/acp-service/runtime-cli')));
 
 /** Resolve an executable on PATH, then in user-local harness directories. */
 export function findAgentBinary(binary: string, options: DiscoveryOptions = {}): string | undefined {
@@ -99,7 +99,21 @@ function localLaunch(id: string, options: DiscoveryOptions): string[] | undefine
   if (!Array.isArray(argv)) return undefined;
   if (argv[0] === 'npx') {
     const index = argv.findIndex((arg, i) => i > 0 && !arg.startsWith('-'));
-    return index < 0 ? undefined : packageLaunch(argv[index], argv.slice(index + 1), options);
+    if (index < 0) return undefined;
+    const extraArgs = argv.slice(index + 1);
+    const packaged = packageLaunch(argv[index], extraArgs, options);
+    if (packaged) return packaged;
+    // Use the runtime's adapter entrypoint, rather than the display/native CLI.
+    // Package lookup above honors the service's explicit search roots.
+    const inspection = createAgentRegistry({
+      resolveExecutable: command => findAgentBinary(command, options),
+      resolvePackageRoot: () => undefined,
+    }).inspect(id);
+    if (inspection?.launch.kind !== 'installed') return undefined;
+    const [binary, ...args] = inspection.launch.argv;
+    return isNodeLauncher(binary)
+      ? [process.execPath, binary, ...args]
+      : [binary, ...args];
   }
   // A package runner alone does not demonstrate an installed harness.
   if (argv[0] === 'uvx') return undefined;

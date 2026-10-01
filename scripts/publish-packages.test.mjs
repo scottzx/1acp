@@ -1,14 +1,54 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { verifyPublishedArchive, verifyRegistryState } from './publish-packages.mjs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { archiveContentDigest, verifyPublishedArchive, verifyRegistryState, verifyPluginService } from './publish-packages.mjs';
 
 test('release retries accept only matching immutable npm artifacts', () => {
   const archive = Buffer.from('release archive');
   const dist = { integrity: 'sha512-' + createHash('sha512').update(archive).digest('base64') };
   assert.doesNotThrow(() => verifyPublishedArchive(archive, dist));
-  assert.throws(() => verifyPublishedArchive(Buffer.from('changed release'), dist), /different contents/);
-  assert.throws(() => verifyPublishedArchive(archive, {}), /different contents/);
+  assert.throws(() => verifyPublishedArchive(Buffer.from('changed release'), dist), /different archive integrity/);
+  assert.throws(() => verifyPublishedArchive(archive, {}), /different archive integrity/);
+});
+
+test('retry comparisons allow compression changes but reject changed files', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'archive-contents-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, 'package'));
+  writeFileSync(join(directory, 'package/index.js'), 'original');
+  const original = join(directory, 'original.tgz');
+  execFileSync('tar', ['-czf', original, '-C', directory, 'package']);
+  const recompressed = join(directory, 'recompressed.tgz');
+  writeFileSync(recompressed, gzipSync(gunzipSync(readFileSync(original)), { level: 1 }));
+  assert.equal(archiveContentDigest(original), archiveContentDigest(recompressed));
+  writeFileSync(join(directory, 'package/index.js'), 'changed');
+  const changed = join(directory, 'changed.tgz');
+  execFileSync('tar', ['-czf', changed, '-C', directory, 'package']);
+  assert.notEqual(archiveContentDigest(original), archiveContentDigest(changed));
+});
+
+test('retry comparisons reject changed executable and directory permissions', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'archive-modes-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, 'package'), { mode: 0o755 });
+  const entry = join(directory, 'package/cli.js');
+  writeFileSync(entry, '#!/usr/bin/env node\n', { mode: 0o644 });
+  const pack = name => {
+    const archive = join(directory, name + '.tgz');
+    execFileSync('tar', ['-czf', archive, '-C', directory, 'package']);
+    return archiveContentDigest(archive);
+  };
+  const original = pack('original');
+  chmodSync(entry, 0o755);
+  assert.notEqual(pack('executable'), original);
+  chmodSync(entry, 0o644);
+  chmodSync(join(directory, 'package'), 0o700);
+  assert.notEqual(pack('directory'), original);
 });
 
 test('registry verification rejects wrong or missing dependency ranges', async () => {
@@ -37,4 +77,30 @@ test('registry verification waits for read propagation after publish', async () 
   await assert.rejects(() =>
     verifyRegistryState('@1agents/acp-service', '0.3.0', '@scottzx/1acp', '^0.16.0',
       async () => '^0.15.1', { attempts: 5, delayMs: 1 }), /expected/);
+});
+
+test('plugin-only release verifies the CI service archive against the registry copy', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'plugin-service-artifact-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const archive = join(root, 'service.tgz');
+  mkdirSync(join(root, 'package'));
+  writeFileSync(join(root, 'package/index.js'), 'CI service');
+  execFileSync('tar', ['-czf', archive, '-C', root, 'package']);
+  const bytes = readFileSync(archive);
+  const integrity = content => 'sha512-' + createHash('sha512').update(content).digest('base64');
+  const artifact = { archive, packed: { name: '@1agents/acp-service', version: '0.4.0' } };
+  const published = { version: '0.4.0', dist: { integrity: integrity(bytes), tarball: 'https://registry.npmjs.org/service.tgz' } };
+  const readDocument = async (name, version) => {
+    assert.equal(name, artifact.packed.name);
+    assert.equal(version, artifact.packed.version);
+    return published;
+  };
+  await assert.doesNotReject(() => verifyPluginService(artifact, readDocument));
+  writeFileSync(join(root, 'package/index.js'), 'different service with the same version');
+  const registryArchive = join(root, 'registry.tgz');
+  execFileSync('tar', ['-czf', registryArchive, '-C', root, 'package']);
+  const registryBytes = readFileSync(registryArchive);
+  published.dist.integrity = integrity(registryBytes);
+  t.mock.method(globalThis, 'fetch', async () => ({ ok: true, arrayBuffer: async () => registryBytes }));
+  await assert.rejects(() => verifyPluginService(artifact, readDocument), /different contents/);
 });

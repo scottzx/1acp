@@ -117,7 +117,11 @@ const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   kimi: { name: "Kimi Code", argv: ["kimi", "acp"] },
   kiro: { name: "Kiro", argv: ["kiro-cli-chat", "acp"] },
   mcode: { name: "MCode", argv: ["mcode", "acp"] },
-  mux: { name: "Mux", argv: ["npx", "-y", `mux@${ACP_ADAPTER_PACKAGE_RANGES.mux}`, "acp"] },
+  mux: {
+    name: "Mux",
+    argv: ["npx", "-y", `mux@${ACP_ADAPTER_PACKAGE_RANGES.mux}`, "acp"],
+    installedArgv: ["mux", "acp"],
+  },
   opencode: {
     name: "OpenCode",
     argv: ["npx", "-y", "opencode-ai", "acp"],

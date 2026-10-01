@@ -1,12 +1,12 @@
 # 1ACP workspace
 
-Three independently versioned packages share one repository and one pnpm lockfile. Runtime and service remain reusable outside DSH; the DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
+Two published packages share one repository and one pnpm lockfile. The upstream runtime remains a private workspace package and ships inside the service. Runtime and service remain reusable outside DSH; the DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
 
-| Directory | npm package | Responsibility |
-| --- | --- | --- |
-| `packages/runtime` | `@scottzx/1acp` | Agent runtime and CLI |
-| `packages/service` | `@1agents/acp-service` | Local harness discovery, ACP JSON-RPC WebSocket service and session recovery |
-| `packages/dsh-plugin` | `@1agents/dsh-acp` | DSH session presets, native commands, model selection and interactions |
+| Directory             | npm package            | Responsibility                                                               |
+| --------------------- | ---------------------- | ---------------------------------------------------------------------------- |
+| `packages/runtime`    | Private workspace only | Upstream agent runtime and CLI, embedded in the service                      |
+| `packages/service`    | `@1agents/acp-service` | Local harness discovery, ACP JSON-RPC WebSocket service and session recovery |
+| `packages/dsh-plugin` | `@1agents/dsh-acp`     | DSH session presets, native commands, model selection and interactions       |
 
 ## Development
 
@@ -22,7 +22,7 @@ pnpm test:integration
 pnpm test
 ```
 
-The service resolves `@scottzx/1acp` directly from the workspace. Build runtime before service. The DSH development links supply types only; the Host provides those services at runtime.
+Build runtime before service; the service build embeds its compiled output, skills and license. Consumers can import `@1agents/acp-service/runtime`, `@1agents/acp-service/flows` and `@1agents/acp-service/agent-registry`, or use the unified `acp-service` CLI. The DSH development links supply types only; the Host provides those services at runtime.
 
 ```sh
 # Run from the DSH checkout; the plugin starts or reuses its local service:
@@ -34,9 +34,13 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 ## Package releases
 
-Package names and versions remain independent. Use `pnpm --filter <package-name> pack` or `pnpm --filter <package-name> publish`; pnpm converts `workspace:^` dependencies into published version ranges for the service and plugin. Publish a required runtime version before the service, and the service before its dependent plugin. The DSH plugin is public and declares the DSH bundle installation metadata.
+Publish `@1agents/acp-service` before `@1agents/dsh-acp`. The runtime is private and is never packed or published separately. The service includes the runtime and its dependencies; the plugin uses `workspace:^`, which pnpm converts to the service's current version range when packing.
 
-The former single-package workflows are retained inside their package directories as historical references and are not active GitHub workflows. Root CI validates the runtime, service and DSH plugin. The former package-local Husky hook is not installed at the workspace root; run the documented checks before committing. The root Release workflow publishes the validated tarballs using the repository’s `NPM_TOKEN` secret; it accepts one package or the complete dependency chain. Versions come from each package manifest. A retry skips an already published version only when its tarball integrity matches; changed contents require a version bump.
+Push CI builds and packs each release package once. Runtime integration tests run in four disjoint lanes; the remaining tests, viewer test, coverage gate and Python Autoreview suite run independently. Fixed-ref DSH build outputs are cached by ref, lockfile, OS, architecture and Node version. CI also installs the service tarball outside the workspace to verify its CLI, public runtime exports and service startup.
+
+Run the root **Release** workflow on `main`, selecting `all`, `service` or `dsh-plugin`. It locates successful push CI for the exact release commit, waits if that CI is still running, and downloads its existing tarballs. An optional `ci_run_id` pins the source run; SHA, repository, workflow, branch and success are verified. No build or test runs during Release. If no matching successful CI exists or its artifacts have expired, run CI first.
+
+Release checks artifact SHA/checksums, manifests, dependencies and the embedded runtime before publishing via `NPM_TOKEN`. A plugin-only release also compares the published service contents with the service tarball from that CI run. Retry Release on the same commit after a publish or registry error: it reuses the CI tarballs and skips already published versions only after verifying their complete contents. Registry propagation retries are bounded to eight attempts with five-second intervals, rather than a fifteen-minute polling loop. Changed published contents require a version bump.
 
 ## Repository migration
 

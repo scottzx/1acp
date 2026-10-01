@@ -322,6 +322,17 @@ test("public inspection resolves installed direct agents without running package
   assert.deepEqual(registry.resolve("opencode"), AGENT_ARGV_REGISTRY.opencode);
 });
 
+test("public inspection resolves installed Mux without running npx", () => {
+  const registry = createAgentRegistry({
+    resolveExecutable: (command) => (command === "mux" ? "/tools/mux" : undefined),
+    resolvePackageRoot: () => undefined,
+  });
+  assert.deepEqual(registry.inspect("mux")?.launch, {
+    kind: "installed",
+    argv: ["/tools/mux", "acp"],
+  });
+});
+
 test("public inspection respects custom overrides and never accepts package-exec readiness", () => {
   const registry = createAgentRegistry({
     overrides: { opencode: ["custom-agent", "--stdio"], qwen: ["npx", "custom-qwen"] },

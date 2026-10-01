@@ -20,10 +20,13 @@ function agentStartupMessage(params: {
       ? `: ${params.stderrSummary.trim()}`
       : "";
   const base = `ACP agent exited before initialize completed (${exitSummary})${stderrSuffix}`;
-  if (process.platform !== "darwin") {
-    return base;
+  if (
+    /npm\s+(?:error|ERR!)\s+code\s+ENOTEMPTY\b/u.test(stderrSuffix) &&
+    /[/\\]_npx[/\\]/u.test(stderrSuffix)
+  ) {
+    return `${base} npm could not replace a directory in its npx cache (ENOTEMPTY). Upgrade npm and move the affected npx cache directory aside before retrying, after ensuring no other installation is using it.`;
   }
-  return `${base} On macOS, this usually means the agent CLI is not installed/executable in your PATH, or a required device (e.g. for full-screen or hardware access) is not configured in System Settings. Check \`which <agent>\` and ensure the binary exists and is executable; also verify device permissions in System Settings → Privacy & Security.`;
+  return base;
 }
 
 export class AcpxOperationalError extends Error {

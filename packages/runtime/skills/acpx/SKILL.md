@@ -81,6 +81,8 @@ If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdi
 
 ## Built-in agent registry
 
+The `@1agents/acp-service` host prefers adapter packages in its search roots, then installed adapter executables, before using npx. JavaScript adapter executables run with the service's Node interpreter. Embedded Mux inspection recognizes the installed `mux acp` entrypoint. A startup diagnostic containing npm `ENOTEMPTY` inside `_npx` identifies a cache directory replacement failure: upgrade npm and move that affected directory aside only after ensuring no installation is using it, then retry.
+
 Friendly agent names resolve to commands:
 
 - `pi` -> `npx pi-acp` (ACPX-owned package range; see `agents/Pi.md`)

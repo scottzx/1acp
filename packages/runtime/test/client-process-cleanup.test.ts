@@ -249,9 +249,13 @@ test(
     await fs.mkdir(bin);
     await fs.writeFile(
       path.join(bin, "ps"),
-      '#!/bin/sh\nexec /bin/cat "$ACPX_TEST_PROCESS_TABLE"\n',
+      '#!/bin/sh\n[ "$1" = --fixture-ready ] && exit 0\nexec /bin/cat "$ACPX_TEST_PROCESS_TABLE"\n',
       { mode: 0o755 },
     );
+    // Prepare the new executable before starting the bounded process-table read.
+    const prepared = spawnSync(path.join(bin, "ps"), ["--fixture-ready"], { timeout: 10_000 });
+    assert.ifError(prepared.error);
+    assert.equal(prepared.status, 0);
     const previousPath = process.env.PATH;
     const previousTable = process.env.ACPX_TEST_PROCESS_TABLE;
     process.env.PATH = `${bin}${path.delimiter}${previousPath ?? ""}`;

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { client } from '@agentclientprotocol/sdk';
-import { createAgentRegistry, createRuntimeStore } from '@scottzx/1acp/runtime';
+import { createAgentRegistry, createRuntimeStore } from '@1agents/acp-service/runtime';
 import { WebSocket } from 'ws';
 
 test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', { timeout: 20000 }, async t => {

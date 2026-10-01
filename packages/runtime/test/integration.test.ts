@@ -7,7 +7,6 @@ import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isAcpJsonRpcMessage } from "../src/acp/jsonrpc.js";
@@ -20,6 +19,7 @@ import {
 } from "../src/session/conversation-model.js";
 import { parseSessionRecord } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+import test from "./integration-test-sharding.js";
 import {
   extractAgentMessageChunkText,
   extractJsonRpcId,

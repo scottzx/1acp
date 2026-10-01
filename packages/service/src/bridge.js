@@ -9,7 +9,7 @@ import {
   createAcpRuntime,
   createRuntimeStore,
   createTurnJournal,
-} from "@scottzx/1acp/runtime";
+} from "@1agents/acp-service/runtime";
 import {
   historyToolInput,
   resolveRuntimeTurnId,

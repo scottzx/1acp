@@ -1,6 +1,6 @@
 # @1agents/dsh-acp
 
-An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and installs acp-service 0.2 as a dependency. No DSH source files are modified.
+An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and installs acp-service 0.4 with its embedded runtime as a dependency. No DSH source files are modified.
 
 ## Use
 
@@ -17,7 +17,7 @@ The package declares `dsh.bundle.patch` and its browser entry, so installation s
 The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
 
 ```sh
-npx --yes @1agents/acp-service@^0.2.0 serve --host 127.0.0.1 --port 36812 --no-report
+npx --yes @1agents/acp-service@^0.4.0 serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
 The service requires each native Agent’s CLI and credentials. Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin`.

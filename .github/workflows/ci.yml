@@ -3,12 +3,15 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_call:
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
-  runtime-service:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -16,42 +19,89 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-      - name: Install autoreview Python dependencies
-        run: python -m pip install -r packages/runtime/requirements-autoreview.txt
       - run: pnpm install --frozen-lockfile
       - run: node --test scripts/*.test.mjs
-      - run: pnpm --filter @scottzx/1acp check
+      - run: pnpm --filter @scottzx/1acp format:check
+      - run: pnpm --filter @scottzx/1acp typecheck
+      - run: pnpm --filter @scottzx/1acp lint
+      - run: pnpm --filter @scottzx/1acp build
+      - run: pnpm --filter @scottzx/1acp viewer:typecheck
+      - run: pnpm --filter @scottzx/1acp viewer:build
       - run: pnpm --filter @scottzx/1acp check:docs
-      - run: pnpm --filter @1agents/acp-service typecheck
-      - run: pnpm --filter @1agents/acp-service test
-      - name: Pack runtime and service tarballs
-        run: |
-          mkdir -p release
-          pnpm --filter @scottzx/1acp pack --pack-destination "$GITHUB_WORKSPACE/release"
-          pnpm --filter @1agents/acp-service pack --pack-destination "$GITHUB_WORKSPACE/release"
-      - name: Verify packed manifests publish correctly
-        run: |
-          set -eu
-          check() {
-            local archive="$1" name="$2" version="$3" dep="$4" want="$5"
-            local got
-            got=$(tar -xOf "release/$archive" package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s);console.log(p.name+'|'+p.version+'|'+(p.dependencies?.[\"$dep\"]??'missing'))})")
-            case "$got" in
-              "$name|$version|$want") echo "ok $name@$version -> $dep@$want" ;;
-              *) echo "::error::packed manifest mismatch for $archive: got [$got], want $name|$version|$want"; exit 1 ;;
-            esac
-          }
-          check scottzx-1acp-0.16.0.tgz @scottzx/1acp 0.16.0 @openclaw/fs-safe '^0.20.0'
-          check 1agents-acp-service-0.3.0.tgz @1agents/acp-service 0.3.0 @scottzx/1acp '^0.16.0'
+      - run: pnpm --filter @scottzx/1acp build:test
       - uses: actions/upload-artifact@v4
         with:
-          name: runtime-service-packages
-          path: release/*.tgz
-  dsh-plugin:
+          name: runtime-tests
+          path: |
+            packages/runtime/dist/
+            packages/runtime/dist-test/
+          retention-days: 7
+      - run: pnpm --filter @1agents/acp-service build
+      - run: pnpm --filter @1agents/acp-service typecheck
+      - run: pnpm --filter @1agents/acp-service test
+      - run: node scripts/release-artifacts.mjs service
+      - run: node scripts/smoke-service-package.mjs release/*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-build
+          path: |
+            packages/service/dist/
+            packages/service/vendor/
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: service-package
+          path: |
+            release/*.tgz
+            release/service-manifest.json
+          retention-days: 30
+  runtime-tests:
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [unit-1, unit-2, integration-1, integration-2, integration-3, integration-4, viewer, coverage]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-tests
+          path: packages/runtime
+      - name: Run partitioned runtime tests
+        if: matrix.lane != 'coverage'
+        run: node scripts/runtime-tests.mjs "$TEST_LANE"
+        env:
+          TEST_LANE: ${{ matrix.lane }}
+      - name: Enforce existing coverage thresholds
+        if: matrix.lane == 'coverage'
+        run: pnpm --filter @scottzx/1acp test:coverage:only
+  autoreview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: packages/runtime/requirements-autoreview.txt
+      - run: python -m pip install -r packages/runtime/requirements-autoreview.txt
+      - run: python -I -B scripts/check-autoreview.py
+        working-directory: packages/runtime
+  dsh-plugin:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DSH_REF: 21638c56315ae6a2b552d6091945d3144c9af32e
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -63,26 +113,40 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: deepseek-ai/deepseek-harness
-          ref: 21638c56315ae6a2b552d6091945d3144c9af32e
+          ref: ${{ env.DSH_REF }}
           path: .dsh-checkout
       - run: corepack pnpm install --frozen-lockfile
         working-directory: .dsh-checkout
-      - run: corepack pnpm run build
+      - uses: actions/cache@v4
+        id: dsh-cache
+        with:
+          path: .dsh-build-cache.tgz
+          key: dsh-build-v1-${{ runner.os }}-${{ runner.arch }}-node24-${{ env.DSH_REF }}-${{ hashFiles('.dsh-checkout/pnpm-lock.yaml') }}
+      - name: Restore fixed DSH build
+        if: steps.dsh-cache.outputs.cache-hit == 'true'
+        run: tar -xzf .dsh-build-cache.tgz -C .dsh-checkout
+      - name: Build fixed DSH checkout
+        if: steps.dsh-cache.outputs.cache-hit != 'true'
+        run: corepack pnpm run build
+        working-directory: .dsh-checkout
+      - name: Archive DSH build outputs
+        if: steps.dsh-cache.outputs.cache-hit != 'true'
+        run: |
+          git ls-files --others --ignored --exclude-standard -z -- packages vendor apps/web/dist native/system .dsh-build ':!:**/node_modules/**' > "$RUNNER_TEMP/dsh-build-files"
+          test -s "$RUNNER_TEMP/dsh-build-files"
+          tar --null -T "$RUNNER_TEMP/dsh-build-files" -czf ../.dsh-build-cache.tgz
         working-directory: .dsh-checkout
       - run: pnpm link:dsh "$GITHUB_WORKSPACE/.dsh-checkout"
-      - run: pnpm --filter @1agents/acp-service... build
+      - uses: actions/download-artifact@v4
+        with:
+          name: service-build
+          path: packages/service
       - run: pnpm --filter @1agents/dsh-acp test
-      - name: Pack plugin tarball and verify its dependency range
-        run: |
-          set -eu
-          mkdir -p release
-          pnpm --filter @1agents/dsh-acp pack --pack-destination "$GITHUB_WORKSPACE/release"
-          got=$(tar -xOf release/1agents-dsh-acp-0.2.1.tgz package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const p=JSON.parse(s);console.log(p.name+'|'+p.version+'|'+p.dependencies?.['@1agents/acp-service']??'missing')})")
-          case "$got" in
-            "@1agents/dsh-acp|0.2.1|^0.3.0") echo "ok plugin manifest" ;;
-            *) echo "::error::packed manifest mismatch: got [$got]"; exit 1 ;;
-          esac
+      - run: node scripts/release-artifacts.mjs dsh-plugin
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-plugin-package
-          path: release/*.tgz
+          path: |
+            release/*.tgz
+            release/dsh-plugin-manifest.json
+          retention-days: 30

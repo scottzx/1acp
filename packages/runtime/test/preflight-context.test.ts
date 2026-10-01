@@ -13,6 +13,7 @@ import type {
   PeerTrace,
   Source,
 } from "./fixtures/preflight-context.js";
+import { preflightLauncher } from "./fixtures/preflight-launcher.js";
 
 const runFile = promisify(execFile);
 const fixturePath = fileURLToPath(new URL("./fixtures/preflight-context.js", import.meta.url));
@@ -112,10 +113,6 @@ const cases: Case[] = [
   },
 ];
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
 for (const scenario of cases) {
   test(scenario.name, { skip: process.platform === "win32", timeout: 20_000 }, async (t) => {
     const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "acpx-preflight-")));
@@ -149,12 +146,13 @@ for (const scenario of cases) {
       if (!config.profiles[source]) {
         continue;
       }
-      const args = [process.execPath, fixturePath, "peer", configPath, source];
-      await fs.writeFile(
-        path.join(bins[source], scenario.agent),
-        `#!/bin/sh\nexec ${args.map(shellQuote).join(" ")} "$@"\n`,
-        { mode: 0o755 },
-      );
+      const command = path.join(bins[source], scenario.agent);
+      await fs.writeFile(command, preflightLauncher(fixturePath, configPath, config, source), {
+        mode: 0o755,
+      });
+      // A new script's first execution can consume the probe budget on macOS.
+      // Finish fixture preparation before measuring the real compatibility probe.
+      await runFile(command, ["--fixture-ready"], { timeout: 10_000 });
     }
     const parentEnv: NodeJS.ProcessEnv = {
       HOME: home,

@@ -1,83 +1,114 @@
-/** Publish CI-validated tarballs in runtime → service → DSH plugin order. */
-import { readFileSync } from 'node:fs';
+/** Publish the immutable tarballs selected from successful CI; never rebuild. */
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-/** A retry may reuse only the immutable archive already present in the registry. */
+import { validateArtifacts, digest } from './release-artifacts.mjs';
+
 export function verifyPublishedArchive(archive, dist) {
   const integrity = 'sha512-' + createHash('sha512').update(archive).digest('base64');
-  if (dist?.integrity !== integrity) throw new Error('Published version has different contents; bump the package version');
+  if (dist?.integrity !== integrity) throw new Error('Published version has different archive integrity');
 }
 
-/** After publishing, confirm the registry copy resolves the declared dependency.
- * Talks to https://registry.npmjs.org directly so a local .npmrc mirror does not
- * delay the publish pipeline; the official write appears immediately, but
- * any mirror cache may lag the write for minutes. */
-export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 60, delayMs = 15_000 } = {}) {
-  let resolved;
+/** Compare contents and permissions when npm has changed only archive compression metadata.
+ * Reject changed code, missing files, links and duplicate or unsafe entries. */
+export function archiveContentDigest(archive) {
+  const listing = execFileSync('tar', ['-tvf', archive], { encoding: 'utf8' }).trim().split('\n');
+  if (listing.some(line => !['-', 'd'].includes(line[0]))) throw new Error('Release archive contains links or special files');
+  const names = execFileSync('tar', ['-tf', archive], { encoding: 'utf8' }).trim().split('\n');
+  if (names.length !== listing.length) throw new Error('Inconsistent release archive listing');
+  const modes = new Map(names.map((name, i) => [name, listing[i].slice(0, 10)]));
+  const entries = [...names].sort();
+  if (!entries.length || new Set(entries).size !== entries.length || entries.some(name => !name.startsWith('package/') || name.split('/').includes('..'))) {
+    throw new Error('Unsafe or duplicate release archive entries');
+  }
+  return digest(Buffer.from(JSON.stringify(entries.map(name => [name, modes.get(name), name.endsWith('/')
+    ? null : digest(execFileSync('tar', ['-xOf', archive, name], { maxBuffer: 16 * 1024 * 1024 }))]))));
+}
+
+export async function verifyRegistryState(name, version, dependency, range, fetcher = fetchRegistry, { attempts = 8, delayMs = 5_000 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      resolved = await fetcher(name, version, dependency);
-      if (resolved === range) {
-        console.log(`registry ok: ${name}@${version} -> ${dependency}@${resolved}`);
-        return;
-      }
-      throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved ?? 'missing'}; expected ${range}`);
+      const resolved = await fetcher(name, version, dependency);
+      if (resolved !== range) throw new Error(`Registry ${name}@${version} declares ${dependency}@${resolved ?? 'missing'}; expected ${range}`);
+      console.log(`registry ok: ${name}@${version}`);
+      return;
     } catch (error) {
-      // Only E404 from the official registry is treated as a propagation delay;
-      // mismatched ranges or network errors short-circuit immediately.
-      if (attempt === attempts || !/E404|404|Not Found/i.test(String(error.message))) throw error;
-      console.log(`registry read for ${name}@${version} not propagated yet (attempt ${attempt}/${attempts}); retrying in ${delayMs / 1000}s`);
-      await new Promise((r) => setTimeout(r, delayMs));
+      if (attempt === attempts || !/^E404 from registry/.test(String(error.message))) throw error;
+      console.log(`Waiting for registry ${name}@${version} (${attempt}/${attempts})`);
+      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 }
 
-async function fetchRegistry(name, version, dependency) {
-  const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`;
-  const response = await fetch(url, { headers: { 'content-type': 'application/json' } });
-  if (response.status === 404) throw new Error(`E404 from registry for ${url}`);
-  if (!response.ok) throw new Error(`Registry check for ${name}@${version} failed: HTTP ${response.status}`);
-  const doc = await response.json();
-  return doc?.dependencies?.[dependency];
+async function registryDocument(name, version) {
+  const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`, { signal: AbortSignal.timeout(15_000) });
+  if (response.status === 404) throw new Error(`E404 from registry for ${name}@${version}`);
+  if (!response.ok) throw new Error(`Registry check failed: HTTP ${response.status}`);
+  return response.json();
 }
 
-const EXPECTED_DEPENDENCIES = {
-  runtime: ['@openclaw/fs-safe', '^0.20.0'],
-  service: ['@scottzx/1acp', '^0.16.0'],
-  'dsh-plugin': ['@1agents/acp-service', '^0.3.0'],
-};
+async function fetchRegistry(name, version, dependency) {
+  const doc = await registryDocument(name, version);
+  return dependency ? doc.dependencies?.[dependency] : doc.version;
+}
+
+async function verifyExisting(archive, dist) {
+  try { verifyPublishedArchive(readFileSync(archive), dist); return; }
+  catch { /* Compare the complete registry artifact, never trust integrity drift. */ }
+  const url = new URL(dist.tarball);
+  if (url.protocol !== 'https:' || url.hostname !== 'registry.npmjs.org') throw new Error('Unexpected registry tarball URL');
+  const response = await fetch(url, { signal: AbortSignal.timeout(30_000), redirect: 'error' });
+  if (!response.ok) throw new Error(`Registry tarball download failed: HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  verifyPublishedArchive(bytes, dist);
+  const directory = mkdtempSync(join(tmpdir(), 'acp-published-'));
+  try {
+    const remote = join(directory, 'published.tgz');
+    writeFileSync(remote, bytes);
+    if (archiveContentDigest(archive) !== archiveContentDigest(remote)) {
+      throw new Error('Published version has different contents; bump the package version');
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+}
+
+/** A plugin-only release must use the service contents validated by its CI. */
+export async function verifyPluginService(artifact, readDocument = registryDocument) {
+  const { name, version } = artifact.packed;
+  await verifyRegistryState(name, version, undefined, version, async () =>
+    (await readDocument(name, version)).version);
+  const published = await readDocument(name, version);
+  await verifyExisting(artifact.archive, published.dist);
+}
 
 async function publishPackages() {
   const selection = process.env.RELEASE_PACKAGE;
-  const packages = ['runtime', 'service', 'dsh-plugin'];
-  if (selection !== 'all' && !packages.includes(selection)) throw new Error('Invalid release package');
-  for (const directory of packages) {
-    if (selection !== 'all' && selection !== directory) continue;
-    const { name, version } = JSON.parse(readFileSync(`packages/${directory}/package.json`, 'utf8'));
-    const archive = resolve(`release/${name.replace('@', '').replace('/', '-')}-${version}.tgz`);
-    const packed = JSON.parse(execFileSync('tar', ['-xOf', archive, 'package/package.json'], { encoding: 'utf8' }));
-    if (packed.name !== name || packed.version !== version || packed.private) throw new Error(`Invalid release archive: ${archive}`);
-    const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`);
-    if (response.status === 404) {
-      execFileSync('npm', ['publish', archive, '--access', 'public', '--provenance'], { stdio: 'inherit' });
-    } else if (response.ok) {
-      const published = await response.json();
-      try {
-        verifyPublishedArchive(readFileSync(archive), published.dist);
-      } catch (error) {
-        // npm re-packs on re-upload (mtime, gzip metadata) so byte-level
-        // integrity often drifts even for identical contents; only the
-        // declared dependency range matters for downstream consumers.
-        console.warn(`${name}@${version} integrity differs (${error.message}); trusting the registry copy`);
-      }
-      console.log(`${name}@${version} is already published; skipping`);
-    } else {
-      throw new Error(`Registry check failed for ${name}: HTTP ${response.status}`);
+  const sha = process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  // Validate all selected artifacts before the first irreversible publish.
+  const artifacts = validateArtifacts(selection, sha);
+  const serviceArtifact = selection === 'dsh-plugin' ? validateArtifacts('service', sha)[0] : undefined;
+  if (serviceArtifact) await verifyPluginService(serviceArtifact);
+  for (const { directory, archive, packed } of artifacts) {
+    const { name, version } = packed;
+    const range = packed.dependencies?.['@1agents/acp-service'];
+    if (directory === 'dsh-plugin') {
+      await verifyRegistryState('@1agents/acp-service', range.slice(1), undefined, range.slice(1));
     }
-    const [dependency, range] = EXPECTED_DEPENDENCIES[directory];
-    await verifyRegistryState(name, version, dependency, range);
+    let existing;
+    try { existing = await registryDocument(name, version); }
+    catch (error) { if (!/^E404 from registry/.test(error.message)) throw error; }
+    if (existing) {
+      await verifyExisting(archive, existing.dist);
+      console.log(`${name}@${version} already published with matching contents; skipping`);
+    } else {
+      execFileSync('npm', ['publish', archive, '--access', 'public', '--provenance', '--registry=https://registry.npmjs.org'], { stdio: 'inherit' });
+    }
+    await verifyRegistryState(name, version, undefined, version);
+    for (const [dependency, expected] of Object.entries(packed.dependencies)) {
+      await verifyRegistryState(name, version, dependency, expected);
+    }
     const tag = `${name.split('/').at(-1)}-v${version}`;
     const remote = execFileSync('git', ['ls-remote', '--tags', 'origin', `refs/tags/${tag}`], { encoding: 'utf8' }).trim();
     if (!remote) {

@@ -7,3 +7,5 @@ coverage/
 .dsh-checkout/
 release/
 .corepack/
+packages/service/vendor/
+.dsh-build-cache.tgz

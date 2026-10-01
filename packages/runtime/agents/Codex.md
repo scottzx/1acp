@@ -21,3 +21,5 @@ For the identified Codex ACP adapter, acpx prefers an offered `decline` or `reje
 Embedded inspection resolves the installed `codex-acp` adapter or its installed `@agentclientprotocol/codex-acp` package. The ACP adapter supplies the launch entrypoint. Configure the adapter’s authentication before acquiring a model catalog or starting a session.
 
 Inspection performs filesystem lookup only. See [embedded agent discovery](../docs/session-control.md#embedded-agent-discovery) for the registry contract and session lifecycle.
+
+The `@1agents/acp-service` host uses an installed adapter package first, then the installed `codex-acp` executable before falling back to npx. JavaScript launchers use the service's Node interpreter. A native `codex` CLI alone does not supply the ACP adapter. When npm reports `ENOTEMPTY` in its `_npx` cache during startup, upgrade npm and move the affected cache directory aside after checking that no installation is using it, then retry.

@@ -25,13 +25,13 @@ import type {
   PeerProfile,
   PeerTrace,
 } from "./fixtures/preflight-context.js";
+import { preflightLauncher } from "./fixtures/preflight-launcher.js";
 
 const peerPath = fileURLToPath(new URL("./fixtures/preflight-context.js", import.meta.url));
 const runFile = promisify(execFile);
 const native = { skip: process.platform === "win32", timeout: 15_000 };
 const modern: PeerProfile = { version: "0.33.0", flag: "--acp" };
 const old: PeerProfile = { version: "0.32.9", flag: "--experimental-acp" };
-const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 test("settled probe streams keep late destruction errors handled", async () => {
   const child = Object.assign(new ChildProcess(), {
@@ -105,11 +105,11 @@ async function fixture(
     cleanupToken: randomUUID(),
   };
   await fs.writeFile(configPath, JSON.stringify(config));
-  await fs.writeFile(
-    command,
-    `#!/bin/sh\nexec ${[process.execPath, peerPath, "peer", configPath, "session"].map(quote).join(" ")} "$@"\n`,
-    { mode: 0o755 },
-  );
+  await fs.writeFile(command, preflightLauncher(peerPath, configPath, config, "session"), {
+    mode: 0o755,
+  });
+  // Separate new executable preparation from the client's bounded probe.
+  await runFile(command, ["--fixture-ready"], { timeout: 10_000 });
   const options: AcpClientOptions = {
     agentCommand: command,
     agentArgv: [command, "--acp", ...(agent === "copilot" ? ["--stdio"] : [])],
@@ -324,15 +324,17 @@ test(
     const f = await fixture(t, { ...modern, probeBehavior: "hold" });
     const denial = new Error("synthetic spawned admission denied");
     let pid = 0;
+    const launches: AcpProcessLaunch[] = [];
     const exits: AcpProcessExit[] = [];
     const client = f.client({
+      onBeforeSpawn: (event) => {
+        launches.push(event);
+      },
       onSpawned: async (event) => {
         assert(event.args.includes("--version"));
         pid = event.pid;
-        await waitUntil(
-          async () => (await f.trace()).some((entry) => entry.pid === pid),
-          "probe did not run",
-        );
+        // The OS spawn receipt proves a live owned child. Waiting for its Node
+        // fixture to boot here races the independent two-second probe deadline.
         assert(isRunning(pid), "probe was not live when admission was rejected");
         throw denial;
       },
@@ -344,6 +346,10 @@ test(
     await waitUntil(() => !isRunning(pid), "rejected probe survived cleanup");
     await waitUntil(() => exits.length === 1, "missing rejected-probe exit");
     assert.equal(exits[0]?.pid, pid);
+    assert.deepEqual(
+      launches.map((event) => event.args),
+      [["--version"]],
+    );
     assert(
       (await f.trace()).every(
         (entry) => entry.args[0] === "--version" && entry.event === "invocation",

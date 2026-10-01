@@ -1,5 +1,7 @@
 # Mux
 
+Embedded inspection recognizes an installed `mux` executable and preserves its `acp` argument. The `@1agents/acp-service` host uses that executable before the npx fallback when no adapter package is installed in its search roots.
+
 - Built-in name: `mux`
 - Default entrypoint: `mux acp` via an ACPX-owned npm range
 - Upstream: https://mux.coder.com/integrations/acp

@@ -36,6 +36,7 @@ Repo: https://github.com/scottzx/1acp
 - Flow shells: collect final output after process exit with a bounded drain for inherited pipes, and reject invalid stdin before spawning. Thanks @odrobnik.
 - Flow timers: reject non-finite or overflowing node and shell deadlines before they become immediate timeouts. Thanks @odrobnik.
 - Windows: preserve complete backslash runs before quotes and at the end of batch-wrapper arguments. Thanks @odrobnik.
+- Service/agents: use installed ACP adapter executables before npx, launch JavaScript adapters with the service interpreter, and report npm cache conflicts without unrelated macOS permission advice.
 
 ## 0.19.3 - 2026-09-25
 

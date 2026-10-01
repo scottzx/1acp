@@ -1,6 +1,6 @@
 {
   "name": "@1agents/acp-service",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DreamMate Network ACP Agent Runtime Service: cross-agent execution runtime for Claude Code, Grok, Codex and ACP-compatible agents.",
   "keywords": [
     "dreammate",
@@ -28,17 +28,31 @@
       "types": "./dist/src/index.d.ts",
       "import": "./dist/src/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./runtime": {
+      "types": "./vendor/runtime/dist/runtime.d.ts",
+      "import": "./vendor/runtime/dist/runtime.js"
+    },
+    "./flows": {
+      "types": "./vendor/runtime/dist/flows.d.ts",
+      "import": "./vendor/runtime/dist/flows.js"
+    },
+    "./runtime-cli": "./vendor/runtime/dist/cli.js",
+    "./agent-registry": {
+      "types": "./vendor/runtime/dist/agent-registry.d.ts",
+      "import": "./vendor/runtime/dist/agent-registry.js"
+    }
   },
   "bin": {
     "acp-service": "dist/bin/acp-service.js"
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "vendor"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node ../../scripts/embed-runtime.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --import tsx --test test/*.test.ts",
     "prepack": "npm run build",
@@ -51,13 +65,18 @@
     "@1agents/dreammate-network": "^0.3.1",
     "@1agents/dreammate-node": "^0.4.0",
     "@agentclientprotocol/sdk": "1.4.0",
-    "@scottzx/1acp": "workspace:^",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "@1agents/acp-runtime-sdk": "npm:@agentclientprotocol/sdk@^1.5.0",
+    "@openclaw/fs-safe": "^0.20.0",
+    "commander": "^15.0.0",
+    "skillflag": "^0.2.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.14",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "@scottzx/1acp": "workspace:*"
   }
 }

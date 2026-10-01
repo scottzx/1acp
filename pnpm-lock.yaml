@@ -140,6 +140,9 @@ importers:
 
   packages/service:
     dependencies:
+      '@1agents/acp-runtime-sdk':
+        specifier: npm:@agentclientprotocol/sdk@^1.5.0
+        version: '@agentclientprotocol/sdk@1.5.0(zod@4.6.5)'
       '@1agents/dreammate-network':
         specifier: ^0.3.1
         version: 0.3.2
@@ -149,22 +152,34 @@ importers:
       '@agentclientprotocol/sdk':
         specifier: 1.4.0
         version: 1.4.0(zod@4.6.5)
-      '@scottzx/1acp':
-        specifier: workspace:^
-        version: link:../runtime
+      '@openclaw/fs-safe':
+        specifier: ^0.20.0
+        version: 0.20.0
+      commander:
+        specifier: ^15.0.0
+        version: 15.0.0
+      skillflag:
+        specifier: ^0.2.1
+        version: 0.2.1
+      tsx:
+        specifier: ^4.23.15
+        version: 4.23.15
       ws:
         specifier: ^8.18.0
         version: 8.21.3
+      zod:
+        specifier: ^4.6.5
+        version: 4.6.5
     devDependencies:
+      '@scottzx/1acp':
+        specifier: workspace:*
+        version: link:../runtime
       '@types/node':
         specifier: ^22.10.2
         version: 22.20.4
       '@types/ws':
         specifier: ^8.5.14
         version: 8.18.1
-      tsx:
-        specifier: ^4.19.2
-        version: 4.23.13
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
@@ -2882,11 +2897,6 @@ packages:
   tslib@2.8.1:
     resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
 
-  tsx@4.23.13:
-    resolution: {integrity: sha512-BL5MGkRln6aDYhb0xbQlEAGw743BaZYWdbWtdJOBriYJboKgUUYCadFp2/FpBBZquBC/ezNBn7wMMPx7FDZUDw==}
-    engines: {node: '>=18.0.0'}
-    hasBin: true
-
   tsx@4.23.15:
     resolution: {integrity: sha512-Yiex1Ovn8z2xPpOWckIiysV1SSyRMY9BkLF++q0yKiDxCqRhosKfMg3janKkiLBwZ5c/YryloKwGZcrEmtwxKw==}
     engines: {node: '>=18.0.0'}
@@ -5477,12 +5487,6 @@ snapshots:
       - vue-tsc
 
   tslib@2.8.1: {}
-
-  tsx@4.23.13:
-    dependencies:
-      esbuild: 0.28.2
-    optionalDependencies:
-      fsevents: 2.3.3
 
   tsx@4.23.15:
     dependencies:

@@ -3,21 +3,28 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: Package to publish at its manifest version
+        description: Package to publish from successful CI for this commit
         type: choice
         default: all
-        options: [all, runtime, service, dsh-plugin]
-concurrency: npm-release
+        options: [all, service, dsh-plugin]
+      ci_run_id:
+        description: Optional successful main CI run ID (must match this commit)
+        type: string
+        default: ''
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
 permissions:
   contents: read
+  actions: read
 jobs:
-  checks:
-    uses: ./.github/workflows/ci.yml
   publish:
-    needs: checks
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
+      actions: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -25,12 +32,20 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - name: Resolve successful CI for this exact commit
+        id: ci
+        run: node scripts/resolve-release-ci.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
       - uses: actions/download-artifact@v4
         with:
-          pattern: '*-package*'
+          pattern: '*-package'
           path: release
           merge-multiple: true
-      - name: Publish validated packages in dependency order
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.ci.outputs.run-id }}
+      - name: Verify and publish existing CI tarballs in dependency order
         run: node scripts/publish-packages.mjs
         env:
           RELEASE_PACKAGE: ${{ inputs.package }}

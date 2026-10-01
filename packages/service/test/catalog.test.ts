@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { createAcpRuntime, createRuntimeStore, type AcpProcessLaunch } from '@1agents/acp-service/runtime';
 import { createServiceAgentRegistry, discoverAgents, findAgentBinary, type DiscoveryOptions } from '../src/catalog.js';
 
 function fixture(t: test.TestContext) {
@@ -44,6 +46,86 @@ test('installed adapter is ready without native CLI, but missing package entry i
   assert.deepEqual(createServiceAgentRegistry(f.options).resolve('codex'), [process.execPath, join(folder, 'cli.js')]);
   assert.equal(f.scan().get('codex')?.installed, false);
   assert.equal(f.scan().get('codex')?.chat_ready, true);
+});
+
+test('installed Codex adapter bypasses npx even without a native CLI or runner', t => {
+  const f = fixture(t);
+  const adapter = f.executable('bin/codex-acp');
+  assert.deepEqual(createServiceAgentRegistry(f.options).resolve('codex'), [adapter]);
+  assert.equal(f.scan().get('codex')?.chat_ready, true);
+  assert.equal(f.scan().get('codex')?.installed, false);
+  chmodSync(adapter, 0o644);
+  assert.equal(f.scan().get('codex')?.chat_ready, false);
+});
+
+test('Node adapter on PATH runs with the service interpreter when node is absent from PATH', t => {
+  const f = fixture(t);
+  const adapter = f.executable('bin/claude-agent-acp', '#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2)));\n');
+  const argv = createServiceAgentRegistry(f.options).resolve('claudecode');
+  assert.deepEqual(argv, [process.execPath, adapter]);
+  assert.ok(Array.isArray(argv));
+  const result = execFileSync(argv[0], [...argv.slice(1), 'argument with spaces'], {
+    encoding: 'utf8', env: { PATH: f.options.env!.PATH },
+  });
+  assert.deepEqual(JSON.parse(result), ['argument with spaces']);
+  assert.equal(f.scan().get('claude')?.chat_ready, true);
+});
+
+test('workspace adapter package retains precedence over a global adapter', t => {
+  const f = fixture(t);
+  f.executable('bin/codex-acp');
+  const folder = join(f.home, 'node_modules/@agentclientprotocol/codex-acp');
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, 'package.json'), JSON.stringify({ name: '@agentclientprotocol/codex-acp', bin: { 'codex-acp': 'cli.js' } }));
+  writeFileSync(join(folder, 'cli.js'), '#!/usr/bin/env node\n');
+  assert.deepEqual(createServiceAgentRegistry(f.options).resolve('codex'), [process.execPath, join(folder, 'cli.js')]);
+});
+
+test('Windows adapter wrappers traverse the embedded runtime batch launch policy', async t => {
+  const f = fixture(t);
+  const adapter = f.executable('bin/codex-acp.CMD', '@echo off\r\n');
+  const options = { ...f.options, platform: 'win32' as const, env: { PATH: join(f.home, 'bin'), PATHEXT: '.EXE;.CMD' } };
+  assert.deepEqual(createServiceAgentRegistry(options).resolve('codex'), [adapter]);
+  const comspec = 'C:\\Windows\\System32\\cmd.exe';
+  let launch: AcpProcessLaunch | undefined;
+  const runtime = createAcpRuntime({
+    cwd: f.home,
+    sessionStore: createRuntimeStore({ stateDir: join(f.home, 'state') }),
+    agentRegistry: createServiceAgentRegistry(options),
+    permissionMode: 'deny-all',
+    agentProcessEnv: { COMSPEC: comspec },
+    processLifecycle: {
+      onBeforeSpawn: event => {
+        launch = event;
+        throw new Error('fixture refuses OS spawn after recording Windows launch');
+      },
+      onSpawned: () => assert.fail('fixture must stop before spawning'),
+    },
+  });
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  try {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const report = await runtime.doctor();
+    assert.equal(report.ok, false);
+    assert.ok(report.details?.some(detail => detail.includes('fixture refuses OS spawn')));
+    assert.ok(launch);
+    assert.equal(launch.command, comspec);
+    assert.deepEqual(launch.args.slice(0, 3), ['/d', '/s', '/c']);
+    assert.match(launch.args[3] ?? '', /codex-acp\.CMD/);
+  } finally {
+    if (platform) Object.defineProperty(process, 'platform', platform);
+    await runtime.shutdown?.();
+  }
+});
+
+test('installed adapters retain their registry arguments exactly once', t => {
+  const f = fixture(t);
+  const adapter = f.executable('bin/opencode');
+  assert.deepEqual(createServiceAgentRegistry(f.options).resolve('opencode'), [adapter, 'acp']);
+  assert.equal(f.scan().get('opencode')?.chat_ready, true);
+  const mux = f.executable('bin/mux');
+  assert.deepEqual(createServiceAgentRegistry(f.options).resolve('mux'), [mux, 'acp']);
+  assert.equal(f.scan().get('mux')?.chat_ready, true);
 });
 
 test('native ACP discovery checks the launch binary, not only a display CLI alias', t => {

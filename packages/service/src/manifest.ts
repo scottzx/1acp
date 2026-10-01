@@ -4,7 +4,7 @@
  * 节点身份来自 `@1agents/dreammate-node`（优先 tailnet，回退本地），
  * 保证整台机器上的所有服务共享同一个 node_id 与 name。
  */
-import { createAgentRegistry } from '@scottzx/1acp/runtime';
+import { createAgentRegistry } from '@1agents/acp-service/runtime';
 import { nodeIdentity, type NodeIdentity } from '@1agents/dreammate-node';
 import {
   PROTOCOL_VERSION,

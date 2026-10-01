@@ -11,7 +11,7 @@ const rawArgs = process.argv.slice(2);
 const invokedBin = 'acp-service';
 
 function getAcpxCliPath(): string {
-  return require.resolve('@scottzx/1acp/dist/cli.js');
+  return require.resolve('@1agents/acp-service/runtime-cli');
 }
 
 function getPackageVersion(): string {
@@ -179,7 +179,7 @@ async function main() {
     return;
   }
 
-  // 6. Any other subcommand or arguments -> forward directly to @scottzx/1acp CLI
+  // 6. Any other subcommand or arguments -> forward directly to the embedded runtime CLI
   forwardToCli(rawArgs);
 }
 
