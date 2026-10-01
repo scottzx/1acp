@@ -9,7 +9,7 @@ import { AcpAdapter } from '../dist/adapter.js';
 import { stream } from '../dist/transport.js';
 import { State } from '../dist/state.js';
 
-async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}) {
+async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = []) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-test-'));
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise(r => wss.once('listening', r));
@@ -51,8 +51,9 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         if (!seen) { executions++; records.set(key, true); }
         const update = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ACP' }, _meta: { '1agents': { turnId, sequence: 1 } } };
         if (!seen) {
-          replay.set(params.sessionId, [update]);
-          await connection.client.notify('session/update', { sessionId: params.sessionId, update });
+          const updates = [update, ...toolUpdates.map((u, i) => ({ ...u, _meta: { ...u._meta, '1agents': { ...u._meta?.['1agents'], turnId, sequence: i + 2 } } }))];
+          replay.set(params.sessionId, updates);
+          for (const update of updates) await connection.client.notify('session/update', { sessionId: params.sessionId, update });
         }
         if (disconnect && !dropped) { dropped = true; ws.terminate(); return new Promise(() => {}); }
         if (interaction === 'question') {
@@ -69,6 +70,8 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     connection = app.connect(stream(ws));
   });
   const local = { id: 'dsh-session', session: { header: { cwd: directory, agentPreset: 'oneagents-acp-codex' }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: { commands: { register: definition => { commands.set(definition.name, definition); return () => commands.delete(definition.name); } } } };
+  const observations = [];
+  local.session.append = (...args) => { assert.equal(args.length, 2); observations.push({ type: args[0], data: structuredClone(args[1]) }); };
   const scopedCommands = local.ctx.commands;
   delete local.ctx.commands;
   local.ctx.inject = async (deps, apply) => { assert.deepEqual(deps, ['commands']); apply({ commands: scopedCommands, effect: () => {} }); return { dispose: async () => {} }; };
@@ -101,7 +104,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const adapter = new AcpAdapter(ctx, config);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
-  return { adapter, options, config, ctx, local, sent, prompts, changes, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
+  return { adapter, options, config, ctx, local, sent, prompts, changes, commands, observations, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
 
@@ -121,6 +124,36 @@ test('reconnect replays missing output and reuses the prompt id without duplicat
   const output = await collect(f.adapter, f.options('message-1'));
   assert.equal(output.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Hello ACP');
   assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
+});
+
+test('remote tool updates are durable observations, retain omitted fields, and never pollute reasoning or execute locally', { timeout: 5000 }, async t => {
+  const updates = [
+    { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Inspect the directory.' } },
+    { sessionUpdate: 'tool_call', toolCallId: 'exec-1', title: 'ls -la', kind: 'execute', status: 'in_progress', rawInput: { command: 'ls -la' }, _meta: { '1agents': { toolName: 'Bash' } } },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'exec-1', content: [{ type: 'content', content: { type: 'text', text: 'README.md' } }] },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'exec-1', status: 'completed', rawOutput: 'README.md' },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'exec-1', status: 'completed' },
+    { sessionUpdate: 'tool_call', toolCallId: 'exec-2', title: 'Read missing file', kind: 'read', status: 'pending', rawInput: { path: '/missing' } },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'exec-2', status: 'failed', rawOutput: 'File missing' },
+  ];
+  const f = await fixture(t, true, 'permission', async () => {}, updates);
+  f.local.session.boundary = { lastTurn: 3, lastStepStartSeq: 10 };
+  f.local.session.eventAt = () => ({ type: 'step/start', data: { turn: 3, step: 2 } });
+  const chunks = await collect(f.adapter, f.options('tools-1'));
+  assert.equal(chunks.filter(c => c.type === 'reasoning-delta').map(c => c.text).join(''), 'Inspect the directory.');
+  assert.ok(!chunks.some(c => c.type === 'tool-call-delta' || c.block?.type === 'tool-call'));
+  assert.equal(f.observations.length, 6); // Replay did not duplicate any observation.
+  assert.ok(f.observations.every(e => e.type === 'oneagents-acp/tool' && e.data.turn === 3 && e.data.step === 2));
+  const completed = f.observations[3].data.tool;
+  assert.equal(completed.title, 'ls -la');
+  assert.equal(completed.name, 'Bash');
+  assert.equal(completed.status, 'completed');
+  assert.deepEqual(completed.rawInput, { command: 'ls -la' });
+  assert.equal(completed.content[0].content.text, 'README.md');
+  assert.equal(f.observations.at(-1).data.tool.status, 'failed');
+  assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
+  await collect(f.adapter, f.options('tools-2'));
+  assert.notEqual(f.observations[0].data.requestId, f.observations[6].data.requestId);
 });
 
 test('binding survives a new adapter instance', { timeout: 5000 }, async t => {

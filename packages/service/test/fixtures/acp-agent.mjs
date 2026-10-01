@@ -17,7 +17,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       break;
     default:
       if (m.id === 'approval') {
-        send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', status: 'completed', rawOutput: 'saved' } } });
+        send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', content: [{ type: 'content', content: { type: 'text', text: 'saved' } }] } } });
+        send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', status: 'completed', rawOutput: { result: 'saved' } } } });
         send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fixture complete' } } } });
         send({ id: turn.id, result: { stopReason: 'end_turn' } });
       } else if (m.id !== undefined) send({ id: m.id, error: { code: -32601, message: 'Method not found' } });

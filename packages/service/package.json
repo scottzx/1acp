@@ -1,6 +1,6 @@
 {
   "name": "@1agents/acp-service",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness plugin in one package.",
   "keywords": [
     "dreammate",
@@ -107,6 +107,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-ui-commands",
         "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-tool",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-api-remotes"
       ]

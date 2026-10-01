@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { client } from '@agentclientprotocol/sdk';
+import { client, type SessionUpdate } from '@agentclientprotocol/sdk';
 import { createAgentRegistry, createRuntimeStore } from '@1agents/acp-service/runtime';
 import { WebSocket } from 'ws';
 
@@ -24,8 +24,12 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   const ws = new WebSocket(`ws://127.0.0.1:${service.port}/agents/codex`);
   await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   const updates: string[] = [];
+  const toolUpdates: Extract<SessionUpdate, { sessionUpdate: 'tool_call' | 'tool_call_update' }>[] = [];
   let permissions = 0;
-  const connection = client().onNotification('session/update', ({ params }) => { updates.push(params.update.sessionUpdate); })
+  const connection = client().onNotification('session/update', ({ params }) => {
+    updates.push(params.update.sessionUpdate);
+    if (params.update.sessionUpdate === 'tool_call' || params.update.sessionUpdate === 'tool_call_update') toolUpdates.push(params.update);
+  })
     .onRequest('session/request_permission', ({ params }) => { permissions++; assert.equal(params.options[0].optionId, 'yes'); return { outcome: { outcome: 'selected' as const, optionId: 'yes' } }; })
     .connect(webSocketStream(ws));
   await connection.agent.request('initialize', { protocolVersion: 1, clientCapabilities: {} });
@@ -36,6 +40,11 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   assert.ok(updates.includes('tool_call'));
   assert.ok(updates.includes('tool_call_update'));
   assert.ok(updates.includes('agent_message_chunk'));
+  assert.equal(toolUpdates[0].title, 'Write');
+  assert.ok(toolUpdates.slice(1).every(u => u.title === undefined && u.status !== 'pending'));
+  const completed = toolUpdates.filter(u => u.status === 'completed');
+  assert.ok(completed.length > 0);
+  assert.ok(completed.every(u => JSON.stringify(u.rawOutput) === '{"result":"saved"}'));
   await connection.agent.request('session/close', { sessionId });
   const list = await connection.agent.request('session/list', {});
   assert.ok(list.sessions.some(session => session.sessionId === sessionId), 'closed sessions remain resumable');

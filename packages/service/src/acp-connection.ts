@@ -106,12 +106,19 @@ function envelope(value: RecordValue): RecordValue {
   const { event: _event, ...fields } = value;
   return { [NS]: fields };
 }
-function updateFor(event: RecordValue): SessionUpdate | undefined {
+function updateFor(event: RecordValue, toolUpdate = false): SessionUpdate | undefined {
   const common = { _meta: envelope(event) };
   switch (event.event) {
     case 'text_delta': return { ...common, sessionUpdate: event.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk', content: { type: 'text', text: event.text || '' } };
-    case 'tool_call': return { ...common, sessionUpdate: 'tool_call', toolCallId: event.toolCallId, title: event.toolName || 'Tool', status: event.status || 'pending', kind: event.kind, rawInput: event.arguments, content: event.content, locations: event.locations };
-    case 'tool_result': return { ...common, sessionUpdate: 'tool_call_update', toolCallId: event.toolCallId, status: event.isError ? 'failed' : 'completed', rawOutput: event.text, content: [{ type: 'content', content: { type: 'text', text: event.text || '' } }] };
+    case 'tool_call': {
+      const fields = { ...common, toolCallId: event.toolCallId, title: event.title ?? event.toolName, status: event.status,
+        kind: event.kind, rawInput: event.arguments, rawOutput: event.rawOutput, content: event.content, locations: event.locations };
+      return toolUpdate ? { ...fields, sessionUpdate: 'tool_call_update' }
+        : { ...fields, sessionUpdate: 'tool_call', title: fields.title ?? 'Tool', status: fields.status ?? 'pending' };
+    }
+    case 'tool_result': return { ...common, sessionUpdate: 'tool_call_update', toolCallId: event.toolCallId, status: event.isError ? 'failed' : 'completed',
+      ...(event.rawOutput !== undefined ? { rawOutput: event.rawOutput } : event.text ? { rawOutput: event.text } : {}),
+      ...(event.content !== undefined ? { content: event.content } : event.text ? { content: [{ type: 'content' as const, content: { type: 'text' as const, text: event.text } }] } : {}) };
     case 'mode_changed': return { ...common, sessionUpdate: 'current_mode_update', currentModeId: event.payload.currentModeId };
     case 'available_commands_update': return { ...common, sessionUpdate: 'available_commands_update', availableCommands: event.payload.availableCommands.map((c: RecordValue) => ({ name: c.name, description: c.description || '', ...(c.hasInput ? { input: { hint: c.inputHint || 'Arguments' } } : {}) })) };
     case 'plan': return { ...common, sessionUpdate: 'plan', entries: event.entries || event.payload?.entries || [] };
@@ -210,10 +217,9 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     if (event.event?.endsWith('_timeout')) interactive.get(event.requestId)?.abort.abort();
     const summary = backend.sessions.get(sessionId)?.acpResponsePolicy === 'summary';
     if (event.event === 'text_delta' && event.type !== 'thought') answers.set(sessionId, (answers.get(sessionId) || '') + (event.text || ''));
-    let update = updateFor(event);
+    let update = updateFor(event, event.event === 'tool_call' && toolsSeen.has(`${sessionId}:${event.toolCallId}`));
     if (update?.sessionUpdate === 'tool_call') {
       const key = `${sessionId}:${update.toolCallId}`;
-      if (toolsSeen.has(key)) update = { ...update, sessionUpdate: 'tool_call_update' };
       toolsSeen.add(key);
     }
     if (update) {

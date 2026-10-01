@@ -1,7 +1,8 @@
 /** Browser controls for native ACP configuration and ordinary DSH models. */
 import { createElement as h, useEffect, useState, useSyncExternalStore } from 'react';
+import { toolConversationDefinition } from './tool-conversation.js';
 
-export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale'];
+export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation'];
 
 const dictionaries = {
   zh: { model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置' },
@@ -36,6 +37,7 @@ function Select({ title, value, rows, disabled, onSelect, placeholder }) {
 }
 
 export function apply(ctx) {
+  ctx.uiConversation.events.register(toolConversationDefinition);
   ctx.effect(() => ctx.locale.register('oneagentsAcp', dictionaries));
   const t = ctx.locale.bind('oneagentsAcp');
   const native = new Map();

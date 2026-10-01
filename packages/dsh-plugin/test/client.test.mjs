@@ -12,6 +12,7 @@ function mount(preset) {
     fetch: async (url, options) => { calls.push([url, options]); return { ok: true, json: async () => native }; },
   });
   const ctx = {
+    uiConversation: { events: { register: () => {} } },
     effect: setup => setup(), on: () => {},
     locale: { register: () => {}, bind: () => key => key },
     slots: { inject: () => {} },

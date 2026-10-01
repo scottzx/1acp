@@ -2891,10 +2891,17 @@ async function runPromptTurn(session, sessionId, promptItem) {
           // so the frontend can treat status as authoritative over heuristics.
           const rawStatus = typeof event.status === "string" ? event.status : undefined;
           const toolStatus = rawStatus === "success" ? "completed" : rawStatus || undefined;
+          // The runtime synthesizes "tool call" for sparse ACP updates.
+          // Do not replace a previously supplied title with that display fallback.
+          const toolTitle = event.tag === "tool_call_update" && event.title === "tool call"
+            ? undefined : event.title;
           sendRuntimeTurnEvent(targetWs, sessionId, turn, {
             event: "tool_call",
             content: event.content,
-            toolName: resolveToolDisplayName(event),
+            ...(event.toolName || event.kind || toolTitle
+              ? { toolName: resolveToolDisplayName(event) } : {}),
+            ...(toolTitle !== undefined ? { title: toolTitle } : {}),
+            ...(event.rawOutput !== undefined ? { rawOutput: event.rawOutput } : {}),
             toolCallId: event.toolCallId,
             ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
             ...(event.rawInput !== undefined ? { arguments: event.rawInput } : {}),
@@ -2925,6 +2932,8 @@ async function runPromptTurn(session, sessionId, promptItem) {
               toolCallId: event.toolCallId,
               toolName: resolveToolDisplayName(event),
               text: textContent,
+              ...(event.rawOutput !== undefined ? { rawOutput: event.rawOutput } : {}),
+              ...(event.content !== undefined ? { content: event.content } : {}),
               isError: toolStatus === "failed",
               ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
             });

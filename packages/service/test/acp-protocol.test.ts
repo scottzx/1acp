@@ -37,7 +37,14 @@ async function fixture(t: test.TestContext) {
           session.activeTurn = null;
           session.ws.send(JSON.stringify({ event: 'done', sessionId: id, stopReason: 'end_turn' }));
         };
-        if (command.text === 'ask' || command.text === 'plan') {
+        if (command.text === 'tools') {
+          const content = [{ type: 'content', content: { type: 'text', text: 'README.md' } }];
+          emit({ event: 'tool_call', toolCallId: 'exec-1', toolName: 'Bash', title: 'ls -la', kind: 'execute', status: 'in_progress', arguments: { command: 'ls -la' } });
+          emit({ event: 'tool_call', toolCallId: 'exec-1', content });
+          emit({ event: 'tool_call', toolCallId: 'exec-1', status: 'completed', rawOutput: { stdout: 'README.md' } });
+          emit({ event: 'tool_result', toolCallId: 'exec-1', text: '', isError: false });
+          queueMicrotask(finish);
+        } else if (command.text === 'ask' || command.text === 'plan') {
           session.permission = { event: command.text === 'ask' ? 'ask_user_question' : 'exit_plan_mode', requestId: 'logical-interaction', toolCallId: 'tool', questions: [{ question: 'Proceed?' }], planContent: 'Plan' };
           pending.set(id, finish); emit(session.permission);
         } else if (command.text === 'permission') {
@@ -104,6 +111,29 @@ test('official ACP client creates, prompts, replays and resumes without replay',
   const wrong = await f.connect(undefined, 'grok-build');
   await assert.rejects(wrong.connection.agent.request('session/resume', { sessionId, cwd: '/tmp', mcpServers: [] }), { code: -32602 });
   await c.connection.agent.request('session/close', { sessionId });
+});
+
+test('tool observations preserve ACP titles, structured output and sparse update semantics through replay', async t => {
+  const f = await fixture(t); const a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'tools' }] });
+  const tools = a.updates.map(u => u.update).filter(u => u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update');
+  assert.equal(tools.length, 4);
+  assert.equal(tools[0].sessionUpdate, 'tool_call');
+  assert.equal(tools[0].title, 'ls -la');
+  assert.deepEqual(tools[0].rawInput, { command: 'ls -la' });
+  assert.ok(tools.slice(1).every(u => u.sessionUpdate === 'tool_call_update'));
+  assert.equal(tools[1].title, undefined);
+  assert.equal(tools[1].status, undefined);
+  assert.equal(tools[1].content?.[0].type, 'content');
+  assert.deepEqual(tools[2].rawOutput, { stdout: 'README.md' });
+  assert.equal(tools[3].content, undefined); // Empty legacy terminal notification must not erase content.
+  assert.equal(tools[3].rawOutput, undefined);
+  a.ws.close(); await a.connection.closed;
+  const b = await f.connect();
+  await b.connection.agent.request('session/load', { sessionId, cwd: '/tmp', mcpServers: [] });
+  const replayed = b.updates.map(u => u.update).filter(u => u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update');
+  assert.deepEqual(replayed, tools);
 });
 
 test('pending permission survives a dropped transport and settles once after resume', async t => {

@@ -13,6 +13,7 @@ import type {} from '@deepseek-ai/dsh-agent-preset-registry';
 import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
 import { State, type Binding } from './state.js';
+import { TOOL_EVENT, mergeTool, type RemoteTool } from './tool-events.js';
 export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number }
 export interface Capabilities {
   agent: string;
@@ -293,6 +294,11 @@ export class AcpAdapter implements LlmAdapter {
     let binding = this.state.get(agent.id);
     if (binding && (binding.agent !== options.model || binding.cwd !== cwd || binding.endpoint !== endpoint.href)) throw new Error('This session is bound to another ACP Agent or endpoint; start a new session');
     const seen = new Set<number>();
+    const tools = new Map<string, RemoteTool>();
+    const boundary = this.ctx.sessionProjections.stateOf(agent.session, 'turnBoundary');
+    const stepStart = boundary?.lastStepStartSeq == null ? undefined : agent.session.eventAt(boundary.lastStepStartSeq);
+    const turn = boundary?.lastTurn ?? 0;
+    const step = stepStart?.type === 'step/start' ? stepStart.data.step : 0;
     let index = 0, current: 'text' | 'reasoning' | undefined, content = '', answer = '';
     const endBlock = () => { if (current) { queue.push({ type: 'block-end', index, block: { type: current, text: content } as ContentBlock }); index++; current = undefined; content = ''; } };
     const emit = (kind: 'text' | 'reasoning', text: string) => {
@@ -309,10 +315,11 @@ export class AcpAdapter implements LlmAdapter {
       seen.add(meta.sequence);
       if ((u.sessionUpdate === 'agent_message_chunk' || u.sessionUpdate === 'agent_thought_chunk') && u.content.type === 'text') emit(u.sessionUpdate === 'agent_message_chunk' ? 'text' : 'reasoning', u.content.text);
       else if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') {
-        // External tools execute inside the remote Agent. Never emit local
-        // tool-call chunks: DSH would execute those calls a second time.
-        const title = 'title' in u && u.title ? u.title : u.toolCallId;
-        emit('reasoning', `\n[ACP ${u.status ?? 'tool'}] ${title}\n`);
+        const tool = mergeTool(tools.get(u.toolCallId), u);
+        tools.set(u.toolCallId, tool);
+        agent.session.append(TOOL_EVENT, {
+          turn, step, requestId, sequence: meta.sequence, tool,
+        });
       }
     };
     let active: Awaited<ReturnType<typeof connect>> | undefined;

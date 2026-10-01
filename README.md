@@ -36,6 +36,8 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 Only `@1agents/acp-service` is published. Version 0.5 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
 
+Version 0.5.1 fixes DSH tool presentation: ACP tool updates retain their titles, input and output, and appear as native tool cards instead of text in the thinking stream. Remote tools remain owned by the ACP Agent and are never executed again by DSH.
+
 ```sh
 # Ordinary CLI installation:
 npm install -g @1agents/acp-service
@@ -55,7 +57,7 @@ Release checks artifact SHA/checksum, manifests, dependencies, runtime and DSH e
 For local packaging, build first, then run `pnpm run pack` from this root. Packing checks existing outputs and never rebuilds them. To verify the resulting package:
 
 ```sh
-node scripts/smoke-service-package.mjs release/1agents-acp-service-0.5.0.tgz /absolute/path/DSH
+node scripts/smoke-service-package.mjs release/1agents-acp-service-0.5.1.tgz /absolute/path/DSH
 ```
 
 ### Migrate a DSH profile
