@@ -12,14 +12,14 @@ import { toolConversationDefinition } from '../src/tool-conversation.js';
 // The development declaration links already identify the matching DSH checkout.
 const dsh = resolve(realpathSync(new URL('../node_modules/@deepseek-ai/dsh-agent', import.meta.url)), '../../..');
 const bundle = await build({
-  stdin: { contents: `export { ConversationNodeAssembler } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-conversation/src/client/conversation/assembler.ts'))}; export { validateStoredEvents } from ${JSON.stringify(resolve(dsh, 'packages/session/session-persistence/src/storage-contract.ts'))};`, resolveDir: dsh, loader: 'ts' },
+  stdin: { contents: `export { ConversationNodeAssembler } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-conversation/src/client/conversation/assembler.ts'))}; export { ChatSnapshotBuilder } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-chat/src/client/conversation-nodes/chat-snapshot-builder.ts'))}; export { assistantDefinition } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-chat/src/client/conversation-nodes/assistant.ts'))}; export { turnProcessDefinition } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-chat/src/client/conversation-nodes/turn-process.ts'))}; export { validateStoredEvents } from ${JSON.stringify(resolve(dsh, 'packages/session/session-persistence/src/storage-contract.ts'))};`, resolveDir: dsh, loader: 'ts' },
   tsconfig: resolve(dsh, 'tsconfig.base.json'), bundle: true, platform: 'node', target: 'es2022', format: 'esm', write: false,
   plugins: [{ name: 'dsh-built-session', setup(build) { build.onResolve({ filter: /^@deepseek-ai\/dsh-session$/ }, () => ({ path: import.meta.resolve('@deepseek-ai/dsh-session').replace('file://', ''), external: true })); } }],
 });
 const directory = mkdtempSync(resolve(tmpdir(), 'acp-dsh-projection-'));
 const path = resolve(directory, 'assembler.mjs');
 writeFileSync(path, bundle.outputFiles[0].text);
-const { ConversationNodeAssembler, validateStoredEvents } = await import(pathToFileURL(path).href);
+const { ConversationNodeAssembler, validateStoredEvents, ChatSnapshotBuilder, assistantDefinition, turnProcessDefinition } = await import(pathToFileURL(path).href);
 rmSync(directory, { recursive: true, force: true });
 
 function engine() {
@@ -37,7 +37,7 @@ const row = (seq, type, data) => ({ type: 'event', event: { seq, time: 1000 + se
 const snapshot = (seq, tool, requestId = 'turn-1') => ({ type: 'block-end', index: seq, block: { type: 'text', text: '', acpTool: { turn: 1, step: 1, requestId, sequence: seq, tool } } });
 const observation = (seq, tool, requestId = 'turn-1') => row(seq, 'assistant/live-chunk', { turn: 1, step: 1, chunk: snapshot(seq, tool, requestId) });
 const started = { toolCallId: 'exec-1', name: 'Bash', title: 'ls -la', status: 'in_progress', kind: 'execute', rawInput: { command: 'ls -la' } };
-const roots = assembler => [...assembler.snapshot('chat').values()].flatMap(node => node.data.roots);
+const roots = assembler => [...assembler.snapshot('chat').values()].flatMap(node => [node.data.root, ...node.data.root.subCalls]);
 
 test('DSH folds running, sparse updates and terminal observations into one ACP tool card', () => {
   const assembler = engine();
@@ -95,6 +95,10 @@ test('remote snapshots survive DSH persistence validation and rebuild every ACP 
   assembler.replaceWindow(restored.snapshotEvents().map(event => ({ type: 'event', event })), false);
   assembler.flush();
   assert.equal(roots(assembler).length, 2);
+  const nodes = [...assembler.snapshot('chat').values()];
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].kind, 'tool-call');
+  assert.equal(nodes[0].data.root.subCalls.length, 1);
   assert.equal(roots(assembler)[0].callTime, 1002);
   assert.equal(roots(assembler)[0].content[0].text, 'README.md');
   assert.equal(roots(assembler)[1].isError, true);
@@ -111,4 +115,29 @@ test('durable attempts do not duplicate tools already seen live and still restor
   assert.equal(roots(assembler).length, 1);
   assert.equal(roots(assembler)[0].content[0].text, 'done');
   assert.equal(roots(assembler)[0].callTime, 1002);
+});
+
+
+test('completed persisted ACP calls keep the native DSH process disclosure expandable', () => {
+  const assembler = new ConversationNodeAssembler(
+    { entries: () => [toolConversationDefinition, assistantDefinition, turnProcessDefinition], fallbackEntry: () => undefined },
+    { entries: () => [{ target: 'chat', create: () => new ChatSnapshotBuilder() }] },
+  );
+  assembler.activateTarget('chat');
+  const message = row(3, 'assistant/message', {
+    turn: 1, step: 1,
+    stream: [{ type: 'chunk', time: 1002, chunk: snapshot(2, { ...started, status: 'completed' }) }],
+    message: { id: 'answer', role: 'assistant', content: [{ type: 'text', text: 'Done' }] },
+  });
+  message.event.surfaceOp = 'append';
+  assembler.replaceWindow([row(0, 'turn/start', { turn: 1 }), row(1, 'step/start', { turn: 1, step: 1 }), message,
+    row(4, 'step/end', { turn: 1, step: 1 }), row(5, 'turn/end', { turn: 1 })], false);
+  assembler.flush();
+  const chat = assembler.snapshot('chat');
+  const card = chat.nodes.values().find(node => node.kind === 'tool-call');
+  const process = chat.nodes.processSource(card.key).getSnapshot();
+  assert.equal(process.turnClosed, true);
+  assert.equal(process.hasExternalProcess, true);
+  assert.ok(card.anchorSeq < process.spec.answerAnchorSeq);
+  assert.equal(chat.legacy.nodes.some(node => node.kind === 'tool-result'), true);
 });

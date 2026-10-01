@@ -65,21 +65,3 @@ test('native writer contention disables only its composer, then clears after res
   f.dispose();
   assert.equal(f.blocks.get(context.sessionId), undefined);
 });
-
-
-test('ACP cards register without redeclaring native slots and display command, status and output', () => {
-  const { slots } = mount('oneagents-acp-codex');
-  const { options, component } = slots.get('oneagents-acp-tools');
-  assert.equal(options.name, 'conversation.chat.node');
-  assert.equal(options.children, undefined);
-  const tree = component({ t: key => key, node: { data: { roots: [{
-    kind: 'tool-result', callId: 'remote-exec', call: { name: 'Bash', argsRaw: '{"command":"ls -la"}' },
-    content: [{ type: 'text', text: 'README.md' }], isError: false,
-  }] } } });
-  const card = tree.children[0][0];
-  assert.equal(card.type, 'details');
-  assert.equal(card.props['data-acp-status'], 'completed');
-  assert.equal(card.children[0].children[0].children[0], 'Bash');
-  assert.equal(card.children[0].children[3].children[0], 'ls -la');
-  assert.equal(card.children[1].children[0], 'README.md');
-});

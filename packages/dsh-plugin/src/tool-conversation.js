@@ -63,7 +63,15 @@ export const toolConversationDefinition = {
     const state = context.state;
     if (!state) return null;
     const location = context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' };
-    return { key: context.key, id: context.id, kind: 'oneagents-acp-tools', target: 'chat',
-      anchorSeq: state.seq, location, visibility: 'visible', data: { roots: [...state.tools.values()].map(tool => rootOf(tool, location)) } };
+    const roots = [...state.tools.values()].map(tool => rootOf(tool, location));
+    if (!roots.length) return null;
+    // DSH's native Tool kind contributes process activity and an expandable
+    // disclosure after reload. Keep one Context per remote stream; additional
+    // remote calls are displayed as sibling branches under the first call.
+    const [first, ...remaining] = roots;
+    return { key: context.key, id: context.id, kind: 'tool-call', target: 'chat',
+      // Durable snapshots share the final answer event; anchor them before that
+      // answer so DSH retains the completed Turn's process disclosure.
+      anchorSeq: location.kind === 'step' ? location.step.start?.seq ?? state.seq : state.seq, location, visibility: 'visible', data: { root: { ...first, subCalls: remaining } } };
   },
 };
