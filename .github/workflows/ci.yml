@@ -29,24 +29,24 @@ jobs:
       - run: pnpm --filter @scottzx/1acp viewer:build
       - run: pnpm --filter @scottzx/1acp check:docs
       - run: pnpm --filter @scottzx/1acp build:test
+      - name: Archive runtime tests with executable permissions
+        run: tar -czf runtime-tests.tgz -C packages/runtime dist dist-test
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-tests
-          path: |
-            packages/runtime/dist/
-            packages/runtime/dist-test/
+          path: runtime-tests.tgz
           retention-days: 7
       - run: pnpm --filter @1agents/acp-service build
       - run: pnpm --filter @1agents/acp-service typecheck
       - run: pnpm --filter @1agents/acp-service test
       - run: node scripts/release-artifacts.mjs service
       - run: node scripts/smoke-service-package.mjs release/*.tgz
+      - name: Archive service build with executable permissions
+        run: tar -czf service-build.tgz -C packages/service dist vendor
       - uses: actions/upload-artifact@v4
         with:
           name: service-build
-          path: |
-            packages/service/dist/
-            packages/service/vendor/
+          path: service-build.tgz
           retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
@@ -74,7 +74,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: runtime-tests
-          path: packages/runtime
+      - name: Restore runtime tests with executable permissions
+        run: |
+          tar -xzf runtime-tests.tgz -C packages/runtime
+          test -x packages/runtime/dist/cli.js
       - name: Run partitioned runtime tests
         if: matrix.lane != 'coverage'
         run: node scripts/runtime-tests.mjs "$TEST_LANE"
@@ -140,7 +143,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: service-build
-          path: packages/service
+      - name: Restore service build with executable permissions
+        run: tar -xzf service-build.tgz -C packages/service
       - run: pnpm --filter @1agents/dsh-acp test
       - run: node scripts/release-artifacts.mjs dsh-plugin
       - uses: actions/upload-artifact@v4
