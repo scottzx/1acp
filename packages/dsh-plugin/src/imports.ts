@@ -8,7 +8,7 @@ import type {} from '@deepseek-ai/dsh-workspace';
 import type {} from '@deepseek-ai/dsh-session-persistence';
 import { AcpAdapter, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
-import { State } from './state.js';
+import { State, hasActiveWriter } from './state.js';
 
 /** Whether a provider is enabled and advertised by the configured service. */
 export interface ImportAvailability { available: boolean; agent?: string; reason?: string }
@@ -20,7 +20,7 @@ export interface NativeSessionInput {
   /** Current DSH events, contiguous from sequence zero. */
   events: readonly SessionEvent[];
 }
-/** Completed restoration and workspace attachment, safe for client navigation. */
+/** Attached historical session, safe for navigation even while native writing is blocked. */
 export interface ImportResult {
   success: true;
   dshSessionId: SessionId;
@@ -28,6 +28,8 @@ export interface ImportResult {
   workspaceId: string;
   agent: string;
   continuation: 'native';
+  writable: boolean;
+  blocked?: 'active-writer';
 }
 declare module '@deepseek-ai/cordis' {
   interface Context { oneagentsAcpSessions: NativeSessions }
@@ -61,7 +63,7 @@ export class NativeSessions {
   }
   /** Restore one native session; repeated calls return its existing DSH identity and never replace its history.
    * @param input Native identity, original workspace and historical events.
-   * @returns The attached DSH session after native restoration succeeds.
+   * @returns The attached DSH session and its native writing availability.
    */
   async importSession(input: NativeSessionInput): Promise<ImportResult> {
     if (this.disposed) throw new Error('ACP plugin has been stopped');
@@ -111,10 +113,15 @@ export class NativeSessions {
       this.ctx.sessions.prepare(id, { seed: input.events, meta: { cwd, agentPreset: preset } });
       await this.ctx.agentPresets.resolve(preset);
     }
+    let blocked = false;
     if (!binding) {
-      binding = { ...await this.adapter.importNative(agent, cwd, input.nativeSessionId), imported: {
-        provider: input.provider, nativeSessionId: input.nativeSessionId, messageIds: [],
-      } };
+      const imported = { provider: input.provider, nativeSessionId: input.nativeSessionId, messageIds: [] as string[] };
+      try { binding = { ...await this.adapter.importNative(agent, cwd, input.nativeSessionId), imported }; }
+      catch (error) {
+        if (!hasActiveWriter(error)) throw error;
+        blocked = true;
+        binding = { agent, cwd, endpoint: endpoint.href, restoreMethod: 'session/resume', imported };
+      }
       // The service ID survives local creation/attachment failure and plugin restart.
       this.state.save(id, binding);
     }
@@ -130,9 +137,10 @@ export class NativeSessions {
     }
     const resolved = await this.ctx.sessionController.resolveAgent(id);
     if ('error' in resolved) throw resolved.error;
-    await this.adapter.describe(resolved.agent);
+    const capabilities = blocked ? { writable: false, blocked: 'active-writer' as const } : await this.adapter.describe(resolved.agent);
     const workspace = await this.ctx.workspaceRegistry.create(cwd);
     await workspace.attachSession(id);
-    return { success: true, dshSessionId: id, workspace: cwd, workspaceId: workspace.id, agent, continuation: 'native' };
+    return { success: true, dshSessionId: id, workspace: cwd, workspaceId: workspace.id, agent, continuation: 'native',
+      writable: capabilities?.writable !== false, ...(capabilities?.blocked ? { blocked: capabilities.blocked } : {}) };
   }
 }

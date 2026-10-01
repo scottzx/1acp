@@ -2,11 +2,11 @@
 import { createElement as h, useEffect, useState, useSyncExternalStore } from 'react';
 import { toolConversationDefinition } from './tool-conversation.js';
 
-export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation'];
+export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation', 'conversation'];
 
 const dictionaries = {
-  zh: { toolRunning: '执行中', toolFailed: '失败', toolCompleted: '已完成', toolNoOutput: '无输出', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置' },
-  en: { toolRunning: 'Running', toolFailed: 'Failed', toolCompleted: 'Completed', toolNoOutput: 'No output', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings' },
+  zh: { toolRunning: '执行中', toolFailed: '失败', toolCompleted: '已完成', toolNoOutput: '无输出', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。' },
+  en: { toolRunning: 'Running', toolFailed: 'Failed', toolCompleted: 'Completed', toolNoOutput: 'No output', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.' },
 };
 
 /** Preserve Agent-owned group labels and option ids. */
@@ -69,18 +69,36 @@ export function apply(ctx) {
   const native = new Map();
   const pending = new Map();
   const listeners = new Map();
+  const blockedSessions = new Set();
+  let disposed = false;
   const presetOf = id => ctx.sessions.binding(id)?.session.projections.faceOf('agentPreset').getSnapshot();
   const isAcp = id => String(presetOf(id) ?? '').startsWith('oneagents-acp-');
-  const publish = (id, value) => { native.set(id, value); for (const fn of listeners.get(id) ?? []) fn(); };
+  const block = (id, reason) => {
+    if (disposed) return;
+    if (reason) blockedSessions.add(id); else blockedSessions.delete(id);
+    ctx.conversation.blocks.set(id, reason ? { reason } : undefined);
+  };
+  ctx.effect(() => () => { disposed = true; for (const id of blockedSessions) ctx.conversation.blocks.set(id, undefined); });
+  const publish = (id, value) => {
+    native.set(id, value);
+    block(id, value?.writable === false ? t(value.blocked === 'active-writer' ? 'activeWriter' : 'error') : undefined);
+    for (const fn of listeners.get(id) ?? []) fn();
+  };
   const load = id => {
     if (!pending.has(id)) {
-      const operation = acpRequest(id).then(value => { publish(id, value); return value; }).finally(() => pending.delete(id));
+      if (!native.has(id)) block(id, t('loading'));
+      const operation = acpRequest(id).then(value => { publish(id, value); return value; }).catch(error => {
+        block(id, `${t('error')}: ${error.message}`); throw error;
+      }).finally(() => pending.delete(id));
       pending.set(id, operation);
     }
     return pending.get(id);
   };
   const configure = async (id, configId, value) => { const updated = await acpRequest(id, { configId, value }); publish(id, updated); };
-  const reset = () => { native.clear(); for (const set of listeners.values()) for (const fn of set) fn(); };
+  const reset = () => {
+    for (const id of native.keys()) block(id, isAcp(id) ? t('loading') : undefined);
+    native.clear(); for (const set of listeners.values()) for (const fn of set) fn();
+  };
   ctx.remote.$on('agent-preset/selected', reset);
   ctx.on('connection/reset', reset);
 
@@ -120,7 +138,7 @@ export function apply(ctx) {
       return () => clearInterval(timer);
     }, [external, sessionId, presetId]);
     const change = async action => { setBusy(true); setError(''); try { await action(); } catch (error) { setError(String(error.message ?? error)); } finally { setBusy(false); } };
-    const disabled = locked || busy;
+    const disabled = locked || busy || (external && capabilities?.writable === false);
     const controls = [];
     if (external && capabilities) {
       const configs = capabilities.configOptions.filter(option => option.type === 'select');

@@ -27,7 +27,7 @@ async function fixture(t) {
   const server = createServer((req, res) => { assert.equal(req.url, '/agents'); res.end(JSON.stringify({ agents: ['codex', 'claude', 'grok-build'].map(id => ({ id, label: id, chat_ready: true })) })); });
   const wss = new WebSocketServer({ server });
   const calls = [], prompts = [], paths = [];
-  const flags = { createFailure: false, attachFailure: false, importFailure: false, resumeFailure: false, disconnect: false };
+  const flags = { createFailure: false, attachFailure: false, importFailure: false, resumeFailure: false, writerBusy: false, resumeBusy: false, disconnect: false };
   const executed = new Set();
   wss.on('connection', (ws, request) => {
     paths.push(request.url);
@@ -36,11 +36,13 @@ async function fixture(t) {
       .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { _meta: { '1agents': { version: 1 } } } }))
       .onRequest('_1agents/session/import', value => value, ({ params }) => {
         calls.push(['import', params.sessionId]);
+        if (flags.writerBusy) throw new RequestError(-32000, 'thread native-123 already has an active writer');
         if (flags.importFailure) throw new RequestError(-32000, 'Native session cannot be restored');
         return { sessionId: `service-${calls.filter(c => c[0] === 'import').length}` };
       })
       .onRequest('session/resume', ({ params }) => {
         calls.push(['resume', params.sessionId]);
+        if (flags.resumeBusy) throw new RequestError(-32000, 'thread native-123 already has an active writer');
         if (flags.resumeFailure) throw new RequestError(-32000, 'Authentication required');
         return {};
       })
@@ -191,4 +193,46 @@ test('an empty native import cannot be replaced by draft preset switching', asyn
   f.ctx.sessionProjections.stateOf = (_session, key) => key === 'agentPreset' ? 'oneagents-acp-claude' : { openTurnStartSeq: null, lastTurn: 0 };
   await assert.rejects(f.adapter.describe(agent), /bound to another ACP Agent/);
   assert.deepEqual(new State(f.config.stateDirectory).get(agent.id), saved);
+});
+
+
+test('an active native writer blocks prompts, not DSH history creation; release restores the same session after restart', async t => {
+  const f = await fixture(t);
+  f.flags.writerBusy = true;
+  const opened = await f.service.importSession(f.input);
+  assert.equal(opened.writable, false);
+  assert.equal(opened.blocked, 'active-writer');
+  assert.deepEqual(f.counts(), { creates: 1, attachments: 1 });
+  assert.equal(f.stored.get(opened.dshSessionId).deriveMessages()[0].content[0].text, 'old question');
+  const state = new State(f.config.stateDirectory);
+  assert.equal(state.get(opened.dshSessionId).sessionId, undefined);
+  assert.equal(state.get(opened.dshSessionId).imported.nativeSessionId, 'native-123');
+  await f.restart();
+  const reopened = await f.service.importSession({ ...f.input, events: [] });
+  assert.equal(reopened.dshSessionId, opened.dshSessionId);
+  assert.equal(reopened.writable, false);
+  const options = { provider: '1agents-acp', model: 'codex', sessionId: opened.dshSessionId, messages: [user('new-question', 'continue')] };
+  await assert.rejects(async () => { for await (const _ of f.adapter.stream(options)) {} }, /active writer/);
+  assert.equal(f.prompts.length, 0);
+  f.flags.writerBusy = false;
+  const ready = await f.adapter.describe(f.ctx.agents.get(opened.dshSessionId));
+  assert.equal(ready.writable, true);
+  for await (const _ of f.adapter.stream(options)) {}
+  assert.equal(f.prompts.length, 1);
+  assert.equal(f.prompts[0].sessionId, state.get(opened.dshSessionId).sessionId);
+  assert.equal(f.prompts[0].prompt[0].text, 'continue');
+  assert.deepEqual(f.counts(), { creates: 1, attachments: 1 });
+});
+
+test('writer contention during resume still opens history and later reuses the saved service identity', async t => {
+  const f = await fixture(t);
+  f.flags.resumeBusy = true;
+  const opened = await f.service.importSession(f.input);
+  assert.equal(opened.writable, false);
+  assert.deepEqual(f.counts(), { creates: 1, attachments: 1 });
+  const saved = new State(f.config.stateDirectory).get(opened.dshSessionId);
+  f.flags.resumeBusy = false;
+  assert.equal((await f.adapter.describe(f.ctx.agents.get(opened.dshSessionId))).writable, true);
+  assert.equal(f.calls.filter(c => c[0] === 'import').length, 1);
+  assert.equal(new State(f.config.stateDirectory).get(opened.dshSessionId).sessionId, saved.sessionId);
 });

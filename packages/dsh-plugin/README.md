@@ -34,14 +34,14 @@ With `@1agents/session-reader` installed, choose **在 DSH 中继续原会话** 
 
 Imported bindings use `session/resume` because the service does not own a complete ACP replay of earlier native history. Existing ordinary ACP bindings continue using `session/load`. Endpoint, source provider and native ID identify an import; repeated admission reuses its DSH session without refreshing or replacing history. Old history-only DSH copies are not adopted. Original Agent history can continue changing outside DSH; the imported DSH history is a snapshot.
 
-The service ID is saved before DSH creation. A failed local creation or workspace attachment can be retried after restart without importing again. Native restoration and authentication failures are reported, never replaced by a new empty session. If the transport is lost before the import response reaches the plugin, the plugin cannot know the service ID and does not automatically retry that RPC.
+The service ID is saved before DSH creation. A failed local creation or workspace attachment can be retried after restart without importing again. When the original session reports `already has an active writer`, DSH still creates and opens its historical session. The composer is disabled with an explanation; capability refresh retries the original identity and restores input after its writer releases it. A pending import survives plugin restart. Other native restoration and authentication failures are reported, never replaced by a new empty session. If the transport is lost before the import response reaches the plugin, the plugin cannot know the service ID and does not automatically retry that RPC.
 
 ### Plugin service API
 
 `ctx.oneagentsAcpSessions` is a Cordis service owned by this plugin; consumers may declare it optional so history browsing works without ACP. Its TypeScript declarations are exported from `@1agents/acp-service/dsh/imports`. Consumers call the service from the Host and must not instantiate it or write its binding files.
 
 - `availability(provider)` returns `{ available, agent?, reason? }` without restoring a session. It checks configuration and the service inventory; successful native restoration remains the final capability/authentication check.
-- `importSession({ provider, nativeSessionId, cwd, events })` accepts current DSH events starting at sequence zero. It returns `{ success: true, dshSessionId, workspace, workspaceId, agent, continuation: 'native' }` only after restoration, DSH creation and workspace attachment succeed.
+- `importSession({ provider, nativeSessionId, cwd, events })` accepts current DSH events starting at sequence zero. It returns `{ success: true, dshSessionId, workspace, workspaceId, agent, continuation: 'native', writable, blocked? }` after DSH creation and workspace attachment. An active native writer returns `writable: false, blocked: 'active-writer'` while leaving history available.
 
 Provider mapping is `claude → claude`, `codex → codex`, `grok → grok-build`. The service validates history through DSH before restoring a new native binding. No DSH Session format changes are required.
 

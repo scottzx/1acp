@@ -9,7 +9,9 @@ export interface NativeImport {
   messageIds: string[];
 }
 export interface Binding {
-  agent: string; cwd: string; endpoint: string; sessionId: string;
+  agent: string; cwd: string; endpoint: string;
+  /** Absent while the original native session has an active writer. Never use session/new for this binding. */
+  sessionId?: string;
   /** Absent on bindings created before native imports were supported. */
   restoreMethod?: 'session/load' | 'session/resume';
   imported?: NativeImport;
@@ -33,7 +35,9 @@ export class State {
 function decodeBinding(value: unknown): Binding {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid ACP binding');
   const binding = value as Record<string, unknown>;
-  if (['agent', 'cwd', 'endpoint', 'sessionId'].some(key => typeof binding[key] !== 'string' || !binding[key])) throw new Error('Invalid ACP binding identity');
+  if (['agent', 'cwd', 'endpoint'].some(key => typeof binding[key] !== 'string' || !binding[key])) throw new Error('Invalid ACP binding identity');
+  if (binding.sessionId !== undefined && (typeof binding.sessionId !== 'string' || !binding.sessionId)) throw new Error('Invalid ACP binding identity');
+  if (binding.sessionId === undefined && binding.imported === undefined) throw new Error('Invalid ACP binding identity');
   if (binding.restoreMethod !== undefined && binding.restoreMethod !== 'session/load' && binding.restoreMethod !== 'session/resume') throw new Error('Invalid ACP restore method');
   if (binding.imported !== undefined) {
     if (!binding.imported || typeof binding.imported !== 'object' || Array.isArray(binding.imported)) throw new Error('Invalid ACP native import');
@@ -43,4 +47,9 @@ function decodeBinding(value: unknown): Binding {
       || binding.restoreMethod !== 'session/resume') throw new Error('Invalid ACP native import');
   }
   return value as Binding;
+}
+
+/** Native writer ownership prevents execution, but must not prevent reading imported history. */
+export function hasActiveWriter(error: unknown): boolean {
+  return error instanceof Error && /already has an active writer/.test(error.message);
 }

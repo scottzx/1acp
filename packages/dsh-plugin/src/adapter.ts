@@ -12,11 +12,13 @@ import type {} from '@deepseek-ai/dsh-session-projection';
 import type {} from '@deepseek-ai/dsh-agent-preset-registry';
 import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
-import { State, type Binding } from './state.js';
+import { State, hasActiveWriter, type Binding } from './state.js';
 import { mergeTool, type RemoteTool } from './tool-events.js';
 export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number }
 export interface Capabilities {
   agent: string;
+  writable?: boolean;
+  blocked?: 'active-writer';
   commands: AvailableCommand[];
   configOptions: SessionConfigOption[];
   modes?: SessionModeState;
@@ -81,14 +83,19 @@ export class AcpAdapter implements LlmAdapter {
     return this.config.agents.includes(name) ? name : undefined;
   }
   async describe(agent: Agent): Promise<Capabilities | null> {
-    if (!this.agentName(agent)) return null;
-    await this.connection(agent);
-    return this.capabilities.get(agent.id)!;
+    const name = this.agentName(agent);
+    if (!name) return null;
+    try { await this.connection(agent); }
+    catch (error) {
+      if (!this.state.get(agent.id)?.imported || !hasActiveWriter(error)) throw error;
+      return { agent: name, commands: [], configOptions: [], writable: false, blocked: 'active-writer' };
+    }
+    return { ...this.capabilities.get(agent.id)!, writable: true };
   }
   async configure(agent: Agent, configId: string, value: string): Promise<Capabilities> {
     if (this.controllers.has(agent.id)) throw new Error('Wait for the current ACP turn to finish before changing configuration');
     const link = await this.connection(agent);
-    const sessionId = this.state.get(agent.id)!.sessionId;
+    const sessionId = this.state.get(agent.id)!.sessionId!;
     const capabilities = this.capabilities.get(agent.id)!;
     if (configId === '$mode') {
       if (!capabilities.modes?.availableModes.some(m => m.id === value)) throw new Error('Unknown ACP mode');
@@ -185,6 +192,11 @@ export class AcpAdapter implements LlmAdapter {
     }
     const existing = this.links.get(agent.id);
     if (existing) return existing;
+    if (binding?.imported && !binding.sessionId) {
+      // Retry the original native identity after its writer releases it; never open an empty replacement.
+      binding = { ...await this.importNative(name, cwd, binding.imported.nativeSessionId), imported: binding.imported };
+      this.state.save(agent.id, binding);
+    }
     const operation = (async () => {
       if (!this.commandContexts.has(agent.id)) {
         const fiber = await agent.ctx.inject(['commands'], scope => {
@@ -222,7 +234,7 @@ export class AcpAdapter implements LlmAdapter {
         const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': { permissionMode: 'approve-reads' } } };
         const cancellationSignal = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]);
         const result = binding
-          ? await link.rpc.request(binding.restoreMethod ?? 'session/load', { ...params, sessionId: binding.sessionId }, { cancellationSignal })
+          ? await link.rpc.request(binding.restoreMethod ?? 'session/load', { ...params, sessionId: binding.sessionId! }, { cancellationSignal })
           : await link.rpc.request('session/new', params, { cancellationSignal });
         if (!binding) this.state.save(agent.id, { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId });
         capabilities.configOptions = result.configOptions ?? capabilities.configOptions;
@@ -327,7 +339,7 @@ export class AcpAdapter implements LlmAdapter {
       }
     };
     let active: Awaited<ReturnType<typeof connect>> | undefined;
-    const cancel = () => { if (binding) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };
+    const cancel = () => { if (binding?.sessionId) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };
     signal.addEventListener('abort', cancel, { once: true });
     try {
       for (let attempt = 0; ; attempt++) {
@@ -337,7 +349,7 @@ export class AcpAdapter implements LlmAdapter {
           active = await this.connection(agent);
           binding = this.state.get(agent.id)!;
           signal.throwIfAborted();
-          const result = await active.rpc.request('session/prompt', { sessionId: binding.sessionId, prompt: [{ type: 'text', text }],
+          const result = await active.rpc.request('session/prompt', { sessionId: binding.sessionId!, prompt: [{ type: 'text', text }],
             _meta: { '1agents': { turnManaged: true, turnId: requestId, requestId } } }, { cancellationSignal: signal });
           signal.throwIfAborted();
           const meta = result._meta?.['1agents'] as JsonObject | undefined;
