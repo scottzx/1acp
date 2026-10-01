@@ -1,13 +1,15 @@
-# @1agents/dsh-acp
+# DSH plugin in @1agents/acp-service
 
-An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and installs acp-service 0.4 with its embedded runtime as a dependency. No DSH source files are modified.
+An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and is embedded with the runtime and service in the single public `@1agents/acp-service` 0.5 package. This directory is a private source module, not a separately installable npm package. No DSH source files are modified.
 
 ## Use
+
+For an existing `@1agents/dsh-acp` installation, stop DSH, remove that bundle and add `@1agents/acp-service`. Keep existing binding files and copy any custom row configuration. The same plugin and preset IDs preserve session identity. Custom preset rows now load `@1agents/acp-service/dsh/preset`.
 
 Install the published bundles from your DSH checkout:
 
 ```sh
-pnpm dsh plugin --profile web add @1agents/dsh-acp @1agents/session-reader
+pnpm dsh plugin --profile web add @1agents/acp-service @1agents/session-reader
 ```
 
 If pnpm pauses the first install for the transitive `esbuild` build script, set `allowBuilds: { esbuild: false }` in that profile's `pnpm-workspace.yaml` and repeat the install. Automatic ACP startup uses published JavaScript and works without running that install script.
@@ -17,10 +19,10 @@ The package declares `dsh.bundle.patch` and its browser entry, so installation s
 The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
 
 ```sh
-npx --yes @1agents/acp-service@^0.4.0 serve --host 127.0.0.1 --port 36812 --no-report
+npx --yes @1agents/acp-service@^0.5.0 serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
-The service requires each native Agent’s CLI and credentials. Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin`.
+The service requires each native Agent’s CLI and credentials. Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service`.
 
 Choose a discovered **ACP · Agent** in the new-session Agent preset picker, choose a workspace, then send a message. ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. Before the first turn, switching the Agent preset replaces the discovery connection and its native commands. Once a turn starts, the session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
 
@@ -36,7 +38,7 @@ The service ID is saved before DSH creation. A failed local creation or workspac
 
 ### Plugin service API
 
-`ctx.oneagentsAcpSessions` is a Cordis service owned by this plugin; consumers may declare it optional so history browsing works without ACP. Its TypeScript declarations are exported from `@1agents/dsh-acp/imports`. Consumers call the service from the Host and must not instantiate it or write its binding files.
+`ctx.oneagentsAcpSessions` is a Cordis service owned by this plugin; consumers may declare it optional so history browsing works without ACP. Its TypeScript declarations are exported from `@1agents/acp-service/dsh/imports`. Consumers call the service from the Host and must not instantiate it or write its binding files.
 
 - `availability(provider)` returns `{ available, agent?, reason? }` without restoring a session. It checks configuration and the service inventory; successful native restoration remains the final capability/authentication check.
 - `importSession({ provider, nativeSessionId, cwd, events })` accepts current DSH events starting at sequence zero. It returns `{ success: true, dshSessionId, workspace, workspaceId, agent, continuation: 'native' }` only after restoration, DSH creation and workspace attachment succeed.
@@ -75,13 +77,13 @@ The child inherits DSH's environment, including native Agent configuration and c
 
 ## Development and removal
 
-Install dependencies from the repository root, then build from this plugin directory:
+Install and build from the repository root:
 
 ```sh
-pnpm -w install --frozen-lockfile
-node scripts/link-dsh-types.mjs /absolute/path/DSH
-pnpm --filter @1agents/acp-service... build
-pnpm test
+pnpm install --frozen-lockfile
+pnpm link:dsh /absolute/path/DSH
+pnpm build
+pnpm test:integration
 ```
 
 The DSH checkout must already have its dependencies installed and declaration outputs built. Development type checking links its matching packages into `node_modules/@deepseek-ai`; generated JavaScript has no runtime imports of those packages and uses the Host's provided services. Tests cover real-WebSocket streaming, permissions, questions, cancellation, reconnection and saved bindings.
@@ -96,4 +98,4 @@ node dist/bin/acp-service.js serve --host 127.0.0.1 --port 36812 --no-report
 
 For automatic startup, set these environment variables on the DSH process instead. `CODEX_PATH` selects the installed app's newer Codex runtime; the global CLI on this machine rejects its configured `gpt-6-astra` model. The separate npm cache avoids a broken pre-existing npx cache. Neither setting changes the global Codex configuration.
 
-Remove using `pnpm dsh plugin --profile web remove @1agents/dsh-acp`, then restart DSH; removing the bundle also restores the stock model-selection row. The preset registrations are removed with the bundle. Keep binding files if sessions may be reattached later.
+Remove using `pnpm dsh plugin --profile web remove @1agents/acp-service`, then restart DSH; removing the bundle also restores the stock model-selection row. The preset registrations are removed with the bundle. Keep binding files if sessions may be reattached later.

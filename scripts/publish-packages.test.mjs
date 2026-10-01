@@ -6,7 +6,7 @@ import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { archiveContentDigest, verifyPublishedArchive, verifyRegistryState, verifyPluginService } from './publish-packages.mjs';
+import { archiveContentDigest, verifyPublishedArchive, verifyRegistryState, verifyExisting } from './publish-packages.mjs';
 
 test('release retries accept only matching immutable npm artifacts', () => {
   const archive = Buffer.from('release archive');
@@ -79,8 +79,9 @@ test('registry verification waits for read propagation after publish', async () 
       async () => '^0.15.1', { attempts: 5, delayMs: 1 }), /expected/);
 });
 
-test('plugin-only release verifies the CI service archive against the registry copy', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'plugin-service-artifact-'));
+
+test('unified release retry rejects a different registry tarball with the same version', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'published-service-artifact-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const archive = join(root, 'service.tgz');
   mkdirSync(join(root, 'package'));
@@ -88,19 +89,13 @@ test('plugin-only release verifies the CI service archive against the registry c
   execFileSync('tar', ['-czf', archive, '-C', root, 'package']);
   const bytes = readFileSync(archive);
   const integrity = content => 'sha512-' + createHash('sha512').update(content).digest('base64');
-  const artifact = { archive, packed: { name: '@1agents/acp-service', version: '0.4.0' } };
-  const published = { version: '0.4.0', dist: { integrity: integrity(bytes), tarball: 'https://registry.npmjs.org/service.tgz' } };
-  const readDocument = async (name, version) => {
-    assert.equal(name, artifact.packed.name);
-    assert.equal(version, artifact.packed.version);
-    return published;
-  };
-  await assert.doesNotReject(() => verifyPluginService(artifact, readDocument));
+  const dist = { integrity: integrity(bytes), tarball: 'https://registry.npmjs.org/service.tgz' };
+  await assert.doesNotReject(() => verifyExisting(archive, dist));
   writeFileSync(join(root, 'package/index.js'), 'different service with the same version');
   const registryArchive = join(root, 'registry.tgz');
   execFileSync('tar', ['-czf', registryArchive, '-C', root, 'package']);
   const registryBytes = readFileSync(registryArchive);
-  published.dist.integrity = integrity(registryBytes);
+  dist.integrity = integrity(registryBytes);
   t.mock.method(globalThis, 'fetch', async () => ({ ok: true, arrayBuffer: async () => registryBytes }));
-  await assert.rejects(() => verifyPluginService(artifact, readDocument), /different contents/);
+  await assert.rejects(() => verifyExisting(archive, dist), /different contents/);
 });

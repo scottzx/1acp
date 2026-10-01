@@ -55,7 +55,7 @@ async function fetchRegistry(name, version, dependency) {
   return dependency ? doc.dependencies?.[dependency] : doc.version;
 }
 
-async function verifyExisting(archive, dist) {
+export async function verifyExisting(archive, dist) {
   try { verifyPublishedArchive(readFileSync(archive), dist); return; }
   catch { /* Compare the complete registry artifact, never trust integrity drift. */ }
   const url = new URL(dist.tarball);
@@ -74,28 +74,12 @@ async function verifyExisting(archive, dist) {
   } finally { rmSync(directory, { recursive: true, force: true }); }
 }
 
-/** A plugin-only release must use the service contents validated by its CI. */
-export async function verifyPluginService(artifact, readDocument = registryDocument) {
-  const { name, version } = artifact.packed;
-  await verifyRegistryState(name, version, undefined, version, async () =>
-    (await readDocument(name, version)).version);
-  const published = await readDocument(name, version);
-  await verifyExisting(artifact.archive, published.dist);
-}
-
 async function publishPackages() {
-  const selection = process.env.RELEASE_PACKAGE;
   const sha = process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-  // Validate all selected artifacts before the first irreversible publish.
-  const artifacts = validateArtifacts(selection, sha);
-  const serviceArtifact = selection === 'dsh-plugin' ? validateArtifacts('service', sha)[0] : undefined;
-  if (serviceArtifact) await verifyPluginService(serviceArtifact);
-  for (const { directory, archive, packed } of artifacts) {
+  // Validate the complete package before publishing.
+  const artifacts = validateArtifacts(sha);
+  for (const { archive, packed } of artifacts) {
     const { name, version } = packed;
-    const range = packed.dependencies?.['@1agents/acp-service'];
-    if (directory === 'dsh-plugin') {
-      await verifyRegistryState('@1agents/acp-service', range.slice(1), undefined, range.slice(1));
-    }
     let existing;
     try { existing = await registryDocument(name, version); }
     catch (error) { if (!/^E404 from registry/.test(error.message)) throw error; }

@@ -3,35 +3,65 @@ import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { validateArtifacts, validateManifest, digest } from './release-artifacts.mjs';
 
-test('packed packages reject wrong versions, external runtime and unresolved workspace ranges', () => {
-  const source = { name: '@1agents/dsh-acp', version: '0.2.2', dependencies: { '@1agents/acp-service': 'workspace:^' } };
-  const packed = { ...source, dependencies: { '@1agents/acp-service': '^0.4.0' } };
-  assert.doesNotThrow(() => validateManifest('dsh-plugin', packed, source, '0.4.0'));
-  for (const override of [{ version: '0.2.1' }, { private: true }, { dependencies: source.dependencies }, { dependencies: { '@scottzx/1acp': '^0.16.0' } }, { dependencies: { '@1agents/acp-service': '^0.3.0' } }]) {
-    assert.throws(() => validateManifest('dsh-plugin', { ...packed, ...override }, source, '0.4.0'));
-  }
+const source = JSON.parse(readFileSync(new URL('../packages/service/package.json', import.meta.url), 'utf8'));
+
+test('unified package rejects split-package dependencies, changed entrypoints and private releases', () => {
+  assert.doesNotThrow(() => validateManifest(source, source));
+  for (const override of [
+    { version: '0.4.0' }, { private: true }, { dsh: undefined }, { exports: { '.': './dist/src/index.js' } },
+    { dependencies: { '@scottzx/1acp': '^0.16.0' } }, { dependencies: { '@1agents/dsh-acp': '^0.2.2' } },
+  ]) assert.throws(() => validateManifest({ ...source, ...override }, source));
+  const leaked = { ...source, dependencies: { ...source.dependencies, other: 'workspace:*' } };
+  assert.throws(() => validateManifest(leaked, leaked), /workspace/);
 });
 
-test('release rejects corrupted or cross-commit CI artifacts before publishing', t => {
+test('release validates commit, checksum and both installed entrypoints before publishing', t => {
   const root = mkdtempSync(join(tmpdir(), 'release-artifacts-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  for (const name of ['packages/service', 'packages/dsh-plugin', 'package', 'release']) mkdirSync(join(root, name), { recursive: true });
-  const source = { name: '@1agents/dsh-acp', version: '0.2.2', dependencies: { '@1agents/acp-service': 'workspace:^' } };
-  writeFileSync(join(root, 'packages/service/package.json'), JSON.stringify({ version: '0.4.0' }));
-  writeFileSync(join(root, 'packages/dsh-plugin/package.json'), JSON.stringify(source));
-  writeFileSync(join(root, 'package/package.json'), JSON.stringify({ ...source, dependencies: { '@1agents/acp-service': '^0.4.0' } }));
-  const filename = '1agents-dsh-acp-0.2.2.tgz';
+  const write = (path, contents) => {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), contents);
+  };
+  write('packages/service/package.json', JSON.stringify(source));
+  const runtime = { name: '@scottzx/1acp', version: '0.16.0' };
+  write('packages/runtime/package.json', JSON.stringify(runtime));
+  write('package/package.json', JSON.stringify(source));
+  const targets = [
+    ...Object.values(source.exports).flatMap(value => typeof value === 'string' ? [value] : Object.values(value)),
+    ...Object.values(source.bin), './vendor/runtime/dist/cli.js', './vendor/dsh/service-worker.js',
+  ];
+  for (const target of targets) if (target !== './package.json') write(`package/${target.replace(/^\.\//, '')}`, 'fixture');
+  write('package/vendor/runtime/package.json', JSON.stringify(runtime));
+  write('package/vendor/dsh/cordis.patch.yml', `- name: '${source.name}'\n`);
+  write('package/vendor/dsh/client.js', `load({id:"${source.name}"});`);
+  const filename = `1agents-acp-service-${source.version}.tgz`;
   const archive = join(root, 'release', filename);
-  execFileSync('tar', ['-czf', archive, '-C', root, 'package']);
+  mkdirSync(join(root, 'release'));
   const sha = 'a'.repeat(40);
-  const receipt = { filename, sha, sha256: digest(readFileSync(archive)) };
-  const file = join(root, 'release/dsh-plugin-manifest.json');
-  writeFileSync(file, JSON.stringify(receipt));
-  assert.equal(validateArtifacts('dsh-plugin', sha, root).length, 1);
-  assert.throws(() => validateArtifacts('dsh-plugin', 'b'.repeat(40), root), /another commit/);
-  writeFileSync(file, JSON.stringify({ ...receipt, sha256: 'bad' }));
-  assert.throws(() => validateArtifacts('dsh-plugin', sha, root), /checksum/);
+  const receiptPath = join(root, 'release/service-manifest.json');
+  const repack = () => {
+    execFileSync('tar', ['-czf', archive, '-C', root, 'package']);
+    const receipt = { filename, sha, sha256: digest(readFileSync(archive)) };
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    return receipt;
+  };
+  const receipt = repack();
+  assert.equal(validateArtifacts(sha, root).length, 1);
+  assert.throws(() => validateArtifacts('b'.repeat(40), root), /another commit/);
+  writeFileSync(receiptPath, JSON.stringify({ ...receipt, sha256: 'bad' }));
+  assert.throws(() => validateArtifacts(sha, root), /checksum/);
+  write('package/vendor/dsh/cordis.patch.yml', "- name: '@1agents/acp-service/dsh'\n");
+  repack();
+  assert.throws(() => validateArtifacts(sha, root), /package root/);
+  write('package/vendor/dsh/cordis.patch.yml', `- name: '${source.name}'\n`);
+  write('package/vendor/dsh/client.js', 'load({id:"@1agents/dsh-acp"});');
+  repack();
+  assert.throws(() => validateArtifacts(sha, root), /Browser registration/);
+  write('package/vendor/dsh/client.js', `load({id:"${source.name}"});`);
+  rmSync(join(root, 'package/vendor/dsh/service-worker.js'));
+  repack();
+  assert.throws(() => validateArtifacts(sha, root));
 });

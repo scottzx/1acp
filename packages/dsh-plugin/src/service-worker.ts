@@ -1,5 +1,5 @@
 /** Isolated service owner. IPC loss also shuts down the service after an abrupt DSH exit. */
-import type { serveAcpService } from '@1agents/acp-service';
+import type { serveAcpService } from '@1agents/acp-service/service';
 
 let startup: ReturnType<typeof serveAcpService> | undefined;
 let stopping = false;
@@ -23,7 +23,7 @@ process.once('message', message => {
   if (stopping) return;
   shutdownTimeoutMs = message.shutdownTimeoutMs;
   const { host, port } = message;
-  startup = import('@1agents/acp-service').then(service => service.serveAcpService({ host, port, report: false }));
+  startup = import('@1agents/acp-service/service').then(service => service.serveAcpService({ host, port, report: false }));
   void startup.then(() => {
     if (!stopping && process.connected) process.send?.({ type: 'ready' });
   }, error => {

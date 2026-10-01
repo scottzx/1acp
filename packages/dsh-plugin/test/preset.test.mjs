@@ -15,7 +15,7 @@ test('bundle registers ACP-only presets and releases them with its lifetime', as
   assert.deepEqual([...presets.keys()],['oneagents-acp-codex','oneagents-acp-grok-build']);
   const codex=presets.get('oneagents-acp-codex');
   assert.equal(codex.plugins[0].config.includeRuntimeContext,false);
-  assert.equal(codex.plugins[1].name,'@1agents/dsh-acp/preset');
+  assert.equal(codex.plugins[1].name,'@1agents/acp-service/dsh/preset');
   assert.equal(codex.plugins[1].config.agent,'codex');
  } finally { for(const dispose of effects) await dispose?.(); rmSync(dir,{recursive:true,force:true}); }
  assert.equal(presets.size,0);

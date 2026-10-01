@@ -4,7 +4,7 @@ ACP Agent Runtime Service for Codex, Grok Build, Claude Code and other Agents su
 
 ## Run
 
-Requires Node.js 22.13 or later. Starting with 0.4, the package includes the 1ACP runtime, CLI, skills and license; installing a separate `@scottzx/1acp` package is unnecessary. The runtime and service retain their respective ACP SDK versions.
+Requires Node.js 22.13 or later. Version 0.5 includes the 1ACP runtime, CLI, service, DSH plugin, browser controls, skills and licenses; installing a separate `@scottzx/1acp` package is unnecessary. The runtime and service retain their respective ACP SDK versions.
 
 The runtime's per-session launch argv and transient credentials APIs support Provider Profiles. Public runtime APIs and flow authoring are available as `@1agents/acp-service/runtime` and `@1agents/acp-service/flows`. The `acp-service` command forwards runtime commands alongside its `serve` command.
 
@@ -36,6 +36,18 @@ HTTP endpoints:
 - `GET /health`: service health and active session/task counts.
 - `GET /manifest`: DreamMate service discovery, ACP version, custom transport and Agent endpoint paths. Profiles listed here describe registered launch configurations, not a successful installation/authentication probe.
 - `GET /services`: current service/session counts.
+
+## DSH installation
+
+The same npm package can be installed as a DSH bundle:
+
+```sh
+pnpm dsh plugin --profile web add @1agents/acp-service
+```
+
+DSH reads the package's bundle patch and browser metadata; the CLI uses its `bin` entry. There is no installation-time mode switch, and both uses can coexist. The package root retains the service API and exposes Cordis metadata plus a lazy `apply`; merely importing it starts no plugin or process. `/service` is the service API, while `/dsh`, `/dsh/preset` and `/dsh/imports` provide the typed plugin interfaces. DSH host dependencies are supplied by DSH rather than installed with the CLI.
+
+The plugin starts or reuses a local service when activated. See [DSH plugin usage](vendor/dsh/README.md) for presets, browser controls, configuration and lifecycle. Before migrating, stop DSH and remove `@1agents/dsh-acp`, then add the unified package; keep session bindings and preserve custom row configuration. Plugin and preset IDs are unchanged.
 
 ## ACP connections
 
@@ -134,7 +146,7 @@ Nonstandard metadata is namespaced; standard `session/update` content is still a
 
 Upgrade the service and 1agents Go client together. Old `action/event` WebSocket clients are not supported by 0.2. The Go `internal/acpwire` client converts existing chat view messages to standard ACP and negotiated extensions; frontend view state can remain unchanged. It stores the returned service session ID for future reconnects and explicitly imports older native IDs when needed.
 
-The npm `@1agents/acp-bridge` launcher must use a dependency range that accepts service 0.4 to adopt this release. Publish the service before dependent plugins or launchers. Install from the workspace root with `pnpm install --frozen-lockfile`; build runtime, then service. Development supervision locates `services/1acp/packages/service`.
+The npm `@1agents/acp-bridge` launcher must use a dependency range that accepts service 0.5 to adopt this release. There is one public package; the DSH plugin is embedded and needs no separate release. Install from the workspace root with `pnpm install --frozen-lockfile`; build runtime, then service. Development supervision locates `services/1acp/packages/service`.
 
 ## Verify
 

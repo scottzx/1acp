@@ -9,8 +9,7 @@ import { AcpAdapter, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
-export const name = 'oneagents-acp';
-export const inject = ['llm', 'agents', 'approval', 'userQuestions', 'commands', 'sessionProjections', 'webServer', 'sessionController', 'agentPresets', 'sessions', 'sessionPersistence', 'workspaceRegistry'];
+export { name, inject } from '@1agents/acp-service';
 export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> = {}): Promise<void> {
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
@@ -60,7 +59,7 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
       order: 20,
       plugins: [
         { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: '', complete: true, includeRuntimeContext: false } },
-        { id: 'acp-session', name: '@1agents/dsh-acp/preset', config: { agent } },
+        { id: 'acp-session', name: '@1agents/acp-service/dsh/preset', config: { agent } },
       ],
     });
     ctx.effect(() => dispose);

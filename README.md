@@ -1,12 +1,12 @@
 # 1ACP workspace
 
-Two published packages share one repository and one pnpm lockfile. The upstream runtime remains a private workspace package and ships inside the service. Runtime and service remain reusable outside DSH; the DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
+One published package, `@1agents/acp-service`, contains the runtime, CLI, service and DSH plugin. The upstream runtime and DSH plugin remain private source modules in one repository with one pnpm lockfile. Runtime and service remain reusable outside DSH; the DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
 
 | Directory             | npm package            | Responsibility                                                               |
 | --------------------- | ---------------------- | ---------------------------------------------------------------------------- |
 | `packages/runtime`    | Private workspace only | Upstream agent runtime and CLI, embedded in the service                      |
 | `packages/service`    | `@1agents/acp-service` | Local harness discovery, ACP JSON-RPC WebSocket service and session recovery |
-| `packages/dsh-plugin` | `@1agents/dsh-acp`     | DSH session presets, native commands, model selection and interactions       |
+| `packages/dsh-plugin` | private source module | DSH session presets, native commands, model selection and interactions       |
 
 ## Development
 
@@ -22,11 +22,11 @@ pnpm test:integration
 pnpm test
 ```
 
-Build runtime before service; the service build embeds its compiled output, skills and license. Consumers can import `@1agents/acp-service/runtime`, `@1agents/acp-service/flows` and `@1agents/acp-service/agent-registry`, or use the unified `acp-service` CLI. The DSH development links supply types only; the Host provides those services at runtime.
+Build runtime, then service, then the private DSH source module; `pnpm build` also embeds the DSH host entry, browser bundle and patch into the service. Consumers can import `@1agents/acp-service/runtime`, `@1agents/acp-service/flows` and `@1agents/acp-service/agent-registry`, or use the unified `acp-service` CLI. The DSH development links supply types only; the Host provides those services at runtime.
 
 ```sh
 # Run from the DSH checkout; the plugin starts or reuses its local service:
-pnpm dsh plugin --profile web add /absolute/path/1acp/packages/dsh-plugin
+pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service
 pnpm dsh web --no-open
 ```
 
@@ -34,13 +34,40 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 ## Package releases
 
-Publish `@1agents/acp-service` before `@1agents/dsh-acp`. The runtime is private and is never packed or published separately. The service includes the runtime and its dependencies; the plugin uses `workspace:^`, which pnpm converts to the service's current version range when packing.
+Only `@1agents/acp-service` is published. Version 0.5 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
 
-Push CI builds and packs each release package once. Runtime integration tests run in four disjoint lanes; the remaining tests, viewer test, coverage gate and Python Autoreview suite run independently. Fixed-ref DSH build outputs are cached by ref, lockfile, OS, architecture and Node version. CI also installs the service tarball outside the workspace to verify its CLI, public runtime exports and service startup.
+```sh
+# Ordinary CLI installation:
+npm install -g @1agents/acp-service
+acp-service --help
+# DSH installation (run from its checkout):
+pnpm dsh plugin --profile web add @1agents/acp-service
+```
 
-Run the root **Release** workflow on `main`, selecting `all`, `service` or `dsh-plugin`. It locates successful push CI for the exact release commit, waits if that CI is still running, and downloads its existing tarballs. An optional `ci_run_id` pins the source run; SHA, repository, workflow, branch and success are verified. No build or test runs during Release. If no matching successful CI exists or its artifacts have expired, run CI first.
+The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.
 
-Release checks artifact SHA/checksums, manifests, dependencies and the embedded runtime before publishing via `NPM_TOKEN`. A plugin-only release also compares the published service contents with the service tarball from that CI run. Retry Release on the same commit after a publish or registry error: it reuses the CI tarballs and skips already published versions only after verifying their complete contents. Registry propagation retries are bounded to eight attempts with five-second intervals, rather than a fifteen-minute polling loop. Changed published contents require a version bump.
+Push CI builds each source module once and packs the unified release package once, after service and plugin checks. Runtime integration tests run in four disjoint lanes; remaining tests, viewer, coverage and Python Autoreview run independently. Fixed-ref DSH build outputs are cached by ref, lockfile, OS, architecture and Node version. CI installs the tarball outside the workspace and verifies the CLI, runtime flows and service, then uses the real DSH profile reader, Cordis Loader and client registry to check plugin startup, browser discovery and cleanup.
+
+Run the root **Release** workflow on `main`. It locates successful push CI for the exact commit, waits if that CI is running, and downloads its single existing tarball. The optional `ci_run_id` pins the source run; SHA, repository, workflow, branch and success are verified. Release performs no install, build or test. If matching CI is absent or artifacts have expired, run CI first.
+
+Release checks artifact SHA/checksum, manifests, dependencies, runtime and DSH entrypoints, then publishes via `NPM_TOKEN`. Retry Release on the same commit after a publish or registry error: it reuses the CI tarball and skips an already published version only after verifying its contents and permissions. Registry propagation retries are bounded to eight attempts with five-second intervals. Changed published contents require a version bump.
+
+For local packaging, build first, then run `pnpm run pack` from this root. Packing checks existing outputs and never rebuilds them. To verify the resulting package:
+
+```sh
+node scripts/smoke-service-package.mjs release/1agents-acp-service-0.5.0.tgz /absolute/path/DSH
+```
+
+### Migrate a DSH profile
+
+The former `@1agents/dsh-acp` package stops receiving independent releases. With DSH stopped, remove the old bundle before installing the unified one:
+
+```sh
+pnpm dsh plugin --profile web remove @1agents/dsh-acp
+pnpm dsh plugin --profile web add @1agents/acp-service
+```
+
+Restart DSH after migration. Plugin IDs, preset IDs, binding paths and service state remain the same; existing sessions retain their identity. Update any custom plugin rows from `@1agents/dsh-acp` to `@1agents/acp-service`, presets to `@1agents/acp-service/dsh/preset`, and native-session imports to `@1agents/acp-service/dsh/imports`. Do not enable both old and new bundles together. Preserve custom row configuration when replacing its package name.
 
 ## Repository migration
 

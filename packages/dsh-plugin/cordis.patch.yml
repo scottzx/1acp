@@ -2,7 +2,7 @@
   disabled: true
 - insert:
     - id: oneagents-acp
-      name: '@1agents/dsh-acp'
+      name: '@1agents/acp-service'
       config:
         serviceMode: auto
         serviceUrl: http://127.0.0.1:36812

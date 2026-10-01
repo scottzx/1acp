@@ -2,11 +2,6 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      package:
-        description: Package to publish from successful CI for this commit
-        type: choice
-        default: all
-        options: [all, service, dsh-plugin]
       ci_run_id:
         description: Optional successful main CI run ID (must match this commit)
         type: string
@@ -40,13 +35,11 @@ jobs:
           CI_RUN_ID: ${{ inputs.ci_run_id }}
       - uses: actions/download-artifact@v4
         with:
-          pattern: '*-package'
+          name: service-package
           path: release
-          merge-multiple: true
           github-token: ${{ github.token }}
           run-id: ${{ steps.ci.outputs.run-id }}
-      - name: Verify and publish existing CI tarballs in dependency order
+      - name: Verify and publish the unified CI tarball
         run: node scripts/publish-packages.mjs
         env:
-          RELEASE_PACKAGE: ${{ inputs.package }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

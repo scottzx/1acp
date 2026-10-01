@@ -22,6 +22,8 @@ try {
     assert.ok(createRuntimeStore({ stateDir: './state' }));
     assert.equal(typeof defineFlow, 'function');
     assert.throws(() => require.resolve('@scottzx/1acp'));
+    assert.throws(() => require.resolve('@1agents/dsh-acp'));
+    assert.throws(() => require.resolve('@deepseek-ai/cordis'));
     const cli = require.resolve('@1agents/acp-service/runtime-cli');
     assert.match(execFileSync(process.execPath, [cli, '--help'], { encoding: 'utf8' }), /Usage:/);
     const service = require.resolve('@1agents/acp-service/package.json').replace(/package\\.json$/, 'dist/bin/acp-service.js');
@@ -29,6 +31,9 @@ try {
     assert.match(execFileSync(process.execPath, [service, 'codex', '--help'], { encoding: 'utf8' }), /codex/);
     const api = await import('@1agents/acp-service');
     assert.equal(typeof api.serveAcpService, 'function');
+    assert.equal(typeof api.apply, 'function');
+    const serviceApi = await import('@1agents/acp-service/service');
+    assert.equal(serviceApi.serveAcpService, api.serveAcpService);
     const server = await api.serveAcpService({ host: '127.0.0.1', port: 0, report: false });
     await server.close();
   `);
@@ -59,6 +64,13 @@ try {
     writeFileSync(join(directory, file), source.replace("'./fixtures/acp-agent.mjs'", "'./test/fixtures/acp-agent.mjs'"));
   }
   execFileSync(process.execPath, ['--test', ...installedTests], { cwd: directory, stdio: 'inherit', timeout: 60_000 });
+  if (process.argv[3]) {
+    cpSync(new URL('./smoke-dsh-package.mjs', import.meta.url), join(directory, 'dsh-smoke.mjs'));
+    execFileSync(process.execPath, ['--expose-internals', 'dsh-smoke.mjs', resolve(process.argv[3])], {
+      cwd: directory, stdio: 'inherit', timeout: 60_000,
+      env: { ...process.env, ACP_STATE_DIR: join(directory, 'state'), DSH_HOME: join(directory, 'dsh-home') },
+    });
+  }
   console.log('Installed service tarball smoke test passed');
 } finally {
   rmSync(directory, { recursive: true, force: true });

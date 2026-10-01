@@ -1,6 +1,5 @@
 {
   "name": "@1agents/dsh-acp",
-  "version": "0.2.2",
   "type": "module",
   "description": "External ACP Agent sessions for DeepSeek Harness",
   "exports": {
@@ -42,8 +41,8 @@
   },
   "scripts": {
     "build": "tsc && node scripts/bundle-client.mjs",
-    "test": "npm run build && node --test test/*.test.mjs",
-    "prepack": "npm run build"
+    "test": "npm run build && npm run test:only",
+    "test:only": "node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=22.13.0"
@@ -65,8 +64,5 @@
     "directory": "packages/dsh-plugin"
   },
   "license": "MIT",
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org"
-  }
+  "private": true
 }

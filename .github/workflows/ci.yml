@@ -38,9 +38,7 @@ jobs:
           retention-days: 7
       - run: pnpm --filter @1agents/acp-service build
       - run: pnpm --filter @1agents/acp-service typecheck
-      - run: pnpm --filter @1agents/acp-service test
-      - run: node scripts/release-artifacts.mjs service
-      - run: node scripts/smoke-service-package.mjs release/*.tgz
+      - run: pnpm --filter @1agents/acp-service test:only
       - name: Archive service build with executable permissions
         run: tar -czf service-build.tgz -C packages/service dist vendor
       - uses: actions/upload-artifact@v4
@@ -48,13 +46,6 @@ jobs:
           name: service-build
           path: service-build.tgz
           retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: service-package
-          path: |
-            release/*.tgz
-            release/service-manifest.json
-          retention-days: 30
   runtime-tests:
     needs: build
     runs-on: ubuntu-latest
@@ -145,12 +136,15 @@ jobs:
           name: service-build
       - name: Restore service build with executable permissions
         run: tar -xzf service-build.tgz -C packages/service
-      - run: pnpm --filter @1agents/dsh-acp test
-      - run: node scripts/release-artifacts.mjs dsh-plugin
+      - run: pnpm --filter @1agents/dsh-acp build
+      - run: pnpm --filter @1agents/dsh-acp test:only
+      - run: node scripts/embed-dsh.mjs
+      - run: node scripts/release-artifacts.mjs
+      - run: node scripts/smoke-service-package.mjs release/*.tgz "$GITHUB_WORKSPACE/.dsh-checkout"
       - uses: actions/upload-artifact@v4
         with:
-          name: dsh-plugin-package
+          name: service-package
           path: |
             release/*.tgz
-            release/dsh-plugin-manifest.json
+            release/service-manifest.json
           retention-days: 30
