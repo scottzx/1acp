@@ -312,12 +312,14 @@ export class AcpAdapter implements LlmAdapter {
     const turn = boundary?.lastTurn ?? 0;
     const step = stepStart?.type === 'step/start' ? stepStart.data.step : 0;
     let index = 0, current: 'text' | 'reasoning' | undefined, content = '', answer = '';
+    const acpStream = { turn, step, requestId };
     const endBlock = () => { if (current) { queue.push({ type: 'block-end', index, block: { type: current, text: content } as ContentBlock }); index++; current = undefined; content = ''; } };
     const emit = (kind: 'text' | 'reasoning', text: string) => {
       if (!text) return;
-      if (current !== kind) { endBlock(); current = kind; queue.push({ type: 'block-start', index, blockType: kind }); }
+      if (current !== kind) { endBlock(); current = kind; queue.push({ type: 'block-start', index, blockType: kind, acpStream } as StreamChunk); }
       content += text; if (kind === 'text') answer += text;
-      queue.push(kind === 'text' ? { type: 'text-delta', index, text } : { type: 'reasoning-delta', index, text });
+      const chunk = kind === 'text' ? { type: 'text-delta' as const, index, text, acpStream } : { type: 'reasoning-delta' as const, index, text, acpStream };
+      queue.push(chunk);
     };
     const update = (u: SessionUpdate) => {
       const meta = u._meta?.['1agents'] as JsonObject | undefined;

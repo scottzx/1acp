@@ -1,12 +1,13 @@
 /** Browser controls for native ACP configuration and ordinary DSH models. */
 import { createElement as h, useEffect, useState, useSyncExternalStore } from 'react';
 import { toolConversationDefinition } from './tool-conversation.js';
+import { installTranscriptView } from './transcript-view.js';
 
 export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation', 'conversation'];
 
 const dictionaries = {
-  zh: { model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。' },
-  en: { model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.' },
+  zh: { toolGroup: '已调用 {count} 个工具', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。' },
+  en: { toolGroup: '{count} tool calls', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.' },
 };
 
 /** Preserve Agent-owned group labels and option ids. */
@@ -38,6 +39,7 @@ function Select({ title, value, rows, disabled, onSelect, placeholder }) {
 
 export function apply(ctx) {
   ctx.uiConversation.events.register(toolConversationDefinition);
+  installTranscriptView(ctx);
   ctx.effect(() => ctx.locale.register('oneagentsAcp', dictionaries));
   const t = ctx.locale.bind('oneagentsAcp');
   const native = new Map();

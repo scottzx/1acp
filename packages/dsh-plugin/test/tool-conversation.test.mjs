@@ -37,7 +37,7 @@ const row = (seq, type, data) => ({ type: 'event', event: { seq, time: 1000 + se
 const snapshot = (seq, tool, requestId = 'turn-1') => ({ type: 'block-end', index: seq, block: { type: 'text', text: '', acpTool: { turn: 1, step: 1, requestId, sequence: seq, tool } } });
 const observation = (seq, tool, requestId = 'turn-1') => row(seq, 'assistant/live-chunk', { turn: 1, step: 1, chunk: snapshot(seq, tool, requestId) });
 const started = { toolCallId: 'exec-1', name: 'Bash', title: 'ls -la', status: 'in_progress', kind: 'execute', rawInput: { command: 'ls -la' } };
-const roots = assembler => [...assembler.snapshot('chat').values()].flatMap(node => [node.data.root, ...node.data.root.subCalls]);
+const roots = assembler => [...assembler.snapshot('chat').values()].flatMap(node => node.data.acpTranscript.groups.flatMap(group => group.roots ?? []));
 
 test('DSH folds running, sparse updates and terminal observations into one ACP tool card', () => {
   const assembler = engine();
@@ -62,7 +62,9 @@ test('DSH restores a cut window from its complete observation and keeps distinct
   assembler.flush();
   assert.equal(roots(assembler)[0].isError, true);
   assert.equal(roots(assembler)[0].call.name, 'Bash');
-  assembler.append(observation(4, started, 'turn-2')); assembler.flush();
+  const next = observation(4, started, 'turn-2');
+  next.event.data.turn = 2; next.event.data.chunk.block.acpTool.turn = 2;
+  assembler.append(next); assembler.flush();
   assert.equal(roots(assembler).length, 2);
   assert.notEqual(roots(assembler)[0].callId, roots(assembler)[1].callId);
 });
@@ -97,8 +99,8 @@ test('remote snapshots survive DSH persistence validation and rebuild every ACP 
   assert.equal(roots(assembler).length, 2);
   const nodes = [...assembler.snapshot('chat').values()];
   assert.equal(nodes.length, 1);
-  assert.equal(nodes[0].kind, 'tool-call');
-  assert.equal(nodes[0].data.root.subCalls.length, 1);
+  assert.equal(nodes[0].kind, 'assistant-step');
+  assert.equal(roots(assembler).every(root => root.subCalls.length === 0), true);
   assert.equal(roots(assembler)[0].callTime, 1002);
   assert.equal(roots(assembler)[0].content[0].text, 'README.md');
   assert.equal(roots(assembler)[1].isError, true);
@@ -118,7 +120,7 @@ test('durable attempts do not duplicate tools already seen live and still restor
 });
 
 
-test('completed persisted ACP calls keep the native DSH process disclosure expandable', () => {
+test('completed persisted ACP transcripts use their own Tool disclosures without an extra process tree', () => {
   const assembler = new ConversationNodeAssembler(
     { entries: () => [toolConversationDefinition, assistantDefinition, turnProcessDefinition], fallbackEntry: () => undefined },
     { entries: () => [{ target: 'chat', create: () => new ChatSnapshotBuilder() }] },
@@ -134,10 +136,40 @@ test('completed persisted ACP calls keep the native DSH process disclosure expan
     row(4, 'step/end', { turn: 1, step: 1 }), row(5, 'turn/end', { turn: 1 })], false);
   assembler.flush();
   const chat = assembler.snapshot('chat');
-  const card = chat.nodes.values().find(node => node.kind === 'tool-call');
+  const card = chat.nodes.values().find(node => node.data.acpTranscript);
   const process = chat.nodes.processSource(card.key).getSnapshot();
   assert.equal(process.turnClosed, true);
-  assert.equal(process.hasExternalProcess, true);
-  assert.ok(card.anchorSeq < process.spec.answerAnchorSeq);
-  assert.equal(chat.legacy.nodes.some(node => node.kind === 'tool-result'), true);
+  assert.equal(process.hasExternalProcess, false);
+  assert.equal(card.anchorSeq, process.spec.answerAnchorSeq);
+  assert.equal(card.data.acpTranscript.groups[0].roots[0].subCalls.length, 0);
+});
+
+
+test('native prose and thinking retain their order between independently collapsed Tool groups after reload', () => {
+  const text = (index, kind, value) => ({ type: 'block-end', index, block: { type: kind, text: value } });
+  const stream = [text(0, 'text', 'First commentary'), snapshot(1, { ...started, toolCallId: 'a', status: 'completed' }),
+    snapshot(2, { ...started, toolCallId: 'b', status: 'completed' }), text(3, 'reasoning', 'Review results'),
+    snapshot(4, { ...started, toolCallId: 'c', status: 'completed' }), text(5, 'text', 'Next commentary'),
+    snapshot(6, { ...started, toolCallId: 'd', status: 'completed' }), text(7, 'text', 'Final answer')]
+    .map(chunk => ({ type: 'chunk', time: 1000 + chunk.index, chunk }));
+  const assembler = engine();
+  assembler.replaceWindow([row(10, 'assistant/message', { turn: 1, step: 1, stream })], false); assembler.flush();
+  const groups = [...assembler.snapshot('chat').values()][0].data.acpTranscript.groups;
+  assert.deepEqual(groups.map(group => group.kind), ['text', 'tools', 'reasoning', 'tools', 'text', 'tools', 'text']);
+  assert.deepEqual(groups.filter(group => group.kind === 'tools').map(group => group.roots.length), [2, 1, 1]);
+  assert.equal(roots(assembler).every(root => root.subCalls.length === 0), true);
+  assert.equal(groups[0].text, 'First commentary');
+  assert.equal(groups.at(-1).text, 'Final answer');
+});
+
+
+test('legacy live prose before the first ACP Tool remains in the transcript when updates arrive', () => {
+  const assembler = engine();
+  assembler.replaceWindow([row(1, 'assistant/live-chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'Before Tool' } })], false);
+  assembler.flush();
+  assert.equal(assembler.snapshot('chat').size, 0);
+  assembler.append(observation(2, started)); assembler.flush();
+  const groups = [...assembler.snapshot('chat').values()][0].data.acpTranscript.groups;
+  assert.equal(groups[0].text, 'Before Tool');
+  assert.equal(groups[1].roots.length, 1);
 });
