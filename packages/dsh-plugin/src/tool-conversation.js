@@ -1,5 +1,4 @@
-/** Project ACP's log-only observations onto DSH's existing Tool card renderer. */
-const EVENT = 'oneagents-acp/tool';
+/** Project remote Tool snapshots carried by DSH's existing assistant stream. */
 const names = { execute: 'Bash', read: 'Read', edit: 'Edit', delete: 'Delete', move: 'Move', search: 'Search', fetch: 'Fetch', think: 'Think' };
 
 function contentOf(tool) {
@@ -30,20 +29,41 @@ function rootOf(state, location) {
   };
 }
 
-const fromMatch = match => ({ data: match.event.data, seq: match.event.seq, time: match.event.time, updatedAt: match.event.time });
+function snapshots(event) {
+  const fromChunk = (chunk, time) => chunk?.type === 'block-end' && chunk.block?.acpTool
+    ? [{ data: chunk.block.acpTool, time }] : [];
+  if (event.type === 'assistant/live-chunk') return fromChunk(event.data.chunk, event.time);
+  if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
+    return (event.data.stream ?? []).flatMap(record => record.type === 'chunk' ? fromChunk(record.chunk, record.time) : []);
+  }
+  return [];
+}
+
+function fold(previous, match) {
+  const tools = new Map(previous?.tools);
+  for (const { data, time } of snapshots(match.event)) {
+    const current = tools.get(data.tool.toolCallId);
+    // Live records and their later durable attempt represent the same stream.
+    if (current && current.data.sequence >= data.sequence) continue;
+    tools.set(data.tool.toolCallId, { data, seq: current?.seq ?? match.event.seq, time: current?.time ?? time, updatedAt: time });
+  }
+  return { tools, seq: previous?.seq ?? match.event.seq };
+}
+
 export const toolConversationDefinition = {
-  kind: 'oneagents-acp-tool', target: 'chat',
-  // Each observation contains a complete merged snapshot, including after a
-  // window cut. A start match also updates an already existing context.
-  match: event => event.type === EVENT ? { id: `${event.data.requestId}:${event.data.tool.toolCallId}`, role: 'start' } : null,
-  start: (_context, match) => fromMatch(match),
-  update: (context, match) => ({ ...context.state, data: match.event.data, updatedAt: match.event.time }),
+  kind: 'oneagents-acp-tools', target: 'chat',
+  match: event => {
+    const first = snapshots(event)[0];
+    return first ? { id: first.data.requestId, role: 'start' } : null;
+  },
+  start: (_context, match) => fold(undefined, match),
+  update: (context, match) => fold(context.state, match),
   publication: () => 'immediate',
   buildViewNode: context => {
     const state = context.state;
     if (!state) return null;
     const location = context.start?.location ?? context.matches[0]?.location ?? { kind: 'unresolved' };
-    return { key: context.key, id: context.id, kind: 'tool-call', target: 'chat',
-      anchorSeq: state.seq, location, visibility: 'visible', data: { root: rootOf(state, location) } };
+    return { key: context.key, id: context.id, kind: 'oneagents-acp-tools', target: 'chat',
+      anchorSeq: state.seq, location, visibility: 'visible', data: { roots: [...state.tools.values()].map(tool => rootOf(tool, location)) } };
   },
 };

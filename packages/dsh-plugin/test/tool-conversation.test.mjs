@@ -12,13 +12,14 @@ import { toolConversationDefinition } from '../src/tool-conversation.js';
 // The development declaration links already identify the matching DSH checkout.
 const dsh = resolve(realpathSync(new URL('../node_modules/@deepseek-ai/dsh-agent', import.meta.url)), '../../..');
 const bundle = await build({
-  stdin: { contents: `export { ConversationNodeAssembler } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-conversation/src/client/conversation/assembler.ts'))};`, resolveDir: dsh, loader: 'ts' },
-  tsconfig: resolve(dsh, 'tsconfig.base.json'), bundle: true, platform: 'node', format: 'esm', write: false,
+  stdin: { contents: `export { ConversationNodeAssembler } from ${JSON.stringify(resolve(dsh, 'packages/client/ui-conversation/src/client/conversation/assembler.ts'))}; export { validateStoredEvents } from ${JSON.stringify(resolve(dsh, 'packages/session/session-persistence/src/storage-contract.ts'))};`, resolveDir: dsh, loader: 'ts' },
+  tsconfig: resolve(dsh, 'tsconfig.base.json'), bundle: true, platform: 'node', target: 'es2022', format: 'esm', write: false,
+  plugins: [{ name: 'dsh-built-session', setup(build) { build.onResolve({ filter: /^@deepseek-ai\/dsh-session$/ }, () => ({ path: import.meta.resolve('@deepseek-ai/dsh-session').replace('file://', ''), external: true })); } }],
 });
 const directory = mkdtempSync(resolve(tmpdir(), 'acp-dsh-projection-'));
 const path = resolve(directory, 'assembler.mjs');
 writeFileSync(path, bundle.outputFiles[0].text);
-const { ConversationNodeAssembler } = await import(pathToFileURL(path).href);
+const { ConversationNodeAssembler, validateStoredEvents } = await import(pathToFileURL(path).href);
 rmSync(directory, { recursive: true, force: true });
 
 function engine() {
@@ -33,11 +34,12 @@ function engine() {
   return assembler;
 }
 const row = (seq, type, data) => ({ type: 'event', event: { seq, time: 1000 + seq, type, data } });
-const observation = (seq, tool, requestId = 'turn-1') => row(seq, 'oneagents-acp/tool', { turn: 1, step: 1, requestId, sequence: seq, tool });
+const snapshot = (seq, tool, requestId = 'turn-1') => ({ type: 'block-end', index: seq, block: { type: 'text', text: '', acpTool: { turn: 1, step: 1, requestId, sequence: seq, tool } } });
+const observation = (seq, tool, requestId = 'turn-1') => row(seq, 'assistant/live-chunk', { turn: 1, step: 1, chunk: snapshot(seq, tool, requestId) });
 const started = { toolCallId: 'exec-1', name: 'Bash', title: 'ls -la', status: 'in_progress', kind: 'execute', rawInput: { command: 'ls -la' } };
-const roots = assembler => [...assembler.snapshot('chat').values()].map(node => node.data.root);
+const roots = assembler => [...assembler.snapshot('chat').values()].flatMap(node => node.data.roots);
 
-test('DSH folds running, sparse updates and terminal observations into one native tool card', () => {
+test('DSH folds running, sparse updates and terminal observations into one ACP tool card', () => {
   const assembler = engine();
   assembler.replaceWindow([row(0, 'turn/start', { turn: 1 }), row(1, 'step/start', { turn: 1, step: 1 }), observation(2, started)], false);
   assembler.flush();
@@ -76,9 +78,37 @@ test('DSH closes unfinished remote tool cards when the owning step is interrupte
   assert.equal(root.isError, true);
 });
 
-test('remote observations remain outside the real DSH model message surface', () => {
+test('remote snapshots survive DSH persistence validation and rebuild every ACP card after reload', () => {
   const session = Session.create('remote-observations');
-  session.append('oneagents-acp/tool', observation(0, started).event.data);
-  assert.equal(session.seq, 1);
-  assert.deepEqual(session.deriveMessages(), []);
+  const chunks = [snapshot(2, started), snapshot(3, { ...started, status: 'completed', rawOutput: 'README.md' }), snapshot(4, { ...started, toolCallId: 'exec-2', status: 'failed', rawOutput: 'Missing' })];
+  const stream = chunks.flatMap(chunk => [
+    { type: 'chunk', time: 1000 + chunk.index, chunk: { type: 'block-start', index: chunk.index, blockType: 'text' } },
+    { type: 'chunk', time: 1000 + chunk.index, chunk },
+  ]);
+  session.append('assistant/message', {
+    turn: 1, step: 1, stream, message: { id: 'remote-answer', role: 'assistant', source: { kind: 'model', provider: '1agents-acp', model: 'codex' }, content: chunks.map(c => c.block) },
+  }, { surfaceOp: 'append' });
+  const stored = validateStoredEvents(session.header, JSON.parse(JSON.stringify(session.snapshotEvents())));
+  const restored = Session.create(session.id, stored, session.header);
+  assert.equal(restored.deriveMessages()[0].content.every(block => block.type === 'text' && block.text === ''), true);
+  const assembler = engine();
+  assembler.replaceWindow(restored.snapshotEvents().map(event => ({ type: 'event', event })), false);
+  assembler.flush();
+  assert.equal(roots(assembler).length, 2);
+  assert.equal(roots(assembler)[0].callTime, 1002);
+  assert.equal(roots(assembler)[0].content[0].text, 'README.md');
+  assert.equal(roots(assembler)[1].isError, true);
+});
+
+test('durable attempts do not duplicate tools already seen live and still restore cancelled calls', () => {
+  const assembler = engine();
+  assembler.replaceWindow([observation(2, started)], false); assembler.flush();
+  const chunk = snapshot(3, { ...started, status: 'completed', rawOutput: 'done' });
+  assembler.append(observation(3, chunk.block.acpTool.tool)); assembler.flush();
+  assembler.append(row(4, 'assistant/attempt', { turn: 1, step: 1, stream: [
+    { type: 'chunk', time: 1002, chunk: snapshot(2, started) }, { type: 'chunk', time: 1003, chunk },
+  ] })); assembler.flush();
+  assert.equal(roots(assembler).length, 1);
+  assert.equal(roots(assembler)[0].content[0].text, 'done');
+  assert.equal(roots(assembler)[0].callTime, 1002);
 });

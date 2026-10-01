@@ -13,7 +13,7 @@ import type {} from '@deepseek-ai/dsh-agent-preset-registry';
 import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
 import { State, type Binding } from './state.js';
-import { TOOL_EVENT, mergeTool, type RemoteTool } from './tool-events.js';
+import { mergeTool, type RemoteTool } from './tool-events.js';
 export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number }
 export interface Capabilities {
   agent: string;
@@ -317,9 +317,13 @@ export class AcpAdapter implements LlmAdapter {
       else if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') {
         const tool = mergeTool(tools.get(u.toolCallId), u);
         tools.set(u.toolCallId, tool);
-        agent.session.append(TOOL_EVENT, {
-          turn, step, requestId, sequence: meta.sequence, tool,
-        });
+        // Known stream records preserve plugin metadata across save/reload.
+        // Empty text is inert; only the plugin projects it into remote Tool cards.
+        endBlock();
+        const block = { type: 'text' as const, text: '', acpTool: { turn, step, requestId, sequence: meta.sequence, tool } };
+        queue.push({ type: 'block-start', index, blockType: 'text' });
+        queue.push({ type: 'block-end', index, block });
+        index++;
       }
     };
     let active: Awaited<ReturnType<typeof connect>> | undefined;

@@ -70,8 +70,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     connection = app.connect(stream(ws));
   });
   const local = { id: 'dsh-session', session: { header: { cwd: directory, agentPreset: 'oneagents-acp-codex' }, boundary: { openTurnStartSeq: null, lastTurn: 0 } }, ctx: { commands: { register: definition => { commands.set(definition.name, definition); return () => commands.delete(definition.name); } } } };
-  const observations = [];
-  local.session.append = (...args) => { assert.equal(args.length, 2); observations.push({ type: args[0], data: structuredClone(args[1]) }); };
+  local.session.append = () => { throw new Error('Remote tools must use existing stream records'); };
   const scopedCommands = local.ctx.commands;
   delete local.ctx.commands;
   local.ctx.inject = async (deps, apply) => { assert.deepEqual(deps, ['commands']); apply({ commands: scopedCommands, effect: () => {} }); return { dispose: async () => {} }; };
@@ -104,7 +103,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const adapter = new AcpAdapter(ctx, config);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
-  return { adapter, options, config, ctx, local, sent, prompts, changes, commands, observations, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
+  return { adapter, options, config, ctx, local, sent, prompts, changes, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
 
@@ -142,18 +141,20 @@ test('remote tool updates are durable observations, retain omitted fields, and n
   const chunks = await collect(f.adapter, f.options('tools-1'));
   assert.equal(chunks.filter(c => c.type === 'reasoning-delta').map(c => c.text).join(''), 'Inspect the directory.');
   assert.ok(!chunks.some(c => c.type === 'tool-call-delta' || c.block?.type === 'tool-call'));
-  assert.equal(f.observations.length, 6); // Replay did not duplicate any observation.
-  assert.ok(f.observations.every(e => e.type === 'oneagents-acp/tool' && e.data.turn === 3 && e.data.step === 2));
-  const completed = f.observations[3].data.tool;
+  const observations = chunks.filter(c => c.type === 'block-end' && c.block.acpTool).map(c => c.block.acpTool);
+  assert.equal(observations.length, 6); // Replay did not duplicate any observation.
+  assert.ok(observations.every(e => e.turn === 3 && e.step === 2));
+  const completed = observations[3].tool;
   assert.equal(completed.title, 'ls -la');
   assert.equal(completed.name, 'Bash');
   assert.equal(completed.status, 'completed');
   assert.deepEqual(completed.rawInput, { command: 'ls -la' });
   assert.equal(completed.content[0].content.text, 'README.md');
-  assert.equal(f.observations.at(-1).data.tool.status, 'failed');
+  assert.equal(observations.at(-1).tool.status, 'failed');
   assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
-  await collect(f.adapter, f.options('tools-2'));
-  assert.notEqual(f.observations[0].data.requestId, f.observations[6].data.requestId);
+  const next = await collect(f.adapter, f.options('tools-2'));
+  assert.notEqual(observations[0].requestId, next.find(c => c.block?.acpTool).block.acpTool.requestId);
+  assert.ok(chunks.filter(c => c.block?.acpTool).every(c => c.block.type === 'text' && c.block.text === ''));
 });
 
 test('binding survives a new adapter instance', { timeout: 5000 }, async t => {

@@ -36,7 +36,7 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 Only `@1agents/acp-service` is published. Version 0.5 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
 
-Version 0.5.1 fixes DSH tool presentation: ACP tool updates retain their titles, input and output, and appear as native tool cards instead of text in the thinking stream. Remote tools remain owned by the ACP Agent and are never executed again by DSH.
+Version 0.5.1 fixes DSH tool presentation: ACP tool updates retain their titles, input and output, and appear as expandable ACP tool cards instead of text in the thinking stream. Remote tools remain owned by the ACP Agent and are never executed again by DSH.
 
 ```sh
 # Ordinary CLI installation:

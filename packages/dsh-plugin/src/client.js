@@ -5,8 +5,8 @@ import { toolConversationDefinition } from './tool-conversation.js';
 export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation'];
 
 const dictionaries = {
-  zh: { model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置' },
-  en: { model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings' },
+  zh: { toolRunning: '执行中', toolFailed: '失败', toolCompleted: '已完成', toolNoOutput: '无输出', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置' },
+  en: { toolRunning: 'Running', toolFailed: 'Failed', toolCompleted: 'Completed', toolNoOutput: 'No output', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings' },
 };
 
 /** Preserve Agent-owned group labels and option ids. */
@@ -36,8 +36,34 @@ function Select({ title, value, rows, disabled, onSelect, placeholder }) {
       rows.map(row => h('option', { key: row.value, value: row.value, title: row.description }, `${row.group ? `${row.group} · ` : ''}${row.name}`))));
 }
 
+/** Remote cards use public chat slots; remote calls have no local inspector. */
+export function AcpTools({ node, t }) {
+  return h('div', { 'data-oneagents-acp-tools': '', style: { display: 'grid', gap: 6 } }, node.data.roots.map(root => {
+    const running = root.phase === 'start';
+    const tool = running ? root : root.call;
+    const output = running ? [] : root.content;
+    const acp = root.meta?.acp;
+    let args;
+    try { args = JSON.parse(tool.argsRaw); } catch { args = tool.argsRaw; }
+    const input = args?.command ?? args?.path ?? args?.file_path ?? acp?.title ?? tool.argsRaw;
+    const state = running ? 'running' : root.isError ? 'failed' : 'completed';
+    const labels = { running: t('toolRunning'), failed: t('toolFailed'), completed: t('toolCompleted'), noOutput: t('toolNoOutput') };
+    return h('details', { key: root.callId, 'data-acp-call': root.callId, 'data-acp-status': state,
+      style: { border: '1px solid var(--dsw-alias-border-l1, #8883)', borderRadius: 8, padding: '7px 10px' } },
+      h('summary', { style: { cursor: 'pointer', fontSize: 13 } },
+        h('strong', null, tool.name), ' ', h('span', { style: { opacity: .65 } }, labels[state]),
+        h('code', { style: { display: 'block', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', marginTop: 4 } }, typeof input === 'string' ? input : JSON.stringify(input))),
+      h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 360, overflow: 'auto', fontSize: 12 } },
+        output.length ? output.map(block => block.text ?? '').join('\n') : running ? labels.running : labels.noOutput));
+  }));
+}
+
 export function apply(ctx) {
   ctx.uiConversation.events.register(toolConversationDefinition);
+  ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
+    name: 'conversation.chat.node', key: 'oneagents-acp-tools',
+    locale: 'oneagentsAcp',
+  }, AcpTools));
   ctx.effect(() => ctx.locale.register('oneagentsAcp', dictionaries));
   const t = ctx.locale.bind('oneagentsAcp');
   const native = new Map();

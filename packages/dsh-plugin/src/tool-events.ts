@@ -1,7 +1,6 @@
-/** Remote tool observations are log-only: they never become local tool requests. */
+/** Display metadata on empty stream blocks never becomes a local tool request. */
 import type { SessionUpdate } from '@agentclientprotocol/sdk';
 
-export const TOOL_EVENT = 'oneagents-acp/tool';
 type ToolUpdate = Extract<SessionUpdate, { sessionUpdate: 'tool_call' | 'tool_call_update' }>;
 export interface RemoteTool {
   toolCallId: string;
@@ -21,12 +20,6 @@ export interface ToolEvent {
   sequence: number;
   tool: RemoteTool;
 }
-declare module '@deepseek-ai/dsh-session/types' {
-  interface SessionEventMap {
-    'oneagents-acp/tool': ToolEvent;
-  }
-}
-
 /** ACP updates replace supplied fields and leave omitted fields intact. */
 export function mergeTool(previous: RemoteTool | undefined, update: ToolUpdate): RemoteTool {
   const tool: RemoteTool = { ...previous, toolCallId: update.toolCallId };
