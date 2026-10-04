@@ -5,7 +5,7 @@ One published package, `@1agents/acp-service`, contains the runtime, CLI, servic
 | Directory             | npm package            | Responsibility                                                               |
 | --------------------- | ---------------------- | ---------------------------------------------------------------------------- |
 | `packages/runtime`    | Private workspace only | Upstream agent runtime and CLI, embedded in the service                      |
-| `packages/service`    | `@1agents/acp-service` | Local harness discovery, ACP JSON-RPC WebSocket service and session recovery |
+| `packages/service`    | `@1agents/acp-service` | ACP CLI/service, A2A delegation and bundled usage skill                     |
 | `packages/dsh-plugin` | private source module | DSH session presets, native commands, model selection and interactions       |
 
 ## Development
@@ -36,7 +36,9 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 Only `@1agents/acp-service` is published. Version 0.5 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
 
-Version 0.5.4 fixes ordered DSH tool groups, native commentary and reasoning: ACP tool updates retain their titles, input and output, and consecutive calls appear as collapsed peer Tool groups, separated by native prose or reasoning in stream order. The DSH components already registered by the host render the cards and prose. Remote tools remain owned by the ACP Agent and are never executed again by DSH.
+Version 0.6.0 adds DSH A2A 1.0 execution, remote-agent gateway tools, a durable completion inbox and the bundled ACP Service usage skill. Tasks return IDs before completion, run in the selected remote workspace and preset, and support standard queries, subscriptions and allowed completion callbacks. The gateway reconciles remote status after reconnect or restart; main-model wake-up still requires a receiving host adapter.
+
+Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasoning: ACP tool updates retain their titles, input and output, and consecutive calls appear as collapsed peer Tool groups, separated by native prose or reasoning in stream order. The DSH components already registered by the host render the cards and prose. Remote tools remain owned by the ACP Agent and are never executed again by DSH.
 
 ```sh
 # Ordinary CLI installation:
@@ -57,7 +59,7 @@ Release checks artifact SHA/checksum, manifests, dependencies, runtime and DSH e
 For local packaging, build first, then run `pnpm run pack` from this root. Packing checks existing outputs and never rebuilds them. To verify the resulting package:
 
 ```sh
-node scripts/smoke-service-package.mjs release/1agents-acp-service-0.5.4.tgz /absolute/path/DSH
+node scripts/smoke-service-package.mjs release/1agents-acp-service-0.6.0.tgz /absolute/path/DSH
 ```
 
 ### Migrate a DSH profile
@@ -78,3 +80,5 @@ This repository preserves the original runtime history and merges the complete s
 `1agents_app/modules/1acp` remains a pinned consumer submodule of this repository. Its runtime is now under `packages/runtime`; package build tooling and adapter discovery use that path. Push this repository's referenced commit before sharing the updated consumer submodule pointer.
 
 See each package README for its protocol, configuration and usage details.
+
+The source-maintained [ACP Service skill](packages/service/skills/acp-service/SKILL.md) ships in the unified npm package, including ACP, DSH and A2A references. Use `acp-service --skill list`, `--skill show acp-service`, or `--skill export acp-service` to discover, read or export it; the existing `acpx` runtime skill remains available.

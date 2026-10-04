@@ -15,6 +15,8 @@ try {
     import assert from 'node:assert/strict';
     import { createRequire } from 'node:module';
     import { execFileSync } from 'node:child_process';
+    import { readFileSync, writeFileSync } from 'node:fs';
+    import { dirname, join } from 'node:path';
     import { createAgentRegistry, createRuntimeStore } from '@1agents/acp-service/runtime';
     import { defineFlow } from '@1agents/acp-service/flows';
     const require = createRequire(import.meta.url);
@@ -29,11 +31,31 @@ try {
     const service = require.resolve('@1agents/acp-service/package.json').replace(/package\\.json$/, 'dist/bin/acp-service.js');
     assert.match(execFileSync(process.execPath, [service, '--help'], { encoding: 'utf8' }), /acp-service serve/);
     assert.match(execFileSync(process.execPath, [service, 'codex', '--help'], { encoding: 'utf8' }), /codex/);
+    const packageRoot = dirname(require.resolve('@1agents/acp-service/package.json'));
+    const skill = readFileSync(join(packageRoot, 'skills/acp-service/SKILL.md'), 'utf8');
+    const listedSkills = JSON.parse(execFileSync(process.execPath, [service, '--skill', 'list', '--json'], { encoding: 'utf8' }));
+    assert.ok(listedSkills.skills.some(item => item.id === 'acp-service'));
+    assert.ok(listedSkills.skills.some(item => item.id === 'acpx'));
+    assert.equal(execFileSync(process.execPath, [service, '--skill', 'show', 'acp-service'], { encoding: 'utf8' }), skill);
+    const skillArchive = join(packageRoot, 'skill-export.tar');
+    writeFileSync(skillArchive, execFileSync(process.execPath, [service, '--skill', 'export', 'acp-service']));
+    const skillEntries = execFileSync('tar', ['-tf', skillArchive], { encoding: 'utf8' }).trim().split('\\n');
+    for (const entry of ['SKILL.md', 'agents/openai.yaml', 'references/acp.md', 'references/dsh.md', 'references/a2a.md']) {
+      assert.ok(skillEntries.includes('acp-service/' + entry), 'Missing exported skill resource: ' + entry);
+      assert.equal(execFileSync('tar', ['-xOf', skillArchive, 'acp-service/' + entry], { encoding: 'utf8' }),
+        readFileSync(join(packageRoot, 'skills/acp-service', entry), 'utf8'));
+    }
     const api = await import('@1agents/acp-service');
     assert.equal(typeof api.serveAcpService, 'function');
     assert.equal(typeof api.apply, 'function');
     const serviceApi = await import('@1agents/acp-service/service');
     assert.equal(serviceApi.serveAcpService, api.serveAcpService);
+    const a2a = await import('@1agents/acp-service/a2a');
+    assert.equal(typeof a2a.createA2AServer, 'function');
+    assert.equal(typeof a2a.FileA2AStore, 'function');
+    assert.equal(typeof a2a.RemoteAgentGateway, 'function');
+    assert.equal(typeof a2a.serveA2AGateway, 'function');
+    assert.match(execFileSync(process.execPath, [service, 'a2a', '--help'], { encoding: 'utf8' }), /remote_agent_spawn/);
     const server = await api.serveAcpService({ host: '127.0.0.1', port: 0, report: false });
     await server.close();
   `);
@@ -57,7 +79,7 @@ try {
   const testDirectory = join(directory, 'test');
   mkdirSync(join(testDirectory, 'fixtures'), { recursive: true });
   cpSync(new URL('../packages/service/test/fixtures/acp-agent.mjs', import.meta.url), join(testDirectory, 'fixtures/acp-agent.mjs'));
-  const installedTests = ['acp-runtime.integration.test.ts', 'catalog.test.ts'];
+  const installedTests = ['acp-runtime.integration.test.ts', 'catalog.test.ts', 'a2a-server.test.ts', 'a2a-store.test.ts', 'a2a-gateway.test.ts'];
   for (const file of installedTests) {
     const source = readFileSync(new URL(`../packages/service/test/${file}`, import.meta.url), 'utf8')
       .replaceAll("'../src/", "'./node_modules/@1agents/acp-service/dist/src/");

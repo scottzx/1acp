@@ -1,14 +1,15 @@
 {
   "name": "@1agents/acp-service",
-  "version": "0.5.4",
-  "description": "ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness plugin in one package.",
+  "version": "0.6.0",
+  "description": "ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness ACP/A2A plugins in one package.",
   "keywords": [
     "dreammate",
     "acp",
     "agent-runtime",
     "claude-code",
     "grok",
-    "codex"
+    "codex",
+    "a2a"
   ],
   "license": "MIT",
   "repository": {
@@ -59,7 +60,11 @@
       "import": "./vendor/dsh/imports.js"
     },
     "./client": "./vendor/dsh/client.js",
-    "./cordis.patch.yml": "./vendor/dsh/cordis.patch.yml"
+    "./cordis.patch.yml": "./vendor/dsh/cordis.patch.yml",
+    "./a2a": {
+      "types": "./dist/src/a2a/index.d.ts",
+      "import": "./dist/src/a2a/index.js"
+    }
   },
   "bin": {
     "acp-service": "dist/bin/acp-service.js"
@@ -67,6 +72,7 @@
   "files": [
     "dist",
     "README.md",
+    "skills",
     "vendor"
   ],
   "scripts": {
@@ -81,22 +87,23 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
+    "@1agents/acp-runtime-sdk": "npm:@agentclientprotocol/sdk@^1.5.0",
     "@1agents/dreammate-network": "^0.3.1",
     "@1agents/dreammate-node": "^0.4.0",
+    "@a2a-js/sdk": "1.3.0",
     "@agentclientprotocol/sdk": "1.4.0",
-    "ws": "^8.18.0",
-    "@1agents/acp-runtime-sdk": "npm:@agentclientprotocol/sdk@^1.5.0",
     "@openclaw/fs-safe": "^0.20.0",
     "commander": "^15.0.0",
     "skillflag": "^0.2.1",
     "tsx": "^4.23.15",
+    "ws": "^8.18.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@scottzx/1acp": "workspace:*",
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.14",
-    "typescript": "^5.7.2",
-    "@scottzx/1acp": "workspace:*"
+    "typescript": "^5.7.2"
   },
   "dsh": {
     "bundle": {

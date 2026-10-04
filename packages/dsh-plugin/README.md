@@ -1,6 +1,8 @@
 # DSH plugin in @1agents/acp-service
 
-An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and is embedded with the runtime and service in the single public `@1agents/acp-service` 0.5 package. This directory is a private source module, not a separately installable npm package. No DSH source files are modified.
+An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and is embedded with the runtime and service in the single public `@1agents/acp-service` package. This directory is a private source module, not a separately installable npm package. No DSH source files are modified.
+
+The same host also supports opt-in A2A 1.0 delegation: remote text messages create or restore DSH sessions, return task IDs, and continue execution independently of HTTP clients. Configure `a2a` on the existing plugin row, set the host's `DSH_A2A_TOKEN`, and choose its public origin, default cwd and preset. Query and subscribe through the official A2A interfaces; allowed webhook origins enable completion callbacks. See the public service README's **DSH A2A** section for the full configuration, metadata and recovery behavior. The shared server is exported as `@1agents/acp-service/a2a` and remains independent of DSH imports.
 
 ## Use
 
@@ -19,7 +21,7 @@ The package declares `dsh.bundle.patch` and its browser entry, so installation s
 The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
 
 ```sh
-npx --yes @1agents/acp-service@^0.5.0 serve --host 127.0.0.1 --port 36812 --no-report
+npx --yes @1agents/acp-service@^0.6.0 serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
 The service requires each native Agent’s CLI and credentials. Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service`.

@@ -49,23 +49,27 @@ await new Promise(resolve => listener.close(resolve));
 const serviceUrl = `http://127.0.0.1:${port}`;
 const ctx = new Context();
 const presets = new Map();
+const routes = new Map();
 class MemoryLoader extends Loader { write() {} }
 try {
   for (const name of api.inject) ctx.provide(name, {});
   ctx.set('llm', { registerAdapter: () => () => {} });
-  ctx.set('webServer', { register: () => () => {} });
+  ctx.set('webServer', { register: route => { routes.set(route.path, route); return () => routes.delete(route.path); } });
   ctx.set('agentPresets', { register: async definition => {
     presets.set(definition.id, definition);
     return () => presets.delete(definition.id);
   } });
   await ctx.plugin(MemoryLoader, { baseUrl: pathToFileURL(process.cwd()).href + '/' });
-  const id = await ctx.loader.create({ name: row.name, config: { ...row.config, serviceUrl, agents: ['codex'] } });
+  const id = await ctx.loader.create({ name: row.name, config: { ...row.config, serviceUrl, agents: ['codex'],
+    a2a: { token: 'package-smoke-token', publicUrl: 'http://127.0.0.1:3080', stateDirectory: join(process.cwd(), 'a2a-state') } } });
   const fiber = ctx.loader.resolve(id).fiber;
   assert.ok(fiber);
   await fiber.await();
   assert.equal((await (await fetch(`${serviceUrl}/health`)).json()).service, 'acp-service');
   assert.equal(presets.get('oneagents-acp-codex').plugins[1].name, '@1agents/acp-service/dsh/preset');
   assert.equal(typeof ctx.oneagentsAcpSessions.importSession, 'function');
+  assert.equal(typeof routes.get('/.well-known/agent-card.json')?.handler, 'function');
+  assert.equal(typeof routes.get('/a2a')?.handler, 'function');
 
   // Verify DSH discovers, serves and registers this same package's client face.
   await ctx.plugin(ClientModuleRegistry);
@@ -84,5 +88,6 @@ try {
   await ctx.fiber.dispose();
 }
 assert.equal(presets.size, 0);
+assert.equal(routes.size, 0);
 await assert.rejects(fetch(`${serviceUrl}/health`, { signal: AbortSignal.timeout(3000) }));
 console.log('Installed unified package passed DSH profile, Loader, browser and service lifecycle smoke tests');

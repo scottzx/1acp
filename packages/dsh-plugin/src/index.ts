@@ -9,8 +9,10 @@ import { AcpAdapter, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
+import { mountDshA2A, type DshA2AOptions } from './a2a.js';
+export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
-export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> = {}): Promise<void> {
+export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions } = {}): Promise<void> {
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
   const service = resolveServiceOptions(input);
@@ -64,4 +66,5 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     });
     ctx.effect(() => dispose);
   }
+  if (input.a2a) await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'));
 }

@@ -3,8 +3,6 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import fs from 'node:fs';
-import { serveAcpService } from '../src/server.js';
-import { attachProcessSignalHandlers } from '../src/bridge.js';
 
 const require = createRequire(import.meta.url);
 const rawArgs = process.argv.slice(2);
@@ -61,11 +59,14 @@ function printUnifiedHelp(binName: string) {
     );
 
   const serverCommands = `Commands:
+  a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
+  a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
 
   help = help.replace(/^Commands:/m, serverCommands);
 
   const serverOptions = `Options:
+  --skill <action>                        List, show, export or install bundled agent skills
   --port, -p <n>                          Server listen port (for serve, default: 36812)
   --host <ip>                             Server bind IP (for serve, default: 0.0.0.0)
   --no-report                             Do not report to local dreammate-node (36908)`;
@@ -120,6 +121,8 @@ function parseServerArgs(args: string[]): {
 }
 
 async function runServer(options: { port?: number; host?: string; report?: boolean }) {
+  const { serveAcpService } = await import('../src/server.js');
+  const { attachProcessSignalHandlers } = await import('../src/bridge.js');
   attachProcessSignalHandlers();
   try {
     await serveAcpService(options);
@@ -130,6 +133,20 @@ async function runServer(options: { port?: number; host?: string; report?: boole
 }
 
 async function main() {
+  if (rawArgs.includes('--skill')) {
+    const { maybeHandleSkillflag } = await import('skillflag');
+    const packageRoot = path.dirname(require.resolve('@1agents/acp-service/package.json'));
+    await maybeHandleSkillflag(process.argv, {
+      skillsRoot: [path.join(packageRoot, 'skills'), path.join(packageRoot, 'vendor/runtime/skills')],
+      includeBundledSkill: false,
+    });
+    return;
+  }
+  if (rawArgs[0] === 'a2a') {
+    const { runA2ACli } = await import('./a2a.js');
+    await runA2ACli(rawArgs.slice(1));
+    return;
+  }
   const isServe = rawArgs[0] === 'serve' || rawArgs[0] === 'run';
   const hasServerExplicitFlag =
     rawArgs[0] === '--port' ||

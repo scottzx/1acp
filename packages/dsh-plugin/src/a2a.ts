@@ -1,0 +1,41 @@
+/** Mount the shared A2A implementation on the current DSH web host. */
+import { createA2AServer, type A2AServerOptions } from '@1agents/acp-service/a2a';
+import type { Context } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-host-webserver';
+import { DshA2ABackend } from './a2a-executor.js';
+
+/** Optional host configuration; omitted configuration leaves A2A disabled. */
+export interface DshA2AOptions extends Omit<A2AServerOptions, 'backend' | 'token' | 'stateDirectory' | 'publicUrl'> {
+  enabled?: boolean;
+  token?: string;
+  /** Defaults to DSH_A2A_TOKEN; host credentials are never copied into tasks. */
+  tokenEnv?: string;
+  stateDirectory?: string;
+  /** Public DSH origin, for example its Tailscale URL. */
+  publicUrl?: string;
+}
+
+/** Routes and in-flight turns are released with the owning Cordis plugin. */
+export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDirectory: string): Promise<void> {
+  if (options.enabled === false) return;
+  const token = options.token ?? process.env[options.tokenEnv ?? 'DSH_A2A_TOKEN'];
+  if (!token) throw new Error('Set DSH_A2A_TOKEN or a2a.token before enabling DSH A2A');
+  await ctx.effect(async () => {
+    const server = await createA2AServer({ ...options, token, backend: new DshA2ABackend(ctx),
+      stateDirectory: options.stateDirectory ?? stateDirectory,
+      publicUrl: options.publicUrl ?? `http://127.0.0.1:${ctx.webServer.port}` });
+    const routes: (() => void)[] = [];
+    try {
+      routes.push(ctx.webServer.register({ kind: 'exact', path: '/.well-known/agent-card.json', handler: server.cardHandler }));
+      routes.push(ctx.webServer.register({ kind: 'exact', path: server.path, handler: server.handler }));
+    } catch (error) {
+      for (const dispose of routes.reverse()) dispose();
+      await server.close();
+      throw error;
+    }
+    return async () => {
+      for (const dispose of routes.reverse()) dispose();
+      await server.close();
+    };
+  });
+}

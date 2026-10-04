@@ -149,6 +149,9 @@ importers:
       '@1agents/dreammate-node':
         specifier: ^0.4.0
         version: 0.4.0
+      '@a2a-js/sdk':
+        specifier: 1.3.0
+        version: 1.3.0
       '@agentclientprotocol/sdk':
         specifier: 1.4.0
         version: 1.4.0(zod@4.6.5)
@@ -194,6 +197,34 @@ packages:
     resolution: {integrity: sha512-VHkteY7LYikEiwFsqo6RVgEn02YYHztWw9ZOz2W2UrrW1xRnH+xJilHSjR+q0OH7IXXH0UTebl7JRxC9FoeS3w==}
     engines: {node: '>=22.5'}
     hasBin: true
+
+  '@a2a-js/sdk@1.3.0':
+    resolution: {integrity: sha512-OpK4nygUnLKlpTFZlM2IrYu7f3c/B7c4u4Z14+vgMq24lEINTVCxH/BqZx+GL92rNf7CoBL5oTP5UhNsl75yyg==}
+    engines: {node: '>=20'}
+    hasBin: true
+    peerDependencies:
+      '@bufbuild/protobuf': ^2.10.2
+      '@grpc/grpc-js': ^1.11.0
+      better-sqlite3: ^12.0.0 || ^13.0.0
+      express: ^4.21.2 || ^5.1.0
+      kysely: ^0.28.17 || ^0.29.0
+      mysql2: ^3.0.0
+      pg: ^8.0.0
+    peerDependenciesMeta:
+      '@bufbuild/protobuf':
+        optional: true
+      '@grpc/grpc-js':
+        optional: true
+      better-sqlite3:
+        optional: true
+      express:
+        optional: true
+      kysely:
+        optional: true
+      mysql2:
+        optional: true
+      pg:
+        optional: true
 
   '@agentclientprotocol/sdk@1.4.0':
     resolution: {integrity: sha512-/eufudw+aFY1LKLolT6yFE6UMmYRl7fMJ/DEONSIyR6wI3slHWITBsANRGqXEY8FRzqUxwh7QEaGiZHcJPVThg==}
@@ -2249,6 +2280,9 @@ packages:
     resolution: {integrity: sha512-HGYWWS/ehqTV3xN10i23tkPkpH46MLCIMFNCaaKNavAXTF1RkqxawEPtnjnGZ6XKSInBKkiOA5BKS+aZiY3AvA==}
     engines: {node: '>=8'}
 
+  jose@6.2.12:
+    resolution: {integrity: sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw==}
+
   js-md4@0.3.2:
     resolution: {integrity: sha512-/GDnfQYsltsjRswQhN9fhv3EMw2sCpUdrdxyWDOUK7eyD++r3gRhzgiQgc/x4MAv2i1iuQ4lxO5mvqM3vj4bwA==}
 
@@ -3118,6 +3152,10 @@ snapshots:
   '@1agents/dreammate-node@0.4.0':
     dependencies:
       '@1agents/dreammate-network': 0.3.2
+
+  '@a2a-js/sdk@1.3.0':
+    dependencies:
+      jose: 6.2.12
 
   '@agentclientprotocol/sdk@1.4.0(zod@4.6.5)':
     dependencies:
@@ -4694,6 +4732,8 @@ snapshots:
     dependencies:
       html-escaper: 2.0.2
       istanbul-lib-report: 3.0.1
+
+  jose@6.2.12: {}
 
   js-md4@0.3.2: {}
 
