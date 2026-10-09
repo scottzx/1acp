@@ -1,22 +1,32 @@
 # DSH plugin in @1agents/acp-service
 
-An out-of-tree DeepSeek Harness plugin for persistent external ACP Agent sessions. It requires the local DSH plugin and preset APIs available in 0.1.7-rc.2 and is embedded with the runtime and service in the single public `@1agents/acp-service` package. This directory is a private source module, not a separately installable npm package. No DSH source files are modified.
+Use persistent native Codex, Claude Code, Grok Build and other locally discovered ACP Agent sessions inside DeepSeek Harness. Choose native models and settings, use advertised commands, and answer tool permissions in DSH. The plugin is embedded with the runtime and service in the single public **`@1agents/acp-service`** package. This directory is its private source module.
 
-The same host also supports opt-in A2A 1.0 delegation: remote text messages create or restore DSH sessions, return task IDs, and continue execution independently of HTTP clients. Configure `a2a` on the existing plugin row, set the host's `DSH_A2A_TOKEN`, and choose its public origin, default cwd and preset. Query and subscribe through the official A2A interfaces; allowed webhook origins enable completion callbacks. See the public service README's **DSH A2A** section for the full configuration, metadata and recovery behavior. The shared server is exported as `@1agents/acp-service/a2a` and remains independent of DSH imports.
+The CI API baseline is **DSH 0.1.7-rc.2**, commit `21638c56315ae6a2b552d6091945d3144c9af32e`. Additional installed-package and interactive checks used an isolated profile on a locally modified DSH build labeled `0.2.0-rc.1`; see the [verification record](https://github.com/scottzx/1acp/blob/main/docs/marketplaces/verification-2026-10-09.md) for the exact scope. Other DSH releases require checking their plugin and preset APIs.
 
-## Use
+The same host supports opt-in A2A 1.0 delegation, disabled by default: remote text messages create or restore DSH sessions, return task IDs, and continue execution independently of HTTP clients. Configure `a2a` on the existing plugin row, set the host's `DSH_A2A_TOKEN`, and choose its public origin, default cwd and preset. Query and subscribe through the official A2A interfaces; allowed webhook origins enable completion callbacks. Waking a caller's main Agent requires its receiving host adapter. See the [service README's DSH A2A section](https://github.com/scottzx/1acp/blob/main/packages/service/README.md#dsh-a2a) for configuration, metadata and recovery behavior. The shared server is exported as `@1agents/acp-service/a2a` and remains independent of DSH imports.
 
-For an existing `@1agents/dsh-acp` installation, stop DSH, remove that bundle and add `@1agents/acp-service`. Keep existing binding files and copy any custom row configuration. The same plugin and preset IDs preserve session identity. Custom preset rows now load `@1agents/acp-service/dsh/preset`.
+## Install and start a session
 
-Install the published bundles from your DSH checkout:
+Requires **Node.js 22.13+**, a working DSH installation, and each selected native Agent's CLI and authentication on the DSH host. Adapter-backed Agents require their ACP adapter as well; the native Codex CLI does not replace `@agentclientprotocol/codex-acp`. Ensure these executables and credentials are available to the DSH process.
+
+Install the one public package:
 
 ```sh
-pnpm dsh plugin --profile web add @1agents/acp-service @1agents/session-reader
+dsh plugin --profile web add @1agents/acp-service@^0.6.0
 ```
 
-If pnpm pauses the first install for the transitive `esbuild` build script, set `allowBuilds: { esbuild: false }` in that profile's `pnpm-workspace.yaml` and repeat the install. Automatic ACP startup uses published JavaScript and works without running that install script.
+If pnpm pauses or fails with an ignored transitive `esbuild` build script, follow its prompt or configure that individual package's approval in the profile's `pnpm-workspace.yaml`, then repeat the install. Approve or deny it according to your policy. A successful isolated package smoke used `--ignore-scripts`; the interactive pnpm 11 profile check approved only `esbuild`. A partial install can leave the bundle disabled, so check the Plugins page afterward.
 
-The package declares `dsh.bundle.patch` and its browser entry, so installation selects the bundle automatically. Restart `pnpm dsh web` after updating packages. If you use an installed `dsh` executable, omit the leading `pnpm`. Replace `web` with `desktop` for the desktop profile.
+Restart DSH after updating packages, confirm **`@1agents/acp-service`** is enabled on its Plugins page, and choose a discovered **ACP · Agent** preset for a new session. Select an existing workspace, then send a text prompt. Replace `web` with your profile name, such as `desktop`; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
+
+For a pinned fallback, install the identical npm artifact from [GitHub Release 0.6.0](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0):
+
+```sh
+dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+```
+
+The package declares `dsh.bundle.patch` and its browser entry, so installation selects the bundle automatically.
 
 The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
 
@@ -24,13 +34,25 @@ The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service i
 npx --yes @1agents/acp-service@^0.6.0 serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
-The service requires each native Agent’s CLI and credentials. Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service`.
+Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service`.
 
-Choose a discovered **ACP · Agent** in the new-session Agent preset picker, choose a workspace, then send a message. ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. Before the first turn, switching the Agent preset replaces the discovery connection and its native commands. Once a turn starts, the session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
+ACP routes are not listed as ordinary DSH models, and the adapter rejects requests from ordinary presets, including previously saved ACP routes. Before the first turn, switching the Agent preset replaces the discovery connection and its native commands. Once a turn starts, the session keeps its remote Agent and workspace; start a new session to change Agent. Native Agent binaries and authentication belong to acp-service.
+
+### Migrate an older installation
+
+For an existing `@1agents/dsh-acp` installation, stop DSH, remove that bundle and add `@1agents/acp-service`. Keep existing binding files and copy any custom row configuration. The same plugin and preset IDs preserve session identity. Custom preset rows now load `@1agents/acp-service/dsh/preset`. Enable only the unified bundle.
+
+## Session behavior
 
 The bundle registers an ACP adapter through DSH's public streaming extension and routes the ACP presets to it. It sends newly admitted messages whose source is `user` to `session/prompt`, not to `subagent-acp`; there is no coordinating DeepSeek model call. DSH-generated workspace instructions and runtime-context messages are excluded. The external Agent owns its model, prompt, tools and native history, including any project instructions it discovers itself. DSH owns its UI and local user/assistant transcript. External tool progress is preserved as display metadata on empty text blocks in DSH's existing assistant stream records and projected onto collapsed groups of peer tool cards, separated by native prose and reasoning. ACP updates retain previously supplied fields, and replay is deduplicated by the managed turn sequence. These snapshots contain no visible text and never dispatch local tools; they use the existing persisted session format so conversations can reopen normally. Only Agent thought chunks enter the thinking stream.
 
 ## Continue imported native sessions
+
+History import is optional. Install the separate history browser only when needed:
+
+```sh
+dsh plugin --profile web add @1agents/session-reader
+```
 
 With `@1agents/session-reader` installed, choose **在 DSH 中继续原会话** on a Claude, Codex or Grok history. The original workspace must still exist. The plugin restores the native session through acp-service's `_1agents/session/import`, creates DSH history under the matching ACP preset, and attaches it to that workspace. Importing sends no prompt. Subsequent messages go to the original Agent; imported messages are never resent, including an unfinished trailing user message. Unsupported sources stay readable in session-reader.
 

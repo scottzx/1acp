@@ -1,6 +1,59 @@
-# 1ACP workspace
+# 1ACP — native Agent sessions in DeepSeek Harness
 
-One published package, `@1agents/acp-service`, contains the runtime, CLI, service and DSH plugin. The upstream runtime and DSH plugin remain private source modules in one repository with one pnpm lockfile. Runtime and service remain reusable outside DSH; the DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
+Use Codex, Claude Code, Grok Build and other locally discovered ACP Agents inside DeepSeek Harness (DSH). Continue persistent native sessions, choose the models and settings exposed by each Agent, and handle tool permissions in DSH's approval UI. The same **`@1agents/acp-service`** package also provides a standalone CLI and ACP HTTP/WebSocket service.
+
+- Keep the native Agent's workspace, tools and session identity when reconnecting.
+- Select native models, reasoning settings, modes and advertised slash commands from the session UI.
+- Optionally continue native history with `@1agents/session-reader`.
+- Enable A2A 1.0 task delegation, status queries and completion callbacks when needed. A2A is off by default; waking a caller's main Agent requires its receiving host adapter.
+
+## Install in DSH
+
+Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
+
+```sh
+dsh plugin --profile web add @1agents/acp-service@^0.6.0
+```
+
+Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, then create a session with an **ACP · Agent** preset and an existing workspace. The plugin starts or reuses its local ACP service automatically. Replace `web` with your profile name; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
+
+If pnpm reports an ignored `esbuild` build script, follow its prompt or configure that package's approval in the profile, then repeat the install. Approve or deny the individual script according to your policy. Check the Plugins page afterward: a partial install can leave the bundle disabled.
+
+For a pinned release artifact, install the identical npm tarball attached to [0.6.0](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0):
+
+```sh
+dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+```
+
+Install `@1agents/session-reader` separately if you want to browse and continue existing Claude, Codex or Grok histories. See the [DSH user guide](packages/dsh-plugin/README.md), [service and A2A guide](packages/service/README.md), and [installation verification](docs/marketplaces/verification-2026-10-09.md).
+
+## Screenshots and compatibility
+
+Choose a locally discovered native Agent:
+
+![DSH ACP Agent preset picker](packages/service/assets/dsh-agent-presets.png)
+
+Open the native Codex model and ACP controls:
+
+![Native Codex model and ACP settings in DSH](packages/service/assets/dsh-codex-controls.png)
+
+These unmodified screenshots come from a fresh isolated profile on a locally modified DSH build labeled `0.2.0-rc.1`; they show discovery and native capability loading, without sending a model prompt. The CI baseline is **DSH 0.1.7-rc.2**, commit [`21638c5`](https://github.com/deepseek-ai/deepseek-harness/commit/21638c56315ae6a2b552d6091945d3144c9af32e). See the verification record for the installed-artifact, profile, Loader, browser and lifecycle checks. Compatibility with other releases requires checking their plugin APIs.
+
+The plugin currently accepts text prompts. Available controls depend on the selected native Agent, adapter and account.
+
+## Standalone CLI
+
+```sh
+npm install -g @1agents/acp-service@^0.6.0
+acp-service --help
+acp-service serve --host 127.0.0.1 --port 36812 --no-report
+```
+
+The runtime and service can be used outside DSH. Installing the npm package starts no process.
+
+## Source workspace
+
+One published package contains the runtime, CLI, service and DSH plugin. The upstream runtime and DSH plugin remain private source modules in one repository with one pnpm lockfile. The DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
 
 | Directory             | npm package            | Responsibility                                                               |
 | --------------------- | ---------------------- | ---------------------------------------------------------------------------- |
@@ -34,7 +87,7 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 ## Package releases
 
-Only `@1agents/acp-service` is published. Version 0.5 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
+Only `@1agents/acp-service` is published. Version 0.6.0 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
 
 Version 0.6.0 adds DSH A2A 1.0 execution, remote-agent gateway tools, a durable completion inbox and the bundled ACP Service usage skill. Tasks return IDs before completion, run in the selected remote workspace and preset, and support standard queries, subscriptions and allowed completion callbacks. The gateway reconciles remote status after reconnect or restart; main-model wake-up still requires a receiving host adapter.
 
@@ -42,10 +95,10 @@ Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasonin
 
 ```sh
 # Ordinary CLI installation:
-npm install -g @1agents/acp-service
+npm install -g @1agents/acp-service@^0.6.0
 acp-service --help
 # DSH installation (run from its checkout):
-pnpm dsh plugin --profile web add @1agents/acp-service
+pnpm dsh plugin --profile web add @1agents/acp-service@^0.6.0
 ```
 
 The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.
@@ -80,5 +133,7 @@ This repository preserves the original runtime history and merges the complete s
 `1agents_app/modules/1acp` remains a pinned consumer submodule of this repository. Its runtime is now under `packages/runtime`; package build tooling and adapter discovery use that path. Push this repository's referenced commit before sharing the updated consumer submodule pointer.
 
 See each package README for its protocol, configuration and usage details.
+
+The embedded runtime preserves its upstream history and attribution from [openclaw/acpx](https://github.com/openclaw/acpx). See the [runtime license](packages/runtime/LICENSE) and [DSH plugin license](packages/dsh-plugin/LICENSE); the unified npm artifact includes its component licenses.
 
 The source-maintained [ACP Service skill](packages/service/skills/acp-service/SKILL.md) ships in the unified npm package, including ACP, DSH and A2A references. Use `acp-service --skill list`, `--skill show acp-service`, or `--skill export acp-service` to discover, read or export it; the existing `acpx` runtime skill remains available.
