@@ -1,6 +1,6 @@
 # DSH marketplace submissions
 
-Updated: **2026-10-10 12:04 Asia/Shanghai**. Submission does not mean acceptance or public availability.
+Updated: **2026-10-11 19:09 Asia/Shanghai**. Submission does not mean acceptance or public availability.
 
 Public package: **`@1agents/acp-service@0.6.0`**. Source package: [`packages/service`](../../packages/service). The repository root and `packages/dsh-plugin` are private development modules, not the advertised installation targets.
 
