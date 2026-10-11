@@ -47,3 +47,17 @@ Two unmodified browser screenshots from this profile are stored in `packages/ser
 ## Per-market acceptance check
 
 After each market accepts an entry, verify its public search result, repository/subpath and exact npm package name. Then install the target advertised by that market in another fresh profile and check loading again. A submitted form or open registry PR is not an accepted listing and cannot yet pass this check.
+
+## Follow-up observation — 2026-10-10 06:03 Asia/Shanghai
+
+No exact 1acp public listing is present in the checked catalogs. No new 1acp profile or service was started, and the artifact/interactive results above remain pre-listing evidence. All existing requests remain open without actionable maintainer feedback. The source-only market contracts still lack the required npm/Release route. See the [structured heartbeat record](/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T215058Z/summary.json); session-reader's separate dsplugin acceptance is not counted for this package.
+
+## Follow-up observation — 2026-10-10 12:04 Asia/Shanghai
+
+No new 1acp public listing or channel-specific profile test. Existing generic artifact results are retained without relabeling. dsh.pub's new automatic root topic scan reports missing_bundle_manifest, consistent with the pending compatibility request; checked source contracts remain unchanged. The independent session-reader Marketplace npm acceptance is recorded separately in the [heartbeat summary](/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261010T035154Z/summary.json).
+
+
+<!-- heartbeat-20261011T100845Z-final -->
+## Follow-up 2026-10-11
+
+No new exact public 1acp listing in the checked live catalogs. No new market-specific runtime acceptance was applicable. Existing npm/Release preparation evidence is retained without being relabeled as market acceptance. The dsh.pub maintainer proposed artifact/directory support in comment6103964957; the fixture/field reply is comment6107952113. Implementation remains pending. Read-only core-contract checks: /Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/contracts/assessment.json.
