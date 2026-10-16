@@ -56,6 +56,15 @@ The demo saves the report as an Activepieces step output before acknowledgement.
 Replace that step with an idempotent business write for production, using noticeId
 or runId as its key.
 
+The report contains the completed turn's final answer. For Codex, explicit
+`commentary` / `final_answer` message phases survive the runtime, ACP transport
+and DSH session journal. All commentary, tools and final text remain in the DSH
+execution log; only final-answer text is written into the terminal answer and
+A2A result. A durable terminal answer takes precedence over streamed text,
+including an explicitly empty answer. A completed ACP turn with known phases
+but no final answer is reported as failed rather than promoting commentary to a
+report. Agents without phase metadata retain their previous output behavior.
+
 The private piece uses an encrypted SecretText connection. Network calls run in
 piece actions; CODE steps only prepare data or shape a report. This preserves
 SANDBOX_CODE_ONLY and keeps the privileged gateway token out of flow definitions.

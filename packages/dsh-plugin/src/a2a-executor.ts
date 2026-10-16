@@ -3,14 +3,16 @@ import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
+import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '@1agents/acp-service/a2a';
 
-function resultOf(reason: TurnEndReason, text: string): A2ARunResult {
+function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean): A2ARunResult {
   switch (reason.kind) {
-    case 'completed': return { outcome: 'completed', text };
+    case 'completed': return finalAnswerExpected && !text.trim()
+      ? { outcome: 'failed', text, detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
+      : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
     case 'error': return { outcome: 'failed', text, detail: reason.error.message };
     case 'max-tokens': return { outcome: 'failed', text, detail: 'DSH reached the model output token limit' };
@@ -20,6 +22,22 @@ function resultOf(reason: TurnEndReason, text: string): A2ARunResult {
     // DSH's turn reasons are merge-extensible; an unknown ending cannot report success.
     default: return { outcome: 'failed', text, detail: 'DSH returned an unsupported turn ending' };
   }
+}
+
+/** Read durable ACP metadata, leaving ordinary DSH messages compatible. */
+function answerOf(content: readonly ContentBlock[], turn: number): { text: string; authoritative: boolean; phased: boolean } {
+  const blocks = content.filter(part => part.type === 'text') as (ContentBlock & {
+    text: string;
+    acpResult?: { turn?: number; finalAnswer?: unknown };
+    acpStream?: { turn?: number; messagePhase?: unknown };
+  })[];
+  const terminal = blocks.findLast(part => part.acpResult?.turn === turn && typeof part.acpResult.finalAnswer === 'string');
+  if (terminal) return { text: terminal.acpResult!.finalAnswer as string, authoritative: true, phased: true };
+  const phased = blocks.some(part => part.acpStream?.turn === turn && typeof part.acpStream.messagePhase === 'string');
+  return {
+    text: blocks.filter(part => !phased || (part.acpStream?.turn === turn && part.acpStream.messagePhase === 'final_answer')).map(part => part.text).join(''),
+    authoritative: false, phased,
+  };
 }
 
 /** Uses public session-controller and inbox events to account for one A2A prompt's exact DSH turn. */
@@ -85,6 +103,8 @@ export class DshA2ABackend implements A2ABackend {
     let messageId: MessageId | undefined;
     let turn: number | undefined;
     let text = '';
+    let finalAnswerExpected = false;
+    let authoritativeAnswer = false;
     let settled = false;
     const owns = (message: UserMessage): boolean => message.source.kind === 'user'
       && 'rpcId' in message.source && message.source.rpcId === options.requestId;
@@ -123,10 +143,12 @@ export class DshA2ABackend implements A2ABackend {
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;
       if (event.type === 'assistant/message' && event.data.turn === turn) {
-        const next = event.data.message.content.filter(part => part.type === 'text').map(part => part.text).join('');
-        if (next.length > 0) text = next;
+        const next = answerOf(event.data.message.content, turn);
+        if (next.authoritative) { text = next.text; authoritativeAnswer = true; finalAnswerExpected = true; }
+        else if (!authoritativeAnswer && next.phased) { text = next.text; finalAnswerExpected = true; }
+        else if (!finalAnswerExpected && next.text.length > 0) text = next.text;
       } else if (event.type === 'turn/end' && event.data.turn === turn) {
-        settle(resultOf(event.data.reason, text));
+        settle(resultOf(event.data.reason, text, finalAnswerExpected));
       }
     }));
     options.signal.addEventListener('abort', cancel, { once: true });

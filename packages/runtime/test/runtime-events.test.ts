@@ -781,6 +781,64 @@ test("parsePromptEventLine preserves messageId and allowlisted _meta on agent_me
   );
 });
 
+test("parsePromptEventLine normalizes recognized Codex message phases without copying nested metadata", () => {
+  for (const phase of ["commentary", "final_answer"]) {
+    assert.deepEqual(
+      parsePromptEventLine(
+        JSON.stringify({
+          method: "session/update",
+          params: {
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              messageId: "assistant-item",
+              _meta: { codex: { phase, token: "redacted" }, other: { phase: "final_answer" } },
+              content: { type: "text", text: "visible text" },
+            },
+          },
+        }),
+      ),
+      {
+        type: "text_delta",
+        text: "visible text",
+        stream: "output",
+        tag: "agent_message_chunk",
+        messageId: "assistant-item",
+        messagePhase: phase,
+      },
+    );
+  }
+});
+
+test("parsePromptEventLine omits malformed, unknown, and aliased message phases", () => {
+  for (const metadata of [
+    { codex: { phase: "analysis" } },
+    { codex: { phase: " final_answer " } },
+    { codex: { phase: 1 } },
+    { codex: { phase: { final_answer: true } } },
+    { codex: [{ phase: "final_answer" }] },
+    { codex: "final_answer" },
+    { codex: null },
+    { phase: "final_answer" },
+    { other: { phase: "final_answer" } },
+  ]) {
+    assert.deepEqual(
+      parsePromptEventLine(
+        JSON.stringify({
+          sessionUpdate: "agent_message_chunk",
+          _meta: metadata,
+          content: { type: "text", text: "visible text" },
+        }),
+      ),
+      {
+        type: "text_delta",
+        text: "visible text",
+        stream: "output",
+        tag: "agent_message_chunk",
+      },
+    );
+  }
+});
+
 test("parsePromptEventLine drops unknown and secret-like _meta keys from text_delta", () => {
   assert.deepEqual(
     parsePromptEventLine(

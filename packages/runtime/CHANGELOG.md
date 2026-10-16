@@ -37,6 +37,7 @@ Repo: https://github.com/scottzx/1acp
 - Flow timers: reject non-finite or overflowing node and shell deadlines before they become immediate timeouts. Thanks @odrobnik.
 - Windows: preserve complete backslash runs before quotes and at the end of batch-wrapper arguments. Thanks @odrobnik.
 - Service/agents: use installed ACP adapter executables before npx, launch JavaScript adapters with the service interpreter, and report npm cache conflicts without unrelated macOS permission advice.
+- Runtime/embedding: preserve recognized Codex commentary and final-answer phases on text events so hosts can show only the final answer in reports while retaining progress in execution logs.
 
 ## 0.19.3 - 2026-09-25
 

@@ -9,7 +9,7 @@ import { AcpAdapter } from '../dist/adapter.js';
 import { stream } from '../dist/transport.js';
 import { State } from '../dist/state.js';
 
-async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = []) {
+async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = [], streamConfig = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-test-'));
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise(r => wss.once('listening', r));
@@ -51,7 +51,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         if (!seen) { executions++; records.set(key, true); }
         const update = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello ACP' }, _meta: { '1agents': { turnId, sequence: 1 } } };
         if (!seen) {
-          const updates = [update, ...toolUpdates.map((u, i) => ({ ...u, _meta: { ...u._meta, '1agents': { ...u._meta?.['1agents'], turnId, sequence: i + 2 } } }))];
+          const updates = (streamConfig.updates ?? [update, ...toolUpdates]).map((u, i) => ({ ...u, _meta: { ...u._meta, '1agents': { ...u._meta?.['1agents'], turnId, sequence: i + 1 } } }));
           replay.set(params.sessionId, updates);
           for (const update of updates) await connection.client.notify('session/update', { sessionId: params.sessionId, update });
         }
@@ -61,11 +61,11 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
           assert.deepEqual(result, { outcome: 'accepted', answers: { 'Choose targets': ['A', 'B'] } });
           const plan = await connection.client.request('_x.ai/exit_plan_mode', { planContent: 'Read the project' });
           assert.deepEqual(plan, { outcome: 'approved' });
-          return { stopReason: 'end_turn' };
+          return streamConfig.result ?? { stopReason: 'end_turn' };
         }
         const permission = await connection.client.request('session/request_permission', { sessionId: params.sessionId, toolCall: { toolCallId: 'edit', title: 'Edit file', rawInput: { path: '/tmp/example' } }, options: [{ optionId: 'once', name: 'Allow once', kind: 'allow_once' }, { optionId: 'no', name: 'Reject', kind: 'reject_once' }] });
         if (interaction !== 'pending') assert.equal(permission.outcome.optionId, 'once');
-        return { stopReason: 'end_turn' };
+        return streamConfig.result ?? { stopReason: 'end_turn' };
       });
     connection = app.connect(stream(ws));
   });
@@ -124,6 +124,74 @@ test('reconnect replays missing output and reuses the prompt id without duplicat
   assert.equal(output.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Hello ACP');
   assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
 });
+
+const textUpdate = (text, messagePhase, messageId) => ({
+  sessionUpdate: 'agent_message_chunk', content: { type: 'text', text },
+  _meta: { '1agents': { messagePhase, messageId } },
+});
+const promptResult = (finalAnswer, stopReason = 'end_turn') => ({ stopReason, _meta: { '1agents': { finalAnswer } } });
+
+test('ACP progress, tools and final messages keep durable identities across replay without repeating final output', { timeout: 5000 }, async t => {
+  const finalAnswer = 'First final block. Second final block.';
+  const f = await fixture(t, true, 'permission', async () => {}, [], {
+    updates: [
+      textUpdate('I will ', 'commentary', 'progress-1'), textUpdate('read README.', 'commentary', 'progress-1'),
+      { sessionUpdate: 'tool_call', toolCallId: 'read', title: 'Read README', kind: 'read', status: 'in_progress' },
+      { sessionUpdate: 'tool_call_update', toolCallId: 'read', status: 'completed', rawOutput: 'README content' },
+      textUpdate('First final ', 'final_answer', 'final-1'), textUpdate('block.', 'final_answer', 'final-1'),
+      textUpdate(' Second final block.', 'final_answer', 'final-2'),
+    ],
+    result: promptResult(finalAnswer),
+  });
+  f.local.session.boundary = { lastTurn: 7, lastStepStartSeq: 3 };
+  f.local.session.eventAt = () => ({ type: 'step/start', data: { turn: 7, step: 2 } });
+  const chunks = await collect(f.adapter, f.options('phased-answer'));
+  assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), `I will read README.${finalAnswer}`);
+  const blocks = JSON.parse(JSON.stringify(chunks.filter(c => c.type === 'block-end').map(c => c.block)));
+  const visible = blocks.filter(b => b.text);
+  assert.deepEqual(visible.map(b => [b.text, b.acpStream.messagePhase, b.acpStream.messageId]), [
+    ['I will read README.', 'commentary', 'progress-1'],
+    ['First final block.', 'final_answer', 'final-1'],
+    [' Second final block.', 'final_answer', 'final-2'],
+  ]);
+  assert.ok(visible.every(b => b.acpStream.turn === 7 && b.acpStream.step === 2 && b.acpStream.requestId.startsWith('dsh-')));
+  const terminals = blocks.filter(b => b.acpResult);
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0].text, '');
+  assert.deepEqual(terminals[0].acpResult, { turn: 7, step: 2, requestId: visible[0].acpStream.requestId, finalAnswer });
+  assert.equal(chunks.at(-1).type, 'finish');
+  assert.ok(chunks.at(-2).block.acpResult);
+  assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
+});
+
+test('terminal answers remain authoritative after streamed progress and preserve an explicit empty answer', { timeout: 5000 }, async t => {
+  for (const finalAnswer of ['Only the final report', '']) {
+    const f = await fixture(t, false, 'permission', async () => {}, [], {
+      updates: [textUpdate('Preparing the task.', 'commentary', 'progress')], result: promptResult(finalAnswer),
+    });
+    const chunks = await collect(f.adapter, f.options(`terminal-${finalAnswer}`));
+    assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Preparing the task.');
+    assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, finalAnswer);
+  }
+});
+
+test('a terminal-only answer is displayed once and recorded before finish', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], { updates: [], result: promptResult('Restored final answer') });
+  const chunks = await collect(f.adapter, f.options('terminal-only'));
+  assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Restored final answer');
+  assert.equal(chunks.find(c => c.block?.text === 'Restored final answer').block.acpStream.messagePhase, 'final_answer');
+  assert.equal(chunks.filter(c => c.block?.acpResult).length, 1);
+  assert.equal(chunks.at(-1).reason.kind, 'stop');
+});
+
+for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens'], ['cancelled', 'aborted']]) {
+  test(`terminal metadata does not turn ACP ${stopReason} into success`, { timeout: 5000 }, async t => {
+    const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', stopReason) });
+    const chunks = await collect(f.adapter, f.options(stopReason));
+    assert.equal(chunks.at(-1).reason.kind, finishKind);
+    assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Partial answer');
+  });
+}
 
 test('remote tool updates are durable observations, retain omitted fields, and never pollute reasoning or execute locally', { timeout: 5000 }, async t => {
   const updates = [

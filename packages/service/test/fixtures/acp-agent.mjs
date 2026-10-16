@@ -12,6 +12,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'session/load': case 'session/resume': reply({}); break;
     case 'session/prompt':
       turn = m;
+      send({ method: 'session/update', params: { sessionId: p.sessionId, update: { sessionUpdate: 'agent_message_chunk', messageId: 'progress', _meta: { codex: { phase: 'commentary' } }, content: { type: 'text', text: 'I will perform the operation.' } } } });
       send({ method: 'session/update', params: { sessionId: p.sessionId, update: { sessionUpdate: 'tool_call', toolCallId: 'write-1', title: 'Write', kind: 'edit', status: 'pending', rawInput: { path: '/tmp/example' } } } });
       send({ id: 'approval', method: 'session/request_permission', params: { sessionId: p.sessionId, toolCall: { toolCallId: 'write-1', title: 'Write', kind: 'edit', rawInput: { path: '/tmp/example' } }, options: [{ optionId: 'yes', kind: 'allow_once', name: 'Allow' }, { optionId: 'no', kind: 'reject_once', name: 'Reject' }] } });
       break;
@@ -19,7 +20,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (m.id === 'approval') {
         send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', content: [{ type: 'content', content: { type: 'text', text: 'saved' } }] } } });
         send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', status: 'completed', rawOutput: { result: 'saved' } } } });
-        send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fixture complete' } } } });
+        for (const text of ['fixture ', 'complete']) send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', messageId: 'answer', _meta: { codex: { phase: 'final_answer' } }, content: { type: 'text', text } } } });
         send({ id: turn.id, result: { stopReason: 'end_turn' } });
       } else if (m.id !== undefined) send({ id: m.id, error: { code: -32601, message: 'Method not found' } });
   }

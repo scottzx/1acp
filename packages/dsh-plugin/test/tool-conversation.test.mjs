@@ -106,6 +106,25 @@ test('remote snapshots survive DSH persistence validation and rebuild every ACP 
   assert.equal(roots(assembler)[1].isError, true);
 });
 
+test('ACP answer phases and empty terminal records survive the DSH storage contract without duplicating prose', () => {
+  const session = Session.create('remote-final-answer');
+  const streamMeta = { turn: 1, step: 1, requestId: 'dsh-managed-request' };
+  const content = [
+    { type: 'text', text: 'I will inspect README.', acpStream: { ...streamMeta, messagePhase: 'commentary', messageId: 'progress' } },
+    { type: 'text', text: 'The final report', acpStream: { ...streamMeta, messagePhase: 'final_answer', messageId: 'final' } },
+    { type: 'text', text: '', acpResult: { ...streamMeta, finalAnswer: 'The final report' } },
+  ];
+  session.append('assistant/message', {
+    turn: 1, step: 1, stream: content.map((block, index) => ({ type: 'chunk', time: 1000 + index, chunk: { type: 'block-end', index, block } })),
+    message: { id: 'remote-answer', role: 'assistant', source: { kind: 'model', provider: '1agents-acp', model: 'codex' }, content },
+  }, { surfaceOp: 'append' });
+  const stored = validateStoredEvents(session.header, JSON.parse(JSON.stringify(session.snapshotEvents())));
+  const restored = Session.create(session.id, stored, session.header);
+  const answer = restored.deriveMessages()[0];
+  assert.deepEqual(answer.content, content);
+  assert.equal(answer.content.filter(block => block.type === 'text').map(block => block.text).join(''), 'I will inspect README.The final report');
+});
+
 test('durable attempts do not duplicate tools already seen live and still restore cancelled calls', () => {
   const assembler = engine();
   assembler.replaceWindow([observation(2, started)], false); assembler.flush();

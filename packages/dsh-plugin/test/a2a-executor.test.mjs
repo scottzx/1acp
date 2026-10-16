@@ -95,6 +95,7 @@ async function fixture(t) {
       ctx.emit('agent/inbox/claimed', { agent, message, turn });
     },
     output: (agent, turn, text) => event(agent, 'assistant/message', { turn, step: 1, message: { content: [{ type: 'text', text }] } }),
+    content: (agent, turn, content) => event(agent, 'assistant/message', { turn, step: 1, message: { content: JSON.parse(JSON.stringify(content)) } }),
     finish: (agent, turn, reason) => event(agent, 'turn/end', { turn, reason }),
   };
 }
@@ -138,6 +139,87 @@ test('run follows only its claimed turn and returns the final assistant text wit
   assert.equal(f.prompts[0].request.mode, 'queue');
   assert.equal(f.prompts[0].request.content[0].text, 'A2A task');
 });
+
+const phasedText = (turn, messagePhase, text, messageId = messagePhase) => ({
+  type: 'text', text, acpStream: { turn, step: 1, requestId: 'dsh-managed-request', messagePhase, messageId },
+});
+const terminalText = (turn, finalAnswer) => ({
+  type: 'text', text: '', acpResult: { turn, step: 1, requestId: 'dsh-managed-request', finalAnswer },
+});
+
+test('durable ACP phase metadata removes progress and tools while preserving all final text blocks', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'task', signal: new AbortController().signal });
+  let settled = false; void result.then(() => { settled = true; });
+  await f.admitted.promise; f.claim(agent, 'task', 5);
+  f.content(agent, 5, [
+    phasedText(5, 'commentary', 'I will read README.'),
+    { type: 'text', text: '', acpTool: { turn: 5, tool: { title: 'Read README', rawOutput: 'contents', status: 'completed' } } },
+    phasedText(5, 'final_answer', 'First final block.', 'final-1'),
+    phasedText(5, 'final_answer', ' Second final block.', 'final-2'),
+  ]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'assistant output alone must not complete a task');
+  f.finish(agent, 4, { kind: 'completed' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'another turn must not complete a task');
+  f.finish(agent, 5, { kind: 'completed' });
+  assert.deepEqual(await result, { outcome: 'completed', text: 'First final block. Second final block.' });
+});
+
+test('matching ACP terminal answer overrides streamed progress and final text without adding a second log copy', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'task', 6);
+  const content = [phasedText(6, 'commentary', 'Preparing.'), phasedText(6, 'final_answer', 'Earlier streamed answer'), terminalText(6, 'Authoritative report')];
+  f.content(agent, 6, content);
+  f.output(agent, 6, 'Late unclassified UI output');
+  f.finish(agent, 6, { kind: 'completed' });
+  assert.deepEqual(await result, { outcome: 'completed', text: 'Authoritative report' });
+  assert.equal(content.filter(part => part.type === 'text').map(part => part.text).join(''), 'Preparing.Earlier streamed answer');
+});
+
+for (const [label, content] of [
+  ['commentary-only', [phasedText(7, 'commentary', 'I will inspect README.')]],
+  ['empty terminal', [phasedText(7, 'final_answer', 'Text overridden by empty terminal'), terminalText(7, '')]],
+]) {
+  test(`completed ACP ${label} fails without exposing progress as a final report`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'task', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'task', 7); f.content(agent, 7, content);
+    f.output(agent, 7, 'Unclassified text must not restore a missing final answer');
+    f.finish(agent, 7, { kind: 'completed' });
+    const value = await result;
+    assert.equal(value.outcome, 'failed'); assert.equal(value.text, ''); assert.match(value.detail, /without a final answer/);
+  });
+}
+
+test('ACP metadata from other turns is ignored and unphased DSH remains compatible', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'task', 8);
+  f.content(agent, 8, [
+    { type: 'text', text: 'Ordinary DSH answer' }, terminalText(100, 'Unrelated final answer'),
+  ]);
+  f.finish(agent, 8, { kind: 'completed' });
+  assert.deepEqual(await result, { outcome: 'completed', text: 'Ordinary DSH answer' });
+});
+
+for (const reason of [{ kind: 'max-tokens' }, { kind: 'aborted', reason: { kind: 'user' } }]) {
+  test(`ACP final metadata preserves failed outcome for ${reason.kind}`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'task', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'task', 9); f.content(agent, 9, [terminalText(9, 'Partial final output')]);
+    f.finish(agent, 9, reason);
+    const value = await result;
+    assert.equal(value.outcome, 'failed'); assert.equal(value.text, 'Partial final output');
+  });
+}
 
 for (const [reason, outcome, detail] of [
   [{ kind: 'blocked' }, 'input-required', /blocked/],

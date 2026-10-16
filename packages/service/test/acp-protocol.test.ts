@@ -136,6 +136,53 @@ test('tool observations preserve ACP titles, structured output and sparse update
   assert.deepEqual(replayed, tools);
 });
 
+for (const finalAnswer of ['Final answer', '']) {
+  test(`managed completion keeps the authoritative ${finalAnswer ? 'final answer' : 'empty answer'} after streamed commentary`, async t => {
+    const f = await fixture(t), a = await f.connect();
+    const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+    const dispatch = f.backend.dispatch.bind(f.backend);
+    let signalEmitted!: () => void;
+    const emitted = new Promise<void>(resolve => { signalEmitted = resolve; });
+    let finish!: () => void;
+    f.backend.dispatch = async (peer, command) => {
+      if (command.action !== 'prompt') return dispatch(peer, command);
+      const common = { sessionId, turnId: 'managed', runtimeRequestId: command.requestId };
+      peer.send(JSON.stringify({ ...common, event: 'text_delta', text: 'I will inspect the files.', type: 'output', messageId: 'progress', messagePhase: 'commentary', sequence: 1 }));
+      if (finalAnswer) peer.send(JSON.stringify({ ...common, event: 'text_delta', text: finalAnswer, type: 'output', messageId: 'final', messagePhase: 'final_answer', sequence: 2 }));
+      finish = () => peer.send(JSON.stringify({ ...common, event: 'turn_terminal', status: 'completed', finalAnswer, stopReason: 'end_turn' }));
+      signalEmitted();
+    };
+    let settled = false;
+    const result = a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'inspect' }] }).then(value => { settled = true; return value; });
+    await emitted;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(settled, false, 'text output alone must not complete a prompt');
+    finish();
+    assert.equal(((await result)._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, finalAnswer);
+    const updates = a.updates.filter(u => u.update.sessionUpdate === 'agent_message_chunk');
+    assert.equal((updates[0].update._meta?.['1agents'] as { messagePhase: string }).messagePhase, 'commentary');
+    a.ws.close(); await a.connection.closed;
+    const b = await f.connect();
+    await b.connection.agent.request('session/load', { sessionId, cwd: '/tmp', mcpServers: [] });
+    assert.deepEqual(b.updates.filter(u => u.update.sessionUpdate === 'agent_message_chunk'), updates);
+  });
+}
+
+test('summary completion with an empty final answer never falls back to commentary', async t => {
+  const f = await fixture(t), a = await f.connect(undefined, 'codex', async () => ({}));
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [], _meta: { '1agents': { responsePolicy: 'summary' } } });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    peer.send(JSON.stringify({ sessionId, event: 'text_delta', text: 'Progress only', type: 'output' }));
+    peer.send(JSON.stringify({ sessionId, event: 'turn_terminal', status: 'completed', finalAnswer: '' }));
+  };
+  const result = await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'inspect' }] });
+  assert.equal((result._meta?.['1agents'] as { resultText: string }).resultText, '');
+  await a.summaryReceived;
+  assert.equal(a.events[0].resultText, '');
+});
+
 test('pending permission survives a dropped transport and settles once after resume', async t => {
   const f = await fixture(t);
   let seen!: () => void; const received = new Promise<void>(r => { seen = r; });

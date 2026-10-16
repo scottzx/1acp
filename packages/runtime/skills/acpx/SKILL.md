@@ -35,6 +35,7 @@ Core capabilities:
 - Stable ACP `authenticate` handshake via env/config credentials
 - Structured streaming output (`text`, `json`, `quiet`) with optional `--suppress-reads`
 - Prompt-response `_meta` preservation across direct, queued, compare, and embedded-runtime results
+- Embedded runtime text events retain message IDs and recognized Codex `commentary` / `final_answer` phases as `messagePhase`; use explicit phases to select report text while keeping the full execution stream, and do not infer finality from prose or tool timing
 - Built-in agent registry plus raw `--agent` escape hatch
 - Claude system prompt override via `--system-prompt` / `--append-system-prompt`
 - Optional ACP filesystem and terminal capability opt-outs via `--no-fs` and `--no-terminal`

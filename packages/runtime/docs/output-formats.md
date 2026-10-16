@@ -183,6 +183,20 @@ Embedded ACP prompts leave the application's `console.error` function unchanged,
 including while prompts overlap or the host replaces its logger. Existing output
 modes and acpx warning and retry suppression controls keep their behavior.
 
+## Embedded runtime assistant messages
+
+The `acpx/runtime` turn stream retains a supplied `messageId` on `text_delta`
+events. When an ACP update supplies `_meta.codex.phase` as `commentary` or
+`final_answer`, the event also carries `messagePhase` with that exact value.
+Absent, unknown, and malformed phases are omitted. Other nested metadata is
+not copied into the text event.
+
+Hosts can use the explicit phase to keep commentary in execution logs and
+select final-answer text for reports. Both phases remain in the event stream.
+These adapter-supplied fields describe message boundaries; they do not
+authenticate authorship or authorize actions. Without a recognized phase,
+hosts must not infer a final answer from prose or tool timing.
+
 ## Embedded runtime plans
 
 The `acpx/runtime` turn stream exposes ACP plan notifications as `status` events

@@ -324,6 +324,14 @@ export type AcpRuntimeEvent =
        */
       messageId?: string;
       /**
+       * Recognized assistant-message phase from ACP update `_meta.codex.phase`.
+       * Omitted for absent or unknown values. This producer-supplied hint lets
+       * consumers separate progress commentary from the final answer without
+       * discarding either from the event stream; it is not an authorization
+       * or authenticated provenance boundary.
+       */
+      messagePhase?: "commentary" | "final_answer";
+      /**
        * Allowlisted origin fields from the ACP update `_meta`.
        * Only the documented string keys `origin`, `kind`, and `source` are
        * preserved. All other keys (including nested objects and secret-like

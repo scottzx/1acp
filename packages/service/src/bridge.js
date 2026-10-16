@@ -1019,6 +1019,7 @@ function sendSummaryTerminal(ws, session, sessionId, payload) {
       status: payload.status,
       responsePolicy: "summary",
       resultText,
+      finalAnswer: resultText,
       sessionRef,
       completedAt: new Date().toISOString(),
       ...(payload.error ? { error: payload.error } : {}),
@@ -1031,6 +1032,7 @@ function sendSummaryTerminal(ws, session, sessionId, payload) {
       status: payload.status,
       responsePolicy: "summary",
       resultText,
+      finalAnswer: resultText,
       sessionRef,
       summary:
         resultText ||
@@ -2835,6 +2837,8 @@ async function runPromptTurn(session, sessionId, promptItem) {
   session.activeTurn = turn;
   let terminalSent = false;
   let accumulatedAnswer = "";
+  let hasMessagePhase = false;
+  let finalAnswer = "";
 
   void (async () => {
     try {
@@ -2843,6 +2847,10 @@ async function runPromptTurn(session, sessionId, promptItem) {
           const streamType = event.stream || "output";
           if (streamType === "output") {
             accumulatedAnswer += event.text || "";
+            if (event.messagePhase === "commentary" || event.messagePhase === "final_answer") {
+              hasMessagePhase = true;
+              if (event.messagePhase === "final_answer") finalAnswer += event.text || "";
+            }
           }
         } else if (
           event.type === "status" &&
@@ -2873,6 +2881,8 @@ async function runPromptTurn(session, sessionId, promptItem) {
             text: event.text,
             type: event.stream || "output",
             ...(event.agentTurnId ? { agentTurnId: event.agentTurnId } : {}),
+            ...(event.messageId ? { messageId: event.messageId } : {}),
+            ...(event.messagePhase ? { messagePhase: event.messagePhase } : {}),
           });
         } else if (event.type === "tool_call") {
           console.log(
@@ -3001,7 +3011,10 @@ async function runPromptTurn(session, sessionId, promptItem) {
 
       const currentSession = activeSessions.get(sessionId);
       const targetWs = currentSession ? currentSession.ws : null;
-      const finalResultText = result.finalAnswer || accumulatedAnswer || "";
+      // Preserve every streamed message in the log, but use explicit provider
+      // phases for the durable result. An empty final answer must not fall back
+      // to commentary. Agents without phase metadata keep their legacy output.
+      const finalResultText = result.finalAnswer ?? (hasMessagePhase ? finalAnswer : accumulatedAnswer);
       const journalTerminal = turn.hostTurnId
         ? await turnJournal.record({
             sessionId,
@@ -3010,7 +3023,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             status: result.status,
             promptText: promptItem.text,
             agentType: currentSession?.agentType || session.agentType,
-            finalAnswer: result.finalAnswer || finalResultText || undefined,
+            finalAnswer: finalResultText,
             errorCode:
               result.status === "failed" ? result.error?.code || "ACP_PROMPT_FAILED" : undefined,
             errorText: result.status === "failed" ? result.error?.message : undefined,
@@ -3051,7 +3064,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             journalSequence: journalTerminal.turn.lastEventSeq,
             stopReason:
               result.stopReason || (result.status === "failed" ? "runtime_error" : undefined),
-            ...(result.finalAnswer ? { finalAnswer: result.finalAnswer } : {}),
+            finalAnswer: finalResultText,
             runtimeRequestId: result.runtimeRequestId || requestId,
             promptMessageId: result.promptMessageId || requestId,
             completedAt: new Date().toISOString(),
@@ -3097,6 +3110,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
               event: "done",
               sessionId,
               stopReason: result.stopReason,
+              finalAnswer: finalResultText,
               summary,
               ...(stopped ? { stopped: true } : {}),
             }),

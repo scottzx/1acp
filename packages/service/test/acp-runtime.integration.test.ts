@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { client, type SessionUpdate } from '@agentclientprotocol/sdk';
+import { client, type PromptRequest, type SessionUpdate } from '@agentclientprotocol/sdk';
 import { createAgentRegistry, createRuntimeStore } from '@1agents/acp-service/runtime';
 import { WebSocket } from 'ws';
 
@@ -24,18 +24,29 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   const ws = new WebSocket(`ws://127.0.0.1:${service.port}/agents/codex`);
   await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   const updates: string[] = [];
+  const textUpdates: SessionUpdate[] = [];
   const toolUpdates: Extract<SessionUpdate, { sessionUpdate: 'tool_call' | 'tool_call_update' }>[] = [];
   let permissions = 0;
   const connection = client().onNotification('session/update', ({ params }) => {
     updates.push(params.update.sessionUpdate);
+    if (params.update.sessionUpdate === 'agent_message_chunk') textUpdates.push(params.update);
     if (params.update.sessionUpdate === 'tool_call' || params.update.sessionUpdate === 'tool_call_update') toolUpdates.push(params.update);
   })
     .onRequest('session/request_permission', ({ params }) => { permissions++; assert.equal(params.options[0].optionId, 'yes'); return { outcome: { outcome: 'selected' as const, optionId: 'yes' } }; })
     .connect(webSocketStream(ws));
-  await connection.agent.request('initialize', { protocolVersion: 1, clientCapabilities: {} });
+  await connection.agent.request('initialize', { protocolVersion: 1, clientCapabilities: { _meta: { '1agents': { version: 1 } } } });
   const { sessionId } = await connection.agent.request('session/new', { cwd: directory, mcpServers: [] });
-  const result = await connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'perform fixture operation' }] });
+  const prompt: PromptRequest = { sessionId, prompt: [{ type: 'text', text: 'perform fixture operation' }], _meta: { '1agents': { turnManaged: true, turnId: 'managed-fixture', requestId: 'managed-fixture' } } };
+  const result = await connection.agent.request('session/prompt', prompt);
   assert.equal(result.stopReason, 'end_turn');
+  assert.equal((result._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, 'fixture complete');
+  assert.deepEqual(textUpdates.map(update => update._meta?.['1agents']).map(meta => {
+    const value = meta as { messageId: string; messagePhase: string };
+    return [value.messageId, value.messagePhase];
+  }), [['progress', 'commentary'], ['answer', 'final_answer'], ['answer', 'final_answer']]);
+  assert.equal(textUpdates.filter(update => update.sessionUpdate === 'agent_message_chunk').map(update => update.content.type === 'text' ? update.content.text : '').join(''), 'I will perform the operation.fixture complete');
+  const replayed = await connection.agent.request('session/prompt', prompt);
+  assert.equal((replayed._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, 'fixture complete');
   assert.equal(permissions, 1);
   assert.ok(updates.includes('tool_call'));
   assert.ok(updates.includes('tool_call_update'));

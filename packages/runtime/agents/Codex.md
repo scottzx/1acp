@@ -11,6 +11,7 @@
 - Reconnecting restores the saved model and effort before prompting, even when the adapter resumes the conversation with different defaults.
 - Legacy `models` metadata may encode both values in a combined id such as `gpt-5.6-sol[max]`; ACPX uses that form only when the adapter does not advertise the newer model config option.
 - When the adapter returns `_meta.codex.turnConfiguration`, ACPX preserves the opaque metadata in direct, queued, compare, and embedded-runtime results. Structured CLI output also retains the raw ACP prompt response.
+- Embedded runtime text events preserve a supplied message ID and normalize `_meta.codex.phase` values `commentary` and `final_answer` into `messagePhase`. Both remain in the execution stream so hosts can select final-answer text for reports without losing progress logs. Unknown phases are omitted.
 
 ## Permission refusals
 

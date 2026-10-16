@@ -24,6 +24,7 @@ export interface Capabilities {
   modes?: SessionModeState;
 }
 type Link = Awaited<ReturnType<typeof connect>>;
+type AcpStream = { turn: number; step: number; requestId: string; messagePhase?: string; messageId?: string };
 
 /** Producer/consumer queue; errors are delivered after already received chunks. */
 class Queue<T> {
@@ -312,13 +313,18 @@ export class AcpAdapter implements LlmAdapter {
     const turn = boundary?.lastTurn ?? 0;
     const step = stepStart?.type === 'step/start' ? stepStart.data.step : 0;
     let index = 0, current: 'text' | 'reasoning' | undefined, content = '', answer = '';
+    let currentStream: AcpStream | undefined;
     const acpStream = { turn, step, requestId };
-    const endBlock = () => { if (current) { queue.push({ type: 'block-end', index, block: { type: current, text: content } as ContentBlock }); index++; current = undefined; content = ''; } };
-    const emit = (kind: 'text' | 'reasoning', text: string) => {
+    const endBlock = () => { if (current) { queue.push({ type: 'block-end', index, block: { type: current, text: content, acpStream: currentStream } as ContentBlock }); index++; current = undefined; currentStream = undefined; content = ''; } };
+    const emit = (kind: 'text' | 'reasoning', text: string, identity: Pick<AcpStream, 'messagePhase' | 'messageId'> = {}) => {
       if (!text) return;
-      if (current !== kind) { endBlock(); current = kind; queue.push({ type: 'block-start', index, blockType: kind, acpStream } as StreamChunk); }
+      const stream = { ...acpStream, ...identity };
+      if (current !== kind || currentStream?.messagePhase !== stream.messagePhase || currentStream?.messageId !== stream.messageId) {
+        endBlock(); current = kind; currentStream = stream;
+        queue.push({ type: 'block-start', index, blockType: kind, acpStream: stream } as StreamChunk);
+      }
       content += text; if (kind === 'text') answer += text;
-      const chunk = kind === 'text' ? { type: 'text-delta' as const, index, text, acpStream } : { type: 'reasoning-delta' as const, index, text, acpStream };
+      const chunk = kind === 'text' ? { type: 'text-delta' as const, index, text, acpStream: stream } : { type: 'reasoning-delta' as const, index, text, acpStream: stream };
       queue.push(chunk);
     };
     const update = (u: SessionUpdate) => {
@@ -327,7 +333,12 @@ export class AcpAdapter implements LlmAdapter {
       if (typeof meta.sequence !== 'number') return;
       if (seen.has(meta.sequence)) return;
       seen.add(meta.sequence);
-      if ((u.sessionUpdate === 'agent_message_chunk' || u.sessionUpdate === 'agent_thought_chunk') && u.content.type === 'text') emit(u.sessionUpdate === 'agent_message_chunk' ? 'text' : 'reasoning', u.content.text);
+      if ((u.sessionUpdate === 'agent_message_chunk' || u.sessionUpdate === 'agent_thought_chunk') && u.content.type === 'text') {
+        emit(u.sessionUpdate === 'agent_message_chunk' ? 'text' : 'reasoning', u.content.text, {
+          ...(typeof meta.messagePhase === 'string' ? { messagePhase: meta.messagePhase } : {}),
+          ...(typeof meta.messageId === 'string' ? { messageId: meta.messageId } : {}),
+        });
+      }
       else if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') {
         const tool = mergeTool(tools.get(u.toolCallId), u);
         tools.set(u.toolCallId, tool);
@@ -355,8 +366,16 @@ export class AcpAdapter implements LlmAdapter {
             _meta: { '1agents': { turnManaged: true, turnId: requestId, requestId } } }, { cancellationSignal: signal });
           signal.throwIfAborted();
           const meta = result._meta?.['1agents'] as JsonObject | undefined;
-          if (!answer && typeof meta?.finalAnswer === 'string') emit('text', meta.finalAnswer);
+          if (!answer && typeof meta?.finalAnswer === 'string') emit('text', meta.finalAnswer, { messagePhase: 'final_answer' });
           endBlock();
+          if (typeof meta?.finalAnswer === 'string') {
+            // The terminal answer is authoritative even when it is empty. Keep
+            // it durable without printing a second copy of streamed output.
+            const block = { type: 'text' as const, text: '', acpResult: { ...acpStream, finalAnswer: meta.finalAnswer } };
+            queue.push({ type: 'block-start', index, blockType: 'text' });
+            queue.push({ type: 'block-end', index, block });
+            index++;
+          }
           queue.push(result.stopReason === 'cancelled' ? { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'ACP turn cancelled' } } } : { type: 'finish', reason: result.stopReason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } });
           return;
         } catch (error) {

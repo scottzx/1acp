@@ -223,12 +223,18 @@ const ORIGIN_META_KEYS = [
  */
 function extractTextDeltaOrigin(payload: Record<string, unknown>): {
   messageId?: string;
+  messagePhase?: "commentary" | "final_answer";
   meta?: AcpTextDeltaOriginMeta;
 } {
   const messageId = asOptionalString(payload.messageId);
+  const phase =
+    isRecord(payload._meta) && isRecord(payload._meta.codex)
+      ? payload._meta.codex.phase
+      : undefined;
   const meta = sanitizeOriginMeta(payload._meta);
   return {
     ...(messageId ? { messageId } : {}),
+    ...(phase === "commentary" || phase === "final_answer" ? { messagePhase: phase } : {}),
     ...(meta ? { meta } : {}),
   };
 }

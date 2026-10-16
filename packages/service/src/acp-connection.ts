@@ -109,7 +109,7 @@ function envelope(value: RecordValue): RecordValue {
 function updateFor(event: RecordValue, toolUpdate = false): SessionUpdate | undefined {
   const common = { _meta: envelope(event) };
   switch (event.event) {
-    case 'text_delta': return { ...common, sessionUpdate: event.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk', content: { type: 'text', text: event.text || '' } };
+    case 'text_delta': return { ...common, ...(event.messageId ? { messageId: event.messageId } : {}), sessionUpdate: event.type === 'thought' ? 'agent_thought_chunk' : 'agent_message_chunk', content: { type: 'text', text: event.text || '' } };
     case 'tool_call': {
       const fields = { ...common, toolCallId: event.toolCallId, title: event.title ?? event.toolName, status: event.status,
         kind: event.kind, rawInput: event.arguments, rawOutput: event.rawOutput, content: event.content, locations: event.locations };
@@ -236,7 +236,8 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     const terminal = (event.event === 'turn_state' && ['completed', 'failed', 'cancelled'].includes(event.status)) || event.event === 'done' || event.event === 'turn_terminal' || (event.event === 'error' && event.terminal !== false && event.scope === 'turn');
     if (terminal) {
       if (summary && event.event !== 'turn_state') {
-        event = { ...event, responsePolicy: 'summary', resultText: event.finalAnswer || answers.get(sessionId) || '', summary: event.finalAnswer || answers.get(sessionId) || event.summary, sessionRef: { sessionId, turnId: event.turnId } };
+        const finalAnswer = event.finalAnswer ?? event.resultText ?? answers.get(sessionId) ?? '';
+        event = { ...event, responsePolicy: 'summary', resultText: finalAnswer, summary: finalAnswer, sessionRef: { sessionId, turnId: event.turnId } };
         if (extensions) notify(`${EXT}events/turn_complete`, { ...event, event: undefined });
       }
       answers.delete(sessionId);
