@@ -3011,10 +3011,10 @@ async function runPromptTurn(session, sessionId, promptItem) {
 
       const currentSession = activeSessions.get(sessionId);
       const targetWs = currentSession ? currentSession.ws : null;
-      // Preserve every streamed message in the log, but use explicit provider
-      // phases for the durable result. An empty final answer must not fall back
-      // to commentary. Agents without phase metadata keep their legacy output.
-      const finalResultText = hasMessagePhase ? finalAnswer : (result.finalAnswer ?? accumulatedAnswer);
+      // An explicit terminal answer is authoritative, including an empty one.
+      // Otherwise select only final-answer phases, while retaining every message
+      // in the execution log. Unphased agents keep their legacy stream fallback.
+      const finalResultText = result.finalAnswer ?? (hasMessagePhase ? finalAnswer : accumulatedAnswer);
       const journalTerminal = turn.hostTurnId
         ? await turnJournal.record({
             sessionId,

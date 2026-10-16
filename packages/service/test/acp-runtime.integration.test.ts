@@ -19,6 +19,14 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   const options = Reflect.get(runtime, 'options');
   options.sessionStore = createRuntimeStore({ stateDir: directory });
   options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, fileURLToPath(new URL('./fixtures/acp-agent.mjs', import.meta.url))] } });
+  const startTurn = runtime.startTurn.bind(runtime);
+  const terminalAnswers = new Map([['terminal only', 'Authoritative terminal answer'], ['terminal empty', ''], ['terminal replacement', 'Corrected terminal answer']]);
+  // The current runtime omits finalAnswer. Exercise the public result contract's
+  // optional authoritative answer without replacing its real event stream/store.
+  runtime.startTurn = input => {
+    const turn = startTurn(input);
+    return terminalAnswers.has(input.text) ? { ...turn, result: turn.result.then(result => ({ ...result, finalAnswer: terminalAnswers.get(input.text)! })) } : turn;
+  };
   const service = await serveAcpService({ host: '127.0.0.1', port: 0, report: false });
   t.after(async () => { await service.close(); delete process.env.ACP_STATE_DIR; rmSync(directory, { recursive: true, force: true }); });
   const ws = new WebSocket(`ws://127.0.0.1:${service.port}/agents/codex`);
@@ -68,6 +76,13 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   assert.equal((commentary._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, '');
   const commentaryReplay = await connection.agent.request('session/prompt', commentaryPrompt);
   assert.equal((commentaryReplay._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, '');
+  for (const [text, finalAnswer] of terminalAnswers) {
+    const terminalPrompt: PromptRequest = { sessionId, prompt: [{ type: 'text', text }], _meta: { '1agents': { turnManaged: true, turnId: text, requestId: text } } };
+    const terminal = await connection.agent.request('session/prompt', terminalPrompt);
+    assert.equal((terminal._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, finalAnswer);
+    const terminalReplay = await connection.agent.request('session/prompt', terminalPrompt);
+    assert.equal((terminalReplay._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, finalAnswer);
+  }
   await connection.agent.request('session/delete', { sessionId });
   await assert.rejects(connection.agent.request('session/resume', { sessionId, cwd: directory, mcpServers: [] }), { code: -32003 });
   assert.equal((await connection.agent.request('session/list', {})).sessions.length, 0);
