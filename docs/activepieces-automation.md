@@ -112,22 +112,27 @@ Save results before removing its piece, connection or flows.
 
 ## Verified WSL deployment
 
-The [verification receipt](activepieces-automation-proof.json) records a genuine
+The [initial verification receipt](activepieces-automation-proof.json) records a genuine
 scheduled PRODUCTION run, Codex execution and successful result processing.
 It also verifies that a gateway restart preserves the Task and that duplicate
 submission/notification processing does not create new work.
 
+The [final-answer verification receipt](activepieces-final-answer-proof.json)
+records the follow-up run with separate commentary and final-answer phases. It
+checks the saved DSH journal against the actual Activepieces report and verifies
+that A2A completion and business acknowledgement follow the DSH turn ending.
+
 | Item | Location / status |
 | --- | --- |
 | Gateway | system service 1acp-automation.service, enabled at boot |
-| Release | /home/scott/.local/share/1acp-automation/releases/v1/package |
-| Private dependencies | releases/v1/dependencies/node_modules; no dependency on a DSH release path |
+| Release | /home/scott/.local/share/1acp-automation/releases/v5-final-answer/package |
+| Private dependencies | releases/v5-final-answer/dependencies/node_modules; no dependency on a DSH release path |
 | Configuration | /home/scott/.config/1acp-automation/gateway.json |
 | Persistent state | /home/scott/.local/state/1acp-automation |
 | Encrypted AP connection | oneacp-automation |
 | Dispatch flow | 1LLAYCJcNyr6oqhopxqaT, published and DISABLED |
 | Result flow | GoMSn0AWtoQB9OYVdLNJl, published and ENABLED |
-| Successful Task | 2e5928f2-e0c7-4387-90a0-41d924701082 |
+| Successful Task | be0ca1c8-0d2b-4420-8020-bfa482ef1e90 |
 
 The temporary dispatch flow uses every-minute Cron. Choose its real business
 task and cadence before enabling it. The demo report is available in the result

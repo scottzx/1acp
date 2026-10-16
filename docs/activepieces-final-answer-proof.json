@@ -1,0 +1,92 @@
+{
+  "startedAtUtc": "2026-10-16T17:36:26.505193Z",
+  "dispatchFlowId": "1LLAYCJcNyr6oqhopxqaT",
+  "resultFlowId": "GoMSn0AWtoQB9OYVdLNJl",
+  "progressMarker": "ONEACP_PROGRESS_ONLY_20261017",
+  "status": "verified",
+  "verifiedAtUtc": "2026-10-16T17:37:36.761370Z",
+  "execution": {
+    "runId": "2c0747ed-ae28-4fd4-8728-d0e74f8559b7",
+    "scheduledFor": "2026-10-16T17:37:00.000Z",
+    "taskId": "be0ca1c8-0d2b-4420-8020-bfa482ef1e90",
+    "contextId": "7183c8db-c51a-400e-b716-dc82adaa4922",
+    "sessionId": "session-41e4201b-361f-4f81-b588-c4b490478885",
+    "state": "TASK_STATE_COMPLETED",
+    "result": "{\"marker\":\"ONEACP_ACTIVEPIECES_SMOKE_OK\",\"cwd\":\"/home/scott/1acp-automation-smoke\",\"summary\":\"已读取 README.md 并实际运行 pwd；全程只读，未修改文件或读取凭据。\"}",
+    "logPath": "/home/scott/.dsh/sessions/--home-scott-1acp-automation-smoke--/session-41e4201b-361f-4f81-b588-c4b490478885/session.v4.jsonl.zstd",
+    "assistantSavedAtUtc": "2026-10-16T17:37:17.782Z",
+    "turnEndedAtUtc": "2026-10-16T17:37:17.786Z",
+    "turnEndReason": "completed",
+    "a2aCompletedAtUtc": "2026-10-16T17:37:17.792Z",
+    "completedTools": [
+      {
+        "title": "Read file '/home/scott/1acp-automation-smoke/README.md'",
+        "status": "completed"
+      },
+      {
+        "title": "Read file '/home/scott/1acp-automation-smoke/README.md'",
+        "status": "completed"
+      },
+      {
+        "title": "pwd",
+        "status": "completed"
+      },
+      {
+        "title": "pwd",
+        "status": "completed"
+      }
+    ]
+  },
+  "resultRunId": "JsbIiROPWT76GpC4gJyRU",
+  "resultRunStatus": "SUCCEEDED",
+  "report": "{\"marker\":\"ONEACP_ACTIVEPIECES_SMOKE_OK\",\"cwd\":\"/home/scott/1acp-automation-smoke\",\"summary\":\"已读取 README.md 并实际运行 pwd；全程只读，未修改文件或读取凭据。\"}",
+  "reportSavedAtUtc": "2026-10-16T17:37:18.663Z",
+  "notification": {
+    "noticeId": "b66aab6af1946b8f2991c46865ddea47b63a4403681ebd46665c0608c9d2b557",
+    "businessCompletedAt": "2026-10-16T17:37:18.711Z",
+    "gatewayAcknowledgedAt": "2026-10-16T17:37:18.726Z"
+  },
+  "dispatchRun": {
+    "id": "MWpFLBG5IHaOY9fTMDKyb",
+    "flowId": "1LLAYCJcNyr6oqhopxqaT",
+    "status": "SUCCEEDED",
+    "environment": "PRODUCTION",
+    "created": "2026-10-16T17:37:00.086Z",
+    "duration": "0.4s",
+    "failedStepName": null
+  },
+  "checks": {
+    "reportIsPureJson": true,
+    "progressExcludedFromReport": true,
+    "resultSavedBeforeAcknowledgement": true,
+    "progressPreservedInExecutionLog": true,
+    "finalAnswerPreservedInExecutionLog": true,
+    "terminalAnswerMatchesReport": true,
+    "resultDeliveredAfterTurnEnd": true,
+    "scheduledProductionRun": true,
+    "temporaryTimerDisabled": true
+  },
+  "timezone": "Asia/Shanghai",
+  "sourceBranch": "codex/activepieces-scheduler",
+  "sourceCommit": "2daa792c5e4447c32fd5732d2b62e54a4cf5526f",
+  "serviceArchiveSha256": "e8f5bfe3a227f2acc04fbe139b441db8d954fea67094cc1a19a78b8563701c2f",
+  "gateway": {
+    "service": "1acp-automation.service",
+    "release": "/home/scott/.local/share/1acp-automation/releases/v5-final-answer/package",
+    "privateDependencySnapshot": true
+  },
+  "dispatchFlowStatus": "DISABLED",
+  "resultFlowStatus": "ENABLED",
+  "tests": {
+    "servicePassed": 68,
+    "dshPluginPassedWithRealHost": 84,
+    "dshPluginSkipped": 0,
+    "runtimeFocusedPassed": 21,
+    "runtimeCoverageTestsPassed": 217,
+    "runtimeCoverageLinesPercent": 85.08,
+    "runtimeFullJsSuitePassed": true,
+    "autoReviewPythonPassed": 522,
+    "autoReviewPythonConditionalSkipped": 2,
+    "codeReviewActionableFindingsP0P1P2": 0
+  }
+}
