@@ -13,7 +13,7 @@ Requires **Node.js 22.13+**, a working DSH installation, and each selected nativ
 Install the one public package:
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.6.0
+dsh plugin --profile web add @1agents/acp-service@^0.7.0
 ```
 
 If pnpm pauses or fails with an ignored transitive `esbuild` build script, follow its prompt or configure that individual package's approval in the profile's `pnpm-workspace.yaml`, then repeat the install. Approve or deny it according to your policy. A successful isolated package smoke used `--ignore-scripts`; the interactive pnpm 11 profile check approved only `esbuild`. A partial install can leave the bundle disabled, so check the Plugins page afterward.
@@ -31,7 +31,7 @@ The package declares `dsh.bundle.patch` and its browser entry, so installation s
 The plugin starts its bundled ACP service on `127.0.0.1:36812` when no service is listening. An existing healthy ACP service is reused. Start DSH normally; no separate service command is needed. To manage the service yourself, set `serviceMode: external` and run:
 
 ```sh
-npx --yes @1agents/acp-service@^0.6.0 serve --host 127.0.0.1 --port 36812 --no-report
+npx --yes @1agents/acp-service@^0.7.0 serve --host 127.0.0.1 --port 36812 --no-report
 ```
 
 Installing the package alone starts no process; activating the plugin starts the service. For local development, install the built checkout with `pnpm dsh plugin --profile web add /absolute/path/1acp/packages/service`.

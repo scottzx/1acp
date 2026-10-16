@@ -12,7 +12,7 @@ Use Codex, Claude Code, Grok Build and other locally discovered ACP Agents insid
 Requires **Node.js 22.13+**, DSH, and the native Agent CLI with working authentication on the DSH host. Adapter-backed Agents also need their ACP adapter; installing the native Codex CLI alone does not install `codex-acp`.
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.6.0
+dsh plugin --profile web add @1agents/acp-service@^0.7.0
 ```
 
 Restart DSH, confirm **`@1agents/acp-service`** is enabled on the Plugins page, then create a session with an **ACP · Agent** preset and an existing workspace. The plugin starts or reuses its local ACP service automatically. Replace `web` with your profile name; from a DSH source checkout, use `pnpm dsh` in place of `dsh`.
@@ -44,7 +44,7 @@ The plugin currently accepts text prompts. Available controls depend on the sele
 ## Standalone CLI
 
 ```sh
-npm install -g @1agents/acp-service@^0.6.0
+npm install -g @1agents/acp-service@^0.7.0
 acp-service --help
 acp-service serve --host 127.0.0.1 --port 36812 --no-report
 ```
@@ -87,7 +87,9 @@ Agent binaries, authentication, service state and DSH session bindings remain ou
 
 ## Package releases
 
-Only `@1agents/acp-service` is published. Version 0.6.0 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
+Only `@1agents/acp-service` is published. Version 0.7.0 includes the runtime, CLI, service and DSH plugin in one tarball. Runtime and DSH source modules stay private; there is one public version to bump and one package to publish.
+
+Version 0.7.0 adds [Activepieces scheduled tasks](docs/activepieces-automation.md) through the existing A2A gateway, with durable occurrence admission, result claims and acknowledgement. Codex commentary stays in DSH execution logs while A2A reports contain the final answer; explicit empty answers survive replay. The [scheduled-chain verification](docs/activepieces-final-answer-proof.json) records the completed WSL deployment test.
 
 Version 0.6.0 adds DSH A2A 1.0 execution, remote-agent gateway tools, a durable completion inbox and the bundled ACP Service usage skill. Tasks return IDs before completion, run in the selected remote workspace and preset, and support standard queries, subscriptions and allowed completion callbacks. The gateway reconciles remote status after reconnect or restart; main-model wake-up still requires a receiving host adapter.
 
@@ -95,10 +97,10 @@ Version 0.5.4 introduced ordered DSH tool groups, native commentary and reasonin
 
 ```sh
 # Ordinary CLI installation:
-npm install -g @1agents/acp-service@^0.6.0
+npm install -g @1agents/acp-service@^0.7.0
 acp-service --help
 # DSH installation (run from its checkout):
-pnpm dsh plugin --profile web add @1agents/acp-service@^0.6.0
+pnpm dsh plugin --profile web add @1agents/acp-service@^0.7.0
 ```
 
 The CLI uses the package's `bin`; DSH selects its `dsh.bundle.patch` and activates the package-root Cordis entry. The root preserves service API exports and lazily loads plugin code when DSH invokes `apply`. DSH scans only package-root rows for browser metadata, so the patch deliberately loads the root, rather than `/dsh`. `/service` offers the service API; `/dsh`, `/dsh/preset` and `/dsh/imports` offer typed plugin APIs. Installing the package does not start a service or require DSH dependencies.
@@ -112,7 +114,7 @@ Release checks artifact SHA/checksum, manifests, dependencies, runtime and DSH e
 For local packaging, build first, then run `pnpm run pack` from this root. Packing checks existing outputs and never rebuilds them. To verify the resulting package:
 
 ```sh
-node scripts/smoke-service-package.mjs release/1agents-acp-service-0.6.0.tgz /absolute/path/DSH
+node scripts/smoke-service-package.mjs release/1agents-acp-service-0.7.0.tgz /absolute/path/DSH
 ```
 
 ### Migrate a DSH profile

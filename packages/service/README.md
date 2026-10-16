@@ -7,7 +7,7 @@ Run persistent Codex, Claude Code, Grok Build and other supported native Agent s
 Requires **Node.js 22.13+**, DSH, and the selected native Agent's CLI and credentials on the DSH host. Adapter-backed Agents also require their ACP adapter; the native Codex CLI alone does not provide `codex-acp`.
 
 ```sh
-dsh plugin --profile web add @1agents/acp-service@^0.6.0
+dsh plugin --profile web add @1agents/acp-service@^0.7.0
 ```
 
 Restart DSH and check that **`@1agents/acp-service`** is enabled on the Plugins page. Create a session with a discovered **ACP · Agent** preset, choose an existing workspace, then send a text prompt. The plugin starts or reuses its local service automatically. Use your own profile name in place of `web`; from a DSH source checkout, replace `dsh` with `pnpm dsh`.
@@ -35,7 +35,7 @@ These unmodified screenshots show discovery and native capability loading in tha
 ## Standalone CLI and service
 
 ```sh
-npm install -g @1agents/acp-service@^0.6.0
+npm install -g @1agents/acp-service@^0.7.0
 acp-service --help
 acp-service serve --host 127.0.0.1 --port 36812 --no-report
 ```
@@ -293,8 +293,8 @@ The service launcher uses the same local command resolution, including absolute 
 The optional automation listener supports Activepieces scheduled tasks:
 authenticated occurrence submission, overlap prevention, durable task
 correlation and completion-processing claims. See the repository's
-[integration guide](../../docs/activepieces-automation.md) and
-[configuration examples](../../examples/activepieces/).
+[integration guide](https://github.com/scottzx/1acp/blob/main/docs/activepieces-automation.md) and
+[configuration examples](https://github.com/scottzx/1acp/tree/main/examples/activepieces).
 
 The same package includes `acp-service a2a gateway --config /absolute/gateway.json` and exports `RemoteAgentGateway` / `serveA2AGateway` from `@1agents/acp-service/a2a`. The gateway calls the standard A2A 1.0 SendMessage, GetTask and CancelTask APIs. It registers seven HTTP methods with the local DreamMate node; an existing `dreammate_invoke` client can use them immediately without another MCP server.
 
