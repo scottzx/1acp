@@ -164,15 +164,40 @@ test('ACP progress, tools and final messages keep durable identities across repl
   assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
 });
 
-test('terminal answers remain authoritative after streamed progress and preserve an explicit empty answer', { timeout: 5000 }, async t => {
-  for (const finalAnswer of ['Only the final report', '']) {
-    const f = await fixture(t, false, 'permission', async () => {}, [], {
-      updates: [textUpdate('Preparing the task.', 'commentary', 'progress')], result: promptResult(finalAnswer),
-    });
-    const chunks = await collect(f.adapter, f.options(`terminal-${finalAnswer}`));
-    assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Preparing the task.');
-    assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, finalAnswer);
+test('a terminal answer missing from the phased stream is displayed once after progress, including after replay', { timeout: 5000 }, async t => {
+  for (const disconnect of [false, true]) {
+    for (const finalAnswer of ['Only the final report', '']) {
+      const f = await fixture(t, disconnect, 'permission', async () => {}, [], {
+        updates: [textUpdate('Preparing the task.', 'commentary', 'progress')], result: promptResult(finalAnswer),
+      });
+      const chunks = await collect(f.adapter, f.options(`terminal-${finalAnswer}`));
+      assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), `Preparing the task.${finalAnswer}`);
+      const visible = chunks.filter(c => c.type === 'block-end' && c.block.text);
+      assert.deepEqual(visible.map(c => c.block.acpStream.messagePhase), finalAnswer ? ['commentary', 'final_answer'] : ['commentary']);
+      assert.equal(chunks.filter(c => c.block?.acpResult).length, 1);
+      assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, finalAnswer);
+      assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
+    }
   }
+});
+
+test('an unphased legacy stream keeps its existing transcript without appending a terminal answer twice', { timeout: 5000 }, async t => {
+  const f = await fixture(t, true, 'permission', async () => {}, [], { result: promptResult('Hello ACP') });
+  const chunks = await collect(f.adapter, f.options('legacy-terminal'));
+  assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Hello ACP');
+  assert.equal(chunks.filter(c => c.type === 'block-end' && c.block.text).length, 1);
+  assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Hello ACP');
+});
+
+test('an unknown producer phase stays unphased and does not append another terminal copy', { timeout: 5000 }, async t => {
+  const f = await fixture(t, true, 'permission', async () => {}, [], {
+    updates: [textUpdate('Legacy final answer', 'vendor_hint', 'legacy')], result: promptResult('Legacy final answer'),
+  });
+  const chunks = await collect(f.adapter, f.options('unknown-phase'));
+  assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Legacy final answer');
+  const visible = chunks.find(c => c.type === 'block-end' && c.block.text).block;
+  assert.equal(visible.acpStream.messagePhase, undefined);
+  assert.equal(visible.acpStream.messageId, 'legacy');
 });
 
 test('a terminal-only answer is displayed once and recorded before finish', { timeout: 5000 }, async t => {

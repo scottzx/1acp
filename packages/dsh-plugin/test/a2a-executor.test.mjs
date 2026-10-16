@@ -209,6 +209,16 @@ test('ACP metadata from other turns is ignored and unphased DSH remains compatib
   assert.deepEqual(await result, { outcome: 'completed', text: 'Ordinary DSH answer' });
 });
 
+test('an unknown producer phase retains legacy answer behavior instead of requiring an explicit final phase', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'task', 8);
+  f.content(agent, 8, [phasedText(8, 'vendor_hint', 'Legacy final answer')]);
+  f.finish(agent, 8, { kind: 'completed' });
+  assert.deepEqual(await result, { outcome: 'completed', text: 'Legacy final answer' });
+});
+
 for (const reason of [{ kind: 'max-tokens' }, { kind: 'aborted', reason: { kind: 'user' } }]) {
   test(`ACP final metadata preserves failed outcome for ${reason.kind}`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });

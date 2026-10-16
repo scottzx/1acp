@@ -24,7 +24,7 @@ export interface Capabilities {
   modes?: SessionModeState;
 }
 type Link = Awaited<ReturnType<typeof connect>>;
-type AcpStream = { turn: number; step: number; requestId: string; messagePhase?: string; messageId?: string };
+type AcpStream = { turn: number; step: number; requestId: string; messagePhase?: 'commentary' | 'final_answer'; messageId?: string };
 
 /** Producer/consumer queue; errors are delivered after already received chunks. */
 class Queue<T> {
@@ -313,6 +313,7 @@ export class AcpAdapter implements LlmAdapter {
     const turn = boundary?.lastTurn ?? 0;
     const step = stepStart?.type === 'step/start' ? stepStart.data.step : 0;
     let index = 0, current: 'text' | 'reasoning' | undefined, content = '', answer = '';
+    let hasPhasedText = false, streamedFinalAnswer = false;
     let currentStream: AcpStream | undefined;
     const acpStream = { turn, step, requestId };
     const endBlock = () => { if (current) { queue.push({ type: 'block-end', index, block: { type: current, text: content, acpStream: currentStream } as ContentBlock }); index++; current = undefined; currentStream = undefined; content = ''; } };
@@ -323,7 +324,12 @@ export class AcpAdapter implements LlmAdapter {
         endBlock(); current = kind; currentStream = stream;
         queue.push({ type: 'block-start', index, blockType: kind, acpStream: stream } as StreamChunk);
       }
-      content += text; if (kind === 'text') answer += text;
+      content += text;
+      if (kind === 'text') {
+        answer += text;
+        if (identity.messagePhase !== undefined) hasPhasedText = true;
+        if (identity.messagePhase === 'final_answer') streamedFinalAnswer = true;
+      }
       const chunk = kind === 'text' ? { type: 'text-delta' as const, index, text, acpStream: stream } : { type: 'reasoning-delta' as const, index, text, acpStream: stream };
       queue.push(chunk);
     };
@@ -335,7 +341,7 @@ export class AcpAdapter implements LlmAdapter {
       seen.add(meta.sequence);
       if ((u.sessionUpdate === 'agent_message_chunk' || u.sessionUpdate === 'agent_thought_chunk') && u.content.type === 'text') {
         emit(u.sessionUpdate === 'agent_message_chunk' ? 'text' : 'reasoning', u.content.text, {
-          ...(typeof meta.messagePhase === 'string' ? { messagePhase: meta.messagePhase } : {}),
+          ...(meta.messagePhase === 'commentary' || meta.messagePhase === 'final_answer' ? { messagePhase: meta.messagePhase } : {}),
           ...(typeof meta.messageId === 'string' ? { messageId: meta.messageId } : {}),
         });
       }
@@ -366,7 +372,9 @@ export class AcpAdapter implements LlmAdapter {
             _meta: { '1agents': { turnManaged: true, turnId: requestId, requestId } } }, { cancellationSignal: signal });
           signal.throwIfAborted();
           const meta = result._meta?.['1agents'] as JsonObject | undefined;
-          if (!answer && typeof meta?.finalAnswer === 'string') emit('text', meta.finalAnswer, { messagePhase: 'final_answer' });
+          if (typeof meta?.finalAnswer === 'string' && (!answer || (hasPhasedText && !streamedFinalAnswer))) {
+            emit('text', meta.finalAnswer, { messagePhase: 'final_answer' });
+          }
           endBlock();
           if (typeof meta?.finalAnswer === 'string') {
             // The terminal answer is authoritative even when it is empty. Keep

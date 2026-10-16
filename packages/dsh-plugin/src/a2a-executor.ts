@@ -33,7 +33,8 @@ function answerOf(content: readonly ContentBlock[], turn: number): { text: strin
   })[];
   const terminal = blocks.findLast(part => part.acpResult?.turn === turn && typeof part.acpResult.finalAnswer === 'string');
   if (terminal) return { text: terminal.acpResult!.finalAnswer as string, authoritative: true, phased: true };
-  const phased = blocks.some(part => part.acpStream?.turn === turn && typeof part.acpStream.messagePhase === 'string');
+  const phased = blocks.some(part => part.acpStream?.turn === turn
+    && (part.acpStream.messagePhase === 'commentary' || part.acpStream.messagePhase === 'final_answer'));
   return {
     text: blocks.filter(part => !phased || (part.acpStream?.turn === turn && part.acpStream.messagePhase === 'final_answer')).map(part => part.text).join(''),
     authoritative: false, phased,
