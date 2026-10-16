@@ -63,6 +63,11 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   const resumed = await connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'continue fixture operation' }] });
   assert.equal(resumed.stopReason, 'end_turn');
   assert.equal(permissions, 2);
+  const commentaryPrompt: PromptRequest = { sessionId, prompt: [{ type: 'text', text: 'commentary only' }], _meta: { '1agents': { turnManaged: true, turnId: 'commentary-fixture', requestId: 'commentary-fixture' } } };
+  const commentary = await connection.agent.request('session/prompt', commentaryPrompt);
+  assert.equal((commentary._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, '');
+  const commentaryReplay = await connection.agent.request('session/prompt', commentaryPrompt);
+  assert.equal((commentaryReplay._meta?.['1agents'] as { finalAnswer: string }).finalAnswer, '');
   await connection.agent.request('session/delete', { sessionId });
   await assert.rejects(connection.agent.request('session/resume', { sessionId, cwd: directory, mcpServers: [] }), { code: -32003 });
   assert.equal((await connection.agent.request('session/list', {})).sessions.length, 0);

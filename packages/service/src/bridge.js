@@ -3014,7 +3014,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
       // Preserve every streamed message in the log, but use explicit provider
       // phases for the durable result. An empty final answer must not fall back
       // to commentary. Agents without phase metadata keep their legacy output.
-      const finalResultText = result.finalAnswer ?? (hasMessagePhase ? finalAnswer : accumulatedAnswer);
+      const finalResultText = hasMessagePhase ? finalAnswer : (result.finalAnswer ?? accumulatedAnswer);
       const journalTerminal = turn.hostTurnId
         ? await turnJournal.record({
             sessionId,

@@ -20,7 +20,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (m.id === 'approval') {
         send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', content: [{ type: 'content', content: { type: 'text', text: 'saved' } }] } } });
         send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', status: 'completed', rawOutput: { result: 'saved' } } } });
-        for (const text of ['fixture ', 'complete']) send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', messageId: 'answer', _meta: { codex: { phase: 'final_answer' } }, content: { type: 'text', text } } } });
+        if (turn.params.prompt[0]?.text !== 'commentary only') for (const text of ['fixture ', 'complete']) send({ method: 'session/update', params: { sessionId: turn.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', messageId: 'answer', _meta: { codex: { phase: 'final_answer' } }, content: { type: 'text', text } } } });
         send({ id: turn.id, result: { stopReason: 'end_turn' } });
       } else if (m.id !== undefined) send({ id: m.id, error: { code: -32601, message: 'Method not found' } });
   }

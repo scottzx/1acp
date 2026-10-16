@@ -140,7 +140,10 @@ const journalEventSchema = z.object({
   occurred_at: z.string(),
   created_at: z.string(),
   agent_type: z.unknown().optional().transform(optionalString),
-  final_answer: z.unknown().optional().transform(optionalString),
+  final_answer: z
+    .unknown()
+    .optional()
+    .transform((value) => (typeof value === "string" ? value : undefined)),
   error_code: z.unknown().optional().transform(optionalString),
   error_text: z.unknown().optional().transform(optionalString),
   runtime_record_id: z.unknown().optional().transform(optionalString),

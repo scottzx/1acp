@@ -115,6 +115,50 @@ test("Turn journal makes client request retries idempotent and rejects changed p
   });
 });
 
+test("Turn journal preserves empty and whitespace final answers across reload and duplicate requests", async () => {
+  for (const finalAnswer of ["", " \n\t ", "  final answer\n"]) {
+    await withTempDir("acpx-turn-final-answer-", async (stateDir) => {
+      const journal = createTurnJournal({ stateDir });
+      await journal.record({
+        sessionId: "session-1",
+        turnId: "turn-1",
+        clientRequestId: "request-1",
+        status: "running",
+        promptText: "same prompt",
+        finalAnswer: "earlier progress",
+      });
+      const completed = {
+        sessionId: "session-1",
+        turnId: "turn-1",
+        clientRequestId: "request-1",
+        status: "completed" as const,
+        promptText: "same prompt",
+        finalAnswer,
+      };
+      assert.equal((await journal.record(completed)).turn.finalAnswer, finalAnswer);
+
+      const journalPath = path.join(stateDir, "sessions", "session-1.turns.ndjson");
+      const persisted = await fs.readFile(journalPath, "utf8");
+      const event: unknown = JSON.parse(persisted.trim().split("\n").at(-1)!);
+      assert.equal((event as { final_answer?: unknown }).final_answer, finalAnswer);
+
+      const reloaded = createTurnJournal({ stateDir });
+      const snapshot = await reloaded.snapshot("session-1");
+      assert.equal(snapshot.turns[0]?.finalAnswer, finalAnswer);
+      assert.equal(snapshot.sequence, 2);
+      const duplicate = await reloaded.record(completed);
+      assert.equal(duplicate.turn.finalAnswer, finalAnswer);
+      assert.equal(duplicate.created, false);
+      assert.equal(duplicate.changed, false);
+      const newCandidate = await reloaded.record({ ...completed, turnId: "retry-candidate" });
+      assert.equal(newCandidate.turn.turnId, "turn-1");
+      assert.equal(newCandidate.turn.finalAnswer, finalAnswer);
+      assert.equal(newCandidate.changed, false);
+      assert.equal(await fs.readFile(journalPath, "utf8"), persisted);
+    });
+  }
+});
+
 test("Turn journal accepts a terminal runtime fact when earlier notifications were lost", async () => {
   await withTempDir("acpx-turn-reconcile-", async (stateDir) => {
     const journal = createTurnJournal({ stateDir });

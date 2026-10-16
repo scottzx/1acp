@@ -38,6 +38,7 @@ Repo: https://github.com/scottzx/1acp
 - Windows: preserve complete backslash runs before quotes and at the end of batch-wrapper arguments. Thanks @odrobnik.
 - Service/agents: use installed ACP adapter executables before npx, launch JavaScript adapters with the service interpreter, and report npm cache conflicts without unrelated macOS permission advice.
 - Runtime/embedding: preserve recognized Codex commentary and final-answer phases on text events so hosts can show only the final answer in reports while retaining progress in execution logs.
+- Turn journal: retain explicit empty final answers and their original whitespace across reloads and duplicate requests so replay does not fall back to progress text.
 
 ## 0.19.3 - 2026-09-25
 
