@@ -5,3 +5,5 @@ export { FileA2AStore } from './store.js';
 export type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from './types.js';
 export { RemoteAgentGateway, serveA2AGateway, REMOTE_AGENT_METHODS } from './gateway.js';
 export type { A2AGatewayConfig, RemoteAgentNotice } from './gateway.js';
+export { A2AAutomation } from './automation.js';
+export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';

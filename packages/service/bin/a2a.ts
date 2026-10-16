@@ -27,6 +27,7 @@ Methods: remote_agent_spawn, remote_agent_get, remote_agent_message,
     const config = JSON.parse(fs.readFileSync(file, 'utf8')) as A2AGatewayConfig;
     const host = await serveA2AGateway(config, { report: !args.includes('--no-report') });
     console.log(`a2a-gateway listening on http://127.0.0.1:${host.port}; registration=${host.registration?.ok ?? false}`);
+    if (host.automationPort !== undefined) console.log(`a2a automation listening on http://${host.gateway.config.automation!.host}:${host.automationPort}`);
     const stop = () => { void host.close().then(() => { process.exitCode = 0; }); };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     return;

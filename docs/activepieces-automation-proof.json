@@ -1,0 +1,66 @@
+{
+  "verifiedAtUtc": "2026-10-16T16:06:36.318268Z",
+  "timezone": "Asia/Shanghai",
+  "sourceBranch": "codex/activepieces-scheduler",
+  "gateway": {
+    "service": "1acp-automation.service",
+    "remoteOrigin": "http://100.75.225.56:3088",
+    "automationPort": 36815,
+    "privateDependencySnapshot": true
+  },
+  "execution": {
+    "scheduleId": "readonly-demo",
+    "scheduledFor": "2026-10-16T15:59:00.000Z",
+    "runId": "5c6ff3b9-d656-42a6-8944-26066ff99f61",
+    "flowRunId": "lCqkqPvNUFO1Th13UjTg7",
+    "taskId": "2e5928f2-e0c7-4387-90a0-41d924701082",
+    "contextId": "d14d0449-730a-4183-bd54-43eaaacd48a5",
+    "sessionId": "session-dfad6c0e-a83c-4926-8efb-96bb35dc218e",
+    "agentPreset": "oneagents-acp-codex",
+    "cwd": "/home/scott/1acp-automation-smoke",
+    "state": "TASK_STATE_COMPLETED",
+    "result": "我会只读查看 README.md，并运行 pwd 获取当前目录。{\"marker\":\"ONEACP_ACTIVEPIECES_SMOKE_OK\",\"cwd\":\"/home/scott/1acp-automation-smoke\",\"summary\":\"已读取 README.md 并实际运行 pwd；该目录用于 Activepieces → 1acp A2A 端到端验证。全程仅执行只读操作，未修改文件或读取凭据。\"}"
+  },
+  "dispatchFlow": {
+    "id": "1LLAYCJcNyr6oqhopxqaT",
+    "displayName": "1acp 验证 · 定时派发",
+    "status": "DISABLED",
+    "published": true,
+    "triggerType": "@activepieces/piece-schedule",
+    "runId": "lCqkqPvNUFO1Th13UjTg7",
+    "runStatus": "SUCCEEDED"
+  },
+  "resultFlow": {
+    "id": "GoMSn0AWtoQB9OYVdLNJl",
+    "displayName": "1acp 验证 · 结果回传",
+    "status": "ENABLED",
+    "published": true,
+    "triggerType": "@activepieces/piece-webhook",
+    "runId": "cmRIoPtDsHElDTkSv2lKD",
+    "runStatus": "SUCCEEDED"
+  },
+  "notification": {
+    "noticeId": "d9a9e8efbb5943e603f6e5bc8e74005be20996088b5a9398aaa1c10c71198fd8",
+    "businessCompletedAt": "2026-10-16T15:59:19.848Z",
+    "gatewayAcknowledgedAt": "2026-10-16T15:59:19.864Z"
+  },
+  "checks": {
+    "scheduledProductionRun": true,
+    "resultSavedBeforeAcknowledgement": true,
+    "gatewayRestartPreservedTask": true,
+    "duplicateOccurrenceDidNotSpawn": true,
+    "duplicateNoticeNotClaimed": true,
+    "activepiecesSandboxMode": "SANDBOX_CODE_ONLY",
+    "temporaryTimerDisabled": true
+  },
+  "tests": {
+    "servicePassed": 64,
+    "dshPluginPassed": 63,
+    "conditionalDshTestsSkipped": 5
+  },
+  "serviceArchiveSha256": "accd69abb7831256f8b35b949ba7c2c8e4f18e271b02a36ad72ec513b1ba6a91",
+  "notes": [
+    "Initial pre-dispatch Agent Card origin mismatch was verified and corrected; its failed record and two skipped occurrences remain for audit.",
+    "Result-flow failures after webhook acceptance require Activepieces step retry or manual replay."
+  ]
+}

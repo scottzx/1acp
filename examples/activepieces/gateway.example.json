@@ -1,0 +1,29 @@
+{
+  "stateDirectory": "/home/scott/.local/state/1acp-automation",
+  "port": 36814,
+  "remotes": {
+    "wsl-dsh": {
+      "url": "http://dsh-host:3088",
+      "token": "REPLACE_WITH_PRIVATE_DSH_A2A_TOKEN"
+    }
+  },
+  "notificationTargets": {
+    "activepieces": {
+      "url": "http://127.0.0.1:8083/api/v1/webhooks/REPLACE_WITH_RESULT_FLOW_ID",
+      "token": "REPLACE_WITH_PRIVATE_NOTIFICATION_TOKEN"
+    }
+  },
+  "automation": {
+    "host": "0.0.0.0",
+    "port": 36815,
+    "token": "REPLACE_WITH_PRIVATE_AUTOMATION_TOKEN",
+    "schedules": {
+      "readonly-demo": {
+        "remote": "wsl-dsh",
+        "cwd": "/home/scott/1acp-automation-smoke",
+        "agentPreset": "oneagents-acp-codex",
+        "notificationTarget": "activepieces"
+      }
+    }
+  }
+}

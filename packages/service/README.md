@@ -256,6 +256,12 @@ The service launcher uses the same local command resolution, including absolute 
 
 ## Remote DSH tools and completion inbox
 
+The optional automation listener supports Activepieces scheduled tasks:
+authenticated occurrence submission, overlap prevention, durable task
+correlation and completion-processing claims. See the repository's
+[integration guide](../../docs/activepieces-automation.md) and
+[configuration examples](../../examples/activepieces/).
+
 The same package includes `acp-service a2a gateway --config /absolute/gateway.json` and exports `RemoteAgentGateway` / `serveA2AGateway` from `@1agents/acp-service/a2a`. The gateway calls the standard A2A 1.0 SendMessage, GetTask and CancelTask APIs. It registers seven HTTP methods with the local DreamMate node; an existing `dreammate_invoke` client can use them immediately without another MCP server.
 
 Create a private configuration file (`chmod 600`):

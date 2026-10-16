@@ -9,6 +9,7 @@ import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, type 
 import { reportAndHoldRegistration } from '@1agents/dreammate-node/client';
 import { z } from 'zod';
 import { FileA2AStore } from './store.js';
+import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
 
 const string = z.string().trim().min(1).max(512);
 const endpoint = z.string().url().refine(value => {
@@ -21,8 +22,14 @@ const configSchema = z.object({
   remotes: z.record(string, z.object({ url: endpoint, token: string }).strict()),
   callback: z.object({ host: string, port: z.number().int().min(0).max(65535), url: endpoint, token: string }).strict().optional(),
   notificationTargets: z.record(string, z.object({ url: endpoint, token: string }).strict()).default({}),
+  automation: automationConfigSchema.optional(),
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
-}).strict();
+}).strict().superRefine((config, ctx) => {
+  for (const [id, schedule] of Object.entries(config.automation?.schedules ?? {})) {
+    if (!Object.hasOwn(config.remotes, schedule.remote)) ctx.addIssue({ code: 'custom', path: ['automation', 'schedules', id, 'remote'], message: 'Unknown automation remote' });
+    if (schedule.notificationTarget && !Object.hasOwn(config.notificationTargets, schedule.notificationTarget)) ctx.addIssue({ code: 'custom', path: ['automation', 'schedules', id, 'notificationTarget'], message: 'Unknown automation notificationTarget' });
+  }
+});
 export type A2AGatewayConfig = z.input<typeof configSchema>;
 type Config = z.output<typeof configSchema>;
 
@@ -95,6 +102,7 @@ function atomicJson(file: string, value: unknown): void {
 
 export class RemoteAgentGateway {
   readonly config: Config;
+  readonly automation?: A2AAutomation;
   private readonly lease: FileA2AStore;
   private readonly stateFile: string;
   private readonly state: State;
@@ -126,6 +134,8 @@ export class RemoteAgentGateway {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { this.lease.close(); throw error; }
       this.state = { version: 1, jobs: [], notices: [] };
     }
+    try { if (this.config.automation) this.automation = new A2AAutomation(this, this.config.automation); }
+    catch (error) { this.lease.close(); throw error; }
     this.timer = setInterval(() => { void this.reconcile(); }, this.config.pollIntervalMs);
     this.timer.unref();
     void this.reconcile();
@@ -208,6 +218,7 @@ export class RemoteAgentGateway {
       await Promise.allSettled(this.state.jobs.filter(job => !terminal.has(taskState(job))).map(job => this.refresh(job)));
       if (this.closed) return;
       await Promise.allSettled(this.state.notices.filter(record => record.target && !record.delivered && !record.acknowledged).map(record => this.deliver(record)));
+      await this.automation?.reconcileAcknowledgements();
     })();
     this.reconciling = pending;
     try { await pending; } finally { this.reconciling = undefined; }
@@ -332,6 +343,8 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
   })(); });
   let receiver: http.Server | undefined;
   let callbackPort: number | undefined;
+  let automationServer: http.Server | undefined;
+  let automationPort: number | undefined;
   try {
     const port = await listen(server, gateway.config.port, '127.0.0.1');
     if (gateway.config.callback) {
@@ -344,13 +357,26 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
       })(); });
       callbackPort = await listen(receiver, callback.port, callback.host);
     }
+    if (gateway.config.automation && gateway.automation) {
+      automationServer = createAutomationServer(gateway.automation);
+      automationPort = await listen(automationServer, gateway.config.automation.port, gateway.config.automation.host);
+    }
     const entry = { id: 'a2a-gateway', name: 'DSH 远端智能体', kind: 'agent_runtime' as const,
       capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http', port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS };
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);
-    let stopped = false;
-    return { gateway, port, callbackPort, registration, close: async () => {
-      if (stopped) return; stopped = true;
-      await gateway.close(); await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : [])]);
+    let closing: Promise<void> | undefined;
+    return { gateway, port, callbackPort, automationPort, registration, close: async () => {
+      closing ??= (async () => {
+        // Stop accepting requests and drain their ledger writes while this instance
+        // still owns the storage lease. Automation continuations and its admission
+        // queue can outlive the gateway operation they awaited.
+        await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : []), ...(automationServer ? [stop(automationServer)] : [])]);
+        await gateway.close();
+      })();
+      await closing;
     } };
-  } catch (error) { await gateway.close(); await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : [])]); throw error; }
+  } catch (error) {
+    await Promise.all([stop(server), ...(receiver ? [stop(receiver)] : []), ...(automationServer ? [stop(automationServer)] : [])]);
+    await gateway.close(); throw error;
+  }
 }

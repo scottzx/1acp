@@ -1,0 +1,11 @@
+{
+  "nodeUrl": "http://127.0.0.1:36908",
+  "activepiecesUrl": "http://127.0.0.1:8083",
+  "connectionExternalId": "oneacp-automation",
+  "envFile": "/home/scott/.config/1acp-automation/activepieces.env",
+  "receiptFile": "/home/scott/.config/1acp-automation/flows.json",
+  "scheduleId": "readonly-demo",
+  "flowNamePrefix": "1acp",
+  "cronExpression": "0 9 * * *",
+  "prompt": "Read README.md in the current workspace and return a short report. Do not modify files, settings or services, and do not read credentials."
+}
