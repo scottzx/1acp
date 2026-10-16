@@ -183,6 +183,20 @@ test('summary completion with an empty final answer never falls back to commenta
   assert.equal(a.events[0].resultText, '');
 });
 
+test('legacy summary-only completion retains its final summary', async t => {
+  const f = await fixture(t), a = await f.connect(undefined, 'codex', async () => ({}));
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [], _meta: { '1agents': { responsePolicy: 'summary' } } });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    peer.send(JSON.stringify({ sessionId, event: 'done', summary: 'Legacy final summary' }));
+  };
+  const result = await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'inspect' }] });
+  assert.equal((result._meta?.['1agents'] as { summary: string }).summary, 'Legacy final summary');
+  await a.summaryReceived;
+  assert.equal(a.events[0].summary, 'Legacy final summary');
+});
+
 test('pending permission survives a dropped transport and settles once after resume', async t => {
   const f = await fixture(t);
   let seen!: () => void; const received = new Promise<void>(r => { seen = r; });

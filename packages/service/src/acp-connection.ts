@@ -236,7 +236,7 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     const terminal = (event.event === 'turn_state' && ['completed', 'failed', 'cancelled'].includes(event.status)) || event.event === 'done' || event.event === 'turn_terminal' || (event.event === 'error' && event.terminal !== false && event.scope === 'turn');
     if (terminal) {
       if (summary && event.event !== 'turn_state') {
-        const finalAnswer = event.finalAnswer ?? event.resultText ?? answers.get(sessionId) ?? '';
+        const finalAnswer = event.finalAnswer ?? event.resultText ?? answers.get(sessionId) ?? event.summary ?? '';
         event = { ...event, responsePolicy: 'summary', resultText: finalAnswer, summary: finalAnswer, sessionRef: { sessionId, turnId: event.turnId } };
         if (extensions) notify(`${EXT}events/turn_complete`, { ...event, event: undefined });
       }
