@@ -1,0 +1,399 @@
+{
+  "schema_version": 1,
+  "mode": "execute",
+  "observed_at": "2026-10-11T11:04:25.535748+00:00",
+  "package": {
+    "repository": "https://github.com/scottzx/1acp",
+    "plugin_path": "packages/service",
+    "name": "@1agents/acp-service",
+    "version": "0.6.0",
+    "published_commit": "5e3fb147f185c083e51b21d6497752cba55a60c8",
+    "artifact_url": "https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz",
+    "artifact_sha256": "c9092fd7bd29f18beebfe38e58105b671bb7166bddc6795825feac885249bee1"
+  },
+  "channels": [
+    {
+      "id": "canonical",
+      "status": "under_review",
+      "submission_url": "https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6950",
+      "latest_observation": {
+        "observed_at": "2026-10-11T10:18:34.105571+00:00",
+        "status": "under_review",
+        "applications": [
+          {
+            "id": "acp-canonical",
+            "url": "https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6950",
+            "state": "open",
+            "updated_at": "2026-10-09T09:52:11Z",
+            "comments": 0,
+            "title": "Add 1acp ACP service plugin",
+            "discussion_counts": {
+              "comments": 0,
+              "reviews": 0,
+              "review-comments": 0
+            },
+            "merged": false,
+            "merged_at": null,
+            "head": "037de5e2f77f37f85e9619b1cf5ddecb5ac74038",
+            "head_ref": "codex/add-1acp",
+            "base": "main",
+            "base_sha": "17ae18761c0f8b1107f92714f50e633929d24c2e",
+            "mergeable": null,
+            "mergeable_state": "unknown",
+            "checks": [
+              {
+                "id": 113768594314,
+                "name": "Submission gate",
+                "status": "completed",
+                "conclusion": "success",
+                "completed_at": "2026-10-09T10:00:30Z",
+                "details_url": "https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/runs/113768594314"
+              },
+              {
+                "id": 113765758096,
+                "name": "check",
+                "status": "completed",
+                "conclusion": "success",
+                "completed_at": "2026-10-09T10:00:02Z",
+                "details_url": "https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/actions/runs/37914031620/job/113765758096"
+              }
+            ],
+            "statuses": []
+          }
+        ],
+        "listing_status": "not_found_in_checked_public_directory",
+        "github_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+        "catalog_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+      },
+      "listing_status": "not_found_in_checked_public_directory",
+      "install_target": null,
+      "latest_catalog_observation": {
+        "observed_at": "2026-10-11T10:13:05.785708+00:00",
+        "listing_status": "not_found_in_checked_public_directory",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+        "channel_id": "canonical"
+      },
+      "consumers": [
+        {
+          "id": "dsh-market",
+          "submission_path": "canonical PR; no duplicate consumer-repository PR",
+          "latest_catalog_observation": {
+            "observed_at": "2026-10-11T10:13:05.785708+00:00",
+            "listing_status": "not_found_in_checked_public_directory",
+            "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+          }
+        }
+      ]
+    },
+    {
+      "id": "dsh-marketplace",
+      "channel": "DSH Marketplace",
+      "repository": "https://github.com/scottzx/1acp",
+      "status": "under_review",
+      "submitted_at": "2026-10-09T15:53:56.381000+00:00",
+      "submission_url": "https://dshmarketplace.dev/submit",
+      "receipt": "Submission received; scottzx/1acp is queued for review.",
+      "request_id": "d01f6c30e439a:n43",
+      "http_status": 200,
+      "response": {
+        "ok": true,
+        "duplicate": false,
+        "repo": {
+          "fullName": "scottzx/1acp",
+          "owner": "scottzx",
+          "repo": "1acp",
+          "url": "https://github.com/scottzx/1acp",
+          "description": "ACP runtime and DeepSeek Harness plugin for persistent Codex, Claude Code and Grok Build sessions, native controls and A2A task delegation.",
+          "homepage": "https://acpx.sh",
+          "language": "TypeScript",
+          "license": null,
+          "stars": 0,
+          "pushedAt": "2026-10-09T09:59:25Z",
+          "topics": [
+            "a2a",
+            "acp",
+            "deepseek-harness",
+            "dsh-plugin"
+          ],
+          "hasDshTopic": true,
+          "alreadyListed": false,
+          "listedSlug": null
+        }
+      },
+      "precheck_attempts_this_round": 1,
+      "normal_submissions_this_round": 1,
+      "contact_email_submitted": false,
+      "notes_file": "marketplace-materials.json",
+      "screenshot": "1acp-marketplace-received.png",
+      "listing_status": "not_found_in_checked_public_directory",
+      "market_search_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T155126Z/root/1acp-marketplace-exact-search.json",
+      "latest_catalog_observation": {
+        "observed_at": "2026-10-11T10:13:05.785708+00:00",
+        "listing_status": "not_found_in_checked_public_directory",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+        "channel_id": "dsh-marketplace"
+      },
+      "latest_observation": {
+        "observed_at": "2026-10-11T10:18:34.105571+00:00",
+        "status": "under_review",
+        "applications": [],
+        "listing_status": "not_found_in_checked_public_directory",
+        "github_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+        "catalog_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+      },
+      "submission_count_fields_scope": "original submission heartbeat 20261009T155126Z; no inspect or submission this heartbeat"
+    },
+    {
+      "id": "dsh-plugin-store",
+      "status": "under_review",
+      "submission_url": "https://dshpluginstore.com/submit",
+      "receipt": "Received on 2026-10-09 17:52 Asia/Shanghai; existing screenshot retained.",
+      "listing_status": "not_found_in_checked_public_directory",
+      "install_target": null,
+      "latest_catalog_observation": {
+        "observed_at": "2026-10-11T10:13:05.785708+00:00",
+        "listing_status": "not_found_in_checked_public_directory",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+        "channel_id": "dsh-plugin-store"
+      },
+      "latest_observation": {
+        "observed_at": "2026-10-11T10:18:34.105571+00:00",
+        "status": "under_review",
+        "applications": [],
+        "listing_status": "not_found_in_checked_public_directory",
+        "github_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+        "catalog_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+      }
+    },
+    {
+      "id": "dsh-store",
+      "status": "blocked",
+      "submission_url": "https://github.com/AI-Scarlett/DSH-Store/issues/1345",
+      "blockers": [
+        "Existing SUBMISSION_SOURCE_HTTP 404 for generated patch; current market still requires committed Git files, artifact route unsupported."
+      ],
+      "compatibility_followup": "https://github.com/AI-Scarlett/DSH-Store/issues/1345#issuecomment-6078641824",
+      "listing_status": "not_found_in_checked_public_directory",
+      "latest_catalog_observation": {
+        "observed_at": "2026-10-11T10:13:05.785708+00:00",
+        "listing_status": "not_found_in_checked_public_directory",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+        "channel_id": "dsh-store"
+      },
+      "latest_observation": {
+        "observed_at": "2026-10-11T10:18:34.105571+00:00",
+        "status": "blocked",
+        "applications": [
+          {
+            "id": "acp-store",
+            "url": "https://github.com/AI-Scarlett/DSH-Store/issues/1345",
+            "state": "open",
+            "updated_at": "2026-10-09T09:57:54Z",
+            "comments": 1,
+            "title": "[Plugin] @1agents/acp-service — persistent native ACP sessions (monorepo/artifact review)",
+            "discussion_counts": {
+              "comments": 1
+            }
+          }
+        ],
+        "listing_status": "not_found_in_checked_public_directory",
+        "github_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+        "catalog_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+      }
+    },
+    {
+      "id": "dsplugin",
+      "status": "under_review",
+      "submission_url": "https://github.com/vbarter/dsh-plugin-registry/issues/333",
+      "review_pr_url": "https://github.com/vbarter/dsh-plugin-registry/pull/334",
+      "correction_pr_url": "https://github.com/vbarter/dsh-plugin-registry/pull/335",
+      "merge_dependency": "Maintainer must merge PR335 into submission/333 before PR334 into main.",
+      "latest_observation": {
+        "observed_at": "2026-10-11T10:18:34.105571+00:00",
+        "status": "under_review",
+        "applications": [
+          {
+            "id": "acp-dsplugin-issue",
+            "url": "https://github.com/vbarter/dsh-plugin-registry/issues/333",
+            "state": "open",
+            "updated_at": "2026-10-09T09:53:03Z",
+            "comments": 1,
+            "title": "[plugin] @1agents/acp-service — packages/service monorepo and npm install target",
+            "discussion_counts": {
+              "comments": 1
+            }
+          },
+          {
+            "id": "acp-dsplugin-pr334",
+            "url": "https://github.com/vbarter/dsh-plugin-registry/pull/334",
+            "state": "open",
+            "updated_at": "2026-10-09T09:55:16Z",
+            "comments": 1,
+            "title": "Review plugin submission #333",
+            "discussion_counts": {
+              "comments": 1,
+              "reviews": 0,
+              "review-comments": 0
+            },
+            "merged": false,
+            "merged_at": null,
+            "head": "a466941508a0764d0fb0aca151b910fb1fd9d098",
+            "head_ref": "submission/333",
+            "base": "main",
+            "base_sha": "55d973d039a26fdb1735b77033399095ed4893f6",
+            "mergeable": null,
+            "mergeable_state": "unknown",
+            "checks": [],
+            "statuses": []
+          },
+          {
+            "id": "acp-dsplugin-pr335",
+            "url": "https://github.com/vbarter/dsh-plugin-registry/pull/335",
+            "state": "open",
+            "updated_at": "2026-10-09T09:58:02Z",
+            "comments": 0,
+            "title": "Fix 1acp submission package identity and npm install target",
+            "discussion_counts": {
+              "comments": 0,
+              "reviews": 0,
+              "review-comments": 0
+            },
+            "merged": false,
+            "merged_at": null,
+            "head": "8eba681ca68fb49b7ad15207a01dcb330f9433b3",
+            "head_ref": "codex/1acp-public-package",
+            "base": "submission/333",
+            "base_sha": "a466941508a0764d0fb0aca151b910fb1fd9d098",
+            "mergeable": true,
+            "mergeable_state": "clean",
+            "checks": [],
+            "statuses": []
+          }
+        ],
+        "listing_status": "not_found_in_checked_public_directory",
+        "github_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+        "catalog_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+      },
+      "listing_status": "not_found_in_checked_public_directory",
+      "proposed_install_target": "@1agents/acp-service@0.6.0",
+      "latest_catalog_observation": {
+        "observed_at": "2026-10-11T10:13:05.785708+00:00",
+        "listing_status": "not_found_in_checked_public_directory",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+        "channel_id": "dsplugin"
+      }
+    },
+    {
+      "id": "dsh-pub",
+      "status": "blocked",
+      "submitted": false,
+      "compatibility_request_url": "https://github.com/dsh-pub/dsh-pub/issues/131",
+      "blockers": [
+        "Public schema remains repository/schemaVersion only, forces repository root and committed runtime/browser/patch."
+      ],
+      "listing_status": "not_found_in_checked_public_directory",
+      "latest_catalog_observation": {
+        "observed_at": "2026-10-11T10:13:05.785708+00:00",
+        "listing_status": "not_found_in_checked_public_directory",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+        "channel_id": "dsh-pub"
+      },
+      "latest_observation": {
+        "observed_at": "2026-10-11T10:18:34.105571+00:00",
+        "status": "blocked",
+        "applications": [
+          {
+            "id": "acp-pub",
+            "url": "https://github.com/dsh-pub/dsh-pub/issues/131",
+            "state": "open",
+            "updated_at": "2026-10-11T00:56:18Z",
+            "comments": 2,
+            "title": "Support monorepo paths and verified npm/Release artifacts for generated DSH bundles",
+            "discussion_counts": {
+              "comments": 2
+            }
+          }
+        ],
+        "listing_status": "not_found_in_checked_public_directory",
+        "github_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+        "catalog_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json"
+      },
+      "automatic_topic_analysis": {
+        "status": "rejected",
+        "code": "missing_bundle_manifest",
+        "message": "Root package.json does not declare dsh.bundle.patch.",
+        "commit": "4cb26e0934c295953ae6faedfc10e0f868fc2316",
+        "scope": "automatic root source scan only; compatibility Issue131 still open, no plugin submission or installable public entry",
+        "evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261010T035154Z/catalog-status/pub-acp-topic-rejection.json"
+      },
+      "maintainer_feedback": {
+        "url": "https://github.com/dsh-pub/dsh-pub/issues/131#issuecomment-6103964957",
+        "created_at": "2026-10-11T00:56:18Z",
+        "summary": "Maintainer plans directory and verified npm/Release artifacts; no implementation or timeline. Asked preferred primary/fallback and branch testing.",
+        "implemented": false
+      },
+      "maintainer_response": {
+        "url": "https://github.com/dsh-pub/dsh-pub/issues/131#issuecomment-6107952113",
+        "body_evidence": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/dsh-pub-maintainer-reply.md",
+        "receipt": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/dsh-pub-maintainer-reply-receipt.json",
+        "summary": "Replied: exact npm primary, identical pinned Release fallback, agreed branch testing; proposed field semantics and explicit unknown provenance."
+      },
+      "next_action": "Wait for agreed schema/implementation branch, then test actual validator, advertised command and CLI together; keep pending compatibility."
+    }
+  ],
+  "post_listing_verification": {
+    "new_listing": false,
+    "new_profile_started": false,
+    "reason": "No exact installable 1acp public entry. Automatic dsh.pub topic rejection reflects the existing root-only compatibility blocker; prior generic artifact tests remain separate."
+  },
+  "last_heartbeat": {
+    "id": "20261011T100845Z",
+    "checked_at": "2026-10-11T11:04:25.535748+00:00",
+    "evidence_root": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z",
+    "github_status": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/github-status/summary.json",
+    "catalog_status": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/catalog-status/acp-summary.json",
+    "compatibility_assessment": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261011T100845Z/contracts/assessment.json",
+    "new_listings": [],
+    "actionable_feedback": [
+      "dsh-pub131"
+    ],
+    "external_writes": true,
+    "forms_inspected_or_resubmitted": false,
+    "new_profile_started": false,
+    "newly_verified_channels": [],
+    "cleanup": "passed",
+    "reader_version_scope_pending": false
+  },
+  "followup": "Existing dsh heartbeat every six hours; quiet while unchanged; no duplicate form submissions.",
+  "heartbeat_history": [
+    {
+      "id": "20261009T155126Z",
+      "evidence_root": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T155126Z",
+      "source_market_summary": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T155126Z/1acp-status/summary.json"
+    },
+    {
+      "id": "20261009T215058Z",
+      "checked_at": "2026-10-09T22:02:54.574323+00:00",
+      "evidence_root": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T215058Z",
+      "github_status": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T215058Z/github-status/summary.json",
+      "catalog_status": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T215058Z/catalog-status/acp-summary.json",
+      "compatibility_assessment": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261009T215058Z/root/contracts/assessment.json",
+      "new_listings": [],
+      "actionable_feedback": [],
+      "external_writes": false,
+      "forms_inspected_or_resubmitted": false
+    },
+    {
+      "id": "20261010T035154Z",
+      "checked_at": "2026-10-10T04:02:45.910060+00:00",
+      "evidence_root": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261010T035154Z",
+      "github_status": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261010T035154Z/github-status/summary.json",
+      "catalog_status": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261010T035154Z/catalog-status/acp-summary.json",
+      "compatibility_assessment": "/Users/scott/.agents/skills/dsh-marketplace-publish-workspace/heartbeat-20261010T035154Z/root/contracts/assessment.json",
+      "new_listings": [],
+      "actionable_feedback": [],
+      "external_writes": false,
+      "forms_inspected_or_resubmitted": false
+    }
+  ]
+}

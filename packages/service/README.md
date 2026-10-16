@@ -1,6 +1,46 @@
 # @1agents/acp-service
 
-ACP Agent Runtime Service for Codex, Grok Build, Claude Code and other Agents supported by its embedded 1ACP runtime. Version 0.2 uses **ACP v1 JSON-RPC 2.0 over WebSocket**. Each connection selects one Agent; each session keeps that Agent and its workspace when reconnected.
+Run persistent Codex, Claude Code, Grok Build and other supported native Agent sessions in DeepSeek Harness (DSH), or use the same package as a standalone CLI and ACP service. DSH exposes the Agent's native models, settings, commands and permission requests; each session keeps its Agent and workspace when reconnected.
+
+## Install in DSH
+
+Requires **Node.js 22.13+**, DSH, and the selected native Agent's CLI and credentials on the DSH host. Adapter-backed Agents also require their ACP adapter; the native Codex CLI alone does not provide `codex-acp`.
+
+```sh
+dsh plugin --profile web add @1agents/acp-service@^0.6.0
+```
+
+Restart DSH and check that **`@1agents/acp-service`** is enabled on the Plugins page. Create a session with a discovered **ACP · Agent** preset, choose an existing workspace, then send a text prompt. The plugin starts or reuses its local service automatically. Use your own profile name in place of `web`; from a DSH source checkout, replace `dsh` with `pnpm dsh`.
+
+If pnpm reports an ignored transitive `esbuild` build script, follow the package manager's prompt or set that individual package's approval in the profile, then repeat the install. Approve or deny the script according to your policy, and check the bundle's enabled state after a partial install.
+
+The pinned [GitHub Release tarball](https://github.com/scottzx/1acp/releases/tag/acp-service-v0.6.0) contains the same published npm artifact:
+
+```sh
+dsh plugin --profile web add https://github.com/scottzx/1acp/releases/download/acp-service-v0.6.0/1agents-acp-service-0.6.0.tgz
+```
+
+`@1agents/session-reader` is optional: install it separately to browse and continue existing Claude, Codex and Grok histories. For presets, native controls, configuration and migration, see the [DSH user guide](https://github.com/scottzx/1acp/blob/main/packages/dsh-plugin/README.md).
+
+The CI baseline is **DSH 0.1.7-rc.2**, commit `21638c56315ae6a2b552d6091945d3144c9af32e`. Additional isolated-profile verification used a locally modified DSH tree labeled `0.2.0-rc.1`. The [verification record](https://github.com/scottzx/1acp/blob/main/docs/marketplaces/verification-2026-10-09.md) describes the installed-package, Loader, browser and lifecycle checks and their limits.
+
+### Screenshots
+
+![Discovered ACP Agent presets in DSH](https://raw.githubusercontent.com/scottzx/1acp/main/packages/service/assets/dsh-agent-presets.png)
+
+![Native Codex model and ACP controls](https://raw.githubusercontent.com/scottzx/1acp/main/packages/service/assets/dsh-codex-controls.png)
+
+These unmodified screenshots show discovery and native capability loading in that fresh isolated local profile. No model prompt was sent for the UI check. Controls depend on the selected Agent, adapter and account.
+
+## Standalone CLI and service
+
+```sh
+npm install -g @1agents/acp-service@^0.6.0
+acp-service --help
+acp-service serve --host 127.0.0.1 --port 36812 --no-report
+```
+
+The service uses **ACP v1 JSON-RPC 2.0 over WebSocket**. DSH is unnecessary for the standalone entry points. A2A delegation is opt-in and disabled by default; its configuration is documented below. Waking a calling system's main Agent after task completion requires that system's receiving host adapter.
 
 ## Bundled usage skill
 
@@ -14,11 +54,11 @@ acp-service --skill export acp-service > acp-service-skill.tar
 acp-service --skill install acp-service --agent codex --scope repo
 ```
 
-The existing embedded `acpx` runtime skill remains available. The new skill and its references can also be read directly from `skills/acp-service/` after installation. A source build containing these files must be installed before using them; an older published package may not include this skill or the A2A gateway.
+The existing embedded `acpx` runtime skill remains available. The skill and its references can also be read directly from `skills/acp-service/` after installing version 0.6.0 or later.
 
-## Run
+## Service development and API
 
-Requires Node.js 22.13 or later. Version 0.5 includes the 1ACP runtime, CLI, service, DSH plugin, browser controls, skills and licenses; installing a separate `@scottzx/1acp` package is unnecessary. The runtime and service retain their respective ACP SDK versions.
+Version 0.6.0 includes the 1ACP runtime, CLI, service, DSH plugin, browser controls, skills and licenses. The runtime and service retain their respective ACP SDK versions.
 
 The runtime's per-session launch argv and transient credentials APIs support Provider Profiles. Public runtime APIs and flow authoring are available as `@1agents/acp-service/runtime` and `@1agents/acp-service/flows`. The `acp-service` command forwards runtime commands alongside its `serve` command.
 
@@ -51,17 +91,11 @@ HTTP endpoints:
 - `GET /manifest`: DreamMate service discovery, ACP version, custom transport and Agent endpoint paths. Profiles listed here describe registered launch configurations, not a successful installation/authentication probe.
 - `GET /services`: current service/session counts.
 
-## DSH installation
-
-The same npm package can be installed as a DSH bundle:
-
-```sh
-pnpm dsh plugin --profile web add @1agents/acp-service
-```
+## DSH package entry points
 
 DSH reads the package's bundle patch and browser metadata; the CLI uses its `bin` entry. There is no installation-time mode switch, and both uses can coexist. The package root retains the service API and exposes Cordis metadata plus a lazy `apply`; merely importing it starts no plugin or process. `/service` is the service API, while `/dsh`, `/dsh/preset` and `/dsh/imports` provide the typed plugin interfaces. DSH host dependencies are supplied by DSH rather than installed with the CLI.
 
-The plugin starts or reuses a local service when activated. See [DSH plugin usage](vendor/dsh/README.md) for presets, browser controls, configuration and lifecycle. Before migrating, stop DSH and remove `@1agents/dsh-acp`, then add the unified package; keep session bindings and preserve custom row configuration. Plugin and preset IDs are unchanged.
+The plugin starts or reuses a local service when activated. See [DSH plugin usage](https://github.com/scottzx/1acp/blob/main/packages/dsh-plugin/README.md) for presets, browser controls, configuration and lifecycle. Before migrating, stop DSH and remove `@1agents/dsh-acp`, then add the unified package; keep session bindings and preserve custom row configuration. Plugin and preset IDs are unchanged.
 
 ## DSH A2A
 

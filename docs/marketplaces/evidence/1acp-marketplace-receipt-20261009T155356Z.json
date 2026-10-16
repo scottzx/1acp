@@ -1,0 +1,40 @@
+{
+  "channel": "DSH Marketplace",
+  "repository": "https://github.com/scottzx/1acp",
+  "status": "under_review",
+  "submitted_at": "2026-10-09T15:53:56.381000+00:00",
+  "submission_url": "https://dshmarketplace.dev/submit",
+  "receipt": "Submission received; scottzx/1acp is queued for review.",
+  "request_id": "d01f6c30e439a:n43",
+  "http_status": 200,
+  "response": {
+    "ok": true,
+    "duplicate": false,
+    "repo": {
+      "fullName": "scottzx/1acp",
+      "owner": "scottzx",
+      "repo": "1acp",
+      "url": "https://github.com/scottzx/1acp",
+      "description": "ACP runtime and DeepSeek Harness plugin for persistent Codex, Claude Code and Grok Build sessions, native controls and A2A task delegation.",
+      "homepage": "https://acpx.sh",
+      "language": "TypeScript",
+      "license": null,
+      "stars": 0,
+      "pushedAt": "2026-10-09T09:59:25Z",
+      "topics": [
+        "a2a",
+        "acp",
+        "deepseek-harness",
+        "dsh-plugin"
+      ],
+      "hasDshTopic": true,
+      "alreadyListed": false,
+      "listedSlug": null
+    }
+  },
+  "precheck_attempts_this_round": 1,
+  "normal_submissions_this_round": 1,
+  "contact_email_submitted": false,
+  "notes_file": "marketplace-materials.json",
+  "screenshot": "1acp-marketplace-received.png"
+}
