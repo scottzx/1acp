@@ -19,7 +19,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const m=JSON.parse(line), p=m.params;
   const reply=result=>send({id:m.id,result});
   if(m.method==='initialize') reply({protocolVersion:1,agentInfo:{name:'synthetic-errors',version:'1'},agentCapabilities:{loadSession:true},authMethods:[]});
-  else if(m.method==='session/new') reply({sessionId:'synthetic-native'});
+  else if(m.method==='session/new') {
+    if(process.env.SYNTHETIC_INIT_FAILURE==='1') send({id:m.id,error:{code:-32603,message:'Internal error',data:{codexErrorInfo:'usageLimitExceeded',message:${JSON.stringify(secret)},additionalDetails:${JSON.stringify(authLink)}}}});
+    else reply({sessionId:'synthetic-native'});
+  }
   else if(m.method==='session/load'||m.method==='session/resume') reply({});
   else if(m.method==='session/prompt') {
     const kind=p.prompt[0]?.text;
@@ -150,5 +153,13 @@ test('A05 native structured errors cross runtime, live ACP and bridge summary wi
       await until(() => !session.activeTurn, 'Thrown stream remained active');
     }
   } finally { bridge.runtime.startTurn = startTurn; session.ws = originalPeer; }
+  // Initialization can fail before a turn exists; its ordinary logger is also closed.
+  try {
+    process.env.SYNTHETIC_INIT_FAILURE = '1';
+    await assert.rejects(connection.agent.request('session/new', { cwd: directory, mcpServers: [] }), error => {
+      assertSafe({ message: (error as RequestError).message, data: (error as RequestError).data });
+      return true;
+    });
+  } finally { delete process.env.SYNTHETIC_INIT_FAILURE; }
   assertSafe({ wire, summary, logs });
 });

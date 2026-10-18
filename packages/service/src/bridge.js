@@ -2538,7 +2538,10 @@ export async function dispatchCommand(ws, payload) {
         }
         return;
       }
-      console.error(`[acpx-server] Action execution failed:`, err);
+      console.error(
+        `[acpx-server] Action execution failed:`,
+        toSafeError(err, { origin: "service", operationId: payload.requestId }),
+      );
       // An AgentStartupError with exit 127 / "command not found" means the
       // agent's ACP adapter binary could not be launched — almost always
       // because the adapter package isn't installed for 1acp (the bare
