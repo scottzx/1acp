@@ -40,6 +40,6 @@ implementing `LlmFailure.publicError` retain these facts through the typed
 and in-band metadata cannot assert this field. A2A retains the canonical safe
 origin and binds the operation identifier to its own caller. Older hosts that
 reduce errors to code and message can lose the optional fields; downstream
-reports unknown instead of reconstructing a cause from text.
+reports unknown without the canonical field, including provider-like host codes.
 Historical journal records containing only error code and text cannot recover
 all original fields.

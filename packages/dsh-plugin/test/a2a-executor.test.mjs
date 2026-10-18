@@ -268,13 +268,13 @@ for (const [label, raw, category] of [
   ['auth', { code: -32603, data: { codexErrorInfo: 'unauthorized' } }, 'auth'],
   ['unknown', { code: 'UNKNOWN' }, 'unknown'],
 ]) {
-  test(`DSH A2A ${label} failure retains explicit provider signals and local request identity`, async t => {
+  test(`DSH A2A ${label} failure retains canonical host fields and local request identity`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
     const agent = f.agents.get(target.sessionId);
     const result = f.backend.run(target, 'task', { requestId: 'synthetic-task', signal: new AbortController().signal });
     await f.admitted.promise; f.claim(agent, 'synthetic-task', 5);
     const safe = toSafeError(raw, { origin: 'acp', operationId: 'synthetic-operation', outcomeUnknown: true });
-    f.finish(agent, 5, { kind: 'error', error: { ...safe, code: safe.providerCode ?? 'UNKNOWN',
+    f.finish(agent, 5, { kind: 'error', error: { code: 'ACP_TURN_FAILED', publicError: safe,
       message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL',
       data: { token: 'SYNTHETIC_TOKEN_NOT_REAL', authUrl: 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL' },
     } });
@@ -283,12 +283,37 @@ for (const [label, raw, category] of [
     assert.equal(value.error.category, category);
     assert.equal(value.error.providerCode, safe.providerCode);
     assert.equal(value.error.retryable, safe.retryable);
-    assert.equal(value.error.outcomeUnknown, false);
-    assert.equal(value.error.origin, 'dsh');
+    assert.equal(value.error.outcomeUnknown, true);
+    assert.equal(value.error.origin, 'acp');
     assert.equal(value.error.operationId, 'synthetic-task');
     assert.equal(value.detail, value.error.message);
     for (const canary of ['SYNTHETIC_SECRET', 'SYNTHETIC_TOKEN', 'SYNTHETIC_AUTH', 'authorize?token=', 'authUrl']) assert.ok(!JSON.stringify(value).includes(canary));
     assert.equal(f.listenerCount, 0);
+  });
+}
+
+for (const [label, error] of [
+  ['provider-like host code', { code: 'usageLimitExceeded' }],
+  ['native-shaped host data', { code: 'ACP_TURN_FAILED', data: { codexErrorInfo: 'usageLimitExceeded' } }],
+  ['native-shaped host cause', { code: 'ACP_TURN_FAILED', cause: { code: 'unauthorized' } }],
+]) {
+  test(`DSH A2A missing canonical publicError keeps ${label} unknown`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'caller-owned-legacy-task', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'caller-owned-legacy-task', 9);
+    f.finish(agent, 9, { kind: 'error', error: { ...error,
+      message: 'SYNTHETIC_HOST_CODE_SECRET_NOT_REAL', operationId: 'SYNTHETIC_HOST_OPERATION_NOT_REAL',
+    } });
+    const value = await result;
+    assert.equal(value.outcome, 'failed');
+    assert.equal(value.error.category, 'unknown');
+    assert.equal(value.error.providerCode, undefined);
+    assert.equal(value.error.retryable, false);
+    assert.equal(value.error.outcomeUnknown, false);
+    assert.equal(value.error.origin, 'dsh');
+    assert.equal(value.error.operationId, 'caller-owned-legacy-task');
+    assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
   });
 }
 
@@ -331,7 +356,7 @@ test('DSH A2A rejects safe-shaped host category and operation secret spoofing', 
 });
 
 for (const [label, error, category] of [
-  ['root aborted hint with quota', { code: 'ABORTED', data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota'],
+  ['root aborted hint with quota', { code: 'ABORTED', data: { codexErrorInfo: 'usageLimitExceeded' } }, 'unknown'],
   ['root aborted hint alone', { code: 'ABORTED' }, 'unknown'],
 ]) {
   test(`DSH A2A ${label} cannot impersonate a local cancellation`, async t => {
@@ -472,6 +497,9 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
           operationId: LlmOperationId(safe.operationId),
         } });
       }
+      if (text === 'host-code-without-public-error') {
+        throw new LlmError('SYNTHETIC_HOST_CODE_SECRET_NOT_REAL', 'usageLimitExceeded');
+      }
       if (text === 'raw-safe-spoof') {
         const publicError = { category: 'quota', providerCode: 'usageLimitExceeded', retryable: true,
           outcomeUnknown: true, origin: 'acp', operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL' };
@@ -579,4 +607,18 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
   assert.equal(spoofed.error.operationId, 'real-spoof');
   assert.ok(!JSON.stringify(spoofed).includes('SYNTHETIC_'));
   assert.equal(requests.length, 5);
+
+  const legacyTarget = await backend.prepare({ cwd });
+  const legacy = await backend.run(legacyTarget, 'host-code-without-public-error', {
+    requestId: 'real-host-code-only', signal: new AbortController().signal,
+  });
+  await ctx.agents.get(legacyTarget.sessionId).whenIdle();
+  const legacyReason = ctx.agents.get(legacyTarget.sessionId).session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(legacyReason.error.code, 'usageLimitExceeded');
+  assert.equal(legacyReason.error.publicError, undefined);
+  assert.equal(legacy.error.category, 'unknown');
+  assert.equal(legacy.error.providerCode, undefined);
+  assert.equal(legacy.error.operationId, 'real-host-code-only');
+  assert.ok(!JSON.stringify(legacy).includes('SYNTHETIC_'));
+  assert.equal(requests.length, 6);
 });
