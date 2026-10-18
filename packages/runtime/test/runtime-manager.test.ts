@@ -5,6 +5,7 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import type { SessionModelState } from "../src/acp/model-support.js";
 import { AcpxOperationalError } from "../src/errors.js";
+import { createTurnJournal, toSafeError } from "../src/runtime.js";
 import { AcpRuntimeManager } from "../src/runtime/engine/manager.js";
 import {
   type SystemPromptOption,
@@ -24,6 +25,7 @@ import {
   createRuntimeOptions,
   InMemorySessionStore,
   makeSessionRecord,
+  withTempDir,
 } from "./runtime-test-helpers.js";
 
 type FakeClientHandlers = {
@@ -4101,6 +4103,145 @@ test("AcpRuntimeManager projects native quota failures into results and legacy e
   } finally {
     await manager.shutdown();
   }
+});
+
+test("AcpRuntimeManager preserves local admission exceptions without dispatching native work", async () => {
+  const store = new InMemorySessionStore([
+    makeSessionRecord({
+      acpxRecordId: "synthetic-admission",
+      acpSessionId: "synthetic-native",
+      agentCommand: "synthetic-agent --acp",
+      cwd: "/workspace",
+    }),
+  ]);
+  let nativePrompts = 0;
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          start: async () => {},
+          close: async () => {},
+          hasReusableSession: () => true,
+          supportsLoadSession: () => true,
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async (
+            _sessionId: string,
+            _prompt: unknown,
+            onRequestWritten: (() => Promise<void> | void) | undefined,
+            _elicitation: unknown,
+            _permission: unknown,
+            authority: { assertActive?: () => void },
+          ) => {
+            authority.assertActive?.();
+            await onRequestWritten?.();
+            nativePrompts += 1;
+            return { stopReason: "end_turn" };
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+  const rejection = new Error("Synthetic local prompt admission revoked");
+  const input = {
+    handle: createHandle("synthetic-admission"),
+    text: "synthetic prompt",
+    mode: "prompt" as const,
+    sessionMode: "persistent" as const,
+    requestId: "synthetic-admission-operation",
+    assertActive: () => {
+      throw rejection;
+    },
+  };
+  try {
+    const turn = manager.startTurn(input);
+    const { events, result } = await collectTurn(turn);
+    assert.deepEqual(events, []);
+    await assert.rejects(turn.promptStarted, (error) => error === rejection);
+    assert.equal(result.status, "failed");
+    if (result.status === "failed") {
+      assert.equal(result.error.message, rejection.message);
+      assert.equal(result.error.operationId, input.requestId);
+      assert.equal(result.error.outcomeUnknown, false);
+    }
+    const legacy = await collectEvents(manager.runTurn(input));
+    assert.equal(legacy.length, 1);
+    assert.equal(legacy[0].type, "error");
+    if (legacy[0].type === "error") {
+      assert.equal(legacy[0].message, rejection.message);
+    }
+    assert.equal(nativePrompts, 0);
+    const accepted = await collectTurn(
+      manager.startTurn({
+        ...input,
+        requestId: "synthetic-authorized-operation",
+        assertActive: () => {},
+      }),
+    );
+    assert.equal(accepted.result.status, "completed");
+    assert.equal(nativePrompts, 1);
+  } finally {
+    await manager.shutdown();
+  }
+});
+
+test("safe quota failures retain the legacy journal replay contract without raw provider data", async () => {
+  await withTempDir("synthetic-safe-error-journal-", async (stateDir) => {
+    const journal = createTurnJournal({ stateDir });
+    const turn = {
+      sessionId: "synthetic-session",
+      turnId: "synthetic-turn",
+      clientRequestId: "synthetic-request",
+      promptText: "synthetic prompt",
+    };
+    const error = toSafeError(
+      {
+        code: -32603,
+        message: "Internal error",
+        data: {
+          codexErrorInfo: "usageLimitExceeded",
+          message: "SYNTHETIC_SECRET_CANARY_NOT_REAL",
+          additionalDetails:
+            "https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL",
+        },
+      },
+      { operationId: "synthetic-operation", outcomeUnknown: true },
+    );
+    await journal.record({ ...turn, status: "queued" });
+    await journal.record({ ...turn, status: "running" });
+    const failed = {
+      ...turn,
+      status: "failed" as const,
+      errorCode: error.providerCode,
+      errorText: error.message,
+      runtimeRequestId: error.operationId,
+    };
+    await journal.record(failed);
+    const restored = createTurnJournal({ stateDir });
+    const snapshot = await restored.snapshot(turn.sessionId);
+    assert.equal(snapshot.active, undefined);
+    assert.deepEqual(snapshot.queued, []);
+    assert.equal(snapshot.turns[0].status, "failed");
+    assert.equal(snapshot.turns[0].errorCode, "usageLimitExceeded");
+    assert.equal((await restored.record(failed)).changed, false);
+    await assert.rejects(
+      restored.record({ ...turn, status: "running" }),
+      /Invalid Turn transition/,
+    );
+    const replay = toSafeError({
+      code: snapshot.turns[0].errorCode,
+      message: snapshot.turns[0].errorText,
+    });
+    assert.equal(replay.category, "quota");
+    assert.equal(replay.providerCode, "usageLimitExceeded");
+    // Legacy journal rows do not retain these fields; do not invent a full replay.
+    assert.equal(Object.hasOwn(snapshot.turns[0], "outcomeUnknown"), false);
+    assert.equal(Object.hasOwn(snapshot.turns[0], "origin"), false);
+    assert.doesNotMatch(JSON.stringify(snapshot), /SYNTHETIC_|example\.invalid|additionalDetails/);
+  });
 });
 
 test("AcpRuntimeManager rejects unsupported runtime attachment media types", async () => {
