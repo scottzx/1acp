@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { SessionNotification, SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeAgentCommandInput } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
-import { toSafeError } from "../../acp/error-normalization.js";
+import { safeErrorRejection, toSafeError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { resolveRequestedConfigOption, resolveRequestedModelId } from "../../acp/model-support.js";
 import {
@@ -261,7 +261,7 @@ function runtimeFailureRejection(
     }
     return error;
   }
-  return Object.assign(new Error(safe.message), safe);
+  return safeErrorRejection(safe);
 }
 
 type RunningRuntimeTurn = {

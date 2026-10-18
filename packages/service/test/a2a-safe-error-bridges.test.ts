@@ -27,12 +27,16 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   else if(m.method==='session/prompt') {
     const kind=p.prompt[0]?.text;
     if(kind==='wait') { pending=m; return; }
-    const code={quota:'usageLimitExceeded',rate:'rateLimitExceeded',budget:'sessionBudgetExceeded',auth:'unauthorized'}[kind];
+    const code=kind.startsWith('quota-local-')?'usageLimitExceeded':{quota:'usageLimitExceeded',rate:'rateLimitExceeded',budget:'sessionBudgetExceeded',auth:'unauthorized','auth-local-watch':'unauthorized'}[kind];
     const data={message:${JSON.stringify(secret)},additionalDetails:${JSON.stringify(authLink)},token:'SYNTHETIC_TOKEN_NOT_REAL',account:{id:'SYNTHETIC_ACCOUNT_NOT_REAL'}};
     if(code) data.codexErrorInfo=code;
     if(kind==='nested') data.error={codexErrorInfo:'usageLimitExceeded'};
     if(kind==='conflicting') { data.codexErrorInfo='usageLimitExceeded'; data.error={codexErrorInfo:'unauthorized'}; }
     if(kind==='spoof') { data.category='quota'; data.operationId='synthetic-provider-spoof'; data.origin='dsh'; data.retryable=true; data.outcomeUnknown=true; }
+    if(kind==='quota-local-auth') data.detailCode='AUTH_REQUIRED';
+    if(kind==='quota-local-watch'||kind==='auth-local-watch') data.detailCode='WATCH_OUTCOME_UNKNOWN';
+    if(kind==='quota-local-timeout') data.code='TIMEOUT';
+    if(kind==='quota-local-permission') data.outputCode='PERMISSION_DENIED';
     send({id:m.id,error:{code:-32603,message:kind==='unknown'?'quota budget retry later '+${JSON.stringify(secret)}:'Internal error',data}});
   } else if(m.method==='session/cancel'&&pending) { send({id:pending.id,result:{stopReason:'cancelled'}}); pending=undefined; }
   else if(m.id!==undefined) send({id:m.id,error:{code:-32601,message:'Method not found'}});
@@ -76,7 +80,8 @@ test('A05 native structured errors cross runtime, live ACP and bridge summary wi
   await connection.agent.request('initialize', { protocolVersion: 1, clientCapabilities: { _meta: { '1agents': { version: 1 } } } });
   const { sessionId } = await connection.agent.request('session/new', { cwd: directory, mcpServers: [] });
 
-  for (const [kind, category] of [['quota', 'quota'], ['rate', 'rate_limit'], ['budget', 'budget'], ['auth', 'auth'], ['unknown', 'unknown'], ['nested', 'quota'], ['conflicting', 'unknown'], ['spoof', 'unknown']] as const) {
+  for (const [kind, category] of [['quota', 'quota'], ['rate', 'rate_limit'], ['budget', 'budget'], ['auth', 'auth'], ['unknown', 'unknown'], ['nested', 'quota'], ['conflicting', 'unknown'], ['spoof', 'unknown'],
+    ['quota-local-auth', 'quota'], ['quota-local-watch', 'quota'], ['quota-local-timeout', 'quota'], ['quota-local-permission', 'quota'], ['auth-local-watch', 'auth']] as const) {
     let rejected: RequestError | undefined;
     await assert.rejects(connection.agent.request('session/prompt', {
       sessionId, prompt: [{ type: 'text', text: kind }],
@@ -88,7 +93,12 @@ test('A05 native structured errors cross runtime, live ACP and bridge summary wi
     assert.equal(error.operationId, `synthetic-${kind}`);
     assert.equal(error.retryable, false);
     assert.equal(error.outcomeUnknown, false);
-    if (kind === 'quota') assert.equal(error.providerCode, 'usageLimitExceeded');
+    if (kind === 'quota' || kind.startsWith('quota-local-')) assert.equal(error.providerCode, 'usageLimitExceeded');
+    if (kind.includes('-local-')) {
+      assert.equal(error.detailCode, undefined);
+      assert.notEqual(error.code, 'TIMEOUT');
+      assert.notEqual(error.code, 'PERMISSION_DENIED');
+    }
     assert.ok(!JSON.stringify(error).includes('synthetic-provider-spoof'));
     assertSafe({ message: rejected!.message, data: error });
     await until(() => !bridge.activeSessions.get(sessionId)?.activeTurn, 'Bridge did not release the failed turn');

@@ -563,12 +563,33 @@ function safeOrigin(
   return options.origin ?? "runtime";
 }
 
-function safeCode(error: unknown, records: Record<string, unknown>[]): string | undefined {
+function localErrorRecord(
+  error: unknown,
+  projected: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  return projected ?? (error instanceof AcpxOperationalError ? asRecord(error) : undefined);
+}
+
+function safeCode(
+  error: unknown,
+  projected: Record<string, unknown> | undefined,
+): string | undefined {
+  const record = asRecord(error);
+  const records = record ? [record] : [];
+  const local = localErrorRecord(error, projected);
   return (
-    safeStringField(records, "outputCode", SAFE_CODES) ??
+    safeStringField(local ? [local] : [], "outputCode", SAFE_CODES) ??
     safeStringField(records, "code", SAFE_CODES) ??
     safeLocalCode(error)
   );
+}
+
+function safeDetailCode(
+  error: unknown,
+  projected: Record<string, unknown> | undefined,
+): string | undefined {
+  const record = localErrorRecord(error, projected);
+  return safeStringField(record ? [record] : [], "detailCode", SAFE_DETAILS);
 }
 
 function safeOptionalFields(
@@ -596,8 +617,8 @@ export function toSafeError(error: unknown, options: SafeErrorOptions = {}): Saf
   const projected = projectedRecord(error, options);
   const records = projected ? [projected] : safeErrorRecords(error);
   const provider = safeProviderCause(records);
-  const code = safeCode(error, records);
-  const detailCode = safeStringField(records, "detailCode", SAFE_DETAILS);
+  const code = safeCode(error, projected);
+  const detailCode = safeDetailCode(error, projected);
   const category = safeCategory(error, projected, provider, code, detailCode);
   const safe: SafeError = {
     ...safeOptionalFields(projected, options, provider, code, detailCode),
@@ -611,4 +632,12 @@ export function toSafeError(error: unknown, options: SafeErrorOptions = {}): Saf
   };
   safeProjections.add(safe);
   return safe;
+}
+
+/** Keep projection provenance when the runtime exposes a promise rejection. */
+export function safeErrorRejection(error: SafeError): Error {
+  const safe = toSafeError(error);
+  const rejection = Object.assign(new Error(safe.message), safe);
+  safeProjections.add(rejection);
+  return rejection;
 }

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { safeErrorRejection } from "../src/acp/error-normalization.js";
+import { AcpxOperationalError } from "../src/errors.js";
 import { toSafeError } from "../src/runtime.js";
 
 // All values in this suite are deliberately synthetic and nonfunctional.
@@ -96,6 +98,55 @@ test("raw safe-shaped fields cannot confer projection provenance", () => {
     assert.notEqual(safe.origin, "transport");
     assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|example\.invalid/);
   }
+});
+
+test("provider detail and local output codes cannot override structured causes or delivery state", () => {
+  for (const fields of [
+    { detailCode: "AUTH_REQUIRED" },
+    { detailCode: "WATCH_OUTCOME_UNKNOWN" },
+    { detailCode: "AGENT_DISCONNECTED" },
+    { code: "TIMEOUT", outputCode: "PERMISSION_DENIED" },
+  ]) {
+    const raw = {
+      ...nativeError("usageLimitExceeded"),
+      data: {
+        codexErrorInfo: "usageLimitExceeded",
+        ...fields,
+      },
+    };
+    const safe = toSafeError(raw);
+    assert.equal(safe.category, "quota");
+    assert.equal(safe.providerCode, "usageLimitExceeded");
+    assert.equal(safe.detailCode, undefined);
+    assert.equal(safe.code, undefined);
+    assert.equal(safe.outcomeUnknown, false);
+  }
+  assert.equal(toSafeError({ code: -32603, detailCode: "AUTH_REQUIRED" }).category, "unknown");
+  const rootOutput = toSafeError({ ...nativeError("usageLimitExceeded"), outputCode: "TIMEOUT" });
+  assert.equal(rootOutput.category, "quota");
+  assert.equal(rootOutput.code, undefined);
+  assert.equal(
+    toSafeError(
+      new AcpxOperationalError(canary, {
+        detailCode: "AUTH_REQUIRED",
+        origin: "acp",
+      }),
+    ).category,
+    "auth",
+  );
+  const uncertain = toSafeError(
+    new AcpxOperationalError(canary, {
+      detailCode: "WATCH_OUTCOME_UNKNOWN",
+      origin: "queue",
+      retryable: true,
+    }),
+  );
+  assert.equal(uncertain.outcomeUnknown, true);
+  assert.equal(uncertain.origin, "queue");
+  assert.equal(uncertain.retryable, true);
+  const rejection = safeErrorRejection(uncertain);
+  assert.ok(rejection instanceof Error);
+  assert.deepEqual(toSafeError(rejection), uncertain);
 });
 
 test("owned wire projections decode only direct fields and regenerate messages", () => {

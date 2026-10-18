@@ -17,6 +17,8 @@ may use `trustedProjection` only to decode a direct safe record from an owned
 boundary. Raw fields that merely resemble a projection cannot supply a category,
 identifier, origin, retryability, or delivery state. Trusted decoding never scans
 nested provider data and always regenerates the fixed message.
+Local detail codes require a trusted operational error or owned projection;
+provider data cannot supply them or override delivery state.
 
 Host-owned `assertActive` admission callbacks keep their exception identity and
 message for in-process callers. Service boundaries project those exceptions again
