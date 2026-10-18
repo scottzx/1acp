@@ -348,7 +348,7 @@ test("runner preserves minimal cases, empty arrays, exact IDs and descriptive me
     definitions.map((value, index) => ({ name: `${index + 1}.json`, value })),
   );
   const result = await runRunner(input.args);
-  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.code, 0, JSON.stringify(result));
   const report = parseReport(result.stdout);
   assert.deepEqual(report.totals, { cases: 5, passed: 5, failed: 0 });
   assert.deepEqual(
