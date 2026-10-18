@@ -21,7 +21,7 @@ const EXT = '_1agents/';
 function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): RecordValue {
   if (['tool_call', 'tool_call_update', 'tool_result'].includes(event.event)) {
     if (event.error === undefined && event.errorCode === undefined && event.errorText === undefined) return event;
-    const error = toSafeError(event.error ?? { code: event.errorCode, message: event.errorText }, { origin: 'service' });
+    const error = toSafeError(event.error ?? (trustedRuntimeErrors ? { code: event.errorCode, message: event.errorText } : undefined), { origin: 'service' });
     return { ...event,
       ...(event.error !== undefined ? { error } : {}),
       ...(event.errorCode !== undefined ? { errorCode: error.providerCode ?? error.code } : {}),
@@ -30,7 +30,7 @@ function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): Re
   }
   const failedTurn = event.status === 'failed' && ['turn_state', 'turn_terminal', 'turn_complete', 'done'].includes(event.event);
   if (!event.error && !failedTurn && event.event !== 'error' && event.event !== 'protocol_error' && event.type !== 'error') return event;
-  const safe = toSafeError(event.error ?? { ...event, code: event.code ?? event.errorCode }, {
+  const safe = toSafeError(event.error ?? (trustedRuntimeErrors ? { ...event, code: event.code ?? event.errorCode } : undefined), {
     origin: 'service', operationId: event.runtimeRequestId ?? event.requestId, trustedProjection: trustedRuntimeErrors,
   });
   const value: RecordValue = {};

@@ -270,6 +270,33 @@ test('summary completion with an empty final answer never falls back to commenta
   assert.equal(a.events[0].resultText, '');
 });
 
+test('flat backend error codes require an owned runtime event while native errors remain recognizable', () => {
+  const project = (event: Record<string, any>, trusted: boolean) => {
+    let received!: Record<string, any>;
+    new RuntimePeer(value => { received = value; }, trusted).send(JSON.stringify(event));
+    return received;
+  };
+  for (const event of ['turn_terminal', 'turn_complete', 'done']) {
+    const value = { event, status: 'failed', requestId: 'synthetic-owned-operation', errorCode: 'usageLimitExceeded' };
+    const untrusted = project(value, false);
+    assert.equal(untrusted.error.category, 'unknown');
+    assert.equal(untrusted.error.providerCode, undefined);
+    assert.equal(untrusted.error.operationId, value.requestId);
+    assert.equal(project(value, true).error.category, 'quota');
+    const native = project({ ...value, error: { code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } } }, false);
+    assert.equal(native.error.category, 'quota');
+  }
+  for (const event of ['tool_call', 'tool_call_update', 'tool_result']) {
+    const value = { event, toolCallId: 'synthetic-tool', errorCode: 'usageLimitExceeded', errorText: 'synthetic-private-detail' };
+    const untrusted = project(value, false);
+    assert.equal(untrusted.errorCode, undefined);
+    assert.equal(untrusted.errorText.includes(value.errorText), false);
+    assert.equal(project(value, true).errorCode, 'usageLimitExceeded');
+    const native = project({ ...value, error: { code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } } }, false);
+    assert.equal(native.error.category, 'quota');
+  }
+});
+
 test('failed summary terminals retain their session reference and summary while sanitizing errors', () => {
   const events: Record<string, any>[] = [];
   const peer = new RuntimePeer(event => events.push(event), true);
