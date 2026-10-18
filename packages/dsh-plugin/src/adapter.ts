@@ -41,6 +41,28 @@ function serviceProjection(error: unknown): JsonObject | undefined {
   return data;
 }
 
+/** Only actual cancellation rejections may replace a racing provider failure. */
+function isCancellationRejection(error: unknown, signal: AbortSignal): boolean {
+  if (!signal.aborted) return false;
+  if (error === signal.reason) return true;
+  // The SDK leaves a canceled request pending for the peer's reply. A real
+  // service error can still arrive; only its cancellation reply is an abort.
+  if (error instanceof RequestError) return error.code === -32800;
+  // node:timers/promises rejects its canceled reconnect delay with this cause.
+  return error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason;
+}
+
+/** Use the host's declared constructor path, with a locally owned identity. */
+function publicFailure(safe: ReturnType<typeof toSafeError>, requestId: string): LlmError {
+  const publicError: LlmPublicError | undefined = typeof DshLlm.LlmOperationId === 'function'
+    && typeof DshLlm.isLlmPublicErrorProviderCode === 'function' ? {
+    category: safe.category, retryable: safe.retryable, outcomeUnknown: safe.outcomeUnknown,
+    origin: safe.origin, operationId: DshLlm.LlmOperationId(requestId),
+    ...(DshLlm.isLlmPublicErrorProviderCode(safe.providerCode) ? { providerCode: safe.providerCode } : {}),
+  } : undefined;
+  return Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED', { publicError }), safe);
+}
+
 /** Producer/consumer queue; errors are delivered after already received chunks. */
 class Queue<T> {
   values: T[] = []; done = false; error: unknown;
@@ -374,10 +396,8 @@ export class AcpAdapter implements LlmAdapter {
     };
     let active: Awaited<ReturnType<typeof connect>> | undefined;
     let requestSent = false;
-    const cancelled = (outcomeUnknown: boolean): StreamChunk => ({ type: 'finish', reason: { kind: 'aborted', failure: {
-      ...toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin: 'dsh', operationId: requestId, outcomeUnknown }),
-      code: 'ABORTED',
-    } } });
+    const cancelled = (outcomeUnknown: boolean, origin: 'dsh' | 'acp' = 'dsh'): LlmError => publicFailure(
+      toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin, operationId: requestId, outcomeUnknown }), requestId);
     const cancel = () => { if (binding?.sessionId) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };
     signal.addEventListener('abort', cancel, { once: true });
     try {
@@ -405,13 +425,15 @@ export class AcpAdapter implements LlmAdapter {
             queue.push({ type: 'block-end', index, block });
             index++;
           }
-          queue.push(result.stopReason === 'cancelled' ? cancelled(false) : { type: 'finish', reason: result.stopReason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } });
+          if (result.stopReason === 'cancelled') throw cancelled(false, 'acp');
+          queue.push({ type: 'finish', reason: result.stopReason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } });
           return;
         } catch (error) {
-          if (signal.aborted) { endBlock(); queue.push(cancelled(requestSent)); return; }
+          if (error instanceof LlmError) throw error;
+          if (isCancellationRejection(error, signal)) { endBlock(); throw cancelled(requestSent); }
           // Only transport loss is retried. The managed request ID makes an
           // uncertain delivery idempotent; provider errors remain errors.
-          if ((active && active.ws.readyState === 1) || attempt >= this.config.reconnectAttempts) {
+          if (error instanceof RequestError || (active && active.ws.readyState === 1) || attempt >= this.config.reconnectAttempts) {
             const transportLost = !active || active.ws.readyState !== 1;
             // The negotiated service sends its canonical projection directly in
             // RequestError.data. Other native and transport errors remain raw.
@@ -424,22 +446,16 @@ export class AcpAdapter implements LlmAdapter {
             if (!requestSent && binding?.imported && !binding.sessionId && safe.category === 'unknown') {
               safe.message = 'The imported ACP session is not ready; check for an active writer before retrying.';
             }
-            const publicError: LlmPublicError | undefined = typeof DshLlm.LlmOperationId === 'function'
-              && typeof DshLlm.isLlmPublicErrorProviderCode === 'function' ? {
-              category: safe.category, retryable: safe.retryable, outcomeUnknown: safe.outcomeUnknown,
-              origin: safe.origin, operationId: DshLlm.LlmOperationId(requestId),
-              ...(DshLlm.isLlmPublicErrorProviderCode(safe.providerCode) ? { providerCode: safe.providerCode } : {}),
-            } : undefined;
             // The host admits these facts through its typed LlmError constructor;
             // ordinary Error properties are deliberately excluded by the host.
-            throw Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED', { publicError }), safe);
+            throw publicFailure(safe, requestId);
           }
           await delay(this.config.reconnectDelayMs, undefined, { signal });
         } finally { active = undefined; }
       }
     } catch (error) {
-      if (!signal.aborted) throw error;
-      endBlock(); queue.push(cancelled(requestSent));
+      if (!isCancellationRejection(error, signal)) throw error;
+      endBlock(); throw cancelled(requestSent);
     } finally { signal.removeEventListener('abort', cancel); this.output.delete(agent.id); }
   }
 }

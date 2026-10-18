@@ -15,7 +15,9 @@ const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_
 // Only the external native provider is synthetic; it has no account or model.
 const nativeFixture = `
 import readline from 'node:readline';
+import {appendFileSync} from 'node:fs';
 const send=x=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...x})+'\\n');
+const pending=new Map();
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line),p=m.params,reply=result=>send({id:m.id,result});
  if(m.method==='initialize') reply({protocolVersion:1,agentInfo:{name:'synthetic-safe-errors',version:'1'},agentCapabilities:{loadSession:true},authMethods:[]});
@@ -23,12 +25,18 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  else if(m.method==='session/load'||m.method==='session/resume') reply({});
  else if(m.method==='session/prompt') {
   const kind=p.prompt[0].text;
+  appendFileSync(process.argv[2],kind+'\\n');
+  if(kind==='local-abort'){pending.set(p.sessionId,m.id);return;}
+  if(kind==='cancelled')return reply({stopReason:'cancelled',_meta:{'1agents':{finalAnswer:'Partial cancelled answer'}}});
   const codes={quota:'usageLimitExceeded',rate:'rateLimitExceeded',budget:'sessionBudgetExceeded',auth:'unauthorized'};
   const data={message:${JSON.stringify(secret)},additionalDetails:${JSON.stringify(authLink)},token:'SYNTHETIC_TOKEN_NOT_REAL'};
   if(codes[kind])data.codexErrorInfo=codes[kind];
   if(kind==='spoof')Object.assign(data,{category:'quota',providerCode:'usageLimitExceeded',retryable:true,outcomeUnknown:true,operationId:'SYNTHETIC_OPERATION_SECRET_NOT_REAL',publicError:{category:'quota',providerCode:'usageLimitExceeded'}});
   send({id:m.id,error:{code:-32603,message:'Internal error',data}});
- } else if(m.method==='session/cancel') {}
+ } else if(m.method==='session/cancel') {
+  const id=pending.get(p.sessionId);
+  if(id!==undefined){pending.delete(p.sessionId);send({id,result:{stopReason:'cancelled'}});}
+ }
  else if(m.id!==undefined)send({id:m.id,error:{code:-32601,message:'Method not found'}});
 });
 `;
@@ -58,22 +66,25 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
     }
   });
   const nativePath = join(directory, 'synthetic-native.mjs');
+  const nativeCalls = join(directory, 'native-calls.txt');
   await writeFile(nativePath, nativeFixture);
+  await writeFile(nativeCalls, '');
   process.env.ACP_STATE_DIR = join(directory, 'runtime');
   const serviceDir = dirname(createRequire(import.meta.url).resolve('@1agents/acp-service/package.json'));
   const bridge = await import(pathToFileURL(join(serviceDir, 'dist/src/bridge.js')).href);
   const { serveAcpService } = await import('@1agents/acp-service/service');
   const options = Reflect.get(bridge.runtime, 'options');
   options.sessionStore = createRuntimeStore({ stateDir: process.env.ACP_STATE_DIR });
-  options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, nativePath] } });
+  options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, nativePath, nativeCalls] } });
   service = await serveAcpService({ host: '127.0.0.1', port: 0, report: false });
   const requireHost = createRequire(join(process.env.DSH_SOURCE, 'packages/core/agent-loop/package.json'));
+  const requireRetry = createRequire(join(process.env.DSH_SOURCE, 'packages/llm/llm-retry/package.json'));
   const load = name => import(pathToFileURL(requireHost.resolve(name)).href);
   const [{ default: Llm }, { default: Sessions }, { default: Projections }, { default: SystemPrompt },
-    { default: Tools }, { default: Agents }, { default: AgentLoop }, { agentPresetProjectionDefinition }] = await Promise.all([
+    { default: Tools }, { default: Agents }, { default: AgentLoop }, LlmRetry, { agentPresetProjectionDefinition }] = await Promise.all([
     load('@deepseek-ai/dsh-llm'), load('@deepseek-ai/dsh-session'), load('@deepseek-ai/dsh-session-projection'),
     load('@deepseek-ai/dsh-system-prompt'), load('@deepseek-ai/dsh-tools'), load('@deepseek-ai/dsh-agent'),
-    load('@deepseek-ai/dsh-agent-loop'), import('@deepseek-ai/dsh-agent-preset-registry'),
+    load('@deepseek-ai/dsh-agent-loop'), import(pathToFileURL(requireRetry.resolve('@deepseek-ai/dsh-llm-retry')).href), import('@deepseek-ai/dsh-agent-preset-registry'),
   ]);
   const clientRequire = createRequire(join(process.env.DSH_SOURCE, 'packages/client/modules/package.json'));
   const [{ default: Loader }, { default: WebServer }] = await Promise.all([
@@ -83,7 +94,7 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
   const sdkRequire = createRequire(join(serviceDir, 'package.json'));
   const persistenceRequire = createRequire(join(process.env.DSH_SOURCE, 'packages/session/session-persistence-jsonl/package.json'));
   const { default: JsonlPersistence } = await import(pathToFileURL(persistenceRequire.resolve('@deepseek-ai/dsh-session-persistence-jsonl')).href);
-  const [{ SendMessageRequest, GetTaskRequest, TaskState }, { ClientFactory }, { ServerCallContext }] = await Promise.all([
+  const [{ SendMessageRequest, GetTaskRequest, CancelTaskRequest, TaskState }, { ClientFactory }, { ServerCallContext }] = await Promise.all([
     import(pathToFileURL(sdkRequire.resolve('@a2a-js/sdk')).href),
     import(pathToFileURL(sdkRequire.resolve('@a2a-js/sdk/client')).href),
     import(pathToFileURL(sdkRequire.resolve('@a2a-js/sdk/server')).href),
@@ -95,6 +106,7 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
   ctx.sessionProjections.register(agentPresetProjectionDefinition);
   await ctx.plugin(JsonlPersistence, { root: join(directory, 'sessions'), compression: 'none' });
   await ctx.plugin(AgentLoop, { agents: [] });
+  await ctx.plugin(LlmRetry, {});
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 });
   for (const name of ['approval', 'userQuestions', 'workspaceRegistry']) ctx.provide(name, {});
   ctx.provide('commands', { register: () => () => {} });
@@ -136,6 +148,7 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
     ['quota', 'quota', 'usageLimitExceeded'], ['rate', 'rate_limit', 'rateLimitExceeded'],
     ['budget', 'budget', 'sessionBudgetExceeded'], ['auth', 'auth', 'unauthorized'],
     ['unknown', 'unknown', undefined], ['spoof', 'unknown', undefined],
+    ['cancelled', 'cancelled', undefined],
   ]) {
     const admitted = await client.sendMessage(SendMessageRequest.fromJSON({
       message: { messageId: `synthetic-${kind}`, role: 'ROLE_USER', parts: [{ text: kind }] },
@@ -160,10 +173,55 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
     assertNoProviderData(task);
     assert.equal(reason.kind, 'error'); assert.equal(reason.error.publicError.category, category);
     assert.equal(reason.error.publicError.providerCode, providerCode); assertNoProviderData(reason);
+    assert.ok(!agent.session.snapshotEvents().some(event => event.type === 'llm/retry'));
     diagnostics.push({ kind, state: task.status.state, category, providerCode,
       hostFields: Object.keys(reason.error.publicError).sort() });
     tasks.push(task);
   }
+  const active = await client.sendMessage(SendMessageRequest.fromJSON({
+    message: { messageId: 'synthetic-local-abort', role: 'ROLE_USER', parts: [{ text: 'local-abort' }] },
+    configuration: { returnImmediately: true },
+  }), authenticated);
+  const deadline = Date.now() + 10000;
+  while (!(await readFile(nativeCalls, 'utf8')).split('\n').includes('local-abort')) {
+    assert.ok(Date.now() < deadline, 'Active cancellation never reached the native provider');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const queued = await client.sendMessage(SendMessageRequest.fromJSON({
+    message: { messageId: 'synthetic-queued-cancel', role: 'ROLE_USER', contextId: active.contextId, parts: [{ text: 'queued-must-not-execute' }] },
+    configuration: { returnImmediately: true },
+  }), authenticated);
+  const queuedCanceled = await client.cancelTask(CancelTaskRequest.fromJSON({ id: queued.id }), authenticated);
+  assert.equal(queuedCanceled.status.state, TaskState.TASK_STATE_CANCELED);
+  assert.equal(queuedCanceled.metadata['1agents'].error.category, 'cancelled');
+  assert.equal(queuedCanceled.metadata['1agents'].error.outcomeUnknown, false);
+  assert.equal(queuedCanceled.metadata['1agents'].error.origin, 'a2a');
+  assert.equal((await client.getTask(GetTaskRequest.fromJSON({ id: active.id }), authenticated)).status.state, TaskState.TASK_STATE_WORKING);
+  const activeCanceled = await client.cancelTask(CancelTaskRequest.fromJSON({ id: active.id }), authenticated);
+  assert.equal(activeCanceled.status.state, TaskState.TASK_STATE_CANCELED);
+  assert.equal(activeCanceled.metadata['1agents'].error.category, 'cancelled');
+  assert.equal(activeCanceled.metadata['1agents'].error.outcomeUnknown, true);
+  assert.equal(activeCanceled.metadata['1agents'].error.origin, 'dsh');
+  for (const [kind, task] of [['queued-cancel', queuedCanceled], ['active-abort', activeCanceled]]) {
+    assert.equal(task.metadata['1agents'].error.retryable, false);
+    assert.match(task.metadata['1agents'].error.operationId, /^a2a-[a-f0-9]{64}$/);
+    assertNoProviderData(task); tasks.push(task);
+    assert.deepEqual((await client.getTask(GetTaskRequest.fromJSON({ id: task.id }), authenticated)).metadata['1agents'].error,
+      task.metadata['1agents'].error);
+    diagnostics.push({ kind, state: task.status.state, error: task.metadata['1agents'].error });
+  }
+  const activeAgent = ctx.agents.get(activeCanceled.metadata['1agents'].sessionId);
+  await activeAgent.whenIdle();
+  const activeReason = activeAgent.session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(activeReason.kind, 'aborted');
+  assert.equal(activeReason.error, undefined);
+  assertNoProviderData(activeAgent.session.snapshotEvents());
+  assert.ok(!activeAgent.session.snapshotEvents().some(event => event.type === 'llm/retry'));
+  const calls = (await readFile(nativeCalls, 'utf8')).trimEnd().split('\n');
+  for (const kind of ['quota', 'rate', 'budget', 'auth', 'unknown', 'spoof', 'cancelled', 'local-abort']) {
+    assert.equal(calls.filter(value => value === kind).length, 1, `Native ${kind} was retried`);
+  }
+  assert.ok(!calls.includes('queued-must-not-execute'));
   assertNoProviderData(logs);
   await fiber.dispose();
   const store = new FileA2AStore(stateDirectory);
@@ -172,7 +230,7 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
     for (const task of tasks) {
       const restored = await store.taskStore.load(task.id, scope);
       assert.deepEqual(restored.metadata['1agents'].error, task.metadata['1agents'].error);
-      assert.equal(restored.status.state, TaskState.TASK_STATE_FAILED); assertNoProviderData(restored);
+      assert.equal(restored.status.state, task.status.state); assertNoProviderData(restored);
     }
   } finally { store.close(); }
   const bindings = await readdir(join(directory, 'adapter'));

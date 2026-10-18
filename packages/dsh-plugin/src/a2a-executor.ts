@@ -3,11 +3,18 @@ import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
+import type { ContentBlock, LlmPublicError, MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
+
+/** Canonical host facts use the local A2A operation identity and no raw host code. */
+function canonicalError(canonical: LlmPublicError, operationId: string) {
+  return toSafeError({ category: canonical.category, providerCode: canonical.providerCode,
+    retryable: canonical.retryable, outcomeUnknown: canonical.outcomeUnknown, origin: canonical.origin,
+  }, { trustedProjection: true, origin: 'dsh', operationId });
+}
 
 function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string): A2ARunResult {
   switch (reason.kind) {
@@ -22,16 +29,14 @@ function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: bool
       // Without that field, host codes/data do not establish a provider cause.
       const canonical = reason.error.publicError;
       const error = canonical
-        ? toSafeError({
-          category: canonical.category, providerCode: canonical.providerCode,
-          retryable: canonical.retryable, outcomeUnknown: canonical.outcomeUnknown, origin: canonical.origin,
-        }, { trustedProjection: true, origin: 'dsh', operationId })
+        ? canonicalError(canonical, operationId)
         : toSafeError(undefined, { origin: 'dsh', operationId });
       return { outcome: 'failed', text, detail: error.message, error };
     }
     case 'max-tokens': return { outcome: 'failed', text, failureReason: 'max-tokens', detail: 'DSH reached the model output token limit' };
     case 'aborted': return { outcome: 'failed', text, failureReason: 'aborted', detail: 'DSH task execution was canceled',
-      error: toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin: 'dsh', operationId }) };
+      error: reason.failure?.publicError ? canonicalError(reason.failure.publicError, operationId)
+        : toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin: 'dsh', operationId, outcomeUnknown: true }) };
     case 'interrupted': return { outcome: 'failed', text, failureReason: 'interrupted', detail: 'DSH task execution was interrupted',
       error: toSafeError(undefined, { origin: 'dsh', operationId, outcomeUnknown: true }) };
     case 'forked': return { outcome: 'failed', text, failureReason: 'forked', detail: 'DSH task turn was closed by a session fork' };
@@ -151,7 +156,9 @@ export class DshA2ABackend implements A2ABackend {
     }));
     listeners.push(agent.ctx.on('agent/inbox/discarded', event => {
       if (event.agent === agent && owns(event.message)) {
-        settle({ outcome: 'failed', text, failureReason: 'discarded', detail: 'DSH discarded the queued task before execution' });
+        settle({ outcome: 'failed', text, failureReason: 'discarded', detail: 'DSH discarded the queued task before execution',
+          ...(options.signal.aborted ? { error: toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'),
+            { origin: 'dsh', operationId: options.requestId, outcomeUnknown: false }) } : {}) });
       }
     }));
     listeners.push(agent.ctx.on('agent/disposed', event => {

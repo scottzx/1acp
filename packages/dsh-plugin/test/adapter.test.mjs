@@ -62,7 +62,10 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
           for (const update of updates) await connection.client.notify('session/update', { sessionId: params.sessionId, update });
         }
         if (disconnect && !dropped) { dropped = true; ws.terminate(); return new Promise(() => {}); }
-        if (streamConfig.error) throw new RequestError(streamConfig.error.code, streamConfig.error.message, streamConfig.error.data);
+        if (streamConfig.error) {
+          await streamConfig.beforeError?.();
+          throw new RequestError(streamConfig.error.code, streamConfig.error.message, streamConfig.error.data);
+        }
         if (interaction === 'question') {
           const result = await connection.client.request('_x.ai/ask_user_question', { questions: [{ question: 'Choose targets', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true }] });
           assert.deepEqual(result, { outcome: 'accepted', answers: { 'Choose targets': ['A', 'B'] } });
@@ -211,6 +214,34 @@ test('the owned service direct RequestError data preserves canonical safe fields
   assert.equal(f.counts().executions, 1);
 });
 
+for (const [label, raw, origin, outcomeUnknown] of [
+  ['quota', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'acp', false],
+  ['auth', { data: { codexErrorInfo: 'unauthorized' } }, 'acp', false],
+  ['uncertain transport', undefined, 'transport', true],
+]) {
+  test(`local abort does not mask the owned service ${label} rejection`, { timeout: 5000 }, async t => {
+    const controller = new AbortController();
+    const safe = toSafeError(raw, { origin, outcomeUnknown, operationId: 'synthetic-service-operation' });
+    const f = await fixture(t, false, 'permission', async () => {}, [], {
+      error: { code: -32000, message: secretCanary, data: { ...safe, raw: authCanary } },
+      beforeError: () => controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL')),
+    });
+    await assert.rejects(collect(f.adapter, { ...f.options(`racing-${label}`), signal: controller.signal }), error => {
+      assert.ok(error instanceof LlmError);
+      assert.equal(error.failure.publicError.category, safe.category);
+      assert.equal(error.failure.publicError.providerCode, safe.providerCode);
+      assert.equal(error.failure.publicError.origin, origin);
+      assert.equal(error.failure.publicError.outcomeUnknown, outcomeUnknown);
+      assert.match(error.failure.publicError.operationId, /^dsh-[a-f0-9]{64}$/);
+      for (const canary of [secretCanary, authCanary, 'SYNTHETIC_CANCEL_SECRET_NOT_REAL', 'synthetic-service-operation']) {
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+      }
+      return true;
+    });
+    assert.equal(f.counts().executions, 1);
+  });
+}
+
 test('native safe-shaped and nested category metadata cannot spoof the adapter projection', { timeout: 5000 }, async t => {
   const f = await fixture(t, false, 'permission', async () => {}, [], {
     error: providerFailure({ message: secretCanary, category: 'quota', providerCode: 'usageLimitExceeded', origin: 'a2a', retryable: true,
@@ -350,16 +381,61 @@ test('a terminal-only answer is displayed once and recorded before finish', { ti
   assert.equal(chunks.at(-1).reason.kind, 'stop');
 });
 
-for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens'], ['cancelled', 'aborted']]) {
+test('confirmed remote cancellation rejects through the genuine typed host error path', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', 'cancelled') });
+  const chunks = [];
+  await assert.rejects(async () => { for await (const chunk of f.adapter.stream(f.options('remote-cancelled'))) chunks.push(chunk); }, error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.code, 'ABORTED');
+    assert.deepEqual(error.failure.publicError, {
+      category: 'cancelled', retryable: false, outcomeUnknown: false, origin: 'acp', operationId: error.operationId,
+    });
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    return true;
+  });
+  assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Partial answer');
+  assert.ok(!chunks.some(chunk => chunk.type === 'finish'));
+  assert.equal(f.counts().executions, 1);
+});
+
+test('a pre-delivery local abort has no uncertain native outcome or leaked reason', async t => {
+  const f = await fixture(t), controller = new AbortController();
+  controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+  await assert.rejects(collect(f.adapter, { ...f.options('before-delivery'), signal: controller.signal }), error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.failure.publicError.category, 'cancelled');
+    assert.equal(error.failure.publicError.outcomeUnknown, false);
+    assert.equal(error.failure.publicError.origin, 'dsh');
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
+    return true;
+  });
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
+});
+
+test('a peer cancellation rejection after local abort stays typed and conservative', async t => {
+  const controller = new AbortController();
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: { code: -32800, message: secretCanary, data: { raw: authCanary } },
+    beforeError: () => controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL')),
+  });
+  await assert.rejects(collect(f.adapter, { ...f.options('peer-cancel'), signal: controller.signal }), error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.failure.publicError.category, 'cancelled');
+    assert.equal(error.failure.publicError.outcomeUnknown, true);
+    assert.equal(error.failure.publicError.origin, 'dsh');
+    for (const canary of [secretCanary, authCanary, 'SYNTHETIC_CANCEL_SECRET_NOT_REAL']) {
+      assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+    }
+    return true;
+  });
+  assert.equal(f.counts().executions, 1);
+});
+
+for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens']]) {
   test(`terminal metadata does not turn ACP ${stopReason} into success`, { timeout: 5000 }, async t => {
     const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', stopReason) });
     const chunks = await collect(f.adapter, f.options(stopReason));
     assert.equal(chunks.at(-1).reason.kind, finishKind);
-    if (stopReason === 'cancelled') {
-      assert.equal(chunks.at(-1).reason.failure.category, 'cancelled');
-      assert.equal(chunks.at(-1).reason.failure.code, 'ABORTED');
-      assert.equal(chunks.at(-1).reason.failure.outcomeUnknown, false);
-    }
     assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Partial answer');
   });
 }
@@ -420,12 +496,15 @@ test('stopping while permission is pending cancels remote work and settles the s
   const output = collect(f.adapter, { ...f.options('message-1'), signal: controller.signal });
   await f.waiting;
   controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
-  const chunks = await output, finish = chunks.at(-1);
-  assert.equal(finish.reason.kind, 'aborted');
-  assert.equal(finish.reason.failure.category, 'cancelled');
-  assert.equal(finish.reason.failure.code, 'ABORTED');
-  assert.equal(finish.reason.failure.outcomeUnknown, true);
-  assert.ok(!JSON.stringify(chunks).includes('SYNTHETIC_CANCEL_SECRET'));
+  await assert.rejects(output, error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.code, 'ABORTED');
+    assert.equal(error.failure.publicError.category, 'cancelled');
+    assert.equal(error.failure.publicError.outcomeUnknown, true);
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
+    return true;
+  });
   await f.cancelled;
 });
 
