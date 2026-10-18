@@ -144,6 +144,10 @@ function isTimeoutLike(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
 }
 
+function isLocalAbortOrTimeoutError(error: unknown): boolean {
+  return (error instanceof Error && error.name === "AbortError") || isTimeoutLike(error);
+}
+
 function isNoSessionLike(error: unknown): boolean {
   return error instanceof Error && error.name === "NoSessionError";
 }
@@ -568,10 +572,14 @@ function safeOrigin(
   if (local) {
     return local;
   }
+  const fallbackOrigin = options.origin ?? "runtime";
+  if (isLocalAbortOrTimeoutError(error)) {
+    return fallbackOrigin;
+  }
   if (records.some((record) => typeof record.code === "number")) {
     return "acp";
   }
-  return options.origin ?? "runtime";
+  return fallbackOrigin;
 }
 
 function localErrorRecord(

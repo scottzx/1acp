@@ -167,6 +167,71 @@ test("only direct owned or trusted projections preserve projected provider codes
   assert.equal(conflicting.providerCode, undefined);
 });
 
+test("genuine DOM cancellation and timeout errors retain their local origins", () => {
+  for (const [name, category, code, nativeCode] of [
+    ["AbortError", "cancelled", "ABORTED", 20],
+    ["TimeoutError", "timeout", "TIMEOUT", 23],
+  ] as const) {
+    for (const origin of [undefined, "runtime", "dsh", "a2a", "transport"] as const) {
+      const error = new DOMException(`${canary} ${authLink}`, name);
+      assert.ok(error instanceof Error);
+      assert.equal(error.code, nativeCode);
+      const safe = toSafeError(error, { origin });
+      assert.equal(safe.origin, origin ?? "runtime");
+      assert.equal(safe.category, category);
+      assert.equal(safe.code, code);
+      assert.equal(safe.retryable, false);
+      assert.equal(safe.outcomeUnknown, false);
+      assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|example\.invalid/);
+    }
+  }
+  const controller = new AbortController();
+  controller.abort();
+  const cancelled = toSafeError(controller.signal.reason, { origin: "a2a" });
+  assert.equal(cancelled.category, "cancelled");
+  assert.equal(cancelled.origin, "a2a");
+});
+
+test("local error origins preserve owned and operational precedence and native ACP causes", () => {
+  for (const name of ["AbortError", "TimeoutError"]) {
+    const owned = toSafeError(new DOMException(canary, name), { origin: "transport" });
+    assert.equal(toSafeError(owned, { origin: "dsh" }).origin, "transport");
+    const rejection = safeErrorRejection(owned);
+    rejection.name = name;
+    assert.equal(toSafeError(rejection, { origin: "dsh" }).origin, "transport");
+    const operational = new AcpxOperationalError(canary, {
+      origin: "queue",
+      cause: new DOMException(canary, name),
+    });
+    operational.name = name;
+    assert.equal(toSafeError(operational, { origin: "dsh" }).origin, "queue");
+  }
+  const native = toSafeError(nativeError("usageLimitExceeded"), { origin: "dsh" });
+  assert.equal(native.origin, "acp");
+  assert.equal(native.category, "quota");
+  assert.equal(native.providerCode, "usageLimitExceeded");
+});
+
+test("plain-object cancellation and timeout names do not confer local error authority", () => {
+  for (const [name, code] of [
+    ["AbortError", 20],
+    ["TimeoutError", 23],
+  ] as const) {
+    for (const error of [
+      { name, message: canary },
+      { name, code, message: authLink },
+    ]) {
+      const safe = toSafeError(error, { origin: "dsh" });
+      assert.equal(safe.category, "unknown");
+      assert.equal(safe.code, undefined);
+      assert.equal(safe.origin, "code" in error ? "acp" : "dsh");
+      assert.equal(safe.retryable, false);
+      assert.equal(safe.outcomeUnknown, false);
+      assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|example\.invalid/);
+    }
+  }
+});
+
 test("provider detail and local output codes cannot override structured causes or delivery state", () => {
   for (const fields of [
     { detailCode: "AUTH_REQUIRED" },
