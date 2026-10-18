@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agent as acpAgent, RequestError } from '@agentclientprotocol/sdk';
 import { WebSocketServer } from 'ws';
+import { LlmError } from '@deepseek-ai/dsh-llm';
 import { AcpAdapter } from '../dist/adapter.js';
 import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
@@ -154,6 +155,7 @@ for (const [label, error, category, providerCode] of [
     const f = await fixture(t, false, 'permission', async () => {}, [], { error });
     let failure;
     await assert.rejects(collect(f.adapter, f.options(`safe-${label}`)), value => { failure = value; return value instanceof Error; });
+    assert.ok(failure instanceof LlmError);
     assert.equal(failure.category, category);
     assert.equal(failure.providerCode, providerCode);
     assert.equal(failure.outcomeUnknown, false);
@@ -161,6 +163,10 @@ for (const [label, error, category, providerCode] of [
     assert.match(failure.operationId, /^dsh-[a-f0-9]{64}$/);
     assert.equal(failure.data, undefined);
     assert.equal(failure.cause, undefined);
+    assert.deepEqual(failure.failure.publicError, {
+      category, retryable: failure.retryable, outcomeUnknown: false, origin: failure.origin,
+      operationId: failure.operationId, ...(providerCode ? { providerCode } : {}),
+    });
     const ordinaryLog = `${failure.stack} ${JSON.stringify(failure)}`;
     for (const canary of [secretCanary, authCanary, 'unknownSyntheticCode']) assert.ok(!ordinaryLog.includes(canary));
     assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 0 });
@@ -188,6 +194,7 @@ test('the owned service direct RequestError data preserves canonical safe fields
     error: { code: -32000, message: safe.message, data: { ...safe, retryable: true } },
   });
   await assert.rejects(collect(f.adapter, f.options('owned-projection')), error => {
+    assert.ok(error instanceof LlmError);
     assert.equal(error.category, 'quota');
     assert.equal(error.providerCode, 'usageLimitExceeded');
     assert.equal(error.origin, 'acp');
@@ -196,6 +203,9 @@ test('the owned service direct RequestError data preserves canonical safe fields
     assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
     assert.notEqual(error.operationId, 'synthetic-service-operation');
     assert.equal(error.data, undefined);
+    assert.equal(error.failure.publicError.retryable, true);
+    assert.equal(error.failure.publicError.outcomeUnknown, true);
+    assert.equal(error.failure.publicError.operationId, error.operationId);
     return true;
   });
   assert.equal(f.counts().executions, 1);

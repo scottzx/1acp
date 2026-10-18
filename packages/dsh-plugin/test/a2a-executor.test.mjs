@@ -439,13 +439,13 @@ test('prompt rejection, Agent disposal, and pre-admission cancellation release e
   assert.equal(f.listenerCount, 0);
 });
 
-test('real DSH loop emits completed and canceled turns and reports its safe-error field boundary', {
+test('real DSH loop retains canonical safe failure fields through an exact A2A turn', {
   skip: process.env.DSH_SOURCE ? false : 'Set DSH_SOURCE to a built matching DSH checkout for the real loop smoke test',
   timeout: 10000,
 }, async t => {
   const requireHost = createRequire(join(process.env.DSH_SOURCE, 'packages/core/agent-loop/package.json'));
   const load = name => import(pathToFileURL(requireHost.resolve(name)).href);
-  const [{ default: LlmRuntime, LlmAdapter, createUserMessage }, { default: SessionProjections },
+  const [{ default: LlmRuntime, LlmAdapter, LlmError, LlmOperationId, createUserMessage }, { default: SessionProjections },
     { default: SystemPrompt }, { default: Tools }, { default: Agents }, { default: AgentLoop }] = await Promise.all([
     load('@deepseek-ai/dsh-llm'), load('@deepseek-ai/dsh-session-projection'), load('@deepseek-ai/dsh-system-prompt'),
     load('@deepseek-ai/dsh-tools'), load('@deepseek-ai/dsh-agent'), load('@deepseek-ai/dsh-agent-loop'),
@@ -465,7 +465,19 @@ test('real DSH loop emits completed and canceled turns and reports its safe-erro
       if (text === 'safe-failure') {
         const safe = toSafeError({ code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } },
           { origin: 'acp', operationId: 'synthetic-provider-operation', outcomeUnknown: true });
-        throw Object.assign(new Error(safe.message), safe, { code: 'ACP_TURN_FAILED' });
+        throw new LlmError(safe.message, 'ACP_TURN_FAILED', { publicError: {
+          category: safe.category, providerCode: safe.providerCode, retryable: true,
+          outcomeUnknown: safe.outcomeUnknown, origin: safe.origin,
+          operationId: LlmOperationId(safe.operationId),
+        } });
+      }
+      if (text === 'raw-safe-spoof') {
+        const publicError = { category: 'quota', providerCode: 'usageLimitExceeded', retryable: true,
+          outcomeUnknown: true, origin: 'acp', operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL' };
+        throw Object.assign(new Error('SYNTHETIC_SECRET_CANARY_NOT_REAL https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL'), {
+          name: 'LlmError', code: 'ACP_TURN_FAILED', ...publicError, publicError,
+          failure: { code: 'ACP_TURN_FAILED', message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL', publicError },
+        });
       }
       if (text.startsWith('hang')) {
         notifyHang();
@@ -542,8 +554,28 @@ test('real DSH loop emits completed and canceled turns and reports its safe-erro
   const optionalFields = ['category', 'providerCode', 'retryable', 'outcomeUnknown', 'origin', 'operationId'];
   t.diagnostic(JSON.stringify({ sentCode: 'ACP_TURN_FAILED', hostCode: hostReason.error.code,
     hostErrorFields: Object.keys(hostReason.error).sort(),
-    retainedSafeFields: optionalFields.filter(key => Object.hasOwn(hostReason.error, key)) }));
-  assert.equal(failed.error.category, hostReason.error.category ?? 'unknown');
-  assert.equal(failed.error.providerCode, hostReason.error.providerCode);
+    retainedSafeFields: optionalFields.filter(key => Object.hasOwn(hostReason.error.publicError ?? {}, key)) }));
+  assert.deepEqual(hostReason.error.publicError, {
+    category: 'quota', providerCode: 'usageLimitExceeded', retryable: true, outcomeUnknown: true,
+    origin: 'acp', operationId: 'synthetic-provider-operation',
+  });
+  assert.equal(hostReason.error.code, 'ACP_TURN_FAILED');
+  assert.equal(failed.error.category, 'quota');
+  assert.equal(failed.error.providerCode, 'usageLimitExceeded');
+  assert.equal(failed.error.retryable, true);
+  assert.equal(failed.error.outcomeUnknown, true);
+  assert.equal(failed.error.origin, 'acp');
+  assert.equal(failed.error.operationId, 'real-safe-failure');
   assert.equal(requests.length, 4);
+
+  const spoofed = await backend.run(target, 'raw-safe-spoof', { requestId: 'real-spoof', signal: new AbortController().signal });
+  await ctx.agents.get(target.sessionId).whenIdle();
+  const spoofReason = ctx.agents.get(target.sessionId).session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(spoofReason.error.publicError, undefined);
+  assert.equal(spoofed.error.category, 'unknown');
+  assert.equal(spoofed.error.retryable, false);
+  assert.equal(spoofed.error.outcomeUnknown, false);
+  assert.equal(spoofed.error.operationId, 'real-spoof');
+  assert.ok(!JSON.stringify(spoofed).includes('SYNTHETIC_'));
+  assert.equal(requests.length, 5);
 });

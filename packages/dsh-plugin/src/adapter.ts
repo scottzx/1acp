@@ -5,6 +5,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId } from '@deepseek-ai/dsh-llm';
+import { LlmError, type LlmPublicError } from '@deepseek-ai/dsh-llm';
+import * as DshLlm from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-user-questions';
 import type {} from '@deepseek-ai/dsh-commands';
@@ -422,7 +424,15 @@ export class AcpAdapter implements LlmAdapter {
             if (!requestSent && binding?.imported && !binding.sessionId && safe.category === 'unknown') {
               safe.message = 'The imported ACP session is not ready; check for an active writer before retrying.';
             }
-            throw Object.assign(new Error(safe.message), safe);
+            const publicError: LlmPublicError | undefined = typeof DshLlm.LlmOperationId === 'function'
+              && typeof DshLlm.isLlmPublicErrorProviderCode === 'function' ? {
+              category: safe.category, retryable: safe.retryable, outcomeUnknown: safe.outcomeUnknown,
+              origin: safe.origin, operationId: DshLlm.LlmOperationId(requestId),
+              ...(DshLlm.isLlmPublicErrorProviderCode(safe.providerCode) ? { providerCode: safe.providerCode } : {}),
+            } : undefined;
+            // The host admits these facts through its typed LlmError constructor;
+            // ordinary Error properties are deliberately excluded by the host.
+            throw Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED', { publicError }), safe);
           }
           await delay(this.config.reconnectDelayMs, undefined, { signal });
         } finally { active = undefined; }

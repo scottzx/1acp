@@ -16,7 +16,13 @@ function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: bool
       : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
     case 'error': {
-      const error = toSafeError(reason.error, { origin: 'dsh', operationId });
+      // publicError is the host's declared canonical turn failure field. The
+      // LLM normalizer admits it only from an explicit LlmError, never from
+      // arbitrary adapter Error properties or in-band finish metadata.
+      const canonical = reason.error.publicError;
+      const error = canonical
+        ? toSafeError({ code: reason.error.code, ...canonical }, { trustedProjection: true, origin: 'dsh', operationId })
+        : toSafeError(reason.error, { origin: 'dsh', operationId });
       return { outcome: 'failed', text, detail: error.message, error };
     }
     case 'max-tokens': return { outcome: 'failed', text, failureReason: 'max-tokens', detail: 'DSH reached the model output token limit' };

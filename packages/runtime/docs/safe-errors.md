@@ -34,8 +34,12 @@ Cancellation keeps the existing cancelled turn status.
 The service's summary and live terminal paths and its ACP connection retain safe
 fields. A2A failures expose them in task metadata under `1agents.error`. A host
 ending such as an output limit can select a fixed status explanation through a
-known failure reason; arbitrary backend failure detail is discarded. A host
-that reduces errors to code and message can lose the optional fields; downstream
-projection then reports unknown instead of reconstructing a cause from text.
+known failure reason; arbitrary backend failure detail is discarded. DSH hosts
+implementing `LlmFailure.publicError` retain these facts through the typed
+`LlmError` constructor and canonical durable turn failure. Raw adapter errors
+and in-band metadata cannot assert this field. A2A retains the canonical safe
+origin and binds the operation identifier to its own caller. Older hosts that
+reduce errors to code and message can lose the optional fields; downstream
+reports unknown instead of reconstructing a cause from text.
 Historical journal records containing only error code and text cannot recover
 all original fields.
