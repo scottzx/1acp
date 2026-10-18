@@ -411,12 +411,21 @@ export class AcpAdapter implements LlmAdapter {
     const cancel = () => { if (binding?.sessionId) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };
     signal.addEventListener('abort', cancel, { once: true });
     try {
-      if (this.diagnostics) await save(async () => { diagnosticId = await this.diagnostics!.begin({ sessionId: agent.id, turn,
-        turnStartSeq: boundary?.openTurnStartSeq ?? 0, stepStartSeq: boundary?.lastStepStartSeq ?? 0,
-        nativeRequestId: requestId, messageIds: input.flatMap(m => m.id === undefined ? [] : [m.id]),
-        requestIds: input.flatMap(m => m.role === 'user' && m.source?.kind === 'user' && 'rpcId' in m.source
-          && typeof m.source.rpcId === 'string' ? [m.source.rpcId] : []),
-      }); });
+      if (this.diagnostics) await save(async () => {
+        const turnStartSeq = boundary?.openTurnStartSeq;
+        if (turnStartSeq == null) throw new Error('ACP diagnostic turn boundary is unavailable');
+        // Old failed turns may have no assistant message separating their input.
+        // Only this turn's admitted user messages can own this attempt's facts.
+        const admittedIds = new Set(agent.session.snapshotEvents().flatMap(event =>
+          event.type === 'user/message' && event.seq > turnStartSeq ? [event.data.id] : []));
+        const admitted = input.filter(message => message.id !== undefined && admittedIds.has(message.id));
+        diagnosticId = await this.diagnostics!.begin({ sessionId: agent.id, turn,
+          turnStartSeq, stepStartSeq: boundary?.lastStepStartSeq ?? 0, nativeRequestId: requestId,
+          messageIds: [...new Set(admitted.flatMap(m => m.id === undefined ? [] : [m.id]))],
+          requestIds: [...new Set(admitted.flatMap(m => m.role === 'user' && m.source?.kind === 'user' && 'rpcId' in m.source
+            && typeof m.source.rpcId === 'string' ? [m.source.rpcId] : []))],
+        });
+      });
       for (let attempt = 0; ; attempt++) {
         signal.throwIfAborted();
         try {

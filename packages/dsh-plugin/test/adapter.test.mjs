@@ -9,6 +9,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm';
 import { AcpAdapter } from '../dist/adapter.js';
 import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
+import { diagnosticsFixture } from './helpers/diagnostics.mjs';
 import { toSafeError } from '@1agents/acp-service/runtime';
 
 function safeFields(error) {
@@ -115,7 +116,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     return { answers: [{ id: q.id, selected: ['A', 'B'] }] };
   } } };
   const config = { serviceUrl: `http://127.0.0.1:${wss.address().port}`, agents: ['codex', 'grok-build'], stateDirectory: directory, reconnectAttempts: 2, reconnectDelayMs: 1 };
-  const adapter = new AcpAdapter(ctx, config);
+  const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
   return { adapter, options, config, ctx, local, sent, prompts, changes, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
@@ -686,4 +687,23 @@ test('draft switching preserves endpoint protection and requires known turn stat
   state.save(f.local.id, { ...state.get(f.local.id), endpoint: 'ws://other.example/agents/codex' });
   await assert.rejects(f.adapter.describe(f.local), /bound to another ACP/);
   assert.equal(f.counts().creations, 1);
+});
+
+test('diagnostics bind only messages admitted in the current official turn, excluding older failed inputs', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-diagnostic-turn-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const { diagnostics } = await diagnosticsFixture(t, directory);
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    diagnostics, error: providerFailure({ codexErrorInfo: 'usageLimitExceeded' }),
+  });
+  const old = f.options('old-message').messages[0]; old.source.rpcId = 'old-request';
+  const current = f.options('current-message').messages[0]; current.source.rpcId = 'current-request';
+  f.local.session.boundary = { openTurnStartSeq: 5, lastTurn: 2 };
+  f.local.session.snapshotEvents = () => [
+    { type: 'user/message', seq: 1, data: old }, { type: 'turn/start', seq: 5, data: { turn: 2 } },
+    { type: 'user/message', seq: 6, data: current },
+  ];
+  await assert.rejects(collect(f.adapter, { ...f.options('unused'), messages: [old, current] }));
+  assert.equal(diagnostics.find(f.local.id, 'old-request'), undefined);
+  assert.equal(diagnostics.find(f.local.id, 'current-request').category, 'quota');
 });

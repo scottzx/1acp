@@ -9,6 +9,7 @@ import { runInNewContext } from 'node:vm';
 import * as api from '@1agents/acp-service';
 
 const dsh = resolve(process.argv[2]);
+const installAnchor = join(dsh, 'apps/cli/package.json');
 const require = createRequire(import.meta.url);
 const hostRequire = createRequire(join(dsh, 'packages/client/modules/package.json'));
 const loadHost = name => import(pathToFileURL(hostRequire.resolve(name)).href);
@@ -26,7 +27,7 @@ assert.throws(() => require.resolve('@deepseek-ai/cordis'), 'DSH must not be an 
 const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
 manifest.dsh = { profile: { bundles: ['@1agents/acp-service'] } };
 writeFileSync('package.json', JSON.stringify(manifest));
-const profile = loadProfileDirectory('dsh', process.cwd(), join(dsh, 'package.json'), { userLayer: false });
+const profile = loadProfileDirectory('dsh', process.cwd(), installAnchor, { userLayer: false });
 assert.deepEqual(profile.skippedBundles, []);
 assert.equal(profile.layers.length, 1);
 const patch = profile.layers[0].patches;
@@ -47,7 +48,7 @@ class MemoryLoader extends Loader { write() {} }
 try {
   // Use the official profile package resolver before loading Host imports.
   await ctx.plugin(PluginPackages, { resolution: await createRuntimeResolution({
-    installAnchor: join(dsh, 'package.json'), profile, home: join(process.cwd(), 'dsh-home'),
+    installAnchor, profile, home: join(process.cwd(), 'dsh-home'),
   }) });
   const [plugin, preset, { NativeSessions }] = await Promise.all([
     import('@1agents/acp-service/dsh'), import('@1agents/acp-service/dsh/preset'),

@@ -94,3 +94,13 @@ test('diagnostic owner rejects a concurrent writer and releases the lease after 
   const reopened = await openDiagnostics(root); t.after(() => reopened.close());
   assert.equal(reopened.diagnostics.find('test-session', 'request-1').category, 'quota');
 });
+
+test('diagnostic identity lengths and batch sizes are bounded without truncation or partial writes', async t => {
+  const { diagnostics } = await diagnosticsFixture(t, await directory(t));
+  for (const change of [ { sessionId: 's'.repeat(257) }, { messageIds: ['m'.repeat(257)] },
+    { requestIds: ['r'.repeat(257)] }, { messageIds: Array.from({ length: 129 }, (_, i) => 'm' + i) },
+    { requestIds: Array.from({ length: 129 }, (_, i) => 'r' + i) } ]) {
+    await assert.rejects(async () => diagnostics.begin(identity(change)));
+  }
+  assert.equal(diagnostics.find('test-session', 'request-1'), undefined);
+});

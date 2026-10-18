@@ -10,10 +10,10 @@ import { DirectoryLease } from '@1agents/acp-service/a2a';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 
 const identitySchema = z.object({
-  sessionId: z.string().min(1), turn: z.number().int().nonnegative(),
+  sessionId: z.string().min(1).max(256), turn: z.number().int().nonnegative(),
   turnStartSeq: z.number().int().nonnegative(), stepStartSeq: z.number().int().nonnegative(),
   nativeRequestId: z.string().regex(/^dsh-[a-f0-9]{64}$/),
-  messageIds: z.array(z.string().min(1)).min(1), requestIds: z.array(z.string().min(1)),
+  messageIds: z.array(z.string().min(1).max(256)).min(1).max(128), requestIds: z.array(z.string().min(1).max(256)).max(128),
 }).strict();
 const errorSchema = z.object({
   category: z.enum(['quota', 'rate_limit', 'budget', 'auth', 'cancelled', 'timeout', 'permission', 'unknown']),
