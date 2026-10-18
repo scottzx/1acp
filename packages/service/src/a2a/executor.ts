@@ -107,7 +107,8 @@ export class A2ASessionExecutor implements AgentExecutor {
       controller.signal.throwIfAborted();
       status(TaskState.TASK_STATE_WORKING);
       const result = await this.backend.run(target, prompt, { requestId, signal: controller.signal });
-      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
+      returnedError = result.outcome === 'failed' && result.error !== undefined
+        ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
       returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
         ? FAILURE_MESSAGES[result.failureReason] : undefined;
       controller.signal.throwIfAborted();
@@ -116,7 +117,8 @@ export class A2ASessionExecutor implements AgentExecutor {
           parts: [{ content: { $case: 'text', value: result.text }, mediaType: 'text/plain', filename: '', metadata: undefined }], metadata: undefined, extensions: [] },
         append: false, lastChunk: true, metadata: undefined }));
       if (result.outcome === 'input-required') this.awaitingInput.set(context.taskId, context.contextId);
-      const error = returnedError ? toSafeError(returnedError, { operationId: requestId }) : undefined;
+      const error = result.outcome === 'failed'
+        ? toSafeError(returnedError, { origin: 'a2a', operationId: requestId }) : undefined;
       status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? error?.message ?? result.detail, error);
     } catch (error) {
       if (!published) bus.publish(AgentEvent.task(Task.fromJSON({ id: context.taskId, contextId: context.contextId,

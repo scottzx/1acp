@@ -396,6 +396,30 @@ test('A2A cancellation preserves a backend uncertainty flag while remaining canc
   assert.equal(error.outcomeUnknown, true);
 });
 
+test('queued backend discard without an error keeps the local cancellation category', { timeout: 10000 }, async t => {
+  const backend = new DeferredBackend();
+  const started = deferred<void>();
+  let callerRequestId: string | undefined;
+  backend.run = async (_target, _prompt, options) => new Promise<A2ARunResult>(resolve => {
+    callerRequestId = options.requestId;
+    options.signal.addEventListener('abort', () => resolve({
+      outcome: 'failed', text: '', failureReason: 'discarded',
+    }), { once: true });
+    started.resolve();
+  });
+  const f = await fixture(t, {}, backend);
+  const task = await submit(f.client, message('synthetic queued backend discard'));
+  await started.promise;
+  const canceled = await f.client.cancelTask(CancelTaskRequest.fromJSON({ id: task.id }), authenticated);
+  assert.equal(canceled.status?.state, TaskState.TASK_STATE_CANCELED);
+  const error = (canceled.metadata?.['1agents'] as { error: SafeError }).error;
+  assert.equal(error.category, 'cancelled');
+  assert.equal(error.retryable, false);
+  assert.equal(error.outcomeUnknown, false);
+  assert.equal(error.origin, 'a2a');
+  assert.equal(error.operationId, callerRequestId);
+});
+
 test('A2A cancellation racing a returned failure preserves all safe error fields', { timeout: 10000 }, async t => {
   const backend = new DeferredBackend();
   const started = deferred<void>();
