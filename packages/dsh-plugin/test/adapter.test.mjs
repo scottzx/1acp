@@ -138,6 +138,8 @@ const providerFailure = (data, message = 'Internal error') => ({ code: -32603, m
 for (const [label, error, category, providerCode] of [
   ['native quota cause', providerFailure({ codexErrorInfo: 'usageLimitExceeded', message: secretCanary, additionalDetails: authCanary }), 'quota', 'usageLimitExceeded'],
   ['known nested cause', providerFailure({ cause: { codexErrorInfo: 'usageLimitExceeded', message: secretCanary } }), 'quota', 'usageLimitExceeded'],
+  ['untrusted aborted code with quota cause', providerFailure({ code: 'ABORTED', codexErrorInfo: 'usageLimitExceeded' }), 'quota', 'usageLimitExceeded'],
+  ['untrusted aborted code alone', providerFailure({ code: 'ABORTED' }), 'unknown', undefined],
   ['rate limit', providerFailure({ codexErrorInfo: 'rateLimitExceeded', message: secretCanary }), 'rate_limit', 'rateLimitExceeded'],
   ['session budget', providerFailure({ codexErrorInfo: 'sessionBudgetExceeded' }), 'budget', 'sessionBudgetExceeded'],
   ['authentication', providerFailure({ codexErrorInfo: 'unauthorized', additionalDetails: authCanary }), 'auth', 'unauthorized'],
@@ -345,6 +347,7 @@ for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens'], ['cancelle
     assert.equal(chunks.at(-1).reason.kind, finishKind);
     if (stopReason === 'cancelled') {
       assert.equal(chunks.at(-1).reason.failure.category, 'cancelled');
+      assert.equal(chunks.at(-1).reason.failure.code, 'ABORTED');
       assert.equal(chunks.at(-1).reason.failure.outcomeUnknown, false);
     }
     assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Partial answer');
@@ -410,6 +413,7 @@ test('stopping while permission is pending cancels remote work and settles the s
   const chunks = await output, finish = chunks.at(-1);
   assert.equal(finish.reason.kind, 'aborted');
   assert.equal(finish.reason.failure.category, 'cancelled');
+  assert.equal(finish.reason.failure.code, 'ABORTED');
   assert.equal(finish.reason.failure.outcomeUnknown, true);
   assert.ok(!JSON.stringify(chunks).includes('SYNTHETIC_CANCEL_SECRET'));
   await f.cancelled;

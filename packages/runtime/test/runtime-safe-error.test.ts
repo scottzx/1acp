@@ -3,6 +3,7 @@ import test from "node:test";
 import { safeErrorRejection } from "../src/acp/error-normalization.js";
 import { AcpxOperationalError } from "../src/errors.js";
 import { toSafeError } from "../src/runtime.js";
+import { AcpRuntimeError } from "../src/runtime/public/errors.js";
 
 // All values in this suite are deliberately synthetic and nonfunctional.
 const canary = "SYNTHETIC_SECRET_CANARY_NOT_REAL";
@@ -125,6 +126,22 @@ test("provider detail and local output codes cannot override structured causes o
   const rootOutput = toSafeError({ ...nativeError("usageLimitExceeded"), outputCode: "TIMEOUT" });
   assert.equal(rootOutput.category, "quota");
   assert.equal(rootOutput.code, undefined);
+  for (const code of ["ABORTED", "TIMEOUT", "PERMISSION_DENIED", "RUNTIME"]) {
+    const rootCode = toSafeError({ code, data: { codexErrorInfo: "usageLimitExceeded" } });
+    assert.equal(rootCode.category, "quota");
+    assert.equal(rootCode.code, undefined);
+  }
+  assert.equal(toSafeError({ code: "ABORTED" }).category, "unknown");
+  assert.equal(toSafeError(new DOMException(canary, "AbortError")).code, "ABORTED");
+  const localRuntime = toSafeError(
+    new AcpRuntimeError("ACP_SESSION_INIT_FAILED", canary, {
+      cause: nativeError("usageLimitExceeded"),
+    }),
+  );
+  assert.equal(localRuntime.code, "ACP_SESSION_INIT_FAILED");
+  assert.equal(localRuntime.category, "quota");
+  assert.doesNotMatch(JSON.stringify(localRuntime), /SYNTHETIC_/);
+  assert.equal(toSafeError({ code: "ACP_SESSION_INIT_FAILED" }).code, undefined);
   assert.equal(
     toSafeError(
       new AcpxOperationalError(canary, {

@@ -21,6 +21,9 @@ export interface A2ARunResult {
   detail?: string;
   /** Bounded, safe failure context; execution state is independent of recovery policy. */
   error?: SafeError;
+  /** Known host endings select a fixed explanation without forwarding raw detail. */
+  failureReason?: 'missing-final-answer' | 'max-tokens' | 'forked' | 'unsupported-ending'
+    | 'discarded' | 'disposed' | 'aborted' | 'interrupted';
 }
 
 /** Implementations own session admission, execution and precise cancellation. */

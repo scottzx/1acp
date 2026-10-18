@@ -4,6 +4,7 @@ import {
   PermissionDeniedError,
   PermissionPromptUnavailableError,
 } from "../errors.js";
+import { AcpRuntimeError } from "../runtime/public/errors.js";
 import {
   EXIT_CODES,
   OUTPUT_ERROR_CODES,
@@ -475,7 +476,10 @@ function projectedRecord(
   return record;
 }
 
-function safeLocalCode(error: unknown): OutputErrorCode | undefined {
+function safeLocalCode(error: unknown): string | undefined {
+  if (error instanceof Error && error.name === "AbortError") {
+    return "ABORTED";
+  }
   if (error instanceof PermissionPromptUnavailableError) {
     return "PERMISSION_PROMPT_UNAVAILABLE";
   }
@@ -567,6 +571,9 @@ function localErrorRecord(
   error: unknown,
   projected: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
+  if (!projected && error instanceof AcpRuntimeError) {
+    return { code: error.code };
+  }
   return projected ?? (error instanceof AcpxOperationalError ? asRecord(error) : undefined);
 }
 
@@ -574,11 +581,10 @@ function safeCode(
   error: unknown,
   projected: Record<string, unknown> | undefined,
 ): string | undefined {
-  const record = asRecord(error);
-  const records = record ? [record] : [];
   const local = localErrorRecord(error, projected);
+  const records = local ? [local] : [];
   return (
-    safeStringField(local ? [local] : [], "outputCode", SAFE_CODES) ??
+    safeStringField(records, "outputCode", SAFE_CODES) ??
     safeStringField(records, "code", SAFE_CODES) ??
     safeLocalCode(error)
   );

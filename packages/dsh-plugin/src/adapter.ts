@@ -373,7 +373,7 @@ export class AcpAdapter implements LlmAdapter {
     let active: Awaited<ReturnType<typeof connect>> | undefined;
     let requestSent = false;
     const cancelled = (outcomeUnknown: boolean): StreamChunk => ({ type: 'finish', reason: { kind: 'aborted', failure: {
-      ...toSafeError({ code: 'ABORTED' }, { origin: 'dsh', operationId: requestId, outcomeUnknown }),
+      ...toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin: 'dsh', operationId: requestId, outcomeUnknown }),
       code: 'ABORTED',
     } } });
     const cancel = () => { if (binding?.sessionId) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };

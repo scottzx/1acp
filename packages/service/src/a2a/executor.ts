@@ -5,7 +5,18 @@ import { ContentTypeNotSupportedError, RequestMalformedError, UnsupportedOperati
 import { AgentEvent, type AgentExecutor, type ExecutionEventBus, type RequestContext, resolveUserScope } from '@a2a-js/sdk/server';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import type { FileA2AStore } from './store.js';
-import type { A2ABackend, A2APrepareInput, A2ATarget } from './types.js';
+import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from './types.js';
+
+const FAILURE_MESSAGES: Record<NonNullable<A2ARunResult['failureReason']>, string> = {
+  'missing-final-answer': 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output',
+  'max-tokens': 'DSH reached the model output token limit',
+  forked: 'DSH task turn was closed by a session fork',
+  'unsupported-ending': 'DSH returned an unsupported turn ending',
+  discarded: 'DSH discarded the queued task before execution',
+  disposed: 'DSH session was disposed before the task finished',
+  aborted: 'DSH task execution was canceled',
+  interrupted: 'DSH task execution was interrupted',
+};
 
 export interface A2AExecutionOptions {
   defaultCwd?: string;
@@ -59,6 +70,7 @@ export class A2ASessionExecutor implements AgentExecutor {
     let published = false;
     let target: A2ATarget | undefined;
     let returnedError: SafeError | undefined;
+    let returnedFailureMessage: string | undefined;
     // DSH deduplicates prompts by rpcId across the whole session. A Task can
     // have several input-required turns, each with its own message identity.
     const requestId = `a2a-${createHash('sha256').update(JSON.stringify([context.taskId, context.userMessage.messageId])).digest('hex')}`;
@@ -96,6 +108,8 @@ export class A2ASessionExecutor implements AgentExecutor {
       status(TaskState.TASK_STATE_WORKING);
       const result = await this.backend.run(target, prompt, { requestId, signal: controller.signal });
       returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a', trustedProjection: true }) : undefined;
+      returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
+        ? FAILURE_MESSAGES[result.failureReason] : undefined;
       controller.signal.throwIfAborted();
       if (result.text) bus.publish(AgentEvent.artifactUpdate({ taskId: context.taskId, contextId: context.contextId,
         artifact: { artifactId: `${context.taskId}-${randomUUID()}`, name: 'DSH response', description: '',
@@ -103,16 +117,16 @@ export class A2ASessionExecutor implements AgentExecutor {
         append: false, lastChunk: true, metadata: undefined }));
       if (result.outcome === 'input-required') this.awaitingInput.set(context.taskId, context.contextId);
       const error = returnedError ? toSafeError(returnedError, { operationId: returnedError.operationId ?? requestId }) : undefined;
-      status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, error?.message ?? result.detail, error);
+      status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? error?.message ?? result.detail, error);
     } catch (error) {
       if (!published) bus.publish(AgentEvent.task(Task.fromJSON({ id: context.taskId, contextId: context.contextId,
         status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() } })));
       const projected = controller.signal.aborted && returnedError ? returnedError : toSafeError(error, { origin: 'a2a' });
       const cancellationOnly = controller.signal.aborted && !returnedError && error === controller.signal.reason;
-      const safe = toSafeError(cancellationOnly ? { code: 'ABORTED' } : projected, {
+      const safe = toSafeError(cancellationOnly ? new DOMException('A2A task canceled', 'AbortError') : projected, {
         origin: 'a2a', operationId: projected.operationId ?? requestId, outcomeUnknown: projected.outcomeUnknown,
       });
-      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, safe.message, safe);
+      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? safe.message, safe);
     } finally {
       this.active.delete(context.taskId);
       finish();

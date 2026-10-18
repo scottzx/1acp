@@ -12,21 +12,21 @@ import { toSafeError } from '@1agents/acp-service/runtime';
 function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string): A2ARunResult {
   switch (reason.kind) {
     case 'completed': return finalAnswerExpected && !text.trim()
-      ? { outcome: 'failed', text, detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
+      ? { outcome: 'failed', text, failureReason: 'missing-final-answer', detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
       : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
     case 'error': {
       const error = toSafeError(reason.error, { origin: 'dsh', operationId });
       return { outcome: 'failed', text, detail: error.message, error };
     }
-    case 'max-tokens': return { outcome: 'failed', text, detail: 'DSH reached the model output token limit' };
-    case 'aborted': return { outcome: 'failed', text, detail: 'DSH task execution was canceled',
-      error: toSafeError({ code: 'ABORTED' }, { origin: 'dsh', operationId }) };
-    case 'interrupted': return { outcome: 'failed', text, detail: 'DSH task execution was interrupted',
+    case 'max-tokens': return { outcome: 'failed', text, failureReason: 'max-tokens', detail: 'DSH reached the model output token limit' };
+    case 'aborted': return { outcome: 'failed', text, failureReason: 'aborted', detail: 'DSH task execution was canceled',
+      error: toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin: 'dsh', operationId }) };
+    case 'interrupted': return { outcome: 'failed', text, failureReason: 'interrupted', detail: 'DSH task execution was interrupted',
       error: toSafeError(undefined, { origin: 'dsh', operationId, outcomeUnknown: true }) };
-    case 'forked': return { outcome: 'failed', text, detail: 'DSH task turn was closed by a session fork' };
+    case 'forked': return { outcome: 'failed', text, failureReason: 'forked', detail: 'DSH task turn was closed by a session fork' };
     // DSH's turn reasons are merge-extensible; an unknown ending cannot report success.
-    default: return { outcome: 'failed', text, detail: 'DSH returned an unsupported turn ending' };
+    default: return { outcome: 'failed', text, failureReason: 'unsupported-ending', detail: 'DSH returned an unsupported turn ending' };
   }
 }
 
@@ -141,11 +141,11 @@ export class DshA2ABackend implements A2ABackend {
     }));
     listeners.push(agent.ctx.on('agent/inbox/discarded', event => {
       if (event.agent === agent && owns(event.message)) {
-        settle({ outcome: 'failed', text, detail: 'DSH discarded the queued task before execution' });
+        settle({ outcome: 'failed', text, failureReason: 'discarded', detail: 'DSH discarded the queued task before execution' });
       }
     }));
     listeners.push(agent.ctx.on('agent/disposed', event => {
-      if (event.agent === agent) settle({ outcome: 'failed', text, detail: 'DSH session was disposed before the task finished' });
+      if (event.agent === agent) settle({ outcome: 'failed', text, failureReason: 'disposed', detail: 'DSH session was disposed before the task finished' });
     }));
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;

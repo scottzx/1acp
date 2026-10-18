@@ -195,6 +195,7 @@ for (const [label, content] of [
     f.finish(agent, 7, { kind: 'completed' });
     const value = await result;
     assert.equal(value.outcome, 'failed'); assert.equal(value.text, ''); assert.match(value.detail, /without a final answer/);
+    assert.equal(value.failureReason, 'missing-final-answer');
   });
 }
 
@@ -229,6 +230,11 @@ for (const reason of [{ kind: 'max-tokens' }, { kind: 'aborted', reason: { kind:
     f.finish(agent, 9, reason);
     const value = await result;
     assert.equal(value.outcome, 'failed'); assert.equal(value.text, 'Partial final output');
+    if (reason.kind === 'aborted') {
+      assert.equal(value.failureReason, 'aborted');
+      assert.equal(value.error.category, 'cancelled');
+      assert.equal(value.error.code, 'ABORTED');
+    } else assert.equal(value.failureReason, 'max-tokens');
   });
 }
 
@@ -237,6 +243,8 @@ for (const [reason, outcome, detail] of [
   [{ kind: 'error', error: { message: 'Provider failed', code: 'UNKNOWN' } }, 'failed', /failed/i],
   [{ kind: 'max-tokens' }, 'failed', /token limit/],
   [{ kind: 'interrupted' }, 'failed', /interrupted/],
+  [{ kind: 'forked' }, 'failed', /fork/],
+  [{ kind: 'synthetic-unsupported' }, 'failed', /unsupported/],
 ]) {
   test(`run reports DSH ${reason.kind} from its exact turn`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
@@ -246,6 +254,9 @@ for (const [reason, outcome, detail] of [
     f.claim(agent, 'task', 5); f.finish(agent, 5, reason);
     const value = await result;
     assert.equal(value.outcome, outcome); assert.match(value.detail, detail);
+    if (reason.kind === 'max-tokens' || reason.kind === 'interrupted' || reason.kind === 'forked') assert.equal(value.failureReason, reason.kind);
+    if (reason.kind === 'synthetic-unsupported') assert.equal(value.failureReason, 'unsupported-ending');
+    if (reason.kind === 'interrupted') assert.equal(value.error.outcomeUnknown, true);
     assert.equal(f.listenerCount, 0);
   });
 }
@@ -318,13 +329,35 @@ test('DSH A2A rejects safe-shaped host category and operation secret spoofing', 
   assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
 });
 
+for (const [label, error, category] of [
+  ['root aborted hint with quota', { code: 'ABORTED', data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota'],
+  ['root aborted hint alone', { code: 'ABORTED' }, 'unknown'],
+]) {
+  test(`DSH A2A ${label} cannot impersonate a local cancellation`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'local-request', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'local-request', 8);
+    f.finish(agent, 8, { kind: 'error', error: { ...error, message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL' } });
+    const value = await result;
+    assert.equal(value.outcome, 'failed');
+    assert.equal(value.error.category, category);
+    assert.equal(value.error.code, undefined);
+    assert.equal(value.failureReason, undefined);
+    assert.equal(value.error.operationId, 'local-request');
+    assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
+  });
+}
+
 test('canceling queued A2A work removes only its inbox item and leaves the active UI turn running', async t => {
   const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
   const agent = f.agents.get(target.sessionId), abort = new AbortController();
   f.insert(agent, 'ui-pending'); agent.activeTurn = 10;
   const result = f.backend.run(target, 'task', { requestId: 'task', signal: abort.signal });
   await f.admitted.promise; abort.abort();
-  assert.equal((await result).outcome, 'failed');
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.failureReason, 'discarded');
   assert.equal(f.pending.has('task-message'), false);
   assert.equal(f.pending.has('ui-pending-message'), true);
   assert.equal(agent.activeTurn, 10); assert.equal(f.cancels.length, 0);
@@ -397,7 +430,9 @@ test('prompt rejection, Agent disposal, and pre-admission cancellation release e
   const result = f.backend.run(target, 'task', { requestId: 'disposed', signal: new AbortController().signal });
   await new Promise(resolve => setImmediate(resolve));
   f.ctx.emit('agent/disposed', { agent: f.agents.get(target.sessionId) });
-  assert.match((await result).detail, /disposed/);
+  const disposed = await result;
+  assert.match(disposed.detail, /disposed/);
+  assert.equal(disposed.failureReason, 'disposed');
   assert.equal(f.listenerCount, 0);
   const abort = new AbortController(); abort.abort();
   await assert.rejects(f.backend.run(target, 'task', { requestId: 'canceled', signal: abort.signal }), { name: 'AbortError' });

@@ -299,6 +299,32 @@ test('A05 A2A errors retain safe categories and uncertain delivery without leaki
   assert.equal(f.backend.runs.length, 4, 'Failed executions must not be retried automatically');
 });
 
+test('known host failure reasons remain queryable while raw failure detail stays private', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const secret = 'SYNTHETIC_HOST_DETAIL_CANARY_NOT_REAL';
+  const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_HOST_AUTH_CANARY_NOT_REAL';
+  for (const [reason, explanation] of [['max-tokens', /model output token limit/], ['forked', /closed by a session fork/], ['missing-final-answer', /without a final answer/]] as const) {
+    const task = await submit(f.client, message(`synthetic host ending ${reason}`));
+    f.backend.runs.at(-1)!.result.resolve({ outcome: 'failed', text: '', failureReason: reason, detail: `${secret} ${authLink}` });
+    const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+    assert.match(String(failed.status?.message?.parts[0].content?.value), explanation);
+    assert.equal((failed.metadata?.['1agents'] as { error: SafeError }).error.category, 'unknown');
+    assert.ok(!JSON.stringify(failed).includes(secret));
+    assert.ok(!JSON.stringify(failed).includes(authLink));
+  }
+  // A malformed backend's arbitrary reason strings never become explanations.
+  for (const reason of [undefined, 'synthetic-unrecognized-reason', 'toString']) {
+    const task = await submit(f.client, message('synthetic unknown host ending'));
+    f.backend.runs.at(-1)!.result.resolve({ outcome: 'failed', text: '',
+      failureReason: reason as A2ARunResult['failureReason'], detail: `${secret} ${authLink}` });
+    const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+    assert.equal(failed.status?.message?.parts[0].content?.value, 'ACP execution failed.');
+    assert.ok(!JSON.stringify(failed).includes(secret));
+    assert.ok(!JSON.stringify(failed).includes(authLink));
+    assert.ok(!JSON.stringify(failed).includes('synthetic-unrecognized-reason'));
+  }
+});
+
 test('A2A cancellation preserves a backend uncertainty flag while remaining canceled', { timeout: 10000 }, async t => {
   const backend = new DeferredBackend();
   const started = deferred<void>();
