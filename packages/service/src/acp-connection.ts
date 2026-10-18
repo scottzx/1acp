@@ -19,6 +19,15 @@ const EXT = '_1agents/';
 
 /** Error envelopes have a closed projection; provider data never becomes metadata. */
 function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): RecordValue {
+  if (['tool_call', 'tool_call_update', 'tool_result'].includes(event.event)) {
+    if (event.error === undefined && event.errorCode === undefined && event.errorText === undefined) return event;
+    const error = toSafeError(event.error ?? { code: event.errorCode, message: event.errorText }, { origin: 'service' });
+    return { ...event,
+      ...(event.error !== undefined ? { error } : {}),
+      ...(event.errorCode !== undefined ? { errorCode: error.providerCode ?? error.code } : {}),
+      ...(event.errorText !== undefined ? { errorText: error.message } : {}),
+    };
+  }
   const failedTurn = event.status === 'failed' && ['turn_state', 'turn_terminal', 'turn_complete', 'done'].includes(event.event);
   if (!event.error && !failedTurn && event.event !== 'error' && event.event !== 'protocol_error' && event.type !== 'error') return event;
   const safe = toSafeError(event.error ?? { ...event, code: event.code ?? event.errorCode }, {

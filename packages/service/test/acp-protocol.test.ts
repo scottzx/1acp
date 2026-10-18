@@ -153,6 +153,52 @@ test('safe turn errors preserve the separate failed tool result contract', async
   assert.deepEqual(update.rawOutput, { exitCode: 1 });
 });
 
+test('failed tools with error objects keep their observation fields and sanitize only the error', async t => {
+  const f = await fixture(t), a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  const secret = 'SYNTHETIC_TOOL_ERROR_CANARY_NOT_REAL';
+  const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_TOOL_AUTH_CANARY_NOT_REAL';
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    const error = { code: -32603, message: 'Internal error', data: { message: secret, additionalDetails: authLink },
+      category: 'quota', origin: 'dsh', retryable: true, outcomeUnknown: true, operationId: 'synthetic-tool-spoof' };
+    peer.send(JSON.stringify({ event: 'tool_call', sessionId, toolCallId: 'synthetic-failed-tool', status: 'failed',
+      title: 'Synthetic failed operation', rawOutput: { exitCode: 1 }, code: 'synthetic_tool_exit',
+      errorCode: 'synthetic_untrusted_provider_code', errorText: `${secret} ${authLink}`, error }));
+    peer.send(JSON.stringify({ event: 'tool_result', sessionId, toolCallId: 'synthetic-failed-tool', isError: true,
+      rawOutput: { stderr: 'Synthetic tool output' }, code: 'synthetic_tool_result',
+      errorCode: 'synthetic_untrusted_provider_code', errorText: `${secret} ${authLink}`, error }));
+    peer.send(JSON.stringify({ event: 'done', sessionId, stopReason: 'end_turn' }));
+  };
+  const result = await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'synthetic tool failure with error object' }] });
+  assert.equal(result.stopReason, 'end_turn');
+  const tools = a.updates.map(item => item.update).filter(update => update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update');
+  assert.equal(tools.length, 2);
+  assert.equal(tools[0].toolCallId, 'synthetic-failed-tool');
+  assert.equal(tools[0].title, 'Synthetic failed operation');
+  assert.equal(tools[0].status, 'failed');
+  assert.deepEqual(tools[0].rawOutput, { exitCode: 1 });
+  assert.equal(tools[1].toolCallId, 'synthetic-failed-tool');
+  assert.equal(tools[1].status, 'failed');
+  assert.deepEqual(tools[1].rawOutput, { stderr: 'Synthetic tool output' });
+  assert.deepEqual(tools.map(tool => (tool._meta?.['1agents'] as { code: string }).code), ['synthetic_tool_exit', 'synthetic_tool_result']);
+  for (const tool of tools) {
+    const metadata = tool._meta?.['1agents'] as { error: { category: string; data?: unknown; retryable: boolean; outcomeUnknown: boolean; operationId?: string }; errorCode?: string; errorText: string };
+    const error = metadata.error;
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.data, undefined);
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.operationId, undefined);
+    assert.equal(metadata.errorCode, undefined);
+    assert.equal(metadata.errorText.includes(secret), false);
+  }
+  assert.ok(!JSON.stringify(a.updates).includes(secret));
+  assert.ok(!JSON.stringify(a.updates).includes(authLink));
+  assert.ok(!JSON.stringify(a.updates).includes('synthetic-tool-spoof'));
+});
+
 test('an untrusted runtime backend cannot self-assert safe error policy fields', async t => {
   const f = await fixture(t), a = await f.connect(undefined, 'codex', async () => ({}));
   const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
