@@ -8,10 +8,12 @@ import { pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
 import SessionStore from '@deepseek-ai/dsh-session';
 import { DshA2ABackend } from '../dist/a2a-executor.js';
+import { diagnosticsFixture, identity } from './helpers/diagnostics.mjs';
 import { toSafeError } from '@1agents/acp-service/runtime';
 
 async function fixture(t) {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), 'dsh-a2a-executor-')));
+  const { diagnostics } = await diagnosticsFixture(t, join(cwd, 'diagnostics'));
   const ctx = new Context();
   await ctx.plugin(SessionStore);
   const agents = new Map(), pending = new Map(), cancels = [], prompts = [];
@@ -33,7 +35,7 @@ async function fixture(t) {
   };
   const makeAgent = session => {
     const agent = {
-      id: session.id, session, activeTurn: undefined, ctx: { on: observe },
+      id: session.id, session, whenIdle: async () => {}, activeTurn: undefined, ctx: { on: observe },
       inbox: { remove: id => {
         const entry = pending.get(id);
         if (!entry) return false;
@@ -81,9 +83,13 @@ async function fixture(t) {
     },
   };
   const host = { sessionController: controller };
-  const backend = new DshA2ABackend(host);
+  const backend = new DshA2ABackend(host, diagnostics);
   t.after(async () => { await ctx.fiber.dispose(); await rm(cwd, { recursive: true, force: true }); });
   return {
+    record: async (agent, requestId, turn, error) => {
+      const id = await diagnostics.begin(identity({ sessionId: agent.id, turn, requestIds: [requestId] }));
+      await diagnostics.submitted(id); await diagnostics.settle(id, error);
+    },
     cwd, backend, ctx, agents, pending, cancels, prompts, controller, admitted,
     get listenerCount() { return activeListeners; },
     get createCount() { return createCount; }, get resolveCount() { return resolveCount; },
@@ -241,11 +247,12 @@ for (const reason of [{ kind: 'max-tokens' }, { kind: 'aborted', reason: { kind:
 for (const [category, providerCode, outcomeUnknown] of [
   ['quota', 'usageLimitExceeded', false], ['auth', 'unauthorized', false], ['unknown', undefined, true],
 ]) {
-  test(`aborted host turn retains its formal current ${category} failure with local identity`, async t => {
+  test(`aborted official turn joins its owned plugin ${category} failure with local identity`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
     const agent = f.agents.get(target.sessionId);
     const result = f.backend.run(target, 'task', { requestId: 'local-aborted-task', signal: new AbortController().signal });
     await f.admitted.promise; f.claim(agent, 'local-aborted-task', 12);
+    await f.record(agent, 'local-aborted-task', 12, toSafeError({ category, providerCode, retryable: false, outcomeUnknown, origin: 'acp' }, { trustedProjection: true }));
     f.finish(agent, 12, { kind: 'aborted', reason: { kind: 'user' }, failure: {
       code: 'ABORTED', message: 'SYNTHETIC_HOST_SECRET_NOT_REAL',
       publicError: { category, providerCode, retryable: false, outcomeUnknown, origin: 'acp', operationId: 'SYNTHETIC_HOST_OPERATION_NOT_REAL' },
@@ -310,12 +317,13 @@ for (const [label, raw, category, hostCode = 'ACP_TURN_FAILED'] of [
   ['auth with cancellation-like host code', { data: { codexErrorInfo: 'unauthorized' } }, 'auth', 'ABORTED'],
   ['quota with conflicting provider-like host code', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota', 'unauthorized'],
 ]) {
-  test(`DSH A2A ${label} failure retains canonical host fields and local request identity`, async t => {
+  test(`DSH A2A ${label} failure retains owned diagnostic fields and local request identity`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
     const agent = f.agents.get(target.sessionId);
     const result = f.backend.run(target, 'task', { requestId: 'synthetic-task', signal: new AbortController().signal });
     await f.admitted.promise; f.claim(agent, 'synthetic-task', 5);
     const safe = toSafeError(raw, { origin: 'acp', operationId: 'synthetic-operation', outcomeUnknown: true });
+    await f.record(agent, 'synthetic-task', 5, safe);
     f.finish(agent, 5, { kind: 'error', error: { code: hostCode, publicError: safe,
       message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL',
       data: { token: 'SYNTHETIC_TOKEN_NOT_REAL', authUrl: 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL' },
@@ -536,13 +544,13 @@ for (const claimed of [false, true]) {
   });
 }
 
-test('real DSH loop retains canonical safe failure fields through an exact A2A turn', {
+test('official DSH loop preserves lifecycle and cannot authenticate provider-shaped fields without plugin diagnostics', {
   skip: process.env.DSH_SOURCE ? false : 'Set DSH_SOURCE to a built matching DSH checkout for the real loop smoke test',
   timeout: 10000,
 }, async t => {
   const requireHost = createRequire(join(process.env.DSH_SOURCE, 'packages/core/agent-loop/package.json'));
   const load = name => import(pathToFileURL(requireHost.resolve(name)).href);
-  const [{ default: LlmRuntime, LlmAdapter, LlmError, LlmOperationId, createUserMessage }, { default: SessionProjections },
+  const [{ default: LlmRuntime, LlmAdapter, LlmError, createUserMessage }, { default: SessionProjections },
     { default: SystemPrompt }, { default: Tools }, { default: Agents }, { default: AgentLoop }] = await Promise.all([
     load('@deepseek-ai/dsh-llm'), load('@deepseek-ai/dsh-session-projection'), load('@deepseek-ai/dsh-system-prompt'),
     load('@deepseek-ai/dsh-tools'), load('@deepseek-ai/dsh-agent'), load('@deepseek-ai/dsh-agent-loop'),
@@ -565,7 +573,7 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
         throw new LlmError(safe.message, 'HOST_EXECUTION_ERROR', { publicError: {
           category: safe.category, providerCode: safe.providerCode, retryable: true,
           outcomeUnknown: safe.outcomeUnknown, origin: safe.origin,
-          operationId: LlmOperationId(safe.operationId),
+          operationId: safe.operationId,
         } });
       }
       if (text === 'host-code-without-public-error') {
@@ -588,7 +596,7 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
           });
           throw new LlmError('ACP execution quota exhausted.', 'ACP_TURN_FAILED', { publicError: {
             category: 'quota', providerCode: 'usageLimitExceeded', retryable: false,
-            outcomeUnknown: false, origin: 'acp', operationId: LlmOperationId('synthetic-provider-race'),
+            outcomeUnknown: false, origin: 'acp', operationId: 'synthetic-provider-race',
           } });
         }
         await new Promise((resolve, reject) => {
@@ -665,16 +673,11 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
   t.diagnostic(JSON.stringify({ sentCode: 'HOST_EXECUTION_ERROR', hostCode: hostReason.error.code,
     hostErrorFields: Object.keys(hostReason.error).sort(),
     retainedSafeFields: optionalFields.filter(key => Object.hasOwn(hostReason.error.publicError ?? {}, key)) }));
-  assert.deepEqual(hostReason.error.publicError, {
-    category: 'quota', providerCode: 'usageLimitExceeded', retryable: true, outcomeUnknown: true,
-    origin: 'acp', operationId: 'synthetic-provider-operation',
-  });
+  assert.equal(hostReason.error.publicError, undefined);
   assert.equal(hostReason.error.code, 'HOST_EXECUTION_ERROR');
-  assert.equal(failed.error.category, 'quota');
-  assert.equal(failed.error.providerCode, 'usageLimitExceeded');
-  assert.equal(failed.error.retryable, true);
-  assert.equal(failed.error.outcomeUnknown, true);
-  assert.equal(failed.error.origin, 'acp');
+  assert.equal(failed.error.category, 'unknown');
+  assert.equal(failed.error.providerCode, undefined);
+  assert.equal(failed.error.outcomeUnknown, false);
   assert.equal(failed.error.operationId, 'real-safe-failure');
   assert.equal(requests.length, 4);
 
@@ -719,12 +722,9 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
   t.diagnostic(JSON.stringify({ contract: 'host abort retains canonical current failure without admitting the chunk',
     turn: raceEnd.data.turn, attemptSeq: attempts[0].seq, admittedChunks: attempts[0].data.stream.length,
     turnEnd: raceEnd.data.reason.kind, resultError: raceResult.error }));
-  assert.deepEqual(raceEnd.data.reason.failure.publicError, {
-    category: 'quota', providerCode: 'usageLimitExceeded', retryable: false,
-    outcomeUnknown: false, origin: 'acp', operationId: 'synthetic-provider-race',
-  });
-  assert.equal(raceResult.error.category, 'quota');
-  assert.equal(raceResult.error.outcomeUnknown, false);
+  assert.equal(raceEnd.data.reason.failure, undefined);
+  assert.equal(raceResult.error.category, 'cancelled');
+  assert.equal(raceResult.error.outcomeUnknown, true);
   assert.equal(raceResult.error.operationId, 'real-quota-abort-race');
   assert.ok(!JSON.stringify(raceResult).includes('SYNTHETIC_CANCEL_SECRET'));
   assert.equal(requests.length, 7);

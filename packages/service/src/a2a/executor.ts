@@ -1,8 +1,9 @@
 /** Official A2A executor with durable DSH context bindings and independent turns. */
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { Role, Task, TaskState, Message, type SendMessageRequest } from '@a2a-js/sdk';
 import { ContentTypeNotSupportedError, RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import { AgentEvent, type AgentExecutor, type ExecutionEventBus, type RequestContext, resolveUserScope } from '@a2a-js/sdk/server';
+import { a2aRequestId } from './request-id.js';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import type { FileA2AStore } from './store.js';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from './types.js';
@@ -73,7 +74,7 @@ export class A2ASessionExecutor implements AgentExecutor {
     let returnedFailureMessage: string | undefined;
     // DSH deduplicates prompts by rpcId across the whole session. A Task can
     // have several input-required turns, each with its own message identity.
-    const requestId = `a2a-${createHash('sha256').update(JSON.stringify([context.taskId, context.userMessage.messageId])).digest('hex')}`;
+    const requestId = a2aRequestId(context.taskId, context.userMessage.messageId);
     const status = (state: TaskState, text?: string, error?: SafeError): void => {
       bus.publish(AgentEvent.statusUpdate({ taskId: context.taskId, contextId: context.contextId,
         status: { state, timestamp: new Date().toISOString(), message: text ? Message.fromJSON({

@@ -11,6 +11,11 @@ import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
 import { toSafeError } from '@1agents/acp-service/runtime';
 
+function safeFields(error) {
+  return Object.fromEntries(['category', 'providerCode', 'retryable', 'outcomeUnknown', 'origin', 'operationId']
+    .filter(key => error[key] !== undefined).map(key => [key, error[key]]));
+}
+
 async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = [], streamConfig = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-test-'));
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
@@ -166,7 +171,7 @@ for (const [label, error, category, providerCode] of [
     assert.match(failure.operationId, /^dsh-[a-f0-9]{64}$/);
     assert.equal(failure.data, undefined);
     assert.equal(failure.cause, undefined);
-    assert.deepEqual(failure.failure.publicError, {
+    assert.deepEqual(safeFields(failure), {
       category, retryable: failure.retryable, outcomeUnknown: false, origin: failure.origin,
       operationId: failure.operationId, ...(providerCode ? { providerCode } : {}),
     });
@@ -206,9 +211,9 @@ test('the owned service direct RequestError data preserves canonical safe fields
     assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
     assert.notEqual(error.operationId, 'synthetic-service-operation');
     assert.equal(error.data, undefined);
-    assert.equal(error.failure.publicError.retryable, true);
-    assert.equal(error.failure.publicError.outcomeUnknown, true);
-    assert.equal(error.failure.publicError.operationId, error.operationId);
+    assert.equal(error.retryable, true);
+    assert.equal(error.outcomeUnknown, true);
+    assert.equal(error.operationId, error.operationId);
     return true;
   });
   assert.equal(f.counts().executions, 1);
@@ -233,10 +238,10 @@ for (const [category, outcomeUnknown] of [['quota', false], ['auth', false], ['u
       assert.ok(error instanceof LlmError);
       assert.equal(closing, true);
       assert.notEqual(link.ws.readyState, 1);
-      assert.equal(error.failure.publicError.category, category);
-      assert.equal(error.failure.publicError.origin, 'acp');
-      assert.equal(error.failure.publicError.outcomeUnknown, outcomeUnknown);
-      assert.match(error.failure.publicError.operationId, /^dsh-[a-f0-9]{64}$/);
+      assert.equal(error.category, category);
+      assert.equal(error.origin, 'acp');
+      assert.equal(error.outcomeUnknown, outcomeUnknown);
+      assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
       for (const canary of [secretCanary, authCanary, 'synthetic-service-operation']) {
         assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
       }
@@ -260,11 +265,11 @@ for (const [label, raw, origin, outcomeUnknown] of [
     });
     await assert.rejects(collect(f.adapter, { ...f.options(`racing-${label}`), signal: controller.signal }), error => {
       assert.ok(error instanceof LlmError);
-      assert.equal(error.failure.publicError.category, safe.category);
-      assert.equal(error.failure.publicError.providerCode, safe.providerCode);
-      assert.equal(error.failure.publicError.origin, origin);
-      assert.equal(error.failure.publicError.outcomeUnknown, outcomeUnknown);
-      assert.match(error.failure.publicError.operationId, /^dsh-[a-f0-9]{64}$/);
+      assert.equal(error.category, safe.category);
+      assert.equal(error.providerCode, safe.providerCode);
+      assert.equal(error.origin, origin);
+      assert.equal(error.outcomeUnknown, outcomeUnknown);
+      assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
       for (const canary of [secretCanary, authCanary, 'SYNTHETIC_CANCEL_SECRET_NOT_REAL', 'synthetic-service-operation']) {
         assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
       }
@@ -413,13 +418,13 @@ test('a terminal-only answer is displayed once and recorded before finish', { ti
   assert.equal(chunks.at(-1).reason.kind, 'stop');
 });
 
-test('confirmed remote cancellation rejects through the genuine typed host error path', { timeout: 5000 }, async t => {
+test('confirmed remote cancellation rejects through the official host error with owned plugin fields path', { timeout: 5000 }, async t => {
   const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', 'cancelled') });
   const chunks = [];
   await assert.rejects(async () => { for await (const chunk of f.adapter.stream(f.options('remote-cancelled'))) chunks.push(chunk); }, error => {
     assert.ok(error instanceof LlmError);
     assert.equal(error.code, 'ABORTED');
-    assert.deepEqual(error.failure.publicError, {
+    assert.deepEqual(safeFields(error), {
       category: 'cancelled', retryable: false, outcomeUnknown: false, origin: 'acp', operationId: error.operationId,
     });
     assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
@@ -453,7 +458,7 @@ for (const [stopReason, origin] of [['cancelled', 'acp'], ['end_turn', 'dsh'], [
     }, error => {
       assert.equal(confirmed, true);
       assert.ok(error instanceof LlmError);
-      assert.deepEqual(error.failure.publicError, {
+      assert.deepEqual(safeFields(error), {
         category: 'cancelled', retryable: false, outcomeUnknown: false, origin, operationId: error.operationId,
       });
       assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
@@ -473,9 +478,9 @@ test('a pre-delivery local abort has no uncertain native outcome or leaked reaso
   controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
   await assert.rejects(collect(f.adapter, { ...f.options('before-delivery'), signal: controller.signal }), error => {
     assert.ok(error instanceof LlmError);
-    assert.equal(error.failure.publicError.category, 'cancelled');
-    assert.equal(error.failure.publicError.outcomeUnknown, false);
-    assert.equal(error.failure.publicError.origin, 'dsh');
+    assert.equal(error.category, 'cancelled');
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.origin, 'dsh');
     assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
     return true;
   });
@@ -490,9 +495,9 @@ test('a peer cancellation rejection after local abort stays typed and conservati
   });
   await assert.rejects(collect(f.adapter, { ...f.options('peer-cancel'), signal: controller.signal }), error => {
     assert.ok(error instanceof LlmError);
-    assert.equal(error.failure.publicError.category, 'cancelled');
-    assert.equal(error.failure.publicError.outcomeUnknown, true);
-    assert.equal(error.failure.publicError.origin, 'dsh');
+    assert.equal(error.category, 'cancelled');
+    assert.equal(error.outcomeUnknown, true);
+    assert.equal(error.origin, 'dsh');
     for (const canary of [secretCanary, authCanary, 'SYNTHETIC_CANCEL_SECRET_NOT_REAL']) {
       assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
     }
@@ -574,10 +579,10 @@ test('stopping while permission is pending retains the confirmed terminal reply'
   await assert.rejects(output, error => {
     assert.ok(error instanceof LlmError);
     assert.equal(error.code, 'ABORTED');
-    assert.equal(error.failure.publicError.category, 'cancelled');
+    assert.equal(error.category, 'cancelled');
     assert.equal(receivedEndTurn, true);
-    assert.equal(error.failure.publicError.outcomeUnknown, false);
-    assert.equal(error.failure.publicError.origin, 'dsh');
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.origin, 'dsh');
     assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
     assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
     return true;

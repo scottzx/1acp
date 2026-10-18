@@ -7,9 +7,6 @@ import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import * as api from '@1agents/acp-service';
-import * as plugin from '@1agents/acp-service/dsh';
-import * as preset from '@1agents/acp-service/dsh/preset';
-import { NativeSessions } from '@1agents/acp-service/dsh/imports';
 
 const dsh = resolve(process.argv[2]);
 const require = createRequire(import.meta.url);
@@ -18,13 +15,9 @@ const loadHost = name => import(pathToFileURL(hostRequire.resolve(name)).href);
 const [{ Context }, { default: Loader }, { ClientModuleRegistry }] = await Promise.all([
   loadHost('@deepseek-ai/cordis'), loadHost('@deepseek-ai/cordis-plugin-loader'), loadHost('@deepseek-ai/dsh-client-modules'),
 ]);
-const { loadProfileDirectory } = await import(pathToFileURL(join(dsh, 'packages/boot/app-boot/lib/index.js')).href);
+const { loadProfileDirectory, createRuntimeResolution, PluginPackages } = await import(pathToFileURL(join(dsh, 'packages/boot/app-boot/lib/index.js')).href);
 assert.equal(typeof api.serveAcpService, 'function');
 assert.equal(typeof api.apply, 'function');
-assert.equal(typeof preset.apply, 'function');
-assert.equal(typeof NativeSessions, 'function');
-assert.equal(api.name, plugin.name);
-assert.deepEqual(api.inject, plugin.inject);
 assert.equal(api.default, undefined, 'Cordis must see the namespace and its inject metadata');
 assert.throws(() => require.resolve('@1agents/dsh-acp'), 'No separately installed plugin');
 assert.throws(() => require.resolve('@deepseek-ai/cordis'), 'DSH must not be an installed package dependency');
@@ -52,6 +45,18 @@ const presets = new Map();
 const routes = new Map();
 class MemoryLoader extends Loader { write() {} }
 try {
+  // Use the official profile package resolver before loading Host imports.
+  await ctx.plugin(PluginPackages, { resolution: await createRuntimeResolution({
+    installAnchor: join(dsh, 'package.json'), profile, home: join(process.cwd(), 'dsh-home'),
+  }) });
+  const [plugin, preset, { NativeSessions }] = await Promise.all([
+    import('@1agents/acp-service/dsh'), import('@1agents/acp-service/dsh/preset'),
+    import('@1agents/acp-service/dsh/imports'),
+  ]);
+  assert.equal(typeof preset.apply, 'function');
+  assert.equal(typeof NativeSessions, 'function');
+  assert.equal(api.name, plugin.name);
+  assert.deepEqual(api.inject, plugin.inject);
   for (const name of api.inject) ctx.provide(name, {});
   ctx.set('llm', { registerAdapter: () => () => {} });
   ctx.set('webServer', { register: route => { routes.set(route.path, route); return () => routes.delete(route.path); } });
@@ -60,7 +65,7 @@ try {
     return () => presets.delete(definition.id);
   } });
   await ctx.plugin(MemoryLoader, { baseUrl: pathToFileURL(process.cwd()).href + '/' });
-  const id = await ctx.loader.create({ name: row.name, config: { ...row.config, serviceUrl, agents: ['codex'],
+  const id = await ctx.loader.create({ name: row.name, config: { ...row.config, serviceUrl, agents: ['codex'], stateDirectory: join(process.cwd(), 'plugin-state'),
     a2a: { token: 'package-smoke-token', publicUrl: 'http://127.0.0.1:3080', stateDirectory: join(process.cwd(), 'a2a-state') } } });
   const fiber = ctx.loader.resolve(id).fiber;
   assert.ok(fiber);

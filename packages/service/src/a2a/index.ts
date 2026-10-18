@@ -7,3 +7,4 @@ export { RemoteAgentGateway, serveA2AGateway, REMOTE_AGENT_METHODS } from './gat
 export type { A2AGatewayConfig, RemoteAgentNotice } from './gateway.js';
 export { A2AAutomation } from './automation.js';
 export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';
+export { DirectoryLease } from './lease.js';

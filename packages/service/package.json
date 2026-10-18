@@ -97,7 +97,8 @@
     "skillflag": "^0.2.1",
     "tsx": "^4.23.15",
     "ws": "^8.18.0",
-    "zod": "^4.6.5"
+    "zod": "^4.6.5",
+    "dsh-zod": "npm:zod@4.4.3"
   },
   "devDependencies": {
     "@scottzx/1acp": "workspace:*",

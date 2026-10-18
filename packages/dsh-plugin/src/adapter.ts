@@ -5,8 +5,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { LlmAdapter, GenerateOptions, StreamChunk, LlmModelInfo, ContentBlock, MessageId } from '@deepseek-ai/dsh-llm';
-import { LlmError, type LlmPublicError } from '@deepseek-ai/dsh-llm';
-import * as DshLlm from '@deepseek-ai/dsh-llm';
+import { LlmError } from '@deepseek-ai/dsh-llm';
+import type { Diagnostics } from './diagnostics.js';
 import type {} from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-user-questions';
 import type {} from '@deepseek-ai/dsh-commands';
@@ -52,15 +52,12 @@ function isCancellationRejection(error: unknown, signal: AbortSignal): boolean {
   return error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason;
 }
 
-/** Use the host's declared constructor path, with a locally owned identity. */
-function publicFailure(safe: ReturnType<typeof toSafeError>, requestId: string): LlmError {
-  const publicError: LlmPublicError | undefined = typeof DshLlm.LlmOperationId === 'function'
-    && typeof DshLlm.isLlmPublicErrorProviderCode === 'function' ? {
-    category: safe.category, retryable: safe.retryable, outcomeUnknown: safe.outcomeUnknown,
-    origin: safe.origin, operationId: DshLlm.LlmOperationId(requestId),
-    ...(DshLlm.isLlmPublicErrorProviderCode(safe.providerCode) ? { providerCode: safe.providerCode } : {}),
-  } : undefined;
-  return Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED', { publicError }), safe);
+const ownedFailures = new WeakMap<Error, ReturnType<typeof toSafeError>>();
+
+/** The official host receives its normal error; complete facts live in the plugin domain. */
+function publicFailure(safe: ReturnType<typeof toSafeError>, _requestId: string): LlmError {
+  const error = Object.assign(new LlmError(safe.message, safe.code ?? 'ACP_TURN_FAILED'), safe);
+  ownedFailures.set(error, safe); return error;
 }
 
 /** Producer/consumer queue; errors are delivered after already received chunks. */
@@ -91,7 +88,7 @@ export class AcpAdapter implements LlmAdapter {
   private commandDisposers = new Map<string, (() => void)[]>();
   private output = new Map<string, (update: SessionUpdate) => void>();
   private lifetime = new AbortController();
-  constructor(private ctx: Context, private config: Config) { this.state = new State(config.stateDirectory); }
+  constructor(private ctx: Context, private config: Config, private readonly diagnostics?: Diagnostics) { this.state = new State(config.stateDirectory); }
   providerInfo(provider: string) { return { id: provider, name: 'ACP Agents' }; }
   providerRetryPolicy() { return { mode: 'normal' as const, maxRetries: 0, retryableCodes: [], initialDelayMs: 1000, maxDelayMs: 1000, jitterRatio: 0 }; }
   imageRequestPricing() { return undefined; }
@@ -239,14 +236,20 @@ export class AcpAdapter implements LlmAdapter {
       if (!this.commandContexts.has(agent.id)) {
         const fiber = await agent.ctx.inject(['commands'], scope => {
           this.commandContexts.set(agent.id, scope);
-          scope.effect(() => () => {
-            this.controllers.get(agent.id)?.abort();
-            void this.links.get(agent.id)?.then(link => link.close(), () => {});
-            this.links.delete(agent.id);
-            this.commandContexts.delete(agent.id);
-            this.commandScopes.delete(agent.id);
-            this.capabilities.delete(agent.id);
-            this.commandDisposers.delete(agent.id);
+          scope.effect(() => async () => {
+            const link = this.links.get(agent.id), active = this.controllers.get(agent.id);
+            active?.abort();
+            // Keep the response transport alive while the official loop drains
+            // cancellation and the plugin commits its diagnostic receipt.
+            if (active) try { await agent.whenIdle(); } catch { /* The loop also reports a failed disposal. */ }
+            try { (await link)?.close(); } catch { /* Connection setup already failed. */ }
+            if (this.links.get(agent.id) === link) this.links.delete(agent.id);
+            if (this.commandContexts.get(agent.id) === scope) {
+              this.commandContexts.delete(agent.id);
+              this.commandScopes.delete(agent.id);
+              this.capabilities.delete(agent.id);
+              this.commandDisposers.delete(agent.id);
+            }
           });
         });
         this.commandScopes.set(agent.id, async () => fiber.dispose());
@@ -395,12 +398,25 @@ export class AcpAdapter implements LlmAdapter {
       }
     };
     let active: Awaited<ReturnType<typeof connect>> | undefined;
-    let requestSent = false;
+    let requestSent = false, nativeConfirmed = false;
+    const save = async (action: () => Promise<unknown>) => {
+      try { await action(); } catch {
+        throw publicFailure(toSafeError(undefined, { origin: 'dsh', operationId: requestId,
+          outcomeUnknown: requestSent && !nativeConfirmed }), requestId);
+      }
+    };
+    let diagnosticId: string | undefined;
     const cancelled = (outcomeUnknown: boolean, origin: 'dsh' | 'acp' = 'dsh'): LlmError => publicFailure(
       toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin, operationId: requestId, outcomeUnknown }), requestId);
     const cancel = () => { if (binding?.sessionId) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };
     signal.addEventListener('abort', cancel, { once: true });
     try {
+      if (this.diagnostics) await save(async () => { diagnosticId = await this.diagnostics!.begin({ sessionId: agent.id, turn,
+        turnStartSeq: boundary?.openTurnStartSeq ?? 0, stepStartSeq: boundary?.lastStepStartSeq ?? 0,
+        nativeRequestId: requestId, messageIds: input.flatMap(m => m.id === undefined ? [] : [m.id]),
+        requestIds: input.flatMap(m => m.role === 'user' && m.source?.kind === 'user' && 'rpcId' in m.source
+          && typeof m.source.rpcId === 'string' ? [m.source.rpcId] : []),
+      }); });
       for (let attempt = 0; ; attempt++) {
         signal.throwIfAborted();
         try {
@@ -408,9 +424,13 @@ export class AcpAdapter implements LlmAdapter {
           active = await this.connection(agent);
           binding = this.state.get(agent.id)!;
           signal.throwIfAborted();
+          if (diagnosticId) await save(() => this.diagnostics!.submitted(diagnosticId!));
+          signal.throwIfAborted();
           requestSent = true;
           const result = await active.rpc.request('session/prompt', { sessionId: binding.sessionId!, prompt: [{ type: 'text', text }],
             _meta: { '1agents': { turnManaged: true, turnId: requestId, requestId } } }, { cancellationSignal: signal });
+          nativeConfirmed = true;
+          if (diagnosticId) await save(() => this.diagnostics!.confirmed(diagnosticId!));
           // A received terminal reply establishes the outcome even if the consumer
           // just aborted. Preserve cancellation without emitting any more chunks.
           if (signal.aborted) throw cancelled(false, result.stopReason === 'cancelled' ? 'acp' : 'dsh');
@@ -449,16 +469,25 @@ export class AcpAdapter implements LlmAdapter {
             if (!requestSent && binding?.imported && !binding.sessionId && safe.category === 'unknown') {
               safe.message = 'The imported ACP session is not ready; check for an active writer before retrying.';
             }
-            // The host admits these facts through its typed LlmError constructor;
-            // ordinary Error properties are deliberately excluded by the host.
+            // Complete facts are saved in the plugin domain before the official
+            // host normalizes this ordinary LlmError.
             throw publicFailure(safe, requestId);
           }
           await delay(this.config.reconnectDelayMs, undefined, { signal });
         } finally { active = undefined; }
       }
     } catch (error) {
-      if (!isCancellationRejection(error, signal)) throw error;
-      endBlock(); throw cancelled(requestSent);
+      const failure = isCancellationRejection(error, signal) ? cancelled(requestSent && !nativeConfirmed) : error;
+      if (diagnosticId) {
+        const safe = failure instanceof Error && ownedFailures.get(failure) || toSafeError(failure, {
+          origin: 'dsh', operationId: requestId, outcomeUnknown: requestSent && !nativeConfirmed });
+        try { await this.diagnostics!.settle(diagnosticId, safe); } catch {
+          throw publicFailure(toSafeError(undefined, { origin: 'dsh', operationId: requestId,
+            outcomeUnknown: requestSent && !nativeConfirmed }), requestId);
+        }
+      }
+      throw failure instanceof Error && ownedFailures.has(failure) ? failure : publicFailure(toSafeError(failure, {
+        origin: 'dsh', operationId: requestId, outcomeUnknown: requestSent && !nativeConfirmed }), requestId);
     } finally { signal.removeEventListener('abort', cancel); this.output.delete(agent.id); }
   }
 }

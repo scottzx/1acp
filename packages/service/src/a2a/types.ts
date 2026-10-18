@@ -28,6 +28,8 @@ export interface A2ARunResult {
 
 /** Implementations own session admission, execution and precise cancellation. */
 export interface A2ABackend {
+  /** Optional read-only reconciliation; never resumes or repeats execution. */
+  recover?(target: A2ATarget, options: { requestId: string }): Promise<SafeError | undefined>;
   prepare(input: A2APrepareInput): Promise<A2ATarget>;
   run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal }): Promise<A2ARunResult>;
 }

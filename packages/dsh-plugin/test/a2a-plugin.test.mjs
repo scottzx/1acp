@@ -21,7 +21,7 @@ async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-a2a-plugin-')), ctx = new Context();
   const presets = new Map();
   let adapters = 0;
-  for (const name of inject) if (name !== 'webServer') ctx.provide(name, {});
+  for (const name of inject) if (name !== 'webServer' && name !== 'storageDomain') ctx.provide(name, {});
   ctx.set('llm', { registerAdapter: () => { adapters++; return () => { adapters--; }; } });
   ctx.set('agentPresets', { register: async definition => {
     presets.set(definition.id, definition);
