@@ -22,7 +22,10 @@ function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: bool
       // Without that field, host codes/data do not establish a provider cause.
       const canonical = reason.error.publicError;
       const error = canonical
-        ? toSafeError({ code: reason.error.code, ...canonical }, { trustedProjection: true, origin: 'dsh', operationId })
+        ? toSafeError({
+          category: canonical.category, providerCode: canonical.providerCode,
+          retryable: canonical.retryable, outcomeUnknown: canonical.outcomeUnknown, origin: canonical.origin,
+        }, { trustedProjection: true, origin: 'dsh', operationId })
         : toSafeError(undefined, { origin: 'dsh', operationId });
       return { outcome: 'failed', text, detail: error.message, error };
     }

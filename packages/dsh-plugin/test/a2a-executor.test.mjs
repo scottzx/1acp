@@ -261,12 +261,15 @@ for (const [reason, outcome, detail] of [
   });
 }
 
-for (const [label, raw, category] of [
+for (const [label, raw, category, hostCode = 'ACP_TURN_FAILED'] of [
   ['quota', { code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota'],
   ['rate', { code: -32603, data: { codexErrorInfo: 'rateLimitExceeded' } }, 'rate_limit'],
   ['budget', { code: -32603, data: { codexErrorInfo: 'sessionBudgetExceeded' } }, 'budget'],
   ['auth', { code: -32603, data: { codexErrorInfo: 'unauthorized' } }, 'auth'],
   ['unknown', { code: 'UNKNOWN' }, 'unknown'],
+  ['quota with unrelated host code', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota', 'HOST_EXECUTION_ERROR'],
+  ['auth with cancellation-like host code', { data: { codexErrorInfo: 'unauthorized' } }, 'auth', 'ABORTED'],
+  ['quota with conflicting provider-like host code', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota', 'unauthorized'],
 ]) {
   test(`DSH A2A ${label} failure retains canonical host fields and local request identity`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
@@ -274,7 +277,7 @@ for (const [label, raw, category] of [
     const result = f.backend.run(target, 'task', { requestId: 'synthetic-task', signal: new AbortController().signal });
     await f.admitted.promise; f.claim(agent, 'synthetic-task', 5);
     const safe = toSafeError(raw, { origin: 'acp', operationId: 'synthetic-operation', outcomeUnknown: true });
-    f.finish(agent, 5, { kind: 'error', error: { code: 'ACP_TURN_FAILED', publicError: safe,
+    f.finish(agent, 5, { kind: 'error', error: { code: hostCode, publicError: safe,
       message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL',
       data: { token: 'SYNTHETIC_TOKEN_NOT_REAL', authUrl: 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL' },
     } });
@@ -491,7 +494,7 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
       if (text === 'safe-failure') {
         const safe = toSafeError({ code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } },
           { origin: 'acp', operationId: 'synthetic-provider-operation', outcomeUnknown: true });
-        throw new LlmError(safe.message, 'ACP_TURN_FAILED', { publicError: {
+        throw new LlmError(safe.message, 'HOST_EXECUTION_ERROR', { publicError: {
           category: safe.category, providerCode: safe.providerCode, retryable: true,
           outcomeUnknown: safe.outcomeUnknown, origin: safe.origin,
           operationId: LlmOperationId(safe.operationId),
@@ -581,14 +584,14 @@ test('real DSH loop retains canonical safe failure fields through an exact A2A t
   assert.equal(failed.outcome, 'failed');
   assert.equal(failed.detail, failed.error.message);
   const optionalFields = ['category', 'providerCode', 'retryable', 'outcomeUnknown', 'origin', 'operationId'];
-  t.diagnostic(JSON.stringify({ sentCode: 'ACP_TURN_FAILED', hostCode: hostReason.error.code,
+  t.diagnostic(JSON.stringify({ sentCode: 'HOST_EXECUTION_ERROR', hostCode: hostReason.error.code,
     hostErrorFields: Object.keys(hostReason.error).sort(),
     retainedSafeFields: optionalFields.filter(key => Object.hasOwn(hostReason.error.publicError ?? {}, key)) }));
   assert.deepEqual(hostReason.error.publicError, {
     category: 'quota', providerCode: 'usageLimitExceeded', retryable: true, outcomeUnknown: true,
     origin: 'acp', operationId: 'synthetic-provider-operation',
   });
-  assert.equal(hostReason.error.code, 'ACP_TURN_FAILED');
+  assert.equal(hostReason.error.code, 'HOST_EXECUTION_ERROR');
   assert.equal(failed.error.category, 'quota');
   assert.equal(failed.error.providerCode, 'usageLimitExceeded');
   assert.equal(failed.error.retryable, true);
