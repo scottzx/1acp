@@ -162,7 +162,8 @@ export class DshA2ABackend implements A2ABackend {
       }
     }));
     listeners.push(agent.ctx.on('agent/disposed', event => {
-      if (event.agent === agent) settle({ outcome: 'failed', text, failureReason: 'disposed', detail: 'DSH session was disposed before the task finished' });
+      if (event.agent === agent) settle({ outcome: 'failed', text, failureReason: 'disposed', detail: 'DSH session was disposed before the task finished',
+        error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: turn !== undefined }) });
     }));
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;

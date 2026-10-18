@@ -514,6 +514,28 @@ test('prompt rejection, Agent disposal, and pre-admission cancellation release e
   assert.equal(f.listenerCount, 0);
 });
 
+for (const claimed of [false, true]) {
+  test(`Agent disposal preserves uncertainty only after this task was claimed (${claimed})`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const requestId = `synthetic-disposed-${claimed}`;
+    const result = f.backend.run(target, 'task', { requestId, signal: new AbortController().signal });
+    await f.admitted.promise;
+    const agent = f.agents.get(target.sessionId);
+    if (claimed) f.claim(agent, requestId, 4);
+    else f.claim(agent, 'synthetic-unrelated-ui-request', 3);
+    f.ctx.emit('agent/disposed', { agent });
+    const disposed = await result;
+    const error = toSafeError(disposed.error, { origin: 'dsh', operationId: requestId, trustedProjection: true });
+    assert.equal(error.outcomeUnknown, claimed);
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.retryable, false);
+    assert.equal(error.origin, 'dsh');
+    assert.equal(error.operationId, requestId);
+    assert.equal(disposed.failureReason, 'disposed');
+    assert.equal(f.listenerCount, 0);
+  });
+}
+
 test('real DSH loop retains canonical safe failure fields through an exact A2A turn', {
   skip: process.env.DSH_SOURCE ? false : 'Set DSH_SOURCE to a built matching DSH checkout for the real loop smoke test',
   timeout: 10000,
