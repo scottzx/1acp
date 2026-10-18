@@ -439,7 +439,8 @@ export class AcpAdapter implements LlmAdapter {
             // RequestError.data. Other native and transport errors remain raw.
             const projected = serviceProjection(error);
             const safe = toSafeError(projected ?? error, { trustedProjection: projected !== undefined,
-              origin: transportLost ? 'transport' : 'dsh', operationId: requestId, outcomeUnknown: transportLost && requestSent });
+              origin: transportLost ? 'transport' : 'dsh', operationId: requestId,
+              outcomeUnknown: projected ? projected.outcomeUnknown === true : transportLost && requestSent });
             // A pending import has no service identity while its original
             // writer owns the native session. Retain that local explanation
             // without copying the failed restoration's provider message.

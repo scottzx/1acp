@@ -214,6 +214,38 @@ test('the owned service direct RequestError data preserves canonical safe fields
   assert.equal(f.counts().executions, 1);
 });
 
+for (const [category, outcomeUnknown] of [['quota', false], ['auth', false], ['unknown', true]]) {
+  test(`a closing response socket preserves canonical ${category} outcomeUnknown=${outcomeUnknown}`, { timeout: 5000 }, async t => {
+    const safe = toSafeError(undefined, { trustedProjection: true });
+    const projected = { ...safe, category, origin: 'acp', outcomeUnknown, retryable: false,
+      operationId: 'synthetic-service-operation' };
+    const f = await fixture(t, false, 'permission', async () => {}, [], {
+      error: { code: -32000, message: secretCanary, data: { ...projected, raw: authCanary } },
+    });
+    const link = await f.adapter.connection(f.local);
+    let closing = false;
+    // Close the real client socket in the error frame's event turn, before the
+    // SDK's pending rejection resumes the adapter. The RPC error stays genuine.
+    link.ws.on('message', raw => {
+      if (JSON.parse(raw.toString()).error?.code === -32000) { closing = true; link.ws.close(); }
+    });
+    await assert.rejects(collect(f.adapter, f.options(`closing-response-${category}`)), error => {
+      assert.ok(error instanceof LlmError);
+      assert.equal(closing, true);
+      assert.notEqual(link.ws.readyState, 1);
+      assert.equal(error.failure.publicError.category, category);
+      assert.equal(error.failure.publicError.origin, 'acp');
+      assert.equal(error.failure.publicError.outcomeUnknown, outcomeUnknown);
+      assert.match(error.failure.publicError.operationId, /^dsh-[a-f0-9]{64}$/);
+      for (const canary of [secretCanary, authCanary, 'synthetic-service-operation']) {
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+      }
+      return true;
+    });
+    assert.equal(f.counts().executions, 1);
+  });
+}
+
 for (const [label, raw, origin, outcomeUnknown] of [
   ['quota', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'acp', false],
   ['auth', { data: { codexErrorInfo: 'unauthorized' } }, 'acp', false],
