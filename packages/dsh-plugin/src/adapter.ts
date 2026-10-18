@@ -411,6 +411,8 @@ export class AcpAdapter implements LlmAdapter {
           requestSent = true;
           const result = await active.rpc.request('session/prompt', { sessionId: binding.sessionId!, prompt: [{ type: 'text', text }],
             _meta: { '1agents': { turnManaged: true, turnId: requestId, requestId } } }, { cancellationSignal: signal });
+          // An aborted consumer must see this confirmed failure before any further chunk.
+          if (signal.aborted && result.stopReason === 'cancelled') throw cancelled(false, 'acp');
           signal.throwIfAborted();
           const meta = result._meta?.['1agents'] as JsonObject | undefined;
           if (typeof meta?.finalAnswer === 'string' && (!answer || (hasPhasedText && !streamedFinalAnswer))) {

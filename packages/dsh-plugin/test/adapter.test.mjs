@@ -430,6 +430,42 @@ test('confirmed remote cancellation rejects through the genuine typed host error
   assert.equal(f.counts().executions, 1);
 });
 
+test('confirmed remote cancellation racing local abort stays certain without post-abort metadata', { timeout: 5000 }, async t => {
+  const controller = new AbortController();
+  const postAbortAnswer = 'SYNTHETIC_POST_ABORT_ANSWER_NOT_REAL';
+  const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult(postAbortAnswer, 'cancelled') });
+  const link = await f.adapter.connection(f.local);
+  let confirmed = false;
+  // Abort in the genuine result frame's event turn, before the SDK resumes the
+  // adapter. Earlier streamed text remains open to expose post-abort block-end.
+  link.ws.on('message', raw => {
+    if (JSON.parse(raw.toString()).result?.stopReason === 'cancelled') {
+      confirmed = true;
+      controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+    }
+  });
+  const chunks = [];
+  await assert.rejects(async () => {
+    for await (const chunk of f.adapter.stream({ ...f.options('confirmed-local-race'), signal: controller.signal })) {
+      chunks.push({ chunk, afterAbort: controller.signal.aborted });
+    }
+  }, error => {
+    assert.equal(confirmed, true);
+    assert.ok(error instanceof LlmError);
+    assert.deepEqual(error.failure.publicError, {
+      category: 'cancelled', retryable: false, outcomeUnknown: false, origin: 'acp', operationId: error.operationId,
+    });
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
+    return true;
+  });
+  assert.equal(chunks.filter(entry => entry.chunk.type === 'text-delta').map(entry => entry.chunk.text).join(''), 'Hello ACP');
+  assert.ok(!chunks.some(entry => entry.afterAbort));
+  assert.ok(!JSON.stringify(chunks).includes(postAbortAnswer));
+  assert.ok(!chunks.some(entry => entry.chunk.block?.acpResult || entry.chunk.type === 'finish'));
+  assert.equal(f.counts().executions, 1);
+});
+
 test('a pre-delivery local abort has no uncertain native outcome or leaked reason', async t => {
   const f = await fixture(t), controller = new AbortController();
   controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
