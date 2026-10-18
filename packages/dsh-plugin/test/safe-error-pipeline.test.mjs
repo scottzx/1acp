@@ -18,6 +18,7 @@ import readline from 'node:readline';
 import {appendFileSync} from 'node:fs';
 const send=x=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...x})+'\\n');
 const pending=new Map();
+const record=x=>appendFileSync(process.argv[3],JSON.stringify(x)+'\\n');
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line),p=m.params,reply=result=>send({id:m.id,result});
  if(m.method==='initialize') reply({protocolVersion:1,agentInfo:{name:'synthetic-safe-errors',version:'1'},agentCapabilities:{loadSession:true},authMethods:[]});
@@ -26,16 +27,20 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  else if(m.method==='session/prompt') {
   const kind=p.prompt[0].text;
   appendFileSync(process.argv[2],kind+'\\n');
-  if(kind==='local-abort'){pending.set(p.sessionId,m.id);return;}
-  if(kind==='cancelled')return reply({stopReason:'cancelled',_meta:{'1agents':{finalAnswer:'Partial cancelled answer'}}});
+  if(kind==='confirmed-active-cancel'||kind==='unconfirmed-active-abort'){pending.set(p.sessionId,{id:m.id,kind});record({kind,event:'prompt-pending'});return;}
+  if(kind==='cancelled'){record({kind,event:'prompt-result',stopReason:'cancelled'});return reply({stopReason:'cancelled',_meta:{'1agents':{finalAnswer:'Partial cancelled answer'}}});}
   const codes={quota:'usageLimitExceeded',rate:'rateLimitExceeded',budget:'sessionBudgetExceeded',auth:'unauthorized'};
   const data={message:${JSON.stringify(secret)},additionalDetails:${JSON.stringify(authLink)},token:'SYNTHETIC_TOKEN_NOT_REAL'};
   if(codes[kind])data.codexErrorInfo=codes[kind];
   if(kind==='spoof')Object.assign(data,{category:'quota',providerCode:'usageLimitExceeded',retryable:true,outcomeUnknown:true,operationId:'SYNTHETIC_OPERATION_SECRET_NOT_REAL',publicError:{category:'quota',providerCode:'usageLimitExceeded'}});
   send({id:m.id,error:{code:-32603,message:'Internal error',data}});
  } else if(m.method==='session/cancel') {
-  const id=pending.get(p.sessionId);
-  if(id!==undefined){pending.delete(p.sessionId);send({id,result:{stopReason:'cancelled'}});}
+  const turn=pending.get(p.sessionId);
+  if(turn){
+   pending.delete(p.sessionId);record({kind:turn.kind,event:'cancel-received'});
+   if(turn.kind==='unconfirmed-active-abort'){record({kind:turn.kind,event:'transport-exit-without-result'});process.exit(0);}
+   record({kind:turn.kind,event:'prompt-result',stopReason:'cancelled'});send({id:turn.id,result:{stopReason:'cancelled'}});
+  }
  }
  else if(m.id!==undefined)send({id:m.id,error:{code:-32601,message:'Method not found'}});
 });
@@ -67,20 +72,22 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
   });
   const nativePath = join(directory, 'synthetic-native.mjs');
   const nativeCalls = join(directory, 'native-calls.txt');
+  const nativeEvidence = join(directory, 'native-evidence.jsonl');
   await writeFile(nativePath, nativeFixture);
   await writeFile(nativeCalls, '');
+  await writeFile(nativeEvidence, '');
   process.env.ACP_STATE_DIR = join(directory, 'runtime');
   const serviceDir = dirname(createRequire(import.meta.url).resolve('@1agents/acp-service/package.json'));
   const bridge = await import(pathToFileURL(join(serviceDir, 'dist/src/bridge.js')).href);
   const { serveAcpService } = await import('@1agents/acp-service/service');
   const options = Reflect.get(bridge.runtime, 'options');
   options.sessionStore = createRuntimeStore({ stateDir: process.env.ACP_STATE_DIR });
-  options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, nativePath, nativeCalls] } });
+  options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, nativePath, nativeCalls, nativeEvidence] } });
   service = await serveAcpService({ host: '127.0.0.1', port: 0, report: false });
   const requireHost = createRequire(join(process.env.DSH_SOURCE, 'packages/core/agent-loop/package.json'));
   const requireRetry = createRequire(join(process.env.DSH_SOURCE, 'packages/llm/llm-retry/package.json'));
   const load = name => import(pathToFileURL(requireHost.resolve(name)).href);
-  const [{ default: Llm }, { default: Sessions }, { default: Projections }, { default: SystemPrompt },
+  const [{ default: Llm }, { default: Sessions, Session }, { default: Projections }, { default: SystemPrompt },
     { default: Tools }, { default: Agents }, { default: AgentLoop }, LlmRetry, { agentPresetProjectionDefinition }] = await Promise.all([
     load('@deepseek-ai/dsh-llm'), load('@deepseek-ai/dsh-session'), load('@deepseek-ai/dsh-session-projection'),
     load('@deepseek-ai/dsh-system-prompt'), load('@deepseek-ai/dsh-tools'), load('@deepseek-ai/dsh-agent'),
@@ -179,11 +186,11 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
     tasks.push(task);
   }
   const active = await client.sendMessage(SendMessageRequest.fromJSON({
-    message: { messageId: 'synthetic-local-abort', role: 'ROLE_USER', parts: [{ text: 'local-abort' }] },
+    message: { messageId: 'synthetic-confirmed-active-cancel', role: 'ROLE_USER', parts: [{ text: 'confirmed-active-cancel' }] },
     configuration: { returnImmediately: true },
   }), authenticated);
   const deadline = Date.now() + 10000;
-  while (!(await readFile(nativeCalls, 'utf8')).split('\n').includes('local-abort')) {
+  while (!(await readFile(nativeCalls, 'utf8')).split('\n').includes('confirmed-active-cancel')) {
     assert.ok(Date.now() < deadline, 'Active cancellation never reached the native provider');
     await new Promise(resolve => setTimeout(resolve, 10));
   }
@@ -200,9 +207,9 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
   const activeCanceled = await client.cancelTask(CancelTaskRequest.fromJSON({ id: active.id }), authenticated);
   assert.equal(activeCanceled.status.state, TaskState.TASK_STATE_CANCELED);
   assert.equal(activeCanceled.metadata['1agents'].error.category, 'cancelled');
-  assert.equal(activeCanceled.metadata['1agents'].error.outcomeUnknown, true);
-  assert.equal(activeCanceled.metadata['1agents'].error.origin, 'dsh');
-  for (const [kind, task] of [['queued-cancel', queuedCanceled], ['active-abort', activeCanceled]]) {
+  assert.equal(activeCanceled.metadata['1agents'].error.outcomeUnknown, false);
+  assert.equal(activeCanceled.metadata['1agents'].error.origin, 'acp');
+  for (const [kind, task] of [['queued-cancel', queuedCanceled], ['confirmed-active-cancel', activeCanceled]]) {
     assert.equal(task.metadata['1agents'].error.retryable, false);
     assert.match(task.metadata['1agents'].error.operationId, /^a2a-[a-f0-9]{64}$/);
     assertNoProviderData(task); tasks.push(task);
@@ -215,10 +222,66 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
   const activeReason = activeAgent.session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
   assert.equal(activeReason.kind, 'aborted');
   assert.equal(activeReason.error, undefined);
+  assert.deepEqual(activeReason.reason, { kind: 'user' });
+  assert.equal(activeReason.failure.publicError.category, 'cancelled');
+  assert.equal(activeReason.failure.publicError.outcomeUnknown, false);
+  assert.equal(activeReason.failure.publicError.origin, 'acp');
   assertNoProviderData(activeAgent.session.snapshotEvents());
   assert.ok(!activeAgent.session.snapshotEvents().some(event => event.type === 'llm/retry'));
+  const unconfirmed = await client.sendMessage(SendMessageRequest.fromJSON({
+    message: { messageId: 'synthetic-unconfirmed-active-abort', role: 'ROLE_USER', parts: [{ text: 'unconfirmed-active-abort' }] },
+    configuration: { returnImmediately: true },
+  }), authenticated);
+  const unconfirmedDeadline = Date.now() + 10000;
+  while (!(await readFile(nativeCalls, 'utf8')).split('\n').includes('unconfirmed-active-abort')) {
+    assert.ok(Date.now() < unconfirmedDeadline, 'Unconfirmed cancellation never reached the native provider');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const uncertainCanceled = await client.cancelTask(CancelTaskRequest.fromJSON({ id: unconfirmed.id }), authenticated);
+  assert.equal(uncertainCanceled.status.state, TaskState.TASK_STATE_CANCELED);
+  const uncertainError = uncertainCanceled.metadata['1agents'].error;
+  // Native transport exit rejects the still-pending prompt as AGENT_DISCONNECTED.
+  assert.equal(uncertainError.category, 'unknown');
+  assert.equal(uncertainError.outcomeUnknown, true);
+  assert.equal(uncertainError.origin, 'acp');
+  assert.equal(uncertainError.retryable, false);
+  assert.match(uncertainError.operationId, /^a2a-[a-f0-9]{64}$/);
+  assertNoProviderData(uncertainCanceled);
+  assert.deepEqual((await client.getTask(GetTaskRequest.fromJSON({ id: unconfirmed.id }), authenticated)).metadata['1agents'].error,
+    uncertainError);
+  tasks.push(uncertainCanceled);
+  diagnostics.push({ kind: 'unconfirmed-active-abort', state: uncertainCanceled.status.state, error: uncertainError });
+  const uncertainAgent = ctx.agents.get(uncertainCanceled.metadata['1agents'].sessionId);
+  await uncertainAgent.whenIdle();
+  const uncertainReason = uncertainAgent.session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(uncertainReason.kind, 'aborted');
+  assert.deepEqual(uncertainReason.reason, { kind: 'user' });
+  assert.equal(uncertainReason.failure.publicError.category, 'unknown');
+  assert.equal(uncertainReason.failure.publicError.outcomeUnknown, true);
+  assert.equal(uncertainReason.failure.publicError.origin, 'acp');
+  assert.ok(!uncertainAgent.session.snapshotEvents().some(event => event.type === 'llm/retry'));
+  assertNoProviderData(uncertainAgent.session.snapshotEvents());
+  for (const [agent, reason] of [[activeAgent, activeReason], [uncertainAgent, uncertainReason]]) {
+    await ctx.sessions.flush(agent.session);
+    const handle = await ctx.sessionPersistence.open(agent.id, 'read');
+    try {
+      const stored = await handle.read();
+      assert.deepEqual(stored.events.findLast(event => event.type === 'turn/end').data.reason, reason);
+      const replay = Session.create(agent.id, stored.events);
+      assert.deepEqual(replay.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason, reason);
+    } finally { await handle.close(); }
+  }
+  const nativeEvents = (await readFile(nativeEvidence, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line));
+  for (const kind of ['cancelled', 'confirmed-active-cancel']) {
+    assert.equal(nativeEvents.filter(event => event.kind === kind && event.event === 'prompt-result' && event.stopReason === 'cancelled').length, 1);
+  }
+  assert.equal(nativeEvents.filter(event => event.kind === 'confirmed-active-cancel' && event.event === 'cancel-received').length, 1);
+  for (const event of ['prompt-pending', 'cancel-received', 'transport-exit-without-result']) {
+    assert.equal(nativeEvents.filter(row => row.kind === 'unconfirmed-active-abort' && row.event === event).length, 1);
+  }
+  assert.ok(!nativeEvents.some(event => event.kind === 'unconfirmed-active-abort' && event.event === 'prompt-result'));
   const calls = (await readFile(nativeCalls, 'utf8')).trimEnd().split('\n');
-  for (const kind of ['quota', 'rate', 'budget', 'auth', 'unknown', 'spoof', 'cancelled', 'local-abort']) {
+  for (const kind of ['quota', 'rate', 'budget', 'auth', 'unknown', 'spoof', 'cancelled', 'confirmed-active-cancel', 'unconfirmed-active-abort']) {
     assert.equal(calls.filter(value => value === kind).length, 1, `Native ${kind} was retried`);
   }
   assert.ok(!calls.includes('queued-must-not-execute'));
@@ -236,5 +299,5 @@ test('native ACP failure crosses the real service, Loader plugin, DSH loop and d
   const bindings = await readdir(join(directory, 'adapter'));
   assert.ok(bindings.some(name => name.endsWith('.json')));
   for (const name of bindings.filter(name => name.endsWith('.json'))) assertNoProviderData(await readFile(join(directory, 'adapter', name), 'utf8'));
-  t.diagnostic(JSON.stringify({ pipeline: 'native-runtime-ACP-adapter-DSH-A2A-query-reload', cases: diagnostics }));
+  t.diagnostic(JSON.stringify({ pipeline: 'native-runtime-ACP-adapter-DSH-A2A-query-reload', cases: diagnostics, nativeCancellationEvidence: nativeEvents }));
 });
