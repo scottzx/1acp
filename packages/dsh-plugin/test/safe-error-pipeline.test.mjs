@@ -26,7 +26,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const codes={quota:'usageLimitExceeded',rate:'rateLimitExceeded',budget:'sessionBudgetExceeded',auth:'unauthorized'};
   const data={message:${JSON.stringify(secret)},additionalDetails:${JSON.stringify(authLink)},token:'SYNTHETIC_TOKEN_NOT_REAL'};
   if(codes[kind])data.codexErrorInfo=codes[kind];
-  if(kind==='spoof')Object.assign(data,{category:'quota',retryable:true,outcomeUnknown:true,operationId:'SYNTHETIC_OPERATION_SECRET_NOT_REAL',publicError:{category:'quota',providerCode:'usageLimitExceeded'}});
+  if(kind==='spoof')Object.assign(data,{category:'quota',providerCode:'usageLimitExceeded',retryable:true,outcomeUnknown:true,operationId:'SYNTHETIC_OPERATION_SECRET_NOT_REAL',publicError:{category:'quota',providerCode:'usageLimitExceeded'}});
   send({id:m.id,error:{code:-32603,message:'Internal error',data}});
  } else if(m.method==='session/cancel') {}
  else if(m.id!==undefined)send({id:m.id,error:{code:-32601,message:'Method not found'}});

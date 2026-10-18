@@ -274,7 +274,7 @@ for (const [label, raw, category] of [
     const result = f.backend.run(target, 'task', { requestId: 'synthetic-task', signal: new AbortController().signal });
     await f.admitted.promise; f.claim(agent, 'synthetic-task', 5);
     const safe = toSafeError(raw, { origin: 'acp', operationId: 'synthetic-operation', outcomeUnknown: true });
-    f.finish(agent, 5, { kind: 'error', error: { ...safe,
+    f.finish(agent, 5, { kind: 'error', error: { ...safe, code: safe.providerCode ?? 'UNKNOWN',
       message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL',
       data: { token: 'SYNTHETIC_TOKEN_NOT_REAL', authUrl: 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL' },
     } });
@@ -316,7 +316,8 @@ test('DSH A2A rejects safe-shaped host category and operation secret spoofing', 
   f.finish(agent, 7, { kind: 'error', error: {
     message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL', category: 'quota', origin: 'acp',
     retryable: true, outcomeUnknown: true, operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL',
-    cause: { category: 'quota', origin: 'a2a', operationId: 'SYNTHETIC_NESTED_OPERATION_SECRET_NOT_REAL' },
+    providerCode: 'usageLimitExceeded',
+    cause: { category: 'quota', providerCode: 'usageLimitExceeded', origin: 'a2a', operationId: 'SYNTHETIC_NESTED_OPERATION_SECRET_NOT_REAL' },
   } });
   const value = await result;
   assert.equal(value.outcome, 'failed');

@@ -107,7 +107,7 @@ export class A2ASessionExecutor implements AgentExecutor {
       controller.signal.throwIfAborted();
       status(TaskState.TASK_STATE_WORKING);
       const result = await this.backend.run(target, prompt, { requestId, signal: controller.signal });
-      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a' }) : undefined;
+      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
       returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
         ? FAILURE_MESSAGES[result.failureReason] : undefined;
       controller.signal.throwIfAborted();
@@ -116,15 +116,15 @@ export class A2ASessionExecutor implements AgentExecutor {
           parts: [{ content: { $case: 'text', value: result.text }, mediaType: 'text/plain', filename: '', metadata: undefined }], metadata: undefined, extensions: [] },
         append: false, lastChunk: true, metadata: undefined }));
       if (result.outcome === 'input-required') this.awaitingInput.set(context.taskId, context.contextId);
-      const error = returnedError ? toSafeError(returnedError, { operationId: returnedError.operationId ?? requestId }) : undefined;
+      const error = returnedError ? toSafeError(returnedError, { operationId: requestId }) : undefined;
       status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? error?.message ?? result.detail, error);
     } catch (error) {
       if (!published) bus.publish(AgentEvent.task(Task.fromJSON({ id: context.taskId, contextId: context.contextId,
         status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() } })));
-      const projected = controller.signal.aborted && returnedError ? returnedError : toSafeError(error, { origin: 'a2a' });
+      const projected = controller.signal.aborted && returnedError ? returnedError : toSafeError(error, { origin: 'a2a', operationId: requestId });
       const cancellationOnly = controller.signal.aborted && !returnedError && error === controller.signal.reason;
       const safe = toSafeError(cancellationOnly ? new DOMException('A2A task canceled', 'AbortError') : projected, {
-        origin: 'a2a', operationId: projected.operationId ?? requestId, outcomeUnknown: projected.outcomeUnknown,
+        origin: 'a2a', operationId: requestId, outcomeUnknown: projected.outcomeUnknown,
       });
       status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? safe.message, safe);
     } finally {

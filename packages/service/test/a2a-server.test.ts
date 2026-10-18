@@ -291,7 +291,7 @@ test('A05 A2A errors retain safe categories and uncertain delivery without leaki
   const metadata = uncertain.metadata?.['1agents'] as { sessionId: string; error: SafeError };
   assert.equal(metadata.sessionId, 'session-4');
   assert.equal(metadata.error.origin, 'transport');
-  assert.equal(metadata.error.operationId, 'synthetic-delivery');
+  assert.equal(metadata.error.operationId, f.backend.runs[3].requestId);
   assert.equal(metadata.error.outcomeUnknown, true);
   assert.equal(metadata.error.category, 'unknown');
   assert.ok(!JSON.stringify(uncertain).includes(secret));
@@ -348,10 +348,35 @@ test('raw backend error records cannot self-assert trusted policy fields or oper
   assert.ok(!JSON.stringify(failed).includes(authLink));
 });
 
+test('owned backend error projections keep safe fields while operation identity belongs to the A2A caller', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const operationCanary = 'SYNTHETIC_OWNED_BACKEND_OPERATION_NOT_REAL';
+  for (const [index, outcome] of ['resolve', 'reject'].entries()) {
+    const task = await submit(f.client, message(`synthetic owned backend ${outcome}`));
+    const error = toSafeError({ code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } }, {
+      origin: 'acp', operationId: operationCanary, outcomeUnknown: true,
+    });
+    if (outcome === 'resolve') f.backend.runs[index].result.resolve({ outcome: 'failed', text: '', error });
+    else f.backend.runs[index].result.reject(error);
+    const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+    const safe = (failed.metadata?.['1agents'] as { error: SafeError }).error;
+    assert.equal(safe.category, 'quota');
+    assert.equal(safe.providerCode, 'usageLimitExceeded');
+    assert.equal(safe.retryable, false);
+    assert.equal(safe.outcomeUnknown, true);
+    assert.equal(safe.origin, 'acp');
+    assert.equal(safe.operationId, f.backend.runs[index].requestId);
+    assert.ok(!JSON.stringify(failed).includes(operationCanary));
+  }
+  assert.equal(f.backend.runs.length, 2, 'Rebinding an error must not retry the backend');
+});
+
 test('A2A cancellation preserves a backend uncertainty flag while remaining canceled', { timeout: 10000 }, async t => {
   const backend = new DeferredBackend();
   const started = deferred<void>();
+  let callerRequestId: string | undefined;
   backend.run = async (_target, _prompt, options) => {
+    callerRequestId = options.requestId;
     started.resolve();
     return new Promise<A2ARunResult>((_resolve, reject) => {
       options.signal.addEventListener('abort', () => reject(toSafeError(undefined, {
@@ -367,14 +392,16 @@ test('A2A cancellation preserves a backend uncertainty flag while remaining canc
   const error = (canceled.metadata?.['1agents'] as { error: SafeError }).error;
   assert.equal(error.category, 'unknown');
   assert.equal(error.origin, 'transport');
-  assert.equal(error.operationId, 'synthetic-cancel-delivery');
+  assert.equal(error.operationId, callerRequestId);
   assert.equal(error.outcomeUnknown, true);
 });
 
 test('A2A cancellation racing a returned failure preserves all safe error fields', { timeout: 10000 }, async t => {
   const backend = new DeferredBackend();
   const started = deferred<void>();
+  let callerRequestId: string | undefined;
   backend.run = async (_target, _prompt, options) => new Promise<A2ARunResult>(resolve => {
+    callerRequestId = options.requestId;
     options.signal.addEventListener('abort', () => {
       assert.equal(options.signal.aborted, true);
       // Return rather than throw: executor cancellation is observed after run resolves.
@@ -396,7 +423,7 @@ test('A2A cancellation racing a returned failure preserves all safe error fields
   assert.equal(error.providerCode, 'usageLimitExceeded');
   assert.equal(error.retryable, true);
   assert.equal(error.origin, 'acp');
-  assert.equal(error.operationId, 'synthetic-returned-delivery');
+  assert.equal(error.operationId, callerRequestId);
   assert.equal(error.outcomeUnknown, true);
 });
 

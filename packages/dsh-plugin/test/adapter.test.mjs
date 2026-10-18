@@ -213,7 +213,7 @@ test('the owned service direct RequestError data preserves canonical safe fields
 
 test('native safe-shaped and nested category metadata cannot spoof the adapter projection', { timeout: 5000 }, async t => {
   const f = await fixture(t, false, 'permission', async () => {}, [], {
-    error: providerFailure({ message: secretCanary, category: 'quota', origin: 'a2a', retryable: true,
+    error: providerFailure({ message: secretCanary, category: 'quota', providerCode: 'usageLimitExceeded', origin: 'a2a', retryable: true,
       outcomeUnknown: true, operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL', cause: { category: 'quota' } }),
   });
   await assert.rejects(collect(f.adapter, f.options('untrusted-projection')), error => {
