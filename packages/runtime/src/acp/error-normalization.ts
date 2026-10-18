@@ -1,4 +1,5 @@
 import {
+  AcpxOperationalError,
   AuthPolicyError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
@@ -354,7 +355,11 @@ type SafeErrorOptions = {
   /** A caller-owned request identifier, never a provider message. */
   operationId?: string;
   outcomeUnknown?: boolean;
+  /** Decode only a direct safe record from an owned boundary, never provider data. */
+  trustedProjection?: boolean;
 };
+
+const safeProjections = new WeakSet<object>();
 
 /** Only known envelope edges are visited, with both depth and node limits. */
 function safeErrorRecords(error: unknown): Record<string, unknown>[] {
@@ -445,21 +450,29 @@ function safeOperationId(value: unknown): string | undefined {
     : undefined;
 }
 
-function projectedOperationId(record: Record<string, unknown> | undefined): string | undefined {
+function hasProjectionFields(record: Record<string, unknown>): boolean {
+  if (typeof record.category !== "string" || !Object.hasOwn(SAFE_MESSAGES, record.category)) {
+    return false;
+  }
+  if (typeof record.origin !== "string" || !SAFE_ORIGINS.has(record.origin)) {
+    return false;
+  }
+  return typeof record.retryable === "boolean" && typeof record.outcomeUnknown === "boolean";
+}
+
+function projectedRecord(
+  error: unknown,
+  options: SafeErrorOptions,
+): Record<string, unknown> | undefined {
+  const record = asRecord(error);
   if (
     !record ||
-    typeof record.category !== "string" ||
-    !Object.hasOwn(SAFE_MESSAGES, record.category)
+    (!safeProjections.has(record) && options.trustedProjection !== true) ||
+    !hasProjectionFields(record)
   ) {
     return undefined;
   }
-  if (typeof record.origin !== "string" || !SAFE_ORIGINS.has(record.origin)) {
-    return undefined;
-  }
-  if (typeof record.retryable !== "boolean" || typeof record.outcomeUnknown !== "boolean") {
-    return undefined;
-  }
-  return safeOperationId(record.operationId);
+  return record;
 }
 
 function safeLocalCode(error: unknown): OutputErrorCode | undefined {
@@ -503,7 +516,7 @@ function localSafeCategory(error: unknown, code?: string, detailCode?: string): 
 
 function safeCategory(
   error: unknown,
-  records: Record<string, unknown>[],
+  projected: Record<string, unknown> | undefined,
   provider: ProviderCause,
   code?: string,
   detailCode?: string,
@@ -515,31 +528,34 @@ function safeCategory(
   if (provider.conflict) {
     return "unknown";
   }
-  const preserved = safeStringField(records, "category", new Set(Object.keys(SAFE_MESSAGES))) as
-    | SafeErrorCategory
-    | undefined;
-  return provider.category ?? preserved ?? "unknown";
+  return provider.category ?? (projected?.category as SafeErrorCategory | undefined) ?? "unknown";
 }
 
 function safeOutcomeUnknown(
-  records: Record<string, unknown>[],
+  projected: Record<string, unknown> | undefined,
   options: SafeErrorOptions,
   detailCode?: string,
 ): boolean {
   return (
     options.outcomeUnknown === true ||
-    records.some((record) => record.outcomeUnknown === true) ||
+    projected?.outcomeUnknown === true ||
     new Set(["WATCH_OUTCOME_UNKNOWN", "AGENT_DISCONNECTED"]).has(detailCode ?? "")
   );
 }
 
 function safeOrigin(
+  error: unknown,
   records: Record<string, unknown>[],
   options: SafeErrorOptions,
+  projected: Record<string, unknown> | undefined,
 ): SafeErrorOrigin {
-  const preserved = safeStringField(records, "origin", SAFE_ORIGINS) as SafeErrorOrigin | undefined;
+  const local = error instanceof AcpxOperationalError ? error.origin : undefined;
+  const preserved = projected?.origin as SafeErrorOrigin | undefined;
   if (preserved) {
     return preserved;
+  }
+  if (local) {
+    return local;
   }
   if (records.some((record) => typeof record.code === "number")) {
     return "acp";
@@ -556,13 +572,14 @@ function safeCode(error: unknown, records: Record<string, unknown>[]): string | 
 }
 
 function safeOptionalFields(
-  error: unknown,
+  projected: Record<string, unknown> | undefined,
   options: SafeErrorOptions,
   provider: ProviderCause,
   code?: string,
   detailCode?: string,
 ): Partial<SafeError> {
-  const operationId = safeOperationId(options.operationId) ?? projectedOperationId(asRecord(error));
+  const operationId =
+    safeOperationId(options.operationId) ?? safeOperationId(projected?.operationId);
   return {
     ...(provider.providerCode ? { providerCode: provider.providerCode } : {}),
     ...(operationId ? { operationId } : {}),
@@ -576,17 +593,22 @@ function safeOptionalFields(
  * codes are copied. Resource categories describe failures, not retry policy.
  */
 export function toSafeError(error: unknown, options: SafeErrorOptions = {}): SafeError {
-  const records = safeErrorRecords(error);
+  const projected = projectedRecord(error, options);
+  const records = projected ? [projected] : safeErrorRecords(error);
   const provider = safeProviderCause(records);
   const code = safeCode(error, records);
   const detailCode = safeStringField(records, "detailCode", SAFE_DETAILS);
-  const category = safeCategory(error, records, provider, code, detailCode);
-  return {
-    ...safeOptionalFields(error, options, provider, code, detailCode),
+  const category = safeCategory(error, projected, provider, code, detailCode);
+  const safe: SafeError = {
+    ...safeOptionalFields(projected, options, provider, code, detailCode),
     message: SAFE_MESSAGES[category],
     category,
-    retryable: records.find((record) => typeof record.retryable === "boolean")?.retryable === true,
-    outcomeUnknown: safeOutcomeUnknown(records, options, detailCode),
-    origin: safeOrigin(records, options),
+    retryable:
+      projected?.retryable === true ||
+      (error instanceof AcpxOperationalError && error.retryable === true),
+    outcomeUnknown: safeOutcomeUnknown(projected, options, detailCode),
+    origin: safeOrigin(error, records, options, projected),
   };
+  safeProjections.add(safe);
+  return safe;
 }

@@ -257,7 +257,7 @@ for (const [label, raw, category] of [
   ['auth', { code: -32603, data: { codexErrorInfo: 'unauthorized' } }, 'auth'],
   ['unknown', { code: 'UNKNOWN' }, 'unknown'],
 ]) {
-  test(`DSH A2A ${label} failure carries only safe structured fields and stays failed`, async t => {
+  test(`DSH A2A ${label} failure retains explicit provider signals and local request identity`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
     const agent = f.agents.get(target.sessionId);
     const result = f.backend.run(target, 'task', { requestId: 'synthetic-task', signal: new AbortController().signal });
@@ -272,9 +272,9 @@ for (const [label, raw, category] of [
     assert.equal(value.error.category, category);
     assert.equal(value.error.providerCode, safe.providerCode);
     assert.equal(value.error.retryable, safe.retryable);
-    assert.equal(value.error.outcomeUnknown, true);
-    assert.equal(value.error.origin, 'acp');
-    assert.equal(value.error.operationId, 'synthetic-operation');
+    assert.equal(value.error.outcomeUnknown, false);
+    assert.equal(value.error.origin, 'dsh');
+    assert.equal(value.error.operationId, 'synthetic-task');
     assert.equal(value.detail, value.error.message);
     for (const canary of ['SYNTHETIC_SECRET', 'SYNTHETIC_TOKEN', 'SYNTHETIC_AUTH', 'authorize?token=', 'authUrl']) assert.ok(!JSON.stringify(value).includes(canary));
     assert.equal(f.listenerCount, 0);
@@ -295,6 +295,27 @@ test('DSH A2A never infers quota from an unknown host error message or nested ar
   assert.equal(value.error.category, 'unknown');
   assert.equal(value.error.providerCode, undefined);
   assert.ok(!JSON.stringify(value).includes('SYNTHETIC_SECRET'));
+});
+
+test('DSH A2A rejects safe-shaped host category and operation secret spoofing', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'caller-owned-task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'caller-owned-task', 7);
+  f.finish(agent, 7, { kind: 'error', error: {
+    message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL', category: 'quota', origin: 'acp',
+    retryable: true, outcomeUnknown: true, operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL',
+    cause: { category: 'quota', origin: 'a2a', operationId: 'SYNTHETIC_NESTED_OPERATION_SECRET_NOT_REAL' },
+  } });
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.error.category, 'unknown');
+  assert.equal(value.error.providerCode, undefined);
+  assert.equal(value.error.retryable, false);
+  assert.equal(value.error.outcomeUnknown, false);
+  assert.equal(value.error.origin, 'dsh');
+  assert.equal(value.error.operationId, 'caller-owned-task');
+  assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
 });
 
 test('canceling queued A2A work removes only its inbox item and leaves the active UI turn running', async t => {

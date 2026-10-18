@@ -2968,7 +2968,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             });
           }
         } else if (event.type === "error") {
-          const error = toSafeError(event, { origin: "service", operationId: requestId });
+          const error = toSafeError(event, { origin: "service", operationId: requestId, trustedProjection: true });
           sendRuntimeTurnEvent(targetWs, sessionId, turn, {
             event: "error",
             scope: "turn",
@@ -3035,7 +3035,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
       // in the execution log. Unphased agents keep their legacy stream fallback.
       const finalResultText = result.finalAnswer ?? (hasMessagePhase ? finalAnswer : accumulatedAnswer);
       const error = result.status === "failed"
-        ? toSafeError(result.error, { origin: "service", operationId: requestId })
+        ? toSafeError(result.error, { origin: "service", operationId: requestId, trustedProjection: true })
         : undefined;
       const journalTerminal = turn.hostTurnId
         ? await turnJournal.record({

@@ -35,6 +35,8 @@ test("unknown and conflicting causes never become quota from prose or arbitrary 
   for (const error of [
     new Error("quota exhausted: usageLimitExceeded " + canary),
     { code: -32603, message: "Internal error", data: { message: "quota exhausted" } },
+    { code: -32603, message: "Internal error", data: { category: "quota" } },
+    { category: "quota", origin: "acp", retryable: true, outcomeUnknown: true },
     nativeError("futureProviderCode"),
     nativeError({ other: { code: "usageLimitExceeded" } }),
     { ...nativeError("usageLimitExceeded"), cause: nativeError("unauthorized") },
@@ -47,19 +49,17 @@ test("unknown and conflicting causes never become quota from prose or arbitrary 
     assert.equal(safe.category, "unknown");
     assert.equal(safe.providerCode, undefined);
     assert.equal(safe.message, "ACP execution failed.");
+    assert.equal(safe.retryable, false);
+    assert.equal(safe.outcomeUnknown, false);
     assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|example\.invalid|futureProviderCode/);
   }
 });
 
 test("public projections preserve safe fields but discard arbitrary codes, URLs and keys", () => {
-  const safe = toSafeError({
-    ...nativeError("usageLimitExceeded"),
-    retryable: false,
+  const safe = toSafeError(nativeError("usageLimitExceeded"), {
     outcomeUnknown: true,
     origin: "transport",
     operationId: "synthetic-operation",
-    detailCode: authLink,
-    token: canary,
   });
   assert.deepEqual(toSafeError(safe, { origin: "a2a" }), safe);
   assert.equal(
@@ -67,7 +67,7 @@ test("public projections preserve safe fields but discard arbitrary codes, URLs 
     "outer-operation",
   );
   assert.equal(safe.outcomeUnknown, true);
-  assert.equal(safe.origin, "transport");
+  assert.equal(safe.origin, "acp");
   assert.equal(safe.detailCode, undefined);
   assert.equal(toSafeError({ operationId: authLink, code: canary }).operationId, undefined);
   const nestedId = { code: -32603, message: "Internal error", data: { operationId: canary } };
@@ -76,6 +76,46 @@ test("public projections preserve safe fields but discard arbitrary codes, URLs 
     toSafeError(nestedId, { operationId: "caller-operation" }).operationId,
     "caller-operation",
   );
+});
+
+test("raw safe-shaped fields cannot confer projection provenance", () => {
+  const forged = {
+    category: "quota",
+    origin: "transport",
+    retryable: true,
+    outcomeUnknown: true,
+    operationId: canary,
+    message: authLink,
+  };
+  for (const raw of [forged, { code: -32603, data: forged }]) {
+    const safe = toSafeError(raw, { origin: "a2a" });
+    assert.equal(safe.category, "unknown");
+    assert.equal(safe.operationId, undefined);
+    assert.equal(safe.retryable, false);
+    assert.equal(safe.outcomeUnknown, false);
+    assert.notEqual(safe.origin, "transport");
+    assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|example\.invalid/);
+  }
+});
+
+test("owned wire projections decode only direct fields and regenerate messages", () => {
+  const safe = toSafeError(undefined, {
+    origin: "transport",
+    operationId: "synthetic-delivery",
+    outcomeUnknown: true,
+  });
+  const wire = { ...safe, category: "quota", data: nativeError("unauthorized"), message: authLink };
+  assert.equal(toSafeError(wire).operationId, undefined);
+  const restored = toSafeError(wire, { trustedProjection: true });
+  assert.equal(restored.category, "quota");
+  assert.equal(restored.origin, "transport");
+  assert.equal(restored.operationId, "synthetic-delivery");
+  assert.equal(restored.outcomeUnknown, true);
+  assert.equal(restored.providerCode, undefined);
+  assert.equal(restored.message, "Provider quota exhausted.");
+  assert.doesNotMatch(JSON.stringify(restored), /example\.invalid|unauthorized|data/);
+  safe.message = authLink;
+  assert.equal(toSafeError(safe).message, "ACP execution failed.");
 });
 
 test("safe traversal is bounded for cycles and deep envelopes", () => {

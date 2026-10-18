@@ -8,6 +8,7 @@ import { WebSocketServer } from 'ws';
 import { AcpAdapter } from '../dist/adapter.js';
 import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
+import { toSafeError } from '@1agents/acp-service/runtime';
 
 async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = [], streamConfig = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-test-'));
@@ -176,6 +177,59 @@ test('transport loss after prompt delivery is safe and explicitly uncertain when
     return true;
   });
   assert.equal(f.counts().executions, 1);
+});
+
+test('the owned service direct RequestError data preserves canonical safe fields with the local request identity', { timeout: 5000 }, async t => {
+  const safe = toSafeError({ code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } },
+    { operationId: 'synthetic-service-operation', outcomeUnknown: true });
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: { code: -32000, message: safe.message, data: { ...safe, retryable: true } },
+  });
+  await assert.rejects(collect(f.adapter, f.options('owned-projection')), error => {
+    assert.equal(error.category, 'quota');
+    assert.equal(error.providerCode, 'usageLimitExceeded');
+    assert.equal(error.origin, 'acp');
+    assert.equal(error.retryable, true);
+    assert.equal(error.outcomeUnknown, true);
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.notEqual(error.operationId, 'synthetic-service-operation');
+    assert.equal(error.data, undefined);
+    return true;
+  });
+  assert.equal(f.counts().executions, 1);
+});
+
+test('native safe-shaped and nested category metadata cannot spoof the adapter projection', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: providerFailure({ message: secretCanary, category: 'quota', origin: 'a2a', retryable: true,
+      outcomeUnknown: true, operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL', cause: { category: 'quota' } }),
+  });
+  await assert.rejects(collect(f.adapter, f.options('untrusted-projection')), error => {
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.origin, 'acp');
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(error).includes('SYNTHETIC_OPERATION_SECRET'));
+    assert.ok(!JSON.stringify(error).includes(secretCanary));
+    return true;
+  });
+});
+
+test('malformed owned-service error data falls back to the raw numerical wrapper', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: { code: -32000, message: secretCanary, data: { category: 'quota', origin: 'a2a',
+      operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL', cause: { category: 'quota' } } },
+  });
+  await assert.rejects(collect(f.adapter, f.options('malformed-projection')), error => {
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.origin, 'acp');
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(error).includes('SYNTHETIC_'));
+    return true;
+  });
 });
 
 test('a known pending native writer keeps a fixed actionable message without provider restoration text', { timeout: 5000 }, async t => {

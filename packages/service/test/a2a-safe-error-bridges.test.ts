@@ -32,6 +32,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     if(code) data.codexErrorInfo=code;
     if(kind==='nested') data.error={codexErrorInfo:'usageLimitExceeded'};
     if(kind==='conflicting') { data.codexErrorInfo='usageLimitExceeded'; data.error={codexErrorInfo:'unauthorized'}; }
+    if(kind==='spoof') { data.category='quota'; data.operationId='synthetic-provider-spoof'; data.origin='dsh'; data.retryable=true; data.outcomeUnknown=true; }
     send({id:m.id,error:{code:-32603,message:kind==='unknown'?'quota budget retry later '+${JSON.stringify(secret)}:'Internal error',data}});
   } else if(m.method==='session/cancel'&&pending) { send({id:pending.id,result:{stopReason:'cancelled'}}); pending=undefined; }
   else if(m.id!==undefined) send({id:m.id,error:{code:-32601,message:'Method not found'}});
@@ -75,7 +76,7 @@ test('A05 native structured errors cross runtime, live ACP and bridge summary wi
   await connection.agent.request('initialize', { protocolVersion: 1, clientCapabilities: { _meta: { '1agents': { version: 1 } } } });
   const { sessionId } = await connection.agent.request('session/new', { cwd: directory, mcpServers: [] });
 
-  for (const [kind, category] of [['quota', 'quota'], ['rate', 'rate_limit'], ['budget', 'budget'], ['auth', 'auth'], ['unknown', 'unknown'], ['nested', 'quota'], ['conflicting', 'unknown']] as const) {
+  for (const [kind, category] of [['quota', 'quota'], ['rate', 'rate_limit'], ['budget', 'budget'], ['auth', 'auth'], ['unknown', 'unknown'], ['nested', 'quota'], ['conflicting', 'unknown'], ['spoof', 'unknown']] as const) {
     let rejected: RequestError | undefined;
     await assert.rejects(connection.agent.request('session/prompt', {
       sessionId, prompt: [{ type: 'text', text: kind }],
@@ -88,6 +89,7 @@ test('A05 native structured errors cross runtime, live ACP and bridge summary wi
     assert.equal(error.retryable, false);
     assert.equal(error.outcomeUnknown, false);
     if (kind === 'quota') assert.equal(error.providerCode, 'usageLimitExceeded');
+    assert.ok(!JSON.stringify(error).includes('synthetic-provider-spoof'));
     assertSafe({ message: rejected!.message, data: error });
     await until(() => !bridge.activeSessions.get(sessionId)?.activeTurn, 'Bridge did not release the failed turn');
   }

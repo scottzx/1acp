@@ -11,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-commands';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type {} from '@deepseek-ai/dsh-agent-preset-registry';
 import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, RequestPermissionResponse, SessionConfigOption, SessionModeState, AvailableCommand } from '@agentclientprotocol/sdk';
+import { RequestError } from '@agentclientprotocol/sdk';
 import { connect, object, type JsonObject } from './transport.js';
 import { State, hasActiveWriter, type Binding } from './state.js';
 import { mergeTool, type RemoteTool } from './tool-events.js';
@@ -26,6 +27,17 @@ export interface Capabilities {
 }
 type Link = Awaited<ReturnType<typeof connect>>;
 type AcpStream = { turn: number; step: number; requestId: string; messagePhase?: 'commentary' | 'final_answer'; messageId?: string };
+
+/** Only the negotiated service's direct canonical error data is a projection. */
+function serviceProjection(error: unknown): JsonObject | undefined {
+  if (!(error instanceof RequestError) || error.code !== -32000
+    || !error.data || typeof error.data !== 'object' || Array.isArray(error.data)) return;
+  const data = error.data as JsonObject;
+  if (typeof data.category !== 'string' || !['quota', 'rate_limit', 'budget', 'auth', 'cancelled', 'timeout', 'permission', 'unknown'].includes(data.category)) return;
+  if (typeof data.origin !== 'string' || !['cli', 'runtime', 'queue', 'acp', 'service', 'transport', 'dsh', 'a2a'].includes(data.origin)) return;
+  if (typeof data.retryable !== 'boolean' || typeof data.outcomeUnknown !== 'boolean') return;
+  return data;
+}
 
 /** Producer/consumer queue; errors are delivered after already received chunks. */
 class Queue<T> {
@@ -399,7 +411,11 @@ export class AcpAdapter implements LlmAdapter {
           // uncertain delivery idempotent; provider errors remain errors.
           if ((active && active.ws.readyState === 1) || attempt >= this.config.reconnectAttempts) {
             const transportLost = !active || active.ws.readyState !== 1;
-            const safe = toSafeError(error, { origin: transportLost ? 'transport' : 'dsh', operationId: requestId, outcomeUnknown: transportLost && requestSent });
+            // The negotiated service sends its canonical projection directly in
+            // RequestError.data. Other native and transport errors remain raw.
+            const projected = serviceProjection(error);
+            const safe = toSafeError(projected ?? error, { trustedProjection: projected !== undefined,
+              origin: transportLost ? 'transport' : 'dsh', operationId: requestId, outcomeUnknown: transportLost && requestSent });
             // A pending import has no service identity while its original
             // writer owns the native session. Retain that local explanation
             // without copying the failed restoration's provider message.

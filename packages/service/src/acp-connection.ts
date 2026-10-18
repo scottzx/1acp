@@ -18,11 +18,11 @@ const NS = '1agents';
 const EXT = '_1agents/';
 
 /** Error envelopes have a closed projection; provider data never becomes metadata. */
-function safeFailureEvent(event: RecordValue): RecordValue {
+function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): RecordValue {
   const failedTurn = event.status === 'failed' && ['turn_state', 'turn_terminal', 'turn_complete', 'done'].includes(event.event);
   if (!event.error && !failedTurn && event.event !== 'error' && event.event !== 'protocol_error' && event.type !== 'error') return event;
   const safe = toSafeError(event.error ?? { ...event, code: event.code ?? event.errorCode }, {
-    origin: 'service', operationId: event.runtimeRequestId ?? event.requestId,
+    origin: 'service', operationId: event.runtimeRequestId ?? event.requestId, trustedProjection: trustedRuntimeErrors,
   });
   const value: RecordValue = {};
   for (const key of ['event', 'type', 'sessionId', 'turnId', 'requestId', 'runtimeRequestId', 'promptMessageId',
@@ -31,7 +31,7 @@ function safeFailureEvent(event: RecordValue): RecordValue {
     if (event[key] !== undefined) value[key] = event[key];
   }
   if (event.error || event.status === 'failed') return { ...value, error: safe, errorCode: safe.providerCode ?? safe.code, errorText: safe.message };
-  return { ...value, ...safe };
+  return { ...value, ...safe, error: safe };
 }
 
 function failure(error: unknown, options?: Parameters<typeof toSafeError>[1]): RequestError {
@@ -106,9 +106,9 @@ export function webSocketStream(ws: WebSocket): Stream {
 export class RuntimePeer {
   readyState = 1;
   _acpxReqHost?: string;
-  constructor(private readonly receive: (event: RecordValue) => void) {}
+  constructor(private readonly receive: (event: RecordValue) => void, private readonly trustedRuntimeErrors = false) {}
   send(raw: string): void {
-    const event = safeFailureEvent(JSON.parse(raw) as RecordValue);
+    const event = safeFailureEvent(JSON.parse(raw) as RecordValue, this.trustedRuntimeErrors);
     const call = calls.getStore();
     if (call?.active) call.events.push(event);
     this.receive(event);
@@ -174,7 +174,9 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
   const interactive = new Map<string, { abort: AbortController; sessionId: string }>();
   const answers = new Map<string, string>();
   const toolsSeen = new Set<string>();
-  const peer = new RuntimePeer(receive);
+  // The production bridge already projects runtime errors before serialization.
+  // Injected backends do not inherit that provenance for self-asserted fields.
+  const peer = new RuntimePeer(receive, backend === production);
   peer._acpxReqHost = req?.headers.host?.split(':')[0];
 
   function notify(method: string, params: RecordValue) {

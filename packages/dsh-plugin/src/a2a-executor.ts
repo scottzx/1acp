@@ -16,8 +16,7 @@ function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: bool
       : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
     case 'error': {
-      const projected = toSafeError(reason.error, { origin: 'dsh' });
-      const error = projected.operationId ? projected : toSafeError(projected, { operationId });
+      const error = toSafeError(reason.error, { origin: 'dsh', operationId });
       return { outcome: 'failed', text, detail: error.message, error };
     }
     case 'max-tokens': return { outcome: 'failed', text, detail: 'DSH reached the model output token limit' };

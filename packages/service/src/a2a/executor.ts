@@ -95,7 +95,7 @@ export class A2ASessionExecutor implements AgentExecutor {
       controller.signal.throwIfAborted();
       status(TaskState.TASK_STATE_WORKING);
       const result = await this.backend.run(target, prompt, { requestId, signal: controller.signal });
-      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a' }) : undefined;
+      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a', trustedProjection: true }) : undefined;
       controller.signal.throwIfAborted();
       if (result.text) bus.publish(AgentEvent.artifactUpdate({ taskId: context.taskId, contextId: context.contextId,
         artifact: { artifactId: `${context.taskId}-${randomUUID()}`, name: 'DSH response', description: '',

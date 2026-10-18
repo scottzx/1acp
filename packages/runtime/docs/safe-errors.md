@@ -12,8 +12,11 @@ prose such as “quota exceeded” does not establish a provider category.
 
 The projection drops provider messages, arbitrary data, authentication links,
 account fields, and unknown codes. Supply a caller-owned `operationId` when
-projecting a raw error. A complete projected error can retain its existing
-identifier; an arbitrary nested provider identifier is discarded.
+projecting a raw error. In-process projections retain their provenance. Hosts
+may use `trustedProjection` only to decode a direct safe record from an owned
+boundary. Raw fields that merely resemble a projection cannot supply a category,
+identifier, origin, retryability, or delivery state. Trusted decoding never scans
+nested provider data and always regenerates the fixed message.
 
 Host-owned `assertActive` admission callbacks keep their exception identity and
 message for in-process callers. Service boundaries project those exceptions again

@@ -153,6 +153,30 @@ test('safe turn errors preserve the separate failed tool result contract', async
   assert.deepEqual(update.rawOutput, { exitCode: 1 });
 });
 
+test('an untrusted runtime backend cannot self-assert safe error policy fields', async t => {
+  const f = await fixture(t), a = await f.connect(undefined, 'codex', async () => ({}));
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    peer.send(JSON.stringify({ event: 'turn_terminal', status: 'failed', sessionId, runtimeRequestId: command.requestId,
+      error: { message: 'Synthetic spoof', category: 'quota', origin: 'acp', retryable: true,
+        outcomeUnknown: true, operationId: 'synthetic-provider-spoof' } }));
+  };
+  await assert.rejects(a.connection.agent.request('session/prompt', {
+    sessionId, prompt: [{ type: 'text', text: 'synthetic raw policy spoof' }],
+    _meta: { '1agents': { requestId: 'synthetic-owned-operation' } },
+  }), error => {
+    const safe = (error as { data: Record<string, unknown> }).data;
+    assert.equal(safe.category, 'unknown');
+    assert.equal(safe.origin, 'service');
+    assert.equal(safe.retryable, false);
+    assert.equal(safe.outcomeUnknown, false);
+    assert.equal(safe.operationId, 'synthetic-owned-operation');
+    return true;
+  });
+});
+
 for (const finalAnswer of ['Final answer', '']) {
   test(`managed completion keeps the authoritative ${finalAnswer ? 'final answer' : 'empty answer'} after streamed commentary`, async t => {
     const f = await fixture(t), a = await f.connect();
