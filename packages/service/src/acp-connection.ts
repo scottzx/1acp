@@ -6,6 +6,7 @@ import { realpathSync } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
 import { agent, RequestError, PROTOCOL_VERSION, type AgentContext, type Stream, type AnyMessage, type SessionUpdate, type PromptResponse, type RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import type { WebSocket } from 'ws';
+import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import { AcpState } from './acp-state.js';
 import { dispatchCommand, activeSessions, runtime, loadSessionHistory, readRuntimeRecord } from './bridge.js';
 
@@ -15,6 +16,28 @@ type RecordValue = Record<string, any>;
 const calls = new AsyncLocalStorage<{ events: RecordValue[]; active: boolean }>();
 const NS = '1agents';
 const EXT = '_1agents/';
+
+/** Error envelopes have a closed projection; provider data never becomes metadata. */
+function safeFailureEvent(event: RecordValue): RecordValue {
+  const failedTurn = event.status === 'failed' && ['turn_state', 'turn_terminal', 'turn_complete', 'done'].includes(event.event);
+  if (!event.error && !failedTurn && event.event !== 'error' && event.event !== 'protocol_error' && event.type !== 'error') return event;
+  const safe = toSafeError(event.error ?? { ...event, code: event.code ?? event.errorCode }, {
+    origin: 'service', operationId: event.runtimeRequestId ?? event.requestId,
+  });
+  const value: RecordValue = {};
+  for (const key of ['event', 'type', 'sessionId', 'turnId', 'requestId', 'runtimeRequestId', 'promptMessageId',
+    'sequence', 'journalSequence', 'scope', 'terminal', 'status', 'responsePolicy', 'stopReason', 'stopped',
+    'completedAt', 'createdAt', 'updatedAt', 'finalAnswer', 'resultText']) {
+    if (event[key] !== undefined) value[key] = event[key];
+  }
+  if (event.error || event.status === 'failed') return { ...value, error: safe, errorCode: safe.providerCode ?? safe.code, errorText: safe.message };
+  return { ...value, ...safe };
+}
+
+function failure(error: unknown, options?: Parameters<typeof toSafeError>[1]): RequestError {
+  const safe = toSafeError(error, { origin: 'service', ...options });
+  return new RequestError(-32000, safe.message, safe);
+}
 
 export interface RuntimeBackend {
   dispatch(peer: RuntimePeer, command: RecordValue): Promise<void>;
@@ -85,7 +108,7 @@ export class RuntimePeer {
   _acpxReqHost?: string;
   constructor(private readonly receive: (event: RecordValue) => void) {}
   send(raw: string): void {
-    const event = JSON.parse(raw) as RecordValue;
+    const event = safeFailureEvent(JSON.parse(raw) as RecordValue);
     const call = calls.getStore();
     if (call?.active) call.events.push(event);
     this.receive(event);
@@ -94,9 +117,13 @@ export class RuntimePeer {
     const events: RecordValue[] = [];
     const call = { events, active: true };
     try { await calls.run(call, () => backend.dispatch(this, payload)); }
+    catch (error) { throw failure(error, { operationId: payload.requestId }); }
     finally { call.active = false; }
-    const failure = events.find(e => (e.event === 'error' || e.type === 'error' || e.event === 'protocol_error') && e.scope !== 'turn');
-    if (failure) throw new RequestError(-32000, failure.message || 'Runtime command failed', { code: failure.code });
+    const failureEvent = events.find(e => (e.event === 'error' || e.type === 'error' || e.event === 'protocol_error') && e.scope !== 'turn');
+    if (failureEvent) {
+      const safe: SafeError = toSafeError(failureEvent.error ?? failureEvent, { origin: 'service', operationId: payload.requestId });
+      throw new RequestError(-32000, safe.message, safe);
+    }
     return events;
   }
 }
@@ -154,7 +181,7 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
     if (!connected) return;
     output = output.then(() => client.notify(method, params)).catch(error => {
       if (!connected) return;
-      for (const pending of prompts.values()) pending.reject(error);
+      for (const pending of prompts.values()) pending.reject(failure(error, { origin: 'transport', operationId: pending.requestId, outcomeUnknown: true }));
       prompts.clear();
       ws.close(1011, 'ACP update delivery failed');
     });
@@ -246,7 +273,7 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       const [key, pending] = entry;
       prompts.delete(key);
       void output.then(() => {
-        if (event.status === 'failed' || event.event === 'error') pending.reject(new RequestError(-32000, event.error?.message || event.message || 'Turn failed', { code: event.error?.code }));
+        if (event.status === 'failed' || event.event === 'error') pending.reject(failure(event.error ?? event, { operationId: pending.requestId }));
         else pending.resolve({ stopReason: event.stopped || event.status === 'cancelled' ? 'cancelled' : ['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled'].includes(event.stopReason) ? event.stopReason : 'end_turn', _meta: envelope(event) });
       });
     }
@@ -416,7 +443,7 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
   ws.once('close', () => {
     connected = false;
     for (const item of interactive.values()) item.abort.abort();
-    for (const pending of prompts.values()) pending.reject(new Error('Connection closed; resume the session to observe the retained turn'));
+    for (const pending of prompts.values()) pending.reject(failure(undefined, { origin: 'transport', operationId: pending.requestId, outcomeUnknown: true }));
     prompts.clear();
   });
   const connection = app.connect(webSocketStream(ws));

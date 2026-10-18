@@ -870,7 +870,7 @@ test("AcpRuntimeManager rejects promptStarted when the turn fails before submiss
     requestId: "req-prompt-not-started",
   });
 
-  await assert.rejects(turn.promptStarted, /connect failed/);
+  await assert.rejects(turn.promptStarted, /ACP execution failed/);
   assert.equal((await turn.result).status, "failed");
 });
 
@@ -917,7 +917,7 @@ test("AcpRuntimeManager rejects promptStarted when the prompt transport write fa
     requestId: "req-prompt-write-failed",
   });
 
-  await assert.rejects(turn.promptStarted, /transport write failed/);
+  await assert.rejects(turn.promptStarted, /ACP execution failed/);
   assert.equal((await turn.result).status, "failed");
 });
 
@@ -1058,7 +1058,9 @@ test("AcpRuntimeManager keeps promptStarted resolved when submission later fails
   const result = await turn.result;
   assert.equal(result.status, "failed");
   if (result.status === "failed") {
-    assert.match(result.error.message, /prompt failed after submission/);
+    assert.equal(result.error.message, "ACP execution failed.");
+    assert.equal(result.error.outcomeUnknown, true);
+    assert.equal(result.error.operationId, "req-prompt-failed");
   }
 });
 
@@ -2406,7 +2408,15 @@ test("AcpRuntimeManager preserves partial output but fails an unresolved timed-o
   ]);
   assert.deepEqual(result, {
     status: "failed",
-    error: { code: "TIMEOUT", message: "Timed out after 20ms" },
+    error: {
+      code: "TIMEOUT",
+      message: "ACP execution timed out.",
+      category: "timeout",
+      retryable: false,
+      outcomeUnknown: false,
+      origin: "runtime",
+      operationId: "req-late-reply",
+    },
   });
 });
 
@@ -3983,8 +3993,12 @@ test("AcpRuntimeManager surfaces normalized prompt failures", async () => {
     error: {
       code: "RUNTIME",
       detailCode: "AGENT_DISCONNECTED",
-      message: "prompt exploded",
+      message: "ACP execution failed.",
       retryable: true,
+      category: "unknown",
+      outcomeUnknown: true,
+      origin: "acp",
+      operationId: "req-error",
     },
   });
   const legacyEvents = await collectEvents(
@@ -4001,10 +4015,92 @@ test("AcpRuntimeManager surfaces normalized prompt failures", async () => {
       type: "error",
       code: "RUNTIME",
       detailCode: "AGENT_DISCONNECTED",
-      message: "prompt exploded",
+      message: "ACP execution failed.",
       retryable: true,
+      category: "unknown",
+      outcomeUnknown: true,
+      origin: "acp",
+      operationId: "req-error-legacy",
     },
   ]);
+});
+
+test("AcpRuntimeManager projects native quota failures into results and legacy events", async () => {
+  const canary = "SYNTHETIC_SECRET_CANARY_NOT_REAL";
+  const store = new InMemorySessionStore([
+    makeSessionRecord({
+      acpxRecordId: "synthetic-safe-error",
+      acpSessionId: "synthetic-native-session",
+      agentCommand: "synthetic-agent --acp",
+      cwd: "/workspace",
+    }),
+  ]);
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          start: async () => {},
+          close: async () => {},
+          hasReusableSession: () => true,
+          supportsLoadSession: () => true,
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => {
+            throw {
+              code: -32603,
+              message: "Internal error",
+              data: {
+                codexErrorInfo: "usageLimitExceeded",
+                message: canary,
+                additionalDetails: "https://example.invalid/authorize?token=" + canary,
+                account: canary,
+              },
+            };
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+  try {
+    const input = {
+      handle: createHandle("synthetic-safe-error"),
+      text: "synthetic prompt",
+      mode: "prompt" as const,
+      sessionMode: "persistent" as const,
+      requestId: "synthetic-operation",
+    };
+    const nativeTurn = manager.startTurn(input);
+    const { events, result } = await collectTurn(nativeTurn);
+    assert.deepEqual(events, []);
+    assert.equal(result.status, "failed");
+    if (result.status !== "failed") {
+      throw new Error("Expected a failed execution");
+    }
+    assert.deepEqual(result.error, {
+      code: "RUNTIME",
+      message: "Provider quota exhausted.",
+      category: "quota",
+      providerCode: "usageLimitExceeded",
+      retryable: false,
+      outcomeUnknown: false,
+      origin: "acp",
+      operationId: "synthetic-operation",
+    });
+    await assert.rejects(nativeTurn.promptStarted, (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "Provider quota exhausted.");
+      assert.doesNotMatch(JSON.stringify(error), /SYNTHETIC_|example\.invalid|additionalDetails/);
+      return true;
+    });
+    const legacy = await collectEvents(manager.runTurn(input));
+    assert.deepEqual(legacy, [{ type: "error", ...result.error }]);
+    assert.doesNotMatch(JSON.stringify({ result, legacy }), /SYNTHETIC_|example\.invalid|account/);
+  } finally {
+    await manager.shutdown();
+  }
 });
 
 test("AcpRuntimeManager rejects unsupported runtime attachment media types", async () => {
@@ -4242,9 +4338,12 @@ test(
         error: {
           code: "RUNTIME",
           detailCode: "SESSION_RESUME_REQUIRED",
-          message:
-            "Persistent ACP session stale-backend-session could not be resumed: saved session cannot be loaded",
+          message: "ACP execution failed.",
           retryable: true,
+          category: "unknown",
+          outcomeUnknown: false,
+          origin: "acp",
+          operationId: "req-failed-reconnect-lease",
         },
       });
       assert.deepEqual(await waitFor(emptyStreamEnd), { done: true, value: undefined });
@@ -4363,7 +4462,12 @@ test(
         status: "failed",
         error: {
           code: "RUNTIME",
-          message: "finalization hook exploded",
+          message: "ACP execution failed.",
+          category: "unknown",
+          retryable: false,
+          outcomeUnknown: false,
+          origin: "runtime",
+          operationId: "req-finalization-failure",
         },
       });
       assert.deepEqual(await waitFor(emptyStreamEnd), { done: true, value: undefined });
@@ -4463,7 +4567,12 @@ test("AcpRuntimeManager fails the turn when the final owner checkpoint throws", 
     status: "failed",
     error: {
       code: "RUNTIME",
-      message: "ENOSPC: no space left on device",
+      message: "ACP execution failed.",
+      category: "unknown",
+      retryable: false,
+      outcomeUnknown: false,
+      origin: "runtime",
+      operationId: "req-finalize-persist",
     },
   });
   assert.equal(closeCalls, 1);
@@ -4527,9 +4636,12 @@ test("AcpRuntimeManager fails persistent turns clearly when session reuse is una
     error: {
       code: "RUNTIME",
       detailCode: "SESSION_RESUME_REQUIRED",
-      message:
-        "Persistent ACP session persistent-backend-session could not be resumed: agent does not support session/resume or session/load",
+      message: "ACP execution failed.",
       retryable: true,
+      category: "unknown",
+      outcomeUnknown: false,
+      origin: "acp",
+      operationId: "req-persistent",
     },
   });
   assert.equal(createSessionCalls, 0);

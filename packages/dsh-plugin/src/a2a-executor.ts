@@ -7,17 +7,24 @@ import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '@1agents/acp-service/a2a';
+import { toSafeError } from '@1agents/acp-service/runtime';
 
-function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean): A2ARunResult {
+function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string): A2ARunResult {
   switch (reason.kind) {
     case 'completed': return finalAnswerExpected && !text.trim()
       ? { outcome: 'failed', text, detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
       : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
-    case 'error': return { outcome: 'failed', text, detail: reason.error.message };
+    case 'error': {
+      const projected = toSafeError(reason.error, { origin: 'dsh' });
+      const error = projected.operationId ? projected : toSafeError(projected, { operationId });
+      return { outcome: 'failed', text, detail: error.message, error };
+    }
     case 'max-tokens': return { outcome: 'failed', text, detail: 'DSH reached the model output token limit' };
-    case 'aborted': return { outcome: 'failed', text, detail: 'DSH task execution was canceled' };
-    case 'interrupted': return { outcome: 'failed', text, detail: 'DSH task execution was interrupted' };
+    case 'aborted': return { outcome: 'failed', text, detail: 'DSH task execution was canceled',
+      error: toSafeError({ code: 'ABORTED' }, { origin: 'dsh', operationId }) };
+    case 'interrupted': return { outcome: 'failed', text, detail: 'DSH task execution was interrupted',
+      error: toSafeError(undefined, { origin: 'dsh', operationId, outcomeUnknown: true }) };
     case 'forked': return { outcome: 'failed', text, detail: 'DSH task turn was closed by a session fork' };
     // DSH's turn reasons are merge-extensible; an unknown ending cannot report success.
     default: return { outcome: 'failed', text, detail: 'DSH returned an unsupported turn ending' };
@@ -149,7 +156,7 @@ export class DshA2ABackend implements A2ABackend {
         else if (!authoritativeAnswer && next.phased) { text = next.text; finalAnswerExpected = true; }
         else if (!finalAnswerExpected && next.text.length > 0) text = next.text;
       } else if (event.type === 'turn/end' && event.data.turn === turn) {
-        settle(resultOf(event.data.reason, text, finalAnswerExpected));
+        settle(resultOf(event.data.reason, text, finalAnswerExpected, options.requestId));
       }
     }));
     options.signal.addEventListener('abort', cancel, { once: true });

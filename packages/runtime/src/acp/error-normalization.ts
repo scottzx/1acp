@@ -11,6 +11,10 @@ import {
   type OutputErrorAcpPayload,
   type OutputErrorCode,
   type OutputErrorOrigin,
+  type SafeError,
+  type SafeErrorCategory,
+  type SafeErrorOrigin,
+  QUEUE_ERROR_DETAIL_CODES,
 } from "../types.js";
 import {
   extractAcpError,
@@ -286,4 +290,303 @@ export function exitCodeForOutputErrorCode(code: OutputErrorCode): ExitCode {
     default:
       return EXIT_CODES.ERROR;
   }
+}
+
+const PROVIDER_SIGNALS: Readonly<Record<string, SafeErrorCategory>> = {
+  usageLimitExceeded: "quota",
+  quota_exhausted: "quota",
+  insufficient_quota: "quota",
+  rateLimitExceeded: "rate_limit",
+  rate_limited: "rate_limit",
+  rate_limit_exceeded: "rate_limit",
+  sessionBudgetExceeded: "budget",
+  budget_exhausted: "budget",
+  unauthorized: "auth",
+  auth_required: "auth",
+  authentication_required: "auth",
+};
+
+const SAFE_MESSAGES: Record<SafeErrorCategory, string> = {
+  quota: "Provider quota exhausted.",
+  rate_limit: "Provider rate limit reached.",
+  budget: "Provider session budget exhausted.",
+  auth: "Provider authentication required.",
+  cancelled: "ACP execution cancelled.",
+  timeout: "ACP execution timed out.",
+  permission: "ACP permission denied.",
+  unknown: "ACP execution failed.",
+};
+
+const SAFE_CODES = new Set<string>([
+  ...OUTPUT_ERROR_CODES,
+  "ACP_BACKEND_MISSING",
+  "ACP_BACKEND_UNAVAILABLE",
+  "ACP_BACKEND_UNSUPPORTED_CONTROL",
+  "ACP_DISPATCH_DISABLED",
+  "ACP_INVALID_RUNTIME_OPTION",
+  "ACP_SESSION_INIT_FAILED",
+  "ACP_TURN_FAILED",
+  "ABORTED",
+]);
+const SAFE_DETAILS = new Set<string>([
+  ...QUEUE_ERROR_DETAIL_CODES,
+  "AUTH_REQUIRED",
+  "AGENT_DISCONNECTED",
+  "AGENT_SPAWN_ENOENT",
+  "AGENT_STARTUP_FAILED",
+  "SESSION_RESUME_REQUIRED",
+  "SESSION_MODE_REPLAY_FAILED",
+  "SESSION_MODEL_REPLAY_FAILED",
+  "SESSION_CONFIG_OPTION_REPLAY_FAILED",
+  "UNSUPPORTED_PROMPT_CONTENT",
+  "WATCH_OUTCOME_UNKNOWN",
+]);
+const SAFE_ORIGINS = new Set<string>([
+  ...OUTPUT_ERROR_ORIGINS,
+  "service",
+  "transport",
+  "dsh",
+  "a2a",
+]);
+
+type SafeErrorOptions = {
+  origin?: SafeErrorOrigin;
+  /** A caller-owned request identifier, never a provider message. */
+  operationId?: string;
+  outcomeUnknown?: boolean;
+};
+
+/** Only known envelope edges are visited, with both depth and node limits. */
+function safeErrorRecords(error: unknown): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = [];
+  const seen = new Set<unknown>();
+  const pending = [{ value: error, depth: 0 }];
+  while (pending.length && records.length < 24) {
+    const entry = pending.shift();
+    if (!entry || entry.depth > 5 || seen.has(entry.value)) {
+      continue;
+    }
+    seen.add(entry.value);
+    const record = asRecord(entry.value);
+    if (!record) {
+      continue;
+    }
+    records.push(record);
+    for (const key of ["error", "acp", "cause", "data"]) {
+      pending.push({ value: record[key], depth: entry.depth + 1 });
+    }
+  }
+  return records;
+}
+
+function providerSignal(value: unknown): SafeErrorCategory | undefined {
+  return typeof value === "string" && Object.hasOwn(PROVIDER_SIGNALS, value)
+    ? PROVIDER_SIGNALS[value]
+    : undefined;
+}
+
+type ProviderCause = {
+  category?: SafeErrorCategory;
+  providerCode?: string;
+  conflict?: boolean;
+};
+
+function collectProviderSignal(state: ProviderCause, key: string, value: unknown): void {
+  if (value === undefined) {
+    return;
+  }
+  const candidate = providerSignal(value);
+  if (!candidate) {
+    state.conflict ||= !isNeutralErrorSignal(key, value);
+    return;
+  }
+  state.conflict ||= state.category !== undefined && state.category !== candidate;
+  state.category = candidate;
+  state.providerCode ??= value as string;
+}
+
+function safeProviderCause(records: Record<string, unknown>[]): ProviderCause {
+  const state: ProviderCause = {};
+  for (const record of records) {
+    for (const key of ["codexErrorInfo", "providerCode", "code", "type"]) {
+      collectProviderSignal(state, key, record[key]);
+    }
+  }
+  return state.conflict ? { conflict: true } : state;
+}
+
+function isNeutralErrorSignal(key: string, value: unknown): boolean {
+  if (key === "code" && (value === -32603 || value === -32000)) {
+    return true;
+  }
+  if (key === "code" && typeof value === "string" && SAFE_CODES.has(value)) {
+    return true;
+  }
+  return key === "type" && value === "error";
+}
+
+function safeStringField(
+  records: Record<string, unknown>[],
+  key: string,
+  allowed: ReadonlySet<string>,
+): string | undefined {
+  for (const record of records) {
+    const value = record[key];
+    if (typeof value === "string" && allowed.has(value)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function safeOperationId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u.test(value)
+    ? value
+    : undefined;
+}
+
+function projectedOperationId(record: Record<string, unknown> | undefined): string | undefined {
+  if (
+    !record ||
+    typeof record.category !== "string" ||
+    !Object.hasOwn(SAFE_MESSAGES, record.category)
+  ) {
+    return undefined;
+  }
+  if (typeof record.origin !== "string" || !SAFE_ORIGINS.has(record.origin)) {
+    return undefined;
+  }
+  if (typeof record.retryable !== "boolean" || typeof record.outcomeUnknown !== "boolean") {
+    return undefined;
+  }
+  return safeOperationId(record.operationId);
+}
+
+function safeLocalCode(error: unknown): OutputErrorCode | undefined {
+  if (error instanceof PermissionPromptUnavailableError) {
+    return "PERMISSION_PROMPT_UNAVAILABLE";
+  }
+  if (error instanceof PermissionDeniedError) {
+    return "PERMISSION_DENIED";
+  }
+  if (isTimeoutLike(error)) {
+    return "TIMEOUT";
+  }
+  if (isNoSessionLike(error)) {
+    return "NO_SESSION";
+  }
+  if (isUsageLike(error)) {
+    return "USAGE";
+  }
+  return undefined;
+}
+
+function localSafeCategory(error: unknown, code?: string, detailCode?: string): SafeErrorCategory {
+  if (error instanceof AuthPolicyError) {
+    return "auth";
+  }
+  if (isTimeoutLike(error)) {
+    return "timeout";
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return "cancelled";
+  }
+  const localCategories: Readonly<Record<string, SafeErrorCategory>> = {
+    AUTH_REQUIRED: "auth",
+    TIMEOUT: "timeout",
+    PERMISSION_DENIED: "permission",
+    PERMISSION_PROMPT_UNAVAILABLE: "permission",
+    ABORTED: "cancelled",
+  };
+  return localCategories[detailCode ?? code ?? ""] ?? "unknown";
+}
+
+function safeCategory(
+  error: unknown,
+  records: Record<string, unknown>[],
+  provider: ProviderCause,
+  code?: string,
+  detailCode?: string,
+): SafeErrorCategory {
+  const local = localSafeCategory(error, code, detailCode);
+  if (local !== "unknown") {
+    return local;
+  }
+  if (provider.conflict) {
+    return "unknown";
+  }
+  const preserved = safeStringField(records, "category", new Set(Object.keys(SAFE_MESSAGES))) as
+    | SafeErrorCategory
+    | undefined;
+  return provider.category ?? preserved ?? "unknown";
+}
+
+function safeOutcomeUnknown(
+  records: Record<string, unknown>[],
+  options: SafeErrorOptions,
+  detailCode?: string,
+): boolean {
+  return (
+    options.outcomeUnknown === true ||
+    records.some((record) => record.outcomeUnknown === true) ||
+    new Set(["WATCH_OUTCOME_UNKNOWN", "AGENT_DISCONNECTED"]).has(detailCode ?? "")
+  );
+}
+
+function safeOrigin(
+  records: Record<string, unknown>[],
+  options: SafeErrorOptions,
+): SafeErrorOrigin {
+  const preserved = safeStringField(records, "origin", SAFE_ORIGINS) as SafeErrorOrigin | undefined;
+  if (preserved) {
+    return preserved;
+  }
+  if (records.some((record) => typeof record.code === "number")) {
+    return "acp";
+  }
+  return options.origin ?? "runtime";
+}
+
+function safeCode(error: unknown, records: Record<string, unknown>[]): string | undefined {
+  return (
+    safeStringField(records, "outputCode", SAFE_CODES) ??
+    safeStringField(records, "code", SAFE_CODES) ??
+    safeLocalCode(error)
+  );
+}
+
+function safeOptionalFields(
+  error: unknown,
+  options: SafeErrorOptions,
+  provider: ProviderCause,
+  code?: string,
+  detailCode?: string,
+): Partial<SafeError> {
+  const operationId = safeOperationId(options.operationId) ?? projectedOperationId(asRecord(error));
+  return {
+    ...(provider.providerCode ? { providerCode: provider.providerCode } : {}),
+    ...(operationId ? { operationId } : {}),
+    ...(code ? { code } : {}),
+    ...(detailCode ? { detailCode } : {}),
+  };
+}
+
+/**
+ * Public bridge projection. No provider text, URLs, arbitrary data or unknown
+ * codes are copied. Resource categories describe failures, not retry policy.
+ */
+export function toSafeError(error: unknown, options: SafeErrorOptions = {}): SafeError {
+  const records = safeErrorRecords(error);
+  const provider = safeProviderCause(records);
+  const code = safeCode(error, records);
+  const detailCode = safeStringField(records, "detailCode", SAFE_DETAILS);
+  const category = safeCategory(error, records, provider, code, detailCode);
+  return {
+    ...safeOptionalFields(error, options, provider, code, detailCode),
+    message: SAFE_MESSAGES[category],
+    category,
+    retryable: records.find((record) => typeof record.retryable === "boolean")?.retryable === true,
+    outcomeUnknown: safeOutcomeUnknown(records, options, detailCode),
+    origin: safeOrigin(records, options),
+  };
 }

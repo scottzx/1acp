@@ -136,6 +136,23 @@ test('tool observations preserve ACP titles, structured output and sparse update
   assert.deepEqual(replayed, tools);
 });
 
+test('safe turn errors preserve the separate failed tool result contract', async t => {
+  const f = await fixture(t), a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    peer.send(JSON.stringify({ event: 'tool_call', sessionId, toolCallId: 'synthetic-tool', status: 'failed', title: 'Synthetic operation', rawOutput: { exitCode: 1 } }));
+    peer.send(JSON.stringify({ event: 'done', sessionId, stopReason: 'end_turn' }));
+  };
+  await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'synthetic tool failure' }] });
+  const update = a.updates.find(item => item.update.sessionUpdate === 'tool_call')?.update;
+  assert.ok(update?.sessionUpdate === 'tool_call');
+  assert.equal(update.toolCallId, 'synthetic-tool');
+  assert.equal(update.status, 'failed');
+  assert.deepEqual(update.rawOutput, { exitCode: 1 });
+});
+
 for (const finalAnswer of ['Final answer', '']) {
   test(`managed completion keeps the authoritative ${finalAnswer ? 'final answer' : 'empty answer'} after streamed commentary`, async t => {
     const f = await fixture(t), a = await f.connect();

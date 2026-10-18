@@ -30,6 +30,7 @@ import type {
   PermissionMode,
   PermissionPolicy,
   SessionRecord,
+  SafeError,
 } from "../../types.js";
 import type { SessionAgentOptions } from "../engine/session-options.js";
 
@@ -414,20 +415,10 @@ export type AcpRuntimeEvent =
    * Compatibility failure event emitted by runTurn(...). startTurn(...).events
    * does not emit terminal events; use AcpRuntimeTurn.result instead.
    */
-  | {
-      type: "error";
-      message: string;
-      code?: string;
-      detailCode?: string;
-      retryable?: boolean;
-    };
+  | ({ type: "error" } & AcpRuntimeTurnResultError);
 
-export type AcpRuntimeTurnResultError = {
-  message: string;
-  code?: string;
-  detailCode?: string;
-  retryable?: boolean;
-};
+export type AcpRuntimeTurnResultError = Pick<SafeError, "message"> &
+  Partial<Omit<SafeError, "message">>;
 
 export type AcpRuntimeTurnResult =
   | {

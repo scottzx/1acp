@@ -13,6 +13,7 @@ import {
 } from '@a2a-js/sdk';
 import { ClientFactory, ClientFactoryOptions, type Client, type RequestOptions } from '@a2a-js/sdk/client';
 import { ServerCallContext } from '@a2a-js/sdk/server';
+import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import { createA2AServer, FileA2AStore, type A2AServerOptions } from '../src/a2a/index.js';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
 
@@ -230,6 +231,7 @@ test('same context starts a new Task with the saved DSH session, while CancelTas
   assert.deepEqual(f.backend.preparations[1], { sessionId: 'session-1', cwd: '/tmp/shared-project', agentPreset: 'reviewer' });
   const canceled = await deadline(f.client.cancelTask(CancelTaskRequest.fromJSON({ id: second.id }), authenticated), 'CancelTask waited forever');
   assert.equal(canceled.status?.state, TaskState.TASK_STATE_CANCELED);
+  assert.equal((canceled.metadata?.['1agents'] as { error: SafeError }).error.category, 'cancelled');
   assert.equal(f.backend.runs[1].signal.aborted, true);
   assert.equal((await f.client.getTask(GetTaskRequest.fromJSON({ id: first.id }), authenticated)).status?.state, TaskState.TASK_STATE_COMPLETED);
   assert.equal((await f.client.cancelTask(CancelTaskRequest.fromJSON({ id: second.id }), authenticated)).status?.state, TaskState.TASK_STATE_CANCELED);
@@ -246,7 +248,8 @@ test('backend failures produce a queryable failed Task and close live subscriber
   const events = await deadline(subsequent, 'Failed Task kept SSE open');
   assert.ok(events.some(event => event.payload?.$case === 'statusUpdate' && event.payload.value.status?.state === TaskState.TASK_STATE_FAILED));
   const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
-  assert.match(String(failed.status?.message?.parts[0].content?.value), /backend crashed/);
+  assert.equal((failed.metadata?.['1agents'] as { error: SafeError }).error.category, 'unknown');
+  assert.ok(!JSON.stringify(failed).includes('backend crashed'));
   assert.equal(failed.artifacts.length, 0);
 
   const backend = new DeferredBackend();
@@ -254,8 +257,98 @@ test('backend failures produce a queryable failed Task and close live subscriber
   const preparationFailure = await fixture(t, {}, backend);
   const refused = await submit(preparationFailure.client, message('session preparation fails'));
   const refusedTask = await waitForTask(preparationFailure.client, refused.id, TaskState.TASK_STATE_FAILED);
-  assert.match(String(refusedTask.status?.message?.parts[0].content?.value), /session could not be resumed/);
+  assert.equal((refusedTask.metadata?.['1agents'] as { error: SafeError }).error.category, 'unknown');
+  assert.ok(!JSON.stringify(refusedTask).includes('session could not be resumed'));
   assert.equal(backend.runs.length, 0);
+});
+
+test('A05 A2A errors retain safe categories and uncertain delivery without leaking provider detail', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const secret = 'SYNTHETIC_SECRET_CANARY_NOT_REAL';
+  const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL';
+  const cases = [
+    { code: -32603, message: 'Internal error', data: { codexErrorInfo: 'usageLimitExceeded', message: secret, additionalDetails: authLink } },
+    { code: -32603, message: `quota budget retry ${secret}`, data: { message: authLink } },
+    { code: -32603, message: 'Internal error', data: { codexErrorInfo: 'unauthorized', token: secret, authUrl: authLink } },
+  ];
+  for (const [index, category] of ['quota', 'unknown', 'auth'].entries()) {
+    const task = await submit(f.client, message(`synthetic failure ${index}`));
+    f.backend.runs[index].result.reject(cases[index]);
+    const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+    const error = (failed.metadata?.['1agents'] as { error: SafeError }).error;
+    assert.equal(error.category, category);
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    const serialized = JSON.stringify(failed);
+    assert.ok(!serialized.includes(secret));
+    assert.ok(!serialized.includes(authLink));
+    assert.ok(!serialized.includes('codexErrorInfo'));
+  }
+  const task = await submit(f.client, message('synthetic uncertain delivery'));
+  f.backend.runs[3].result.resolve({ outcome: 'failed', text: '', detail: `${secret} ${authLink}`,
+    error: toSafeError(undefined, { origin: 'transport', operationId: 'synthetic-delivery', outcomeUnknown: true }) });
+  const uncertain = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+  const metadata = uncertain.metadata?.['1agents'] as { sessionId: string; error: SafeError };
+  assert.equal(metadata.sessionId, 'session-4');
+  assert.equal(metadata.error.origin, 'transport');
+  assert.equal(metadata.error.operationId, 'synthetic-delivery');
+  assert.equal(metadata.error.outcomeUnknown, true);
+  assert.equal(metadata.error.category, 'unknown');
+  assert.ok(!JSON.stringify(uncertain).includes(secret));
+  assert.ok(!JSON.stringify(uncertain).includes(authLink));
+  assert.equal(f.backend.runs.length, 4, 'Failed executions must not be retried automatically');
+});
+
+test('A2A cancellation preserves a backend uncertainty flag while remaining canceled', { timeout: 10000 }, async t => {
+  const backend = new DeferredBackend();
+  const started = deferred<void>();
+  backend.run = async (_target, _prompt, options) => {
+    started.resolve();
+    return new Promise<A2ARunResult>((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(toSafeError(undefined, {
+        origin: 'transport', operationId: 'synthetic-cancel-delivery', outcomeUnknown: true,
+      })), { once: true });
+    });
+  };
+  const f = await fixture(t, {}, backend);
+  const task = await submit(f.client, message('synthetic uncertain cancellation'));
+  await started.promise;
+  const canceled = await f.client.cancelTask(CancelTaskRequest.fromJSON({ id: task.id }), authenticated);
+  assert.equal(canceled.status?.state, TaskState.TASK_STATE_CANCELED);
+  const error = (canceled.metadata?.['1agents'] as { error: SafeError }).error;
+  assert.equal(error.category, 'unknown');
+  assert.equal(error.origin, 'transport');
+  assert.equal(error.operationId, 'synthetic-cancel-delivery');
+  assert.equal(error.outcomeUnknown, true);
+});
+
+test('A2A cancellation racing a returned failure preserves all safe error fields', { timeout: 10000 }, async t => {
+  const backend = new DeferredBackend();
+  const started = deferred<void>();
+  backend.run = async (_target, _prompt, options) => new Promise<A2ARunResult>(resolve => {
+    options.signal.addEventListener('abort', () => {
+      assert.equal(options.signal.aborted, true);
+      // Return rather than throw: executor cancellation is observed after run resolves.
+      resolve({ outcome: 'failed', text: '', error: {
+        ...toSafeError({ code: -32603, message: 'Internal error', data: { codexErrorInfo: 'usageLimitExceeded' } }, {
+          origin: 'acp', operationId: 'synthetic-returned-delivery', outcomeUnknown: true,
+        }), retryable: true,
+      } });
+    }, { once: true });
+    started.resolve();
+  });
+  const f = await fixture(t, {}, backend);
+  const task = await submit(f.client, message('synthetic returned failure cancellation race'));
+  await started.promise;
+  const canceled = await f.client.cancelTask(CancelTaskRequest.fromJSON({ id: task.id }), authenticated);
+  assert.equal(canceled.status?.state, TaskState.TASK_STATE_CANCELED);
+  const error = (canceled.metadata?.['1agents'] as { error: SafeError }).error;
+  assert.equal(error.category, 'quota');
+  assert.equal(error.providerCode, 'usageLimitExceeded');
+  assert.equal(error.retryable, true);
+  assert.equal(error.origin, 'acp');
+  assert.equal(error.operationId, 'synthetic-returned-delivery');
+  assert.equal(error.outcomeUnknown, true);
 });
 
 test('blocking SendMessage waits for the result and input-required tasks accept a follow-up', { timeout: 10000 }, async t => {

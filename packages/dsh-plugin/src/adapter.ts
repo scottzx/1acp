@@ -14,6 +14,7 @@ import type { NewSessionRequest, SessionUpdate, RequestPermissionRequest, Reques
 import { connect, object, type JsonObject } from './transport.js';
 import { State, hasActiveWriter, type Binding } from './state.js';
 import { mergeTool, type RemoteTool } from './tool-events.js';
+import { toSafeError } from '@1agents/acp-service/runtime';
 export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number }
 export interface Capabilities {
   agent: string;
@@ -358,6 +359,11 @@ export class AcpAdapter implements LlmAdapter {
       }
     };
     let active: Awaited<ReturnType<typeof connect>> | undefined;
+    let requestSent = false;
+    const cancelled = (outcomeUnknown: boolean): StreamChunk => ({ type: 'finish', reason: { kind: 'aborted', failure: {
+      ...toSafeError({ code: 'ABORTED' }, { origin: 'dsh', operationId: requestId, outcomeUnknown }),
+      code: 'ABORTED',
+    } } });
     const cancel = () => { if (binding?.sessionId) void active?.rpc.notify('session/cancel', { sessionId: binding.sessionId }).catch(() => {}); };
     signal.addEventListener('abort', cancel, { once: true });
     try {
@@ -368,6 +374,7 @@ export class AcpAdapter implements LlmAdapter {
           active = await this.connection(agent);
           binding = this.state.get(agent.id)!;
           signal.throwIfAborted();
+          requestSent = true;
           const result = await active.rpc.request('session/prompt', { sessionId: binding.sessionId!, prompt: [{ type: 'text', text }],
             _meta: { '1agents': { turnManaged: true, turnId: requestId, requestId } } }, { cancellationSignal: signal });
           signal.throwIfAborted();
@@ -384,16 +391,29 @@ export class AcpAdapter implements LlmAdapter {
             queue.push({ type: 'block-end', index, block });
             index++;
           }
-          queue.push(result.stopReason === 'cancelled' ? { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'ACP turn cancelled' } } } : { type: 'finish', reason: result.stopReason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } });
+          queue.push(result.stopReason === 'cancelled' ? cancelled(false) : { type: 'finish', reason: result.stopReason === 'max_tokens' ? { kind: 'max-tokens' } : { kind: 'stop' } });
           return;
         } catch (error) {
-          if (signal.aborted) { endBlock(); queue.push({ type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'ACP turn cancelled' } } }); return; }
+          if (signal.aborted) { endBlock(); queue.push(cancelled(requestSent)); return; }
           // Only transport loss is retried. The managed request ID makes an
           // uncertain delivery idempotent; provider errors remain errors.
-          if ((active && active.ws.readyState === 1) || attempt >= this.config.reconnectAttempts) throw error;
+          if ((active && active.ws.readyState === 1) || attempt >= this.config.reconnectAttempts) {
+            const transportLost = !active || active.ws.readyState !== 1;
+            const safe = toSafeError(error, { origin: transportLost ? 'transport' : 'dsh', operationId: requestId, outcomeUnknown: transportLost && requestSent });
+            // A pending import has no service identity while its original
+            // writer owns the native session. Retain that local explanation
+            // without copying the failed restoration's provider message.
+            if (!requestSent && binding?.imported && !binding.sessionId && safe.category === 'unknown') {
+              safe.message = 'The imported ACP session is not ready; check for an active writer before retrying.';
+            }
+            throw Object.assign(new Error(safe.message), safe);
+          }
           await delay(this.config.reconnectDelayMs, undefined, { signal });
         } finally { active = undefined; }
       }
+    } catch (error) {
+      if (!signal.aborted) throw error;
+      endBlock(); queue.push(cancelled(requestSent));
     } finally { signal.removeEventListener('abort', cancel); this.output.delete(agent.id); }
   }
 }

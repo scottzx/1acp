@@ -9,6 +9,7 @@ import {
   createAcpRuntime,
   createRuntimeStore,
   createTurnJournal,
+  toSafeError,
 } from "@1agents/acp-service/runtime";
 import {
   historyToolInput,
@@ -1012,6 +1013,7 @@ function sendSummaryTerminal(ws, session, sessionId, payload) {
     sessionReaderPort: 7777,
   };
   const resultText = payload.resultText || "";
+  const error = payload.error ? toSafeError(payload.error, { origin: "service" }) : undefined;
   ws.send(
     JSON.stringify({
       event: "turn_complete",
@@ -1022,7 +1024,7 @@ function sendSummaryTerminal(ws, session, sessionId, payload) {
       finalAnswer: resultText,
       sessionRef,
       completedAt: new Date().toISOString(),
-      ...(payload.error ? { error: payload.error } : {}),
+      ...(error ? { error } : {}),
     }),
   );
   ws.send(
@@ -1040,6 +1042,7 @@ function sendSummaryTerminal(ws, session, sessionId, payload) {
           ? "Execution failed."
           : "Execution completed successfully."),
       ...(payload.stopped ? { stopped: true } : {}),
+      ...(error ? { error } : {}),
     }),
   );
 }
@@ -2522,6 +2525,19 @@ export async function dispatchCommand(ws, payload) {
           sendError(ws, sessionId, "UNKNOWN_ACTION", `Action ${action} is not supported`);
       }
     } catch (err) {
+      if (action === "prompt") {
+        const error = toSafeError(err, { origin: "service", operationId: payload.requestId });
+        console.error("[acpx-server] Prompt dispatch failed:", error);
+        const session = activeSessions.get(sessionId);
+        if (resolveResponsePolicy(payload.responsePolicy, session?.responsePolicy) === "summary") {
+          sendSummaryTerminal(ws, session, sessionId, {
+            status: "failed", resultText: "", turnId: payload.turnId || payload.requestId, error,
+          });
+        } else {
+          ws.send(JSON.stringify({ event: "error", sessionId, scope: "turn", ...error }));
+        }
+        return;
+      }
       console.error(`[acpx-server] Action execution failed:`, err);
       // An AgentStartupError with exit 127 / "command not found" means the
       // agent's ACP adapter binary could not be launched — almost always
@@ -2949,12 +2965,12 @@ async function runPromptTurn(session, sessionId, promptItem) {
             });
           }
         } else if (event.type === "error") {
+          const error = toSafeError(event, { origin: "service", operationId: requestId });
           sendRuntimeTurnEvent(targetWs, sessionId, turn, {
             event: "error",
             scope: "turn",
             terminal: false,
-            code: event.code,
-            message: event.message,
+            ...error,
           });
         } else if (
           event.type === "status" &&
@@ -3015,6 +3031,9 @@ async function runPromptTurn(session, sessionId, promptItem) {
       // Otherwise select only final-answer phases, while retaining every message
       // in the execution log. Unphased agents keep their legacy stream fallback.
       const finalResultText = result.finalAnswer ?? (hasMessagePhase ? finalAnswer : accumulatedAnswer);
+      const error = result.status === "failed"
+        ? toSafeError(result.error, { origin: "service", operationId: requestId })
+        : undefined;
       const journalTerminal = turn.hostTurnId
         ? await turnJournal.record({
             sessionId,
@@ -3024,9 +3043,8 @@ async function runPromptTurn(session, sessionId, promptItem) {
             promptText: promptItem.text,
             agentType: currentSession?.agentType || session.agentType,
             finalAnswer: finalResultText,
-            errorCode:
-              result.status === "failed" ? result.error?.code || "ACP_PROMPT_FAILED" : undefined,
-            errorText: result.status === "failed" ? result.error?.message : undefined,
+            errorCode: error?.providerCode || error?.code,
+            errorText: error?.message,
             runtimeRecordId:
               currentSession?.handle?.acpxRecordId || session.handle?.acpxRecordId || sessionId,
             runtimeRequestId: result.runtimeRequestId || requestId,
@@ -3042,13 +3060,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
           status: result.status,
           resultText: finalResultText,
           turnId: turn.hostTurnId || result.agentTurnId || result.runtimeRequestId || requestId,
-          error:
-            result.status === "failed"
-              ? {
-                  code: result.error?.code || "ACP_PROMPT_FAILED",
-                  message: result.error?.message || "Turn execution failed",
-                }
-              : undefined,
+          error,
           stopped: result.status === "cancelled",
         });
         if (targetWs && targetWs.readyState === 1 /* OPEN */) {
@@ -3068,14 +3080,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             runtimeRequestId: result.runtimeRequestId || requestId,
             promptMessageId: result.promptMessageId || requestId,
             completedAt: new Date().toISOString(),
-            ...(result.status === "failed"
-              ? {
-                  error: {
-                    code: result.error?.code || "ACP_PROMPT_FAILED",
-                    message: result.error?.message || "Turn execution failed",
-                  },
-                }
-              : {}),
+            ...(error ? { error } : {}),
           });
           terminalSent = true;
           void sendSessionMeta(targetWs, sessionId, currentSession.handle);
@@ -3085,7 +3090,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
               event: "error",
               scope: "turn",
               sessionId,
-              message: result.error?.message || "Turn execution failed",
+              ...error,
             }),
           );
         } else {
@@ -3123,7 +3128,8 @@ async function runPromptTurn(session, sessionId, promptItem) {
         }
       }
     } catch (err) {
-      console.error(`[acpx-server] Error executing turn:`, err);
+      const error = toSafeError(err, { origin: "service", operationId: requestId });
+      console.error(`[acpx-server] Error executing turn:`, error);
       const currentSession = activeSessions.get(sessionId);
       const targetWs = currentSession ? currentSession.ws : null;
       if (turn.hostTurnId && !terminalSent) {
@@ -3135,8 +3141,8 @@ async function runPromptTurn(session, sessionId, promptItem) {
             status: "failed",
             promptText: promptItem.text,
             agentType: currentSession?.agentType,
-            errorCode: "ACP_PROMPT_FAILED",
-            errorText: err?.message || String(err),
+            errorCode: error.providerCode || error.code,
+            errorText: error.message,
             runtimeRecordId: currentSession?.handle?.acpxRecordId || sessionId,
             runtimeRequestId: requestId,
             promptMessageId: requestId,
@@ -3148,10 +3154,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
               status: "failed",
               resultText: accumulatedAnswer,
               turnId: turn.hostTurnId,
-              error: {
-                code: "ACP_PROMPT_FAILED",
-                message: err?.message || String(err),
-              },
+              error,
             });
           } else {
             sendRuntimeTurnEvent(targetWs, sessionId, turn, {
@@ -3163,10 +3166,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
               runtimeRequestId: requestId,
               promptMessageId: requestId,
               completedAt: new Date().toISOString(),
-              error: {
-                code: "ACP_PROMPT_FAILED",
-                message: err?.message || String(err),
-              },
+              error,
             });
           }
           terminalSent = true;
@@ -3175,7 +3175,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             targetWs,
             sessionId,
             "TURN_JOURNAL_FAILED",
-            journalError?.message || String(journalError),
+            toSafeError(journalError, { origin: "service", operationId: requestId }).message,
           );
         }
       } else if (isSummaryMode) {
@@ -3183,10 +3183,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
           status: "failed",
           resultText: accumulatedAnswer,
           turnId: turn.hostTurnId || requestId,
-          error: {
-            code: "ACP_PROMPT_FAILED",
-            message: err?.message || String(err),
-          },
+          error,
         });
       } else if (targetWs && targetWs.readyState === 1 /* OPEN */) {
         targetWs.send(
@@ -3194,7 +3191,7 @@ async function runPromptTurn(session, sessionId, promptItem) {
             event: "error",
             scope: "turn",
             sessionId,
-            message: err.message,
+            ...error,
           }),
         );
       }

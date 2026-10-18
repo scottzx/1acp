@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agent as acpAgent } from '@agentclientprotocol/sdk';
+import { agent as acpAgent, RequestError } from '@agentclientprotocol/sdk';
 import { WebSocketServer } from 'ws';
 import { AcpAdapter } from '../dist/adapter.js';
-import { stream } from '../dist/transport.js';
+import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
 
 async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = [], streamConfig = {}) {
@@ -33,6 +33,10 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         await connection.client.notify('session/update', { sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'review', description: 'Native review', input: { hint: 'Scope' } }, { name: 'model', description: 'Native model' }] } });
         return { sessionId, configOptions: configOptions(), modes: { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] } };
       })
+      .onRequest('_1agents/session/import', object, () => {
+        if (streamConfig.importError) throw new RequestError(streamConfig.importError.code, streamConfig.importError.message, streamConfig.importError.data);
+        return { sessionId: 'synthetic-imported-session' };
+      })
       .onRequest('session/set_config_option', async ({ params }) => {
         assert.equal(params.configId, 'native-model');
         assert.ok(['native-a', 'native-b'].includes(params.value));
@@ -56,6 +60,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
           for (const update of updates) await connection.client.notify('session/update', { sessionId: params.sessionId, update });
         }
         if (disconnect && !dropped) { dropped = true; ws.terminate(); return new Promise(() => {}); }
+        if (streamConfig.error) throw new RequestError(streamConfig.error.code, streamConfig.error.message, streamConfig.error.data);
         if (interaction === 'question') {
           const result = await connection.client.request('_x.ai/ask_user_question', { questions: [{ question: 'Choose targets', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true }] });
           assert.deepEqual(result, { outcome: 'accepted', answers: { 'Choose targets': ['A', 'B'] } });
@@ -123,6 +128,76 @@ test('reconnect replays missing output and reuses the prompt id without duplicat
   const output = await collect(f.adapter, f.options('message-1'));
   assert.equal(output.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Hello ACP');
   assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
+});
+
+const secretCanary = 'SYNTHETIC_SECRET_CANARY_NOT_REAL';
+const authCanary = 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL';
+const providerFailure = (data, message = 'Internal error') => ({ code: -32603, message, data });
+
+for (const [label, error, category, providerCode] of [
+  ['native quota cause', providerFailure({ codexErrorInfo: 'usageLimitExceeded', message: secretCanary, additionalDetails: authCanary }), 'quota', 'usageLimitExceeded'],
+  ['known nested cause', providerFailure({ cause: { codexErrorInfo: 'usageLimitExceeded', message: secretCanary } }), 'quota', 'usageLimitExceeded'],
+  ['rate limit', providerFailure({ codexErrorInfo: 'rateLimitExceeded', message: secretCanary }), 'rate_limit', 'rateLimitExceeded'],
+  ['session budget', providerFailure({ codexErrorInfo: 'sessionBudgetExceeded' }), 'budget', 'sessionBudgetExceeded'],
+  ['authentication', providerFailure({ codexErrorInfo: 'unauthorized', additionalDetails: authCanary }), 'auth', 'unauthorized'],
+  ['unknown provider code', providerFailure({ codexErrorInfo: 'unknownSyntheticCode', message: secretCanary }), 'unknown', undefined],
+  ['quota prose alone', providerFailure({ message: `quota rate budget ${secretCanary}` }), 'unknown', undefined],
+  ['internal error alone', providerFailure(undefined), 'unknown', undefined],
+  ['conflicting structured codes', providerFailure({ codexErrorInfo: 'usageLimitExceeded', code: 'unauthorized' }), 'unknown', undefined],
+  ['unrelated nested code', providerFailure({ arbitrary: { codexErrorInfo: 'usageLimitExceeded' } }), 'unknown', undefined],
+  ['auth link alone', providerFailure({ message: authCanary }), 'unknown', undefined],
+]) {
+  test(`ACP adapter sanitizes actual RPC ${label} and does not resubmit it`, { timeout: 5000 }, async t => {
+    const f = await fixture(t, false, 'permission', async () => {}, [], { error });
+    let failure;
+    await assert.rejects(collect(f.adapter, f.options(`safe-${label}`)), value => { failure = value; return value instanceof Error; });
+    assert.equal(failure.category, category);
+    assert.equal(failure.providerCode, providerCode);
+    assert.equal(failure.outcomeUnknown, false);
+    assert.equal(typeof failure.retryable, 'boolean');
+    assert.match(failure.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.equal(failure.data, undefined);
+    assert.equal(failure.cause, undefined);
+    const ordinaryLog = `${failure.stack} ${JSON.stringify(failure)}`;
+    for (const canary of [secretCanary, authCanary, 'unknownSyntheticCode']) assert.ok(!ordinaryLog.includes(canary));
+    assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 0 });
+  });
+}
+
+test('transport loss after prompt delivery is safe and explicitly uncertain when reconnects are exhausted', { timeout: 5000 }, async t => {
+  const f = await fixture(t, true);
+  f.config.reconnectAttempts = 0;
+  await assert.rejects(collect(f.adapter, f.options('uncertain-delivery')), error => {
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.origin, 'transport');
+    assert.equal(error.outcomeUnknown, true);
+    assert.match(error.operationId, /^dsh-/);
+    assert.equal(error.data, undefined);
+    return true;
+  });
+  assert.equal(f.counts().executions, 1);
+});
+
+test('a known pending native writer keeps a fixed actionable message without provider restoration text', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    importError: { code: -32000, message: `SYNTHETIC_RESTORE_SECRET_NOT_REAL ${authCanary}` },
+  });
+  f.config.reconnectAttempts = 0;
+  const endpoint = new URL('/agents/codex', f.config.serviceUrl); endpoint.protocol = 'ws:';
+  new State(f.config.stateDirectory).save(f.local.id, {
+    agent: 'codex', cwd: f.local.session.header.cwd, endpoint: endpoint.href, restoreMethod: 'session/resume',
+    imported: { provider: 'codex', nativeSessionId: 'synthetic-native-session', messageIds: [] },
+  });
+  await assert.rejects(collect(f.adapter, f.options('pending-writer')), error => {
+    assert.match(error.message, /active writer/);
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.outcomeUnknown, false);
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_RESTORE_SECRET'));
+    assert.ok(!JSON.stringify(error).includes(authCanary));
+    assert.equal(error.data, undefined);
+    return true;
+  });
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
 });
 
 const textUpdate = (text, messagePhase, messageId) => ({
@@ -214,6 +289,10 @@ for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens'], ['cancelle
     const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', stopReason) });
     const chunks = await collect(f.adapter, f.options(stopReason));
     assert.equal(chunks.at(-1).reason.kind, finishKind);
+    if (stopReason === 'cancelled') {
+      assert.equal(chunks.at(-1).reason.failure.category, 'cancelled');
+      assert.equal(chunks.at(-1).reason.failure.outcomeUnknown, false);
+    }
     assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Partial answer');
   });
 }
@@ -273,8 +352,12 @@ test('stopping while permission is pending cancels remote work and settles the s
   const controller = new AbortController();
   const output = collect(f.adapter, { ...f.options('message-1'), signal: controller.signal });
   await f.waiting;
-  controller.abort();
-  assert.equal((await output).at(-1).reason.kind, 'aborted');
+  controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+  const chunks = await output, finish = chunks.at(-1);
+  assert.equal(finish.reason.kind, 'aborted');
+  assert.equal(finish.reason.failure.category, 'cancelled');
+  assert.equal(finish.reason.failure.outcomeUnknown, true);
+  assert.ok(!JSON.stringify(chunks).includes('SYNTHETIC_CANCEL_SECRET'));
   await f.cancelled;
 });
 
