@@ -107,7 +107,7 @@ export class A2ASessionExecutor implements AgentExecutor {
       controller.signal.throwIfAborted();
       status(TaskState.TASK_STATE_WORKING);
       const result = await this.backend.run(target, prompt, { requestId, signal: controller.signal });
-      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a', trustedProjection: true }) : undefined;
+      returnedError = result.outcome === 'failed' ? toSafeError(result.error, { origin: 'a2a' }) : undefined;
       returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
         ? FAILURE_MESSAGES[result.failureReason] : undefined;
       controller.signal.throwIfAborted();

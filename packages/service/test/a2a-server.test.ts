@@ -325,6 +325,29 @@ test('known host failure reasons remain queryable while raw failure detail stays
   }
 });
 
+test('raw backend error records cannot self-assert trusted policy fields or operation IDs', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const secret = 'SYNTHETIC_BACKEND_ERROR_CANARY_NOT_REAL';
+  const operationCanary = 'SYNTHETIC_BACKEND_OPERATION_SECRET_NOT_REAL';
+  const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_BACKEND_AUTH_CANARY_NOT_REAL';
+  const task = await submit(f.client, message('synthetic backend policy spoof'));
+  f.backend.runs[0].result.resolve({ outcome: 'failed', text: '', detail: secret, error: {
+    message: `${secret} ${authLink}`, category: 'quota', origin: 'dsh', retryable: true,
+    outcomeUnknown: true, operationId: operationCanary,
+  } });
+  const failed = await waitForTask(f.client, task.id, TaskState.TASK_STATE_FAILED);
+  const error = (failed.metadata?.['1agents'] as { error: SafeError }).error;
+  assert.equal(error.category, 'unknown');
+  assert.equal(error.origin, 'a2a');
+  assert.equal(error.retryable, false);
+  assert.equal(error.outcomeUnknown, false);
+  assert.equal(error.operationId, f.backend.runs[0].requestId);
+  assert.equal(failed.status?.message?.parts[0].content?.value, 'ACP execution failed.');
+  assert.ok(!JSON.stringify(failed).includes(secret));
+  assert.ok(!JSON.stringify(failed).includes(operationCanary));
+  assert.ok(!JSON.stringify(failed).includes(authLink));
+});
+
 test('A2A cancellation preserves a backend uncertainty flag while remaining canceled', { timeout: 10000 }, async t => {
   const backend = new DeferredBackend();
   const started = deferred<void>();
@@ -355,11 +378,11 @@ test('A2A cancellation racing a returned failure preserves all safe error fields
     options.signal.addEventListener('abort', () => {
       assert.equal(options.signal.aborted, true);
       // Return rather than throw: executor cancellation is observed after run resolves.
-      resolve({ outcome: 'failed', text: '', error: {
-        ...toSafeError({ code: -32603, message: 'Internal error', data: { codexErrorInfo: 'usageLimitExceeded' } }, {
-          origin: 'acp', operationId: 'synthetic-returned-delivery', outcomeUnknown: true,
-        }), retryable: true,
-      } });
+      const error = toSafeError({ code: -32603, message: 'Internal error', data: { codexErrorInfo: 'usageLimitExceeded' } }, {
+        origin: 'acp', operationId: 'synthetic-returned-delivery', outcomeUnknown: true,
+      });
+      error.retryable = true;
+      resolve({ outcome: 'failed', text: '', error });
     }, { once: true });
     started.resolve();
   });
