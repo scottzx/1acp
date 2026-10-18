@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { client, type SessionNotification } from '@agentclientprotocol/sdk';
-import { attachAcpConnection, webSocketStream, type RuntimeBackend, type RuntimePeer } from '../src/acp-connection.js';
+import { attachAcpConnection, webSocketStream, RuntimePeer, type RuntimeBackend } from '../src/acp-connection.js';
 import { AcpState } from '../src/acp-state.js';
 import { dispatchCommand, activeSessions, pendingPermissions, pendingAskUserQuestions, pendingExitPlanModes } from '../src/bridge.js';
 
@@ -268,6 +268,33 @@ test('summary completion with an empty final answer never falls back to commenta
   assert.equal((result._meta?.['1agents'] as { resultText: string }).resultText, '');
   await a.summaryReceived;
   assert.equal(a.events[0].resultText, '');
+});
+
+test('failed summary terminals retain their session reference and summary while sanitizing errors', () => {
+  const events: Record<string, any>[] = [];
+  const peer = new RuntimePeer(event => events.push(event), true);
+  const sessionRef = { sessionId: 'synthetic-session', turnId: 'synthetic-turn',
+    sessionReaderUrl: 'http://127.0.0.1:7777', sessionReaderPort: 7777 };
+  for (const event of ['turn_complete', 'done']) {
+    peer.send(JSON.stringify({ event, status: 'failed', responsePolicy: 'summary',
+      sessionId: sessionRef.sessionId, resultText: '', finalAnswer: '', sessionRef,
+      ...(event === 'done' ? { summary: 'Execution failed.' } : {}),
+      error: { message: 'synthetic-private-provider-detail', data: { credential: 'synthetic-nonfunctional' } },
+    }));
+  }
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.deepEqual(event.sessionRef, sessionRef);
+    assert.equal(event.status, 'failed');
+    assert.equal(event.responsePolicy, 'summary');
+    assert.equal(event.resultText, '');
+    assert.equal(event.finalAnswer, '');
+    assert.equal(event.error.category, 'unknown');
+    assert.equal(event.error.data, undefined);
+    assert.equal(JSON.stringify(event).includes('synthetic-private-provider-detail'), false);
+  }
+  assert.equal(events[0].summary, undefined);
+  assert.equal(events[1].summary, 'Execution failed.');
 });
 
 test('legacy summary-only completion retains its final summary', async t => {

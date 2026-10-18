@@ -36,7 +36,7 @@ function safeFailureEvent(event: RecordValue, trustedRuntimeErrors: boolean): Re
   const value: RecordValue = {};
   for (const key of ['event', 'type', 'sessionId', 'turnId', 'requestId', 'runtimeRequestId', 'promptMessageId',
     'sequence', 'journalSequence', 'scope', 'terminal', 'status', 'responsePolicy', 'stopReason', 'stopped',
-    'completedAt', 'createdAt', 'updatedAt', 'finalAnswer', 'resultText']) {
+    'completedAt', 'createdAt', 'updatedAt', 'finalAnswer', 'resultText', 'sessionRef', 'summary']) {
     if (event[key] !== undefined) value[key] = event[key];
   }
   if (event.error || event.status === 'failed') return { ...value, error: safe, errorCode: safe.providerCode ?? safe.code, errorText: safe.message };
