@@ -208,6 +208,7 @@ type ExistingRuntimeSession = {
 type RuntimeTurnTaskState = {
   pendingCancel: boolean;
   promptWritten: boolean;
+  authorityFailure?: { error: unknown };
   turnActive: boolean;
   activeController: ActiveSessionController | null;
 };
@@ -227,6 +228,41 @@ type RuntimeTurnTask = {
   settleResult: (next: AcpRuntimeTurnResult) => void;
   abortHandler: () => void;
 };
+
+function observeTurnAuthority(
+  input: RuntimeTurnTask["input"],
+  state: RuntimeTurnTaskState,
+): RuntimeTurnTask["input"] {
+  if (!input.assertActive) {
+    return input;
+  }
+  return {
+    ...input,
+    assertActive: () => {
+      try {
+        input.assertActive?.();
+      } catch (error) {
+        state.authorityFailure = { error };
+        throw error;
+      }
+    },
+  };
+}
+
+function runtimeFailureRejection(
+  task: RuntimeTurnTask,
+  error: unknown,
+  safe: ReturnType<typeof toSafeError>,
+): unknown {
+  if (task.state.authorityFailure && task.state.authorityFailure.error === error) {
+    // Host-owned admission callbacks preserve their in-process exception contract.
+    if (error instanceof Error) {
+      safe.message = error.message;
+    }
+    return error;
+  }
+  return Object.assign(new Error(safe.message), safe);
+}
 
 type RunningRuntimeTurn = {
   record: SessionRecord;
@@ -1284,7 +1320,7 @@ export class AcpRuntimeManager {
       input.handle.acpxRecordId ?? input.handle.sessionKey,
       async () =>
         this.runRuntimeTurnTask({
-          input,
+          input: observeTurnAuthority(input, state),
           promptInput,
           queue,
           promptStarted,
@@ -1368,7 +1404,7 @@ export class AcpRuntimeManager {
    */
   private finalizationFailureResult(task: RuntimeTurnTask, error: unknown): AcpRuntimeTurnResult {
     const normalized = toSafeError(error, { origin: "runtime", operationId: task.input.requestId });
-    const rejection = Object.assign(new Error(normalized.message), normalized);
+    const rejection = runtimeFailureRejection(task, error, normalized);
     task.promptStarted.reject(rejection);
     task.sessionReady.reject(rejection);
     return {
@@ -1827,7 +1863,7 @@ export class AcpRuntimeManager {
       operationId: task.input.requestId,
       outcomeUnknown: task.state.promptWritten && !extractAcpError(error),
     });
-    const rejection = Object.assign(new Error(normalized.message), normalized);
+    const rejection = runtimeFailureRejection(task, error, normalized);
     task.promptStarted.reject(rejection);
     task.sessionReady.reject(rejection);
     if (turn) {

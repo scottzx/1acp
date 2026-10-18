@@ -15,6 +15,11 @@ account fields, and unknown codes. Supply a caller-owned `operationId` when
 projecting a raw error. A complete projected error can retain its existing
 identifier; an arbitrary nested provider identifier is discarded.
 
+Host-owned `assertActive` admission callbacks keep their exception identity and
+message for in-process callers. Service boundaries project those exceptions again
+before transport. This preserves the local authority callback contract without
+forwarding raw provider exceptions.
+
 Failure remains a failed execution. A resource category does not enqueue work,
 wait for resources, or schedule a retry. `retryable` is a hint for a caller's
 policy. `outcomeUnknown` records uncertainty, including a lost response after
