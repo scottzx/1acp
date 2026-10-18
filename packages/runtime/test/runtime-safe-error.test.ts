@@ -101,6 +101,72 @@ test("raw safe-shaped fields cannot confer projection provenance", () => {
   }
 });
 
+test("raw providerCode fields cannot establish a provider cause", () => {
+  const forged = {
+    providerCode: "usageLimitExceeded",
+    category: "quota",
+    origin: "transport",
+    retryable: true,
+    outcomeUnknown: true,
+    operationId: canary,
+    message: authLink,
+  };
+  for (const raw of [
+    { providerCode: "usageLimitExceeded" },
+    { data: { providerCode: "usageLimitExceeded" } },
+    forged,
+    { code: -32603, data: forged },
+    new AcpRuntimeError("ACP_TURN_FAILED", canary, { cause: forged }),
+  ]) {
+    const safe = toSafeError(raw);
+    assert.equal(safe.category, "unknown");
+    assert.equal(safe.providerCode, undefined);
+    assert.equal(safe.retryable, false);
+    assert.equal(safe.outcomeUnknown, false);
+    assert.equal(safe.operationId, undefined);
+    assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|example\.invalid/);
+  }
+});
+
+test("raw providerCode fields cannot conflict with explicit native signal keys", () => {
+  for (const key of ["codexErrorInfo", "code", "type"]) {
+    for (const providerCode of ["unauthorized", canary]) {
+      const safe = toSafeError({
+        code: -32603,
+        data: { [key]: "usageLimitExceeded", providerCode },
+      });
+      assert.equal(safe.category, "quota");
+      assert.equal(safe.providerCode, "usageLimitExceeded");
+      assert.doesNotMatch(JSON.stringify(safe), /SYNTHETIC_|unauthorized/);
+    }
+  }
+});
+
+test("only direct owned or trusted projections preserve projected provider codes", () => {
+  const safe = toSafeError(nativeError("usageLimitExceeded"), {
+    operationId: "owned-operation",
+  });
+  assert.deepEqual(toSafeError(safe), safe);
+  assert.deepEqual(toSafeError(safeErrorRejection(safe)), safe);
+  assert.equal(toSafeError({ ...safe }).category, "unknown");
+  const wire = { ...safe, message: authLink };
+  assert.equal(toSafeError(wire).category, "unknown");
+  assert.equal(toSafeError({ data: wire }, { trustedProjection: true }).category, "unknown");
+  assert.deepEqual(
+    toSafeError({ ...wire, data: nativeError("unauthorized") }, { trustedProjection: true }),
+    safe,
+  );
+  for (const providerCode of ["futureProviderCode", `usageLimitExceeded${canary.repeat(1_000)}`]) {
+    const unknown = toSafeError({ ...wire, providerCode }, { trustedProjection: true });
+    assert.equal(unknown.category, "unknown");
+    assert.equal(unknown.providerCode, undefined);
+    assert.doesNotMatch(JSON.stringify(unknown), /SYNTHETIC_|example\.invalid|futureProviderCode/);
+  }
+  const conflicting = toSafeError({ ...wire, code: "unauthorized" }, { trustedProjection: true });
+  assert.equal(conflicting.category, "unknown");
+  assert.equal(conflicting.providerCode, undefined);
+});
+
 test("provider detail and local output codes cannot override structured causes or delivery state", () => {
   for (const fields of [
     { detailCode: "AUTH_REQUIRED" },

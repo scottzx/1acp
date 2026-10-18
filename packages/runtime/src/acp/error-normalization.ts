@@ -411,10 +411,17 @@ function collectProviderSignal(state: ProviderCause, key: string, value: unknown
   state.providerCode ??= value as string;
 }
 
-function safeProviderCause(records: Record<string, unknown>[]): ProviderCause {
+function safeProviderCause(
+  records: Record<string, unknown>[],
+  projected: Record<string, unknown> | undefined,
+): ProviderCause {
   const state: ProviderCause = {};
   for (const record of records) {
     for (const key of ["codexErrorInfo", "providerCode", "code", "type"]) {
+      // providerCode belongs to our direct projection, never raw provider data.
+      if (key === "providerCode" && record !== projected) {
+        continue;
+      }
       collectProviderSignal(state, key, record[key]);
     }
   }
@@ -622,7 +629,7 @@ function safeOptionalFields(
 export function toSafeError(error: unknown, options: SafeErrorOptions = {}): SafeError {
   const projected = projectedRecord(error, options);
   const records = projected ? [projected] : safeErrorRecords(error);
-  const provider = safeProviderCause(records);
+  const provider = safeProviderCause(records, projected);
   const code = safeCode(error, projected);
   const detailCode = safeDetailCode(error, projected);
   const category = safeCategory(error, projected, provider, code, detailCode);
