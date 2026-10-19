@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { SessionNotification, SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeAgentCommandInput } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
-import { normalizeOutputError } from "../../acp/error-normalization.js";
+import { safeErrorRejection, toSafeError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { resolveRequestedConfigOption, resolveRequestedModelId } from "../../acp/model-support.js";
 import {
@@ -207,6 +207,8 @@ type ExistingRuntimeSession = {
 
 type RuntimeTurnTaskState = {
   pendingCancel: boolean;
+  promptWritten: boolean;
+  authorityFailure?: { error: unknown };
   turnActive: boolean;
   activeController: ActiveSessionController | null;
 };
@@ -226,6 +228,41 @@ type RuntimeTurnTask = {
   settleResult: (next: AcpRuntimeTurnResult) => void;
   abortHandler: () => void;
 };
+
+function observeTurnAuthority(
+  input: RuntimeTurnTask["input"],
+  state: RuntimeTurnTaskState,
+): RuntimeTurnTask["input"] {
+  if (!input.assertActive) {
+    return input;
+  }
+  return {
+    ...input,
+    assertActive: () => {
+      try {
+        input.assertActive?.();
+      } catch (error) {
+        state.authorityFailure = { error };
+        throw error;
+      }
+    },
+  };
+}
+
+function runtimeFailureRejection(
+  task: RuntimeTurnTask,
+  error: unknown,
+  safe: ReturnType<typeof toSafeError>,
+): unknown {
+  if (task.state.authorityFailure && task.state.authorityFailure.error === error) {
+    // Host-owned admission callbacks preserve their in-process exception contract.
+    if (error instanceof Error) {
+      safe.message = error.message;
+    }
+    return error;
+  }
+  return safeErrorRejection(safe);
+}
 
 type RunningRuntimeTurn = {
   record: SessionRecord;
@@ -1238,6 +1275,7 @@ export class AcpRuntimeManager {
     let resultSettled = false;
     const state: RuntimeTurnTaskState = {
       pendingCancel: false,
+      promptWritten: false,
       turnActive: true,
       activeController: null,
     };
@@ -1282,7 +1320,7 @@ export class AcpRuntimeManager {
       input.handle.acpxRecordId ?? input.handle.sessionKey,
       async () =>
         this.runRuntimeTurnTask({
-          input,
+          input: observeTurnAuthority(input, state),
           promptInput,
           queue,
           promptStarted,
@@ -1365,17 +1403,13 @@ export class AcpRuntimeManager {
    * turn-results snapshot because that save would fail too.
    */
   private finalizationFailureResult(task: RuntimeTurnTask, error: unknown): AcpRuntimeTurnResult {
-    task.promptStarted.reject(error);
-    task.sessionReady.reject(error);
-    const normalized = normalizeOutputError(error, { origin: "runtime" });
+    const normalized = toSafeError(error, { origin: "runtime", operationId: task.input.requestId });
+    const rejection = runtimeFailureRejection(task, error, normalized);
+    task.promptStarted.reject(rejection);
+    task.sessionReady.reject(rejection);
     return {
       status: "failed",
-      error: {
-        message: normalized.message,
-        ...(normalized.code ? { code: normalized.code } : {}),
-        ...(normalized.detailCode ? { detailCode: normalized.detailCode } : {}),
-        ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
-      },
+      error: { code: "RUNTIME", ...normalized },
     };
   }
 
@@ -1404,7 +1438,10 @@ export class AcpRuntimeManager {
       timeoutMs: task.input.timeoutMs ?? this.options.timeoutMs,
       conversation: turn.conversation,
       promptMessageId: turn.promptMessageId,
-      onPromptRequestWritten: () => task.promptStarted.resolve(),
+      onPromptRequestWritten: () => {
+        task.state.promptWritten = true;
+        task.promptStarted.resolve();
+      },
       onElicitation: task.input.onElicitation,
       onPermissionRequest: task.input.onPermissionRequest,
       authority: task.input,
@@ -1821,9 +1858,14 @@ export class AcpRuntimeManager {
     turn: RunningRuntimeTurn | undefined,
     error: unknown,
   ): Promise<AcpRuntimeTurnResult> {
-    task.promptStarted.reject(error);
-    task.sessionReady.reject(error);
-    const normalized = normalizeOutputError(error, { origin: "runtime" });
+    const normalized = toSafeError(error, {
+      origin: "runtime",
+      operationId: task.input.requestId,
+      outcomeUnknown: task.state.promptWritten && !extractAcpError(error),
+    });
+    const rejection = runtimeFailureRejection(task, error, normalized);
+    task.promptStarted.reject(rejection);
+    task.sessionReady.reject(rejection);
     if (turn) {
       await this.saveTerminalRuntimeTurn(
         turn,
@@ -1834,12 +1876,7 @@ export class AcpRuntimeManager {
     }
     return {
       status: "failed",
-      error: {
-        message: normalized.message,
-        ...(normalized.code ? { code: normalized.code } : {}),
-        ...(normalized.detailCode ? { detailCode: normalized.detailCode } : {}),
-        ...(normalized.retryable !== undefined ? { retryable: normalized.retryable } : {}),
-      },
+      error: { code: "RUNTIME", ...normalized },
     };
   }
 
@@ -1928,7 +1965,10 @@ export class AcpRuntimeManager {
   async *runTurn(input: RuntimeTurnTask["input"]): AsyncIterable<AcpRuntimeEvent> {
     const turn = this.startTurn(input);
     yield* turn.events;
-    yield legacyTerminalEventFromTurnResult(await turn.result);
+    const result = await turn.result;
+    yield result.status === "failed"
+      ? { type: "error", ...result.error }
+      : legacyTerminalEventFromTurnResult(result);
   }
 
   getStatus(handle: AcpRuntimeHandle): Promise<AcpRuntimeStatus> {

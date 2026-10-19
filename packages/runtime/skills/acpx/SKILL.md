@@ -36,6 +36,7 @@ Core capabilities:
 - Structured streaming output (`text`, `json`, `quiet`) with optional `--suppress-reads`
 - Prompt-response `_meta` preservation across direct, queued, compare, and embedded-runtime results
 - Embedded runtime text events retain message IDs and recognized Codex `commentary` / `final_answer` phases as `messagePhase`; use explicit phases to select report text while keeping the full execution stream, and do not infer finality from prose or tool timing
+- Embedded runtime failures expose safe optional category, provider code, retryability, delivery uncertainty, origin and operation ID fields. Use structured signals instead of provider prose; a failed resource condition does not automatically retry or wait. See `docs/safe-errors.md` for projection and host limitations.
 - Built-in agent registry plus raw `--agent` escape hatch
 - Claude system prompt override via `--system-prompt` / `--append-system-prompt`
 - Optional ACP filesystem and terminal capability opt-outs via `--no-fs` and `--no-terminal`

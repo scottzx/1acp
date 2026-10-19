@@ -38,6 +38,8 @@ test('default bundle imports service-discovered harness names and labels, then d
   { id: 'local-harness', label: 'Local Harness', chat_ready: true },
   { id: 'missing', label: 'Missing', chat_ready: false },
  ] });
+ const stateDirectory = mkdtempSync(join(tmpdir(), 'dsh-acp-discovery-'));
+ t.after(() => rmSync(stateDirectory, { recursive: true, force: true }));
  const effects = []; const presets = new Map(); let adapter;
  const ctx = { provide: (key, value) => { ctx[key] = value; effects.push(() => delete ctx[key]); }, get: () => undefined, effect: async setup => { effects.push(await setup()); },
   llm: { registerAdapter: (_names, value) => { adapter = value; return () => {}; } },
@@ -45,7 +47,7 @@ test('default bundle imports service-discovered harness names and labels, then d
   agentPresets: { register: async preset => { presets.set(preset.id, preset); return () => presets.delete(preset.id); } },
  };
  try {
-  await apply(ctx, { serviceUrl, serviceMode: 'external' });
+  await apply(ctx, { serviceUrl, serviceMode: 'external', stateDirectory });
   assert.deepEqual([...presets.keys()], ['oneagents-acp-local-harness']);
   assert.equal(presets.get('oneagents-acp-local-harness').name, 'ACP · Local Harness');
   assert.equal(presets.get('oneagents-acp-local-harness').plugins[1].config.agent, 'local-harness');

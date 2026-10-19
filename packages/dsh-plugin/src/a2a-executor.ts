@@ -7,20 +7,28 @@ import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '@1agents/acp-service/a2a';
+import { toSafeError } from '@1agents/acp-service/runtime';
 
-function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean): A2ARunResult {
+import type { Diagnostics } from './diagnostics.js';
+
+function resultOf(reason: TurnEndReason, text: string, finalAnswerExpected: boolean, operationId: string, diagnostic?: ReturnType<typeof toSafeError>): A2ARunResult {
   switch (reason.kind) {
     case 'completed': return finalAnswerExpected && !text.trim()
-      ? { outcome: 'failed', text, detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
+      ? { outcome: 'failed', text, failureReason: 'missing-final-answer', detail: 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output' }
       : { outcome: 'completed', text };
     case 'blocked': return { outcome: 'input-required', text, detail: 'DSH blocked the task before its next model step' };
-    case 'error': return { outcome: 'failed', text, detail: reason.error.message };
-    case 'max-tokens': return { outcome: 'failed', text, detail: 'DSH reached the model output token limit' };
-    case 'aborted': return { outcome: 'failed', text, detail: 'DSH task execution was canceled' };
-    case 'interrupted': return { outcome: 'failed', text, detail: 'DSH task execution was interrupted' };
-    case 'forked': return { outcome: 'failed', text, detail: 'DSH task turn was closed by a session fork' };
+    case 'error': {
+      const error = diagnostic ?? toSafeError(undefined, { origin: 'dsh', operationId });
+      return { outcome: 'failed', text, detail: error.message, error };
+    }
+    case 'max-tokens': return { outcome: 'failed', text, failureReason: 'max-tokens', detail: 'DSH reached the model output token limit' };
+    case 'aborted': return { outcome: 'failed', text, failureReason: 'aborted', detail: 'DSH task execution was canceled',
+      error: diagnostic ?? toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'), { origin: 'dsh', operationId, outcomeUnknown: true }) };
+    case 'interrupted': return { outcome: 'failed', text, failureReason: 'interrupted', detail: 'DSH task execution was interrupted',
+      error: toSafeError(undefined, { origin: 'dsh', operationId, outcomeUnknown: true }) };
+    case 'forked': return { outcome: 'failed', text, failureReason: 'forked', detail: 'DSH task turn was closed by a session fork' };
     // DSH's turn reasons are merge-extensible; an unknown ending cannot report success.
-    default: return { outcome: 'failed', text, detail: 'DSH returned an unsupported turn ending' };
+    default: return { outcome: 'failed', text, failureReason: 'unsupported-ending', detail: 'DSH returned an unsupported turn ending' };
   }
 }
 
@@ -45,7 +53,12 @@ function answerOf(content: readonly ContentBlock[], turn: number): { text: strin
 export class DshA2ABackend implements A2ABackend {
   private readonly executions = new Map<string, Promise<void>>();
   /** @param ctx DSH plugin context that owns session-controller and execution event registrations. */
-  constructor(private readonly ctx: Context) {}
+  constructor(private readonly ctx: Context, private readonly diagnostics?: Diagnostics) {}
+
+  /** Restart reconciliation reads the plugin domain and never dispatches another prompt. */
+  async recover(target: A2ATarget, options: { requestId: string }) {
+    return this.diagnostics?.find(target.sessionId, options.requestId);
+  }
 
   /** Create a new session or restore an explicitly addressed session without changing its workspace or preset.
    * @param input Remote host directory, preset, and optional existing DSH session identity.
@@ -115,10 +128,34 @@ export class DshA2ABackend implements A2ABackend {
       options.signal.removeEventListener('abort', cancel);
       completion.resolve(result);
     };
+    const finishTurn = (reason: TurnEndReason): void => {
+      const start = agent.session.snapshotEvents().findLast(event => event.type === 'turn/start' && event.data.turn === turn);
+      let diagnostic;
+      try { diagnostic = this.diagnostics?.find(agent.id, options.requestId, turn, start?.seq); }
+      catch { /* A stopping storage provider cannot supply durable diagnostics. */ }
+      settle(resultOf(reason, text, finalAnswerExpected, options.requestId, diagnostic));
+    };
     const cancel = (): void => {
       if (settled) return;
-      if (turn !== undefined) agent.cancel({ kind: 'user' }, { keepInbox: true });
-      else if (messageId !== undefined) agent.inbox.remove(messageId);
+      if (turn !== undefined) {
+        agent.cancel({ kind: 'user' }, { keepInbox: true });
+        // Root shutdown can remove event subscriptions before the final turn is
+        // published. The public idle barrier still drains that exact activity.
+        void agent.whenIdle().then(() => {
+          if (settled) return;
+          const ended = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end' && event.data.turn === turn);
+          if (ended?.type === 'turn/end') finishTurn(ended.data.reason);
+          else settle({ outcome: 'failed', text, failureReason: 'disposed',
+            error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: true }) });
+        }, () => {
+          settle({ outcome: 'failed', text, failureReason: 'disposed',
+            error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: true }) });
+        });
+      } else if (messageId !== undefined && agent.inbox.remove(messageId)) {
+        settle({ outcome: 'failed', text, failureReason: 'discarded',
+          error: toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'),
+            { origin: 'dsh', operationId: options.requestId, outcomeUnknown: false }) });
+      }
     };
     // The session owns these temporary listeners until its turn settles. Plugin
     // unloading removes plugin effects concurrently with the server's cancel/drain.
@@ -135,11 +172,14 @@ export class DshA2ABackend implements A2ABackend {
     }));
     listeners.push(agent.ctx.on('agent/inbox/discarded', event => {
       if (event.agent === agent && owns(event.message)) {
-        settle({ outcome: 'failed', text, detail: 'DSH discarded the queued task before execution' });
+        settle({ outcome: 'failed', text, failureReason: 'discarded', detail: 'DSH discarded the queued task before execution',
+          ...(options.signal.aborted ? { error: toSafeError(new DOMException('ACP execution cancelled.', 'AbortError'),
+            { origin: 'dsh', operationId: options.requestId, outcomeUnknown: false }) } : {}) });
       }
     }));
     listeners.push(agent.ctx.on('agent/disposed', event => {
-      if (event.agent === agent) settle({ outcome: 'failed', text, detail: 'DSH session was disposed before the task finished' });
+      if (event.agent === agent) settle({ outcome: 'failed', text, failureReason: 'disposed', detail: 'DSH session was disposed before the task finished',
+        error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: turn !== undefined }) });
     }));
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;
@@ -149,7 +189,7 @@ export class DshA2ABackend implements A2ABackend {
         else if (!authoritativeAnswer && next.phased) { text = next.text; finalAnswerExpected = true; }
         else if (!finalAnswerExpected && next.text.length > 0) text = next.text;
       } else if (event.type === 'turn/end' && event.data.turn === turn) {
-        settle(resultOf(event.data.reason, text, finalAnswerExpected));
+        finishTurn(event.data.reason);
       }
     }));
     options.signal.addEventListener('abort', cancel, { once: true });

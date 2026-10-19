@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync,
-  openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync,
+  openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { Message, Role, Task, TaskPushNotificationConfig, TaskState } from '@a2a-js/sdk';
@@ -10,13 +10,14 @@ import {
   type PushNotificationStore, type StoredPushNotificationConfig, type TaskStore,
 } from '@a2a-js/sdk/server';
 import { RequestMalformedError } from '@a2a-js/sdk/errors';
+import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
+import { DirectoryLease } from './lease.js';
 import type { A2ATarget } from './types.js';
 
 interface Scope { tenant: string; owner: string }
 type Kind = 'task' | 'push' | 'target';
 interface Envelope { version: 1; kind: Kind; scope: Scope; id: string; value: unknown }
 interface CachedTask { scope: Scope; task: Task }
-interface Lock { pid: number; token: string }
 
 const terminalStates = new Set([
   TaskState.TASK_STATE_COMPLETED, TaskState.TASK_STATE_FAILED,
@@ -141,7 +142,7 @@ export class FileA2AStore {
   readonly taskStore: TaskStore;
   readonly pushStore: PushNotificationStore;
   private readonly directory: string;
-  private readonly lock: Lock = { pid: process.pid, token: randomUUID() };
+  private readonly lease: DirectoryLease;
   private readonly memory = new InMemoryTaskStore();
   private readonly tasks = new Map<string, CachedTask>();
   private readonly pushes = new Map<string, StoredPushNotificationConfig[]>();
@@ -155,7 +156,7 @@ export class FileA2AStore {
     const stat = lstatSync(this.directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('A2A storage directory must be a real directory');
     chmodSync(this.directory, 0o700);
-    this.acquireLock();
+    this.lease = new DirectoryLease(this.directory);
     try {
       const loads: Promise<void>[] = [];
       for (const name of readdirSync(this.directory)) {
@@ -278,18 +279,24 @@ export class FileA2AStore {
   }
 
   /** Persist failure for interrupted executions. A restart never reruns work. */
-  async recoverInterrupted(): Promise<void> {
+  async recoverInterrupted(recover?: (task: Task, context: ServerCallContext) => Promise<SafeError | undefined>): Promise<void> {
     this.assertOpen();
     await this.ready;
     for (const { scope, task } of [...this.tasks.values()]) {
       if (task.status && terminalStates.has(task.status.state)) continue;
+      const recovered = await recover?.(task, contextOf(scope));
+      const previous = task.metadata?.['1agents'];
+      const metadata = recovered ? { ...task.metadata, '1agents': {
+        ...(previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}),
+        error: toSafeError(recovered, { origin: 'a2a' }),
+      } } : task.metadata;
       const message = Message.fromJSON({
         messageId: randomUUID(), contextId: task.contextId, taskId: task.id,
         role: 'ROLE_AGENT',
         parts: [{ text: 'Execution was interrupted by an A2A service restart and was not restarted.' }],
       });
       await this.taskStore.save({
-        ...task,
+        ...task, metadata,
         status: { state: TaskState.TASK_STATE_FAILED, timestamp: new Date().toISOString(), message },
         history: [...task.history, message],
       }, contextOf(scope));
@@ -299,16 +306,7 @@ export class FileA2AStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    // The owner filename is unique to this instance. Never unlink a shared
-    // lock path: another process may have acquired it since our last check.
-    const path = this.ownerPath();
-    try {
-      const lock = this.readJson(path) as Lock;
-      if (lock.token === this.lock.token && lock.pid === this.lock.pid) unlinkSync(path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    this.removeEmptyLockDirectory();
+    this.lease.close();
   }
 
   private loadPush(taskId: string, context: ServerCallContext): StoredPushNotificationConfig[] {
@@ -319,78 +317,6 @@ export class FileA2AStore {
 
   private assertOpen(): void {
     if (this.closed) throw new Error('A2A store is closed');
-  }
-
-  private acquireLock(): void {
-    const path = join(this.directory, '.lock');
-    for (let attempt = 0; attempt < 32; attempt++) {
-      try {
-        mkdirSync(path, { mode: 0o700 });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        try {
-          const stat = lstatSync(path);
-          if (!stat.isDirectory() || stat.isSymbolicLink()) {
-            throw new Error('Legacy or invalid A2A .lock file; verify no instance is running before removing it');
-          }
-          const names = readdirSync(path);
-          for (const name of names) {
-            const lock = record(this.readJson(join(path, name)), 'storage lock');
-            if (!Number.isInteger(lock.pid) || (lock.pid as number) <= 0 ||
-              typeof lock.token !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(lock.token) ||
-              name !== `owner-${lock.pid}-${lock.token}.json`) {
-              throw new Error('Invalid A2A storage lock; inspect the storage directory before removing it');
-            }
-            let dead = false;
-            try { process.kill(lock.pid as number, 0); } catch (cause) {
-              dead = (cause as NodeJS.ErrnoException).code === 'ESRCH';
-            }
-            if (!dead) throw new Error('A2A storage directory is already in use by another instance');
-          }
-          // Only remove the unique filenames observed above. A new live owner
-          // can never share them, so a delayed contender cannot delete its lock.
-          for (const name of names) {
-            try { unlinkSync(join(path, name)); } catch (cause) {
-              if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
-            }
-          }
-          this.removeEmptyLockDirectory();
-        } catch (cause) {
-          if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
-        }
-        continue;
-      }
-
-      try {
-        const fd = openSync(this.ownerPath(), 'wx', 0o600);
-        try { writeFileSync(fd, JSON.stringify(this.lock)); fsyncSync(fd); } finally { closeSync(fd); }
-        // A competing recovery can replace an empty directory between mkdir
-        // and marker creation. If both contenders wrote into that replacement,
-        // only the sole remaining owner may return a successfully held lock.
-        const names = readdirSync(path);
-        if (names.length !== 1 || names[0] !== this.ownerName()) {
-          throw new Error('A2A storage directory is already in use by another instance');
-        }
-        return;
-      } catch (error) {
-        try { unlinkSync(this.ownerPath()); } catch (cause) {
-          if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
-        }
-        this.removeEmptyLockDirectory();
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
-    }
-    throw new Error('Could not acquire A2A storage lock');
-  }
-
-  private ownerName(): string { return `owner-${this.lock.pid}-${this.lock.token}.json`; }
-  private ownerPath(): string { return join(this.directory, '.lock', this.ownerName()); }
-
-  private removeEmptyLockDirectory(): void {
-    try { rmdirSync(join(this.directory, '.lock')); } catch (error) {
-      // A live marker makes rmdir fail; never recursively remove a lock directory.
-      if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
-    }
   }
 
   private readJson(path: string): unknown {

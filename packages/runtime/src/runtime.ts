@@ -34,6 +34,8 @@ export type {
 } from "./agent-registry.js";
 export { AcpRuntimeError, isAcpRuntimeError } from "./runtime/public/errors.js";
 export type { AcpRuntimeErrorCode } from "./runtime/public/errors.js";
+export { toSafeError } from "./acp/error-normalization.js";
+export type { SafeError, SafeErrorCategory, SafeErrorOrigin } from "./types.js";
 export {
   REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE,
   REQUESTED_MODEL_UNSUPPORTED_REASONS,

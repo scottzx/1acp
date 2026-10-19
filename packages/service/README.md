@@ -340,3 +340,8 @@ To wake a main-agent host, configure `notificationTargets` as a map of trusted t
 ## 0.8.0 — DreamMate dependency transition
 
 The public service now targets dreammate-node ^0.15.0 and dreammate-network ^0.5.0. The runtime and DSH plugin remain embedded in this one public package. Update consuming DSH profiles and service installations from the lockfile; do not substitute the older standalone dsh-acp release. This change does not alter stored agent sessions or configured credentials.
+
+
+## 0.8.1 — preserve deployed diagnostics and cancellation fixes
+
+Includes the already deployed c055869 branch: structured error provenance, confirmed/unconfirmed cancellation handling, journal ownership, and persisted current-turn diagnostics. This avoids regressing the ERP pilot during the DreamMate 0.15 dependency migration.

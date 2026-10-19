@@ -3,11 +3,19 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { agent as acpAgent } from '@agentclientprotocol/sdk';
+import { agent as acpAgent, RequestError } from '@agentclientprotocol/sdk';
 import { WebSocketServer } from 'ws';
+import { LlmError } from '@deepseek-ai/dsh-llm';
 import { AcpAdapter } from '../dist/adapter.js';
-import { stream } from '../dist/transport.js';
+import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
+import { diagnosticsFixture } from './helpers/diagnostics.mjs';
+import { toSafeError } from '@1agents/acp-service/runtime';
+
+function safeFields(error) {
+  return Object.fromEntries(['category', 'providerCode', 'retryable', 'outcomeUnknown', 'origin', 'operationId']
+    .filter(key => error[key] !== undefined).map(key => [key, error[key]]));
+}
 
 async function fixture(t, disconnect = false, interaction = 'permission', beforeNew = async () => {}, toolUpdates = [], streamConfig = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-test-'));
@@ -33,6 +41,10 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         await connection.client.notify('session/update', { sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'review', description: 'Native review', input: { hint: 'Scope' } }, { name: 'model', description: 'Native model' }] } });
         return { sessionId, configOptions: configOptions(), modes: { currentModeId: 'read', availableModes: [{ id: 'read', name: 'Read' }, { id: 'write', name: 'Write' }] } };
       })
+      .onRequest('_1agents/session/import', object, () => {
+        if (streamConfig.importError) throw new RequestError(streamConfig.importError.code, streamConfig.importError.message, streamConfig.importError.data);
+        return { sessionId: 'synthetic-imported-session' };
+      })
       .onRequest('session/set_config_option', async ({ params }) => {
         assert.equal(params.configId, 'native-model');
         assert.ok(['native-a', 'native-b'].includes(params.value));
@@ -56,6 +68,10 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
           for (const update of updates) await connection.client.notify('session/update', { sessionId: params.sessionId, update });
         }
         if (disconnect && !dropped) { dropped = true; ws.terminate(); return new Promise(() => {}); }
+        if (streamConfig.error) {
+          await streamConfig.beforeError?.();
+          throw new RequestError(streamConfig.error.code, streamConfig.error.message, streamConfig.error.data);
+        }
         if (interaction === 'question') {
           const result = await connection.client.request('_x.ai/ask_user_question', { questions: [{ question: 'Choose targets', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true }] });
           assert.deepEqual(result, { outcome: 'accepted', answers: { 'Choose targets': ['A', 'B'] } });
@@ -100,7 +116,7 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     return { answers: [{ id: q.id, selected: ['A', 'B'] }] };
   } } };
   const config = { serviceUrl: `http://127.0.0.1:${wss.address().port}`, agents: ['codex', 'grok-build'], stateDirectory: directory, reconnectAttempts: 2, reconnectDelayMs: 1 };
-  const adapter = new AcpAdapter(ctx, config);
+  const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
   return { adapter, options, config, ctx, local, sent, prompts, changes, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
@@ -123,6 +139,200 @@ test('reconnect replays missing output and reuses the prompt id without duplicat
   const output = await collect(f.adapter, f.options('message-1'));
   assert.equal(output.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'Hello ACP');
   assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 1 });
+});
+
+const secretCanary = 'SYNTHETIC_SECRET_CANARY_NOT_REAL';
+const authCanary = 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL';
+const providerFailure = (data, message = 'Internal error') => ({ code: -32603, message, data });
+
+for (const [label, error, category, providerCode] of [
+  ['native quota cause', providerFailure({ codexErrorInfo: 'usageLimitExceeded', message: secretCanary, additionalDetails: authCanary }), 'quota', 'usageLimitExceeded'],
+  ['known nested cause', providerFailure({ cause: { codexErrorInfo: 'usageLimitExceeded', message: secretCanary } }), 'quota', 'usageLimitExceeded'],
+  ['untrusted aborted code with quota cause', providerFailure({ code: 'ABORTED', codexErrorInfo: 'usageLimitExceeded' }), 'quota', 'usageLimitExceeded'],
+  ['untrusted aborted code alone', providerFailure({ code: 'ABORTED' }), 'unknown', undefined],
+  ['rate limit', providerFailure({ codexErrorInfo: 'rateLimitExceeded', message: secretCanary }), 'rate_limit', 'rateLimitExceeded'],
+  ['session budget', providerFailure({ codexErrorInfo: 'sessionBudgetExceeded' }), 'budget', 'sessionBudgetExceeded'],
+  ['authentication', providerFailure({ codexErrorInfo: 'unauthorized', additionalDetails: authCanary }), 'auth', 'unauthorized'],
+  ['unknown provider code', providerFailure({ codexErrorInfo: 'unknownSyntheticCode', message: secretCanary }), 'unknown', undefined],
+  ['quota prose alone', providerFailure({ message: `quota rate budget ${secretCanary}` }), 'unknown', undefined],
+  ['internal error alone', providerFailure(undefined), 'unknown', undefined],
+  ['conflicting structured codes', providerFailure({ codexErrorInfo: 'usageLimitExceeded', code: 'unauthorized' }), 'unknown', undefined],
+  ['unrelated nested code', providerFailure({ arbitrary: { codexErrorInfo: 'usageLimitExceeded' } }), 'unknown', undefined],
+  ['auth link alone', providerFailure({ message: authCanary }), 'unknown', undefined],
+]) {
+  test(`ACP adapter sanitizes actual RPC ${label} and does not resubmit it`, { timeout: 5000 }, async t => {
+    const f = await fixture(t, false, 'permission', async () => {}, [], { error });
+    let failure;
+    await assert.rejects(collect(f.adapter, f.options(`safe-${label}`)), value => { failure = value; return value instanceof Error; });
+    assert.ok(failure instanceof LlmError);
+    assert.equal(failure.category, category);
+    assert.equal(failure.providerCode, providerCode);
+    assert.equal(failure.outcomeUnknown, false);
+    assert.equal(typeof failure.retryable, 'boolean');
+    assert.match(failure.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.equal(failure.data, undefined);
+    assert.equal(failure.cause, undefined);
+    assert.deepEqual(safeFields(failure), {
+      category, retryable: failure.retryable, outcomeUnknown: false, origin: failure.origin,
+      operationId: failure.operationId, ...(providerCode ? { providerCode } : {}),
+    });
+    const ordinaryLog = `${failure.stack} ${JSON.stringify(failure)}`;
+    for (const canary of [secretCanary, authCanary, 'unknownSyntheticCode']) assert.ok(!ordinaryLog.includes(canary));
+    assert.deepEqual(f.counts(), { creations: 1, executions: 1, permissions: 0 });
+  });
+}
+
+test('transport loss after prompt delivery is safe and explicitly uncertain when reconnects are exhausted', { timeout: 5000 }, async t => {
+  const f = await fixture(t, true);
+  f.config.reconnectAttempts = 0;
+  await assert.rejects(collect(f.adapter, f.options('uncertain-delivery')), error => {
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.origin, 'transport');
+    assert.equal(error.outcomeUnknown, true);
+    assert.match(error.operationId, /^dsh-/);
+    assert.equal(error.data, undefined);
+    return true;
+  });
+  assert.equal(f.counts().executions, 1);
+});
+
+test('the owned service direct RequestError data preserves canonical safe fields with the local request identity', { timeout: 5000 }, async t => {
+  const safe = toSafeError({ code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } },
+    { operationId: 'synthetic-service-operation', outcomeUnknown: true });
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: { code: -32000, message: safe.message, data: { ...safe, retryable: true } },
+  });
+  await assert.rejects(collect(f.adapter, f.options('owned-projection')), error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.category, 'quota');
+    assert.equal(error.providerCode, 'usageLimitExceeded');
+    assert.equal(error.origin, 'acp');
+    assert.equal(error.retryable, true);
+    assert.equal(error.outcomeUnknown, true);
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.notEqual(error.operationId, 'synthetic-service-operation');
+    assert.equal(error.data, undefined);
+    assert.equal(error.retryable, true);
+    assert.equal(error.outcomeUnknown, true);
+    assert.equal(error.operationId, error.operationId);
+    return true;
+  });
+  assert.equal(f.counts().executions, 1);
+});
+
+for (const [category, outcomeUnknown] of [['quota', false], ['auth', false], ['unknown', true]]) {
+  test(`a closing response socket preserves canonical ${category} outcomeUnknown=${outcomeUnknown}`, { timeout: 5000 }, async t => {
+    const safe = toSafeError(undefined, { trustedProjection: true });
+    const projected = { ...safe, category, origin: 'acp', outcomeUnknown, retryable: false,
+      operationId: 'synthetic-service-operation' };
+    const f = await fixture(t, false, 'permission', async () => {}, [], {
+      error: { code: -32000, message: secretCanary, data: { ...projected, raw: authCanary } },
+    });
+    const link = await f.adapter.connection(f.local);
+    let closing = false;
+    // Close the real client socket in the error frame's event turn, before the
+    // SDK's pending rejection resumes the adapter. The RPC error stays genuine.
+    link.ws.on('message', raw => {
+      if (JSON.parse(raw.toString()).error?.code === -32000) { closing = true; link.ws.close(); }
+    });
+    await assert.rejects(collect(f.adapter, f.options(`closing-response-${category}`)), error => {
+      assert.ok(error instanceof LlmError);
+      assert.equal(closing, true);
+      assert.notEqual(link.ws.readyState, 1);
+      assert.equal(error.category, category);
+      assert.equal(error.origin, 'acp');
+      assert.equal(error.outcomeUnknown, outcomeUnknown);
+      assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+      for (const canary of [secretCanary, authCanary, 'synthetic-service-operation']) {
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+      }
+      return true;
+    });
+    assert.equal(f.counts().executions, 1);
+  });
+}
+
+for (const [label, raw, origin, outcomeUnknown] of [
+  ['quota', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'acp', false],
+  ['auth', { data: { codexErrorInfo: 'unauthorized' } }, 'acp', false],
+  ['uncertain transport', undefined, 'transport', true],
+]) {
+  test(`local abort does not mask the owned service ${label} rejection`, { timeout: 5000 }, async t => {
+    const controller = new AbortController();
+    const safe = toSafeError(raw, { origin, outcomeUnknown, operationId: 'synthetic-service-operation' });
+    const f = await fixture(t, false, 'permission', async () => {}, [], {
+      error: { code: -32000, message: secretCanary, data: { ...safe, raw: authCanary } },
+      beforeError: () => controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL')),
+    });
+    await assert.rejects(collect(f.adapter, { ...f.options(`racing-${label}`), signal: controller.signal }), error => {
+      assert.ok(error instanceof LlmError);
+      assert.equal(error.category, safe.category);
+      assert.equal(error.providerCode, safe.providerCode);
+      assert.equal(error.origin, origin);
+      assert.equal(error.outcomeUnknown, outcomeUnknown);
+      assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+      for (const canary of [secretCanary, authCanary, 'SYNTHETIC_CANCEL_SECRET_NOT_REAL', 'synthetic-service-operation']) {
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+      }
+      return true;
+    });
+    assert.equal(f.counts().executions, 1);
+  });
+}
+
+test('native safe-shaped and nested category metadata cannot spoof the adapter projection', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: providerFailure({ message: secretCanary, category: 'quota', providerCode: 'usageLimitExceeded', origin: 'a2a', retryable: true,
+      outcomeUnknown: true, operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL', cause: { category: 'quota' } }),
+  });
+  await assert.rejects(collect(f.adapter, f.options('untrusted-projection')), error => {
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.origin, 'acp');
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(error).includes('SYNTHETIC_OPERATION_SECRET'));
+    assert.ok(!JSON.stringify(error).includes(secretCanary));
+    return true;
+  });
+});
+
+test('malformed owned-service error data falls back to the raw numerical wrapper', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: { code: -32000, message: secretCanary, data: { category: 'quota', origin: 'a2a',
+      operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL', cause: { category: 'quota' } } },
+  });
+  await assert.rejects(collect(f.adapter, f.options('malformed-projection')), error => {
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.origin, 'acp');
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(error).includes('SYNTHETIC_'));
+    return true;
+  });
+});
+
+test('a known pending native writer keeps a fixed actionable message without provider restoration text', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    importError: { code: -32000, message: `SYNTHETIC_RESTORE_SECRET_NOT_REAL ${authCanary}` },
+  });
+  f.config.reconnectAttempts = 0;
+  const endpoint = new URL('/agents/codex', f.config.serviceUrl); endpoint.protocol = 'ws:';
+  new State(f.config.stateDirectory).save(f.local.id, {
+    agent: 'codex', cwd: f.local.session.header.cwd, endpoint: endpoint.href, restoreMethod: 'session/resume',
+    imported: { provider: 'codex', nativeSessionId: 'synthetic-native-session', messageIds: [] },
+  });
+  await assert.rejects(collect(f.adapter, f.options('pending-writer')), error => {
+    assert.match(error.message, /active writer/);
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.outcomeUnknown, false);
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_RESTORE_SECRET'));
+    assert.ok(!JSON.stringify(error).includes(authCanary));
+    assert.equal(error.data, undefined);
+    return true;
+  });
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
 });
 
 const textUpdate = (text, messagePhase, messageId) => ({
@@ -209,7 +419,95 @@ test('a terminal-only answer is displayed once and recorded before finish', { ti
   assert.equal(chunks.at(-1).reason.kind, 'stop');
 });
 
-for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens'], ['cancelled', 'aborted']]) {
+test('confirmed remote cancellation rejects through the official host error with owned plugin fields path', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', 'cancelled') });
+  const chunks = [];
+  await assert.rejects(async () => { for await (const chunk of f.adapter.stream(f.options('remote-cancelled'))) chunks.push(chunk); }, error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.code, 'ABORTED');
+    assert.deepEqual(safeFields(error), {
+      category: 'cancelled', retryable: false, outcomeUnknown: false, origin: 'acp', operationId: error.operationId,
+    });
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    return true;
+  });
+  assert.equal(chunks.find(c => c.block?.acpResult).block.acpResult.finalAnswer, 'Partial answer');
+  assert.ok(!chunks.some(chunk => chunk.type === 'finish'));
+  assert.equal(f.counts().executions, 1);
+});
+
+for (const [stopReason, origin] of [['cancelled', 'acp'], ['end_turn', 'dsh'], ['max_tokens', 'dsh']]) {
+  test(`confirmed ${stopReason} reply racing local abort stays certain without post-abort metadata`, { timeout: 5000 }, async t => {
+    const controller = new AbortController();
+    const postAbortAnswer = 'SYNTHETIC_POST_ABORT_ANSWER_NOT_REAL';
+    const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult(postAbortAnswer, stopReason) });
+    const link = await f.adapter.connection(f.local);
+    let confirmed = false;
+    // Abort in the genuine result frame's event turn, before the SDK resumes the
+    // adapter. Earlier streamed text remains open to expose post-abort block-end.
+    link.ws.on('message', raw => {
+      if (JSON.parse(raw.toString()).result?.stopReason === stopReason) {
+        confirmed = true;
+        controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+      }
+    });
+    const chunks = [];
+    await assert.rejects(async () => {
+      for await (const chunk of f.adapter.stream({ ...f.options('confirmed-local-race'), signal: controller.signal })) {
+        chunks.push({ chunk, afterAbort: controller.signal.aborted });
+      }
+    }, error => {
+      assert.equal(confirmed, true);
+      assert.ok(error instanceof LlmError);
+      assert.deepEqual(safeFields(error), {
+        category: 'cancelled', retryable: false, outcomeUnknown: false, origin, operationId: error.operationId,
+      });
+      assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+      assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
+      return true;
+    });
+    assert.equal(chunks.filter(entry => entry.chunk.type === 'text-delta').map(entry => entry.chunk.text).join(''), 'Hello ACP');
+    assert.ok(!chunks.some(entry => entry.afterAbort));
+    assert.ok(!JSON.stringify(chunks).includes(postAbortAnswer));
+    assert.ok(!chunks.some(entry => entry.chunk.block?.acpResult || entry.chunk.type === 'finish'));
+    assert.equal(f.counts().executions, 1);
+  });
+}
+
+test('a pre-delivery local abort has no uncertain native outcome or leaked reason', async t => {
+  const f = await fixture(t), controller = new AbortController();
+  controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+  await assert.rejects(collect(f.adapter, { ...f.options('before-delivery'), signal: controller.signal }), error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.category, 'cancelled');
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.origin, 'dsh');
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
+    return true;
+  });
+  assert.deepEqual(f.counts(), { creations: 0, executions: 0, permissions: 0 });
+});
+
+test('a peer cancellation rejection after local abort stays typed and conservative', async t => {
+  const controller = new AbortController();
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    error: { code: -32800, message: secretCanary, data: { raw: authCanary } },
+    beforeError: () => controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL')),
+  });
+  await assert.rejects(collect(f.adapter, { ...f.options('peer-cancel'), signal: controller.signal }), error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.category, 'cancelled');
+    assert.equal(error.outcomeUnknown, true);
+    assert.equal(error.origin, 'dsh');
+    for (const canary of [secretCanary, authCanary, 'SYNTHETIC_CANCEL_SECRET_NOT_REAL']) {
+      assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+    }
+    return true;
+  });
+  assert.equal(f.counts().executions, 1);
+});
+
+for (const [stopReason, finishKind] of [['max_tokens', 'max-tokens']]) {
   test(`terminal metadata does not turn ACP ${stopReason} into success`, { timeout: 5000 }, async t => {
     const f = await fixture(t, false, 'permission', async () => {}, [], { result: promptResult('Partial answer', stopReason) });
     const chunks = await collect(f.adapter, f.options(stopReason));
@@ -268,13 +566,28 @@ test('Grok questions and plan review use DSH interactions', { timeout: 5000 }, a
   assert.equal(result.at(-1).reason.kind, 'stop');
 });
 
-test('stopping while permission is pending cancels remote work and settles the stream', { timeout: 5000 }, async t => {
+test('stopping while permission is pending retains the confirmed terminal reply', { timeout: 5000 }, async t => {
   const f = await fixture(t, false, 'pending');
   const controller = new AbortController();
+  const link = await f.adapter.connection(f.local);
+  let receivedEndTurn = false;
+  link.ws.on('message', raw => {
+    if (JSON.parse(raw.toString()).result?.stopReason === 'end_turn') receivedEndTurn = true;
+  });
   const output = collect(f.adapter, { ...f.options('message-1'), signal: controller.signal });
   await f.waiting;
-  controller.abort();
-  assert.equal((await output).at(-1).reason.kind, 'aborted');
+  controller.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+  await assert.rejects(output, error => {
+    assert.ok(error instanceof LlmError);
+    assert.equal(error.code, 'ABORTED');
+    assert.equal(error.category, 'cancelled');
+    assert.equal(receivedEndTurn, true);
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.origin, 'dsh');
+    assert.match(error.operationId, /^dsh-[a-f0-9]{64}$/);
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('SYNTHETIC_CANCEL_SECRET'));
+    return true;
+  });
   await f.cancelled;
 });
 
@@ -374,4 +687,23 @@ test('draft switching preserves endpoint protection and requires known turn stat
   state.save(f.local.id, { ...state.get(f.local.id), endpoint: 'ws://other.example/agents/codex' });
   await assert.rejects(f.adapter.describe(f.local), /bound to another ACP/);
   assert.equal(f.counts().creations, 1);
+});
+
+test('diagnostics bind only messages admitted in the current official turn, excluding older failed inputs', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-acp-diagnostic-turn-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const { diagnostics } = await diagnosticsFixture(t, directory);
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    diagnostics, error: providerFailure({ codexErrorInfo: 'usageLimitExceeded' }),
+  });
+  const old = f.options('old-message').messages[0]; old.source.rpcId = 'old-request';
+  const current = f.options('current-message').messages[0]; current.source.rpcId = 'current-request';
+  f.local.session.boundary = { openTurnStartSeq: 5, lastTurn: 2 };
+  f.local.session.snapshotEvents = () => [
+    { type: 'user/message', seq: 1, data: old }, { type: 'turn/start', seq: 5, data: { turn: 2 } },
+    { type: 'user/message', seq: 6, data: current },
+  ];
+  await assert.rejects(collect(f.adapter, { ...f.options('unused'), messages: [old, current] }));
+  assert.equal(diagnostics.find(f.local.id, 'old-request'), undefined);
+  assert.equal(diagnostics.find(f.local.id, 'current-request').category, 'quota');
 });

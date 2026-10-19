@@ -1,6 +1,6 @@
 {
   "name": "@1agents/acp-service",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness ACP/A2A plugins in one package.",
   "keywords": [
     "dreammate",
@@ -97,7 +97,8 @@
     "skillflag": "^0.2.1",
     "tsx": "^4.23.15",
     "ws": "^8.18.0",
-    "zod": "^4.6.5"
+    "zod": "^4.6.5",
+    "dsh-zod": "npm:zod@4.4.3"
   },
   "devDependencies": {
     "@scottzx/1acp": "workspace:*",

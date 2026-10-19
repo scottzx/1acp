@@ -8,9 +8,12 @@ import { pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
 import SessionStore from '@deepseek-ai/dsh-session';
 import { DshA2ABackend } from '../dist/a2a-executor.js';
+import { diagnosticsFixture, identity } from './helpers/diagnostics.mjs';
+import { toSafeError } from '@1agents/acp-service/runtime';
 
 async function fixture(t) {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), 'dsh-a2a-executor-')));
+  const { diagnostics } = await diagnosticsFixture(t, join(cwd, 'diagnostics'));
   const ctx = new Context();
   await ctx.plugin(SessionStore);
   const agents = new Map(), pending = new Map(), cancels = [], prompts = [];
@@ -32,7 +35,7 @@ async function fixture(t) {
   };
   const makeAgent = session => {
     const agent = {
-      id: session.id, session, activeTurn: undefined, ctx: { on: observe },
+      id: session.id, session, whenIdle: async () => {}, activeTurn: undefined, ctx: { on: observe },
       inbox: { remove: id => {
         const entry = pending.get(id);
         if (!entry) return false;
@@ -80,9 +83,13 @@ async function fixture(t) {
     },
   };
   const host = { sessionController: controller };
-  const backend = new DshA2ABackend(host);
+  const backend = new DshA2ABackend(host, diagnostics);
   t.after(async () => { await ctx.fiber.dispose(); await rm(cwd, { recursive: true, force: true }); });
   return {
+    record: async (agent, requestId, turn, error) => {
+      const id = await diagnostics.begin(identity({ sessionId: agent.id, turn, requestIds: [requestId] }));
+      await diagnostics.submitted(id); await diagnostics.settle(id, error);
+    },
     cwd, backend, ctx, agents, pending, cancels, prompts, controller, admitted,
     get listenerCount() { return activeListeners; },
     get createCount() { return createCount; }, get resolveCount() { return resolveCount; },
@@ -194,6 +201,7 @@ for (const [label, content] of [
     f.finish(agent, 7, { kind: 'completed' });
     const value = await result;
     assert.equal(value.outcome, 'failed'); assert.equal(value.text, ''); assert.match(value.detail, /without a final answer/);
+    assert.equal(value.failureReason, 'missing-final-answer');
   });
 }
 
@@ -228,14 +236,61 @@ for (const reason of [{ kind: 'max-tokens' }, { kind: 'aborted', reason: { kind:
     f.finish(agent, 9, reason);
     const value = await result;
     assert.equal(value.outcome, 'failed'); assert.equal(value.text, 'Partial final output');
+    if (reason.kind === 'aborted') {
+      assert.equal(value.failureReason, 'aborted');
+      assert.equal(value.error.category, 'cancelled');
+      assert.equal(value.error.code, 'ABORTED');
+    } else assert.equal(value.failureReason, 'max-tokens');
   });
 }
 
+for (const [category, providerCode, outcomeUnknown] of [
+  ['quota', 'usageLimitExceeded', false], ['auth', 'unauthorized', false], ['unknown', undefined, true],
+]) {
+  test(`aborted official turn joins its owned plugin ${category} failure with local identity`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'local-aborted-task', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'local-aborted-task', 12);
+    await f.record(agent, 'local-aborted-task', 12, toSafeError({ category, providerCode, retryable: false, outcomeUnknown, origin: 'acp' }, { trustedProjection: true }));
+    f.finish(agent, 12, { kind: 'aborted', reason: { kind: 'user' }, failure: {
+      code: 'ABORTED', message: 'SYNTHETIC_HOST_SECRET_NOT_REAL',
+      publicError: { category, providerCode, retryable: false, outcomeUnknown, origin: 'acp', operationId: 'SYNTHETIC_HOST_OPERATION_NOT_REAL' },
+    } });
+    const value = await result;
+    assert.equal(value.failureReason, 'aborted');
+    assert.equal(value.error.category, category);
+    assert.equal(value.error.providerCode, providerCode);
+    assert.equal(value.error.outcomeUnknown, outcomeUnknown);
+    assert.equal(value.error.operationId, 'local-aborted-task');
+    assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
+    assert.equal(f.listenerCount, 0);
+  });
+}
+
+test('aborted host facts without canonical publicError do not assert a provider cause', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'local-aborted-task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'local-aborted-task', 12);
+  f.finish(agent, 12, { kind: 'aborted', reason: { kind: 'user' }, failure: {
+    category: 'quota', code: 'usageLimitExceeded', providerCode: 'usageLimitExceeded',
+    outcomeUnknown: false, operationId: 'SYNTHETIC_HOST_OPERATION_NOT_REAL',
+  } });
+  const value = await result;
+  assert.equal(value.error.category, 'cancelled');
+  assert.equal(value.error.outcomeUnknown, true);
+  assert.equal(value.error.operationId, 'local-aborted-task');
+  assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
+});
+
 for (const [reason, outcome, detail] of [
   [{ kind: 'blocked' }, 'input-required', /blocked/],
-  [{ kind: 'error', error: { message: 'Provider failed', code: 'UNKNOWN' } }, 'failed', /Provider failed/],
+  [{ kind: 'error', error: { message: 'Provider failed', code: 'UNKNOWN' } }, 'failed', /failed/i],
   [{ kind: 'max-tokens' }, 'failed', /token limit/],
   [{ kind: 'interrupted' }, 'failed', /interrupted/],
+  [{ kind: 'forked' }, 'failed', /fork/],
+  [{ kind: 'synthetic-unsupported' }, 'failed', /unsupported/],
 ]) {
   test(`run reports DSH ${reason.kind} from its exact turn`, async t => {
     const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
@@ -245,7 +300,128 @@ for (const [reason, outcome, detail] of [
     f.claim(agent, 'task', 5); f.finish(agent, 5, reason);
     const value = await result;
     assert.equal(value.outcome, outcome); assert.match(value.detail, detail);
+    if (reason.kind === 'max-tokens' || reason.kind === 'interrupted' || reason.kind === 'forked') assert.equal(value.failureReason, reason.kind);
+    if (reason.kind === 'synthetic-unsupported') assert.equal(value.failureReason, 'unsupported-ending');
+    if (reason.kind === 'interrupted') assert.equal(value.error.outcomeUnknown, true);
     assert.equal(f.listenerCount, 0);
+  });
+}
+
+for (const [label, raw, category, hostCode = 'ACP_TURN_FAILED'] of [
+  ['quota', { code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota'],
+  ['rate', { code: -32603, data: { codexErrorInfo: 'rateLimitExceeded' } }, 'rate_limit'],
+  ['budget', { code: -32603, data: { codexErrorInfo: 'sessionBudgetExceeded' } }, 'budget'],
+  ['auth', { code: -32603, data: { codexErrorInfo: 'unauthorized' } }, 'auth'],
+  ['unknown', { code: 'UNKNOWN' }, 'unknown'],
+  ['quota with unrelated host code', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota', 'HOST_EXECUTION_ERROR'],
+  ['auth with cancellation-like host code', { data: { codexErrorInfo: 'unauthorized' } }, 'auth', 'ABORTED'],
+  ['quota with conflicting provider-like host code', { data: { codexErrorInfo: 'usageLimitExceeded' } }, 'quota', 'unauthorized'],
+]) {
+  test(`DSH A2A ${label} failure retains owned diagnostic fields and local request identity`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'synthetic-task', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'synthetic-task', 5);
+    const safe = toSafeError(raw, { origin: 'acp', operationId: 'synthetic-operation', outcomeUnknown: true });
+    await f.record(agent, 'synthetic-task', 5, safe);
+    f.finish(agent, 5, { kind: 'error', error: { code: hostCode, publicError: safe,
+      message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL',
+      data: { token: 'SYNTHETIC_TOKEN_NOT_REAL', authUrl: 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL' },
+    } });
+    const value = await result;
+    assert.equal(value.outcome, 'failed');
+    assert.equal(value.error.category, category);
+    assert.equal(value.error.providerCode, safe.providerCode);
+    assert.equal(value.error.retryable, safe.retryable);
+    assert.equal(value.error.outcomeUnknown, true);
+    assert.equal(value.error.origin, 'acp');
+    assert.equal(value.error.operationId, 'synthetic-task');
+    assert.equal(value.detail, value.error.message);
+    for (const canary of ['SYNTHETIC_SECRET', 'SYNTHETIC_TOKEN', 'SYNTHETIC_AUTH', 'authorize?token=', 'authUrl']) assert.ok(!JSON.stringify(value).includes(canary));
+    assert.equal(f.listenerCount, 0);
+  });
+}
+
+for (const [label, error] of [
+  ['provider-like host code', { code: 'usageLimitExceeded' }],
+  ['native-shaped host data', { code: 'ACP_TURN_FAILED', data: { codexErrorInfo: 'usageLimitExceeded' } }],
+  ['native-shaped host cause', { code: 'ACP_TURN_FAILED', cause: { code: 'unauthorized' } }],
+]) {
+  test(`DSH A2A missing canonical publicError keeps ${label} unknown`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'caller-owned-legacy-task', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'caller-owned-legacy-task', 9);
+    f.finish(agent, 9, { kind: 'error', error: { ...error,
+      message: 'SYNTHETIC_HOST_CODE_SECRET_NOT_REAL', operationId: 'SYNTHETIC_HOST_OPERATION_NOT_REAL',
+    } });
+    const value = await result;
+    assert.equal(value.outcome, 'failed');
+    assert.equal(value.error.category, 'unknown');
+    assert.equal(value.error.providerCode, undefined);
+    assert.equal(value.error.retryable, false);
+    assert.equal(value.error.outcomeUnknown, false);
+    assert.equal(value.error.origin, 'dsh');
+    assert.equal(value.error.operationId, 'caller-owned-legacy-task');
+    assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
+  });
+}
+
+test('DSH A2A never infers quota from an unknown host error message or nested arbitrary data', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'unknown-task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'unknown-task', 6);
+  f.finish(agent, 6, { kind: 'error', error: { code: 'UNKNOWN',
+    message: 'quota budget rate exhausted SYNTHETIC_SECRET_CANARY_NOT_REAL',
+    arbitrary: { codexErrorInfo: 'usageLimitExceeded' },
+  } });
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.error.category, 'unknown');
+  assert.equal(value.error.providerCode, undefined);
+  assert.ok(!JSON.stringify(value).includes('SYNTHETIC_SECRET'));
+});
+
+test('DSH A2A rejects safe-shaped host category and operation secret spoofing', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const result = f.backend.run(target, 'task', { requestId: 'caller-owned-task', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'caller-owned-task', 7);
+  f.finish(agent, 7, { kind: 'error', error: {
+    message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL', category: 'quota', origin: 'acp',
+    retryable: true, outcomeUnknown: true, operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL',
+    providerCode: 'usageLimitExceeded',
+    cause: { category: 'quota', providerCode: 'usageLimitExceeded', origin: 'a2a', operationId: 'SYNTHETIC_NESTED_OPERATION_SECRET_NOT_REAL' },
+  } });
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.error.category, 'unknown');
+  assert.equal(value.error.providerCode, undefined);
+  assert.equal(value.error.retryable, false);
+  assert.equal(value.error.outcomeUnknown, false);
+  assert.equal(value.error.origin, 'dsh');
+  assert.equal(value.error.operationId, 'caller-owned-task');
+  assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
+});
+
+for (const [label, error, category] of [
+  ['root aborted hint with quota', { code: 'ABORTED', data: { codexErrorInfo: 'usageLimitExceeded' } }, 'unknown'],
+  ['root aborted hint alone', { code: 'ABORTED' }, 'unknown'],
+]) {
+  test(`DSH A2A ${label} cannot impersonate a local cancellation`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const agent = f.agents.get(target.sessionId);
+    const result = f.backend.run(target, 'task', { requestId: 'local-request', signal: new AbortController().signal });
+    await f.admitted.promise; f.claim(agent, 'local-request', 8);
+    f.finish(agent, 8, { kind: 'error', error: { ...error, message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL' } });
+    const value = await result;
+    assert.equal(value.outcome, 'failed');
+    assert.equal(value.error.category, category);
+    assert.equal(value.error.code, undefined);
+    assert.equal(value.failureReason, undefined);
+    assert.equal(value.error.operationId, 'local-request');
+    assert.ok(!JSON.stringify(value).includes('SYNTHETIC_'));
   });
 }
 
@@ -255,7 +431,12 @@ test('canceling queued A2A work removes only its inbox item and leaves the activ
   f.insert(agent, 'ui-pending'); agent.activeTurn = 10;
   const result = f.backend.run(target, 'task', { requestId: 'task', signal: abort.signal });
   await f.admitted.promise; abort.abort();
-  assert.equal((await result).outcome, 'failed');
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.failureReason, 'discarded');
+  assert.equal(value.error.category, 'cancelled');
+  assert.equal(value.error.outcomeUnknown, false);
+  assert.equal(value.error.operationId, 'task');
   assert.equal(f.pending.has('task-message'), false);
   assert.equal(f.pending.has('ui-pending-message'), true);
   assert.equal(agent.activeTurn, 10); assert.equal(f.cancels.length, 0);
@@ -268,7 +449,11 @@ test('canceling the claimed A2A turn preserves other pending prompts', async t =
   const result = f.backend.run(target, 'task', { requestId: 'task', signal: abort.signal });
   await f.admitted.promise;
   f.claim(agent, 'task', 20); f.insert(agent, 'ui-pending'); abort.abort();
-  assert.equal((await result).outcome, 'failed');
+  const value = await result;
+  assert.equal(value.outcome, 'failed');
+  assert.equal(value.error.category, 'cancelled');
+  assert.equal(value.error.outcomeUnknown, true);
+  assert.equal(value.error.operationId, 'task');
   assert.equal(f.cancels.length, 1);
   assert.deepEqual(f.cancels[0].options, { keepInbox: true });
   assert.equal(f.pending.has('ui-pending-message'), true);
@@ -328,20 +513,44 @@ test('prompt rejection, Agent disposal, and pre-admission cancellation release e
   const result = f.backend.run(target, 'task', { requestId: 'disposed', signal: new AbortController().signal });
   await new Promise(resolve => setImmediate(resolve));
   f.ctx.emit('agent/disposed', { agent: f.agents.get(target.sessionId) });
-  assert.match((await result).detail, /disposed/);
+  const disposed = await result;
+  assert.match(disposed.detail, /disposed/);
+  assert.equal(disposed.failureReason, 'disposed');
   assert.equal(f.listenerCount, 0);
   const abort = new AbortController(); abort.abort();
   await assert.rejects(f.backend.run(target, 'task', { requestId: 'canceled', signal: abort.signal }), { name: 'AbortError' });
   assert.equal(f.listenerCount, 0);
 });
 
-test('real DSH registry and agent-loop emit completed and canceled A2A turns without an API key', {
+for (const claimed of [false, true]) {
+  test(`Agent disposal preserves uncertainty only after this task was claimed (${claimed})`, async t => {
+    const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+    const requestId = `synthetic-disposed-${claimed}`;
+    const result = f.backend.run(target, 'task', { requestId, signal: new AbortController().signal });
+    await f.admitted.promise;
+    const agent = f.agents.get(target.sessionId);
+    if (claimed) f.claim(agent, requestId, 4);
+    else f.claim(agent, 'synthetic-unrelated-ui-request', 3);
+    f.ctx.emit('agent/disposed', { agent });
+    const disposed = await result;
+    const error = toSafeError(disposed.error, { origin: 'dsh', operationId: requestId, trustedProjection: true });
+    assert.equal(error.outcomeUnknown, claimed);
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.retryable, false);
+    assert.equal(error.origin, 'dsh');
+    assert.equal(error.operationId, requestId);
+    assert.equal(disposed.failureReason, 'disposed');
+    assert.equal(f.listenerCount, 0);
+  });
+}
+
+test('official DSH loop preserves lifecycle and cannot authenticate provider-shaped fields without plugin diagnostics', {
   skip: process.env.DSH_SOURCE ? false : 'Set DSH_SOURCE to a built matching DSH checkout for the real loop smoke test',
   timeout: 10000,
 }, async t => {
   const requireHost = createRequire(join(process.env.DSH_SOURCE, 'packages/core/agent-loop/package.json'));
   const load = name => import(pathToFileURL(requireHost.resolve(name)).href);
-  const [{ default: LlmRuntime, LlmAdapter, createUserMessage }, { default: SessionProjections },
+  const [{ default: LlmRuntime, LlmAdapter, LlmError, createUserMessage }, { default: SessionProjections },
     { default: SystemPrompt }, { default: Tools }, { default: Agents }, { default: AgentLoop }] = await Promise.all([
     load('@deepseek-ai/dsh-llm'), load('@deepseek-ai/dsh-session-projection'), load('@deepseek-ai/dsh-system-prompt'),
     load('@deepseek-ai/dsh-tools'), load('@deepseek-ai/dsh-agent'), load('@deepseek-ai/dsh-agent-loop'),
@@ -358,8 +567,38 @@ test('real DSH registry and agent-loop emit completed and canceled A2A turns wit
       requests.push(options);
       const user = options.messages.findLast(message => message.role === 'user');
       const text = user.content.filter(part => part.type === 'text').map(part => part.text).join('');
+      if (text === 'safe-failure') {
+        const safe = toSafeError({ code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } },
+          { origin: 'acp', operationId: 'synthetic-provider-operation', outcomeUnknown: true });
+        throw new LlmError(safe.message, 'HOST_EXECUTION_ERROR', { publicError: {
+          category: safe.category, providerCode: safe.providerCode, retryable: true,
+          outcomeUnknown: safe.outcomeUnknown, origin: safe.origin,
+          operationId: safe.operationId,
+        } });
+      }
+      if (text === 'host-code-without-public-error') {
+        throw new LlmError('SYNTHETIC_HOST_CODE_SECRET_NOT_REAL', 'usageLimitExceeded');
+      }
+      if (text === 'raw-safe-spoof') {
+        const publicError = { category: 'quota', providerCode: 'usageLimitExceeded', retryable: true,
+          outcomeUnknown: true, origin: 'acp', operationId: 'SYNTHETIC_OPERATION_SECRET_NOT_REAL' };
+        throw Object.assign(new Error('SYNTHETIC_SECRET_CANARY_NOT_REAL https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL'), {
+          name: 'LlmError', code: 'ACP_TURN_FAILED', ...publicError, publicError,
+          failure: { code: 'ACP_TURN_FAILED', message: 'SYNTHETIC_SECRET_CANARY_NOT_REAL', publicError },
+        });
+      }
       if (text.startsWith('hang')) {
         notifyHang();
+        if (text === 'hang-quota-race') {
+          await new Promise(resolve => {
+            if (options.signal.aborted) resolve();
+            else options.signal.addEventListener('abort', resolve, { once: true });
+          });
+          throw new LlmError('ACP execution quota exhausted.', 'ACP_TURN_FAILED', { publicError: {
+            category: 'quota', providerCode: 'usageLimitExceeded', retryable: false,
+            outcomeUnknown: false, origin: 'acp', operationId: 'synthetic-provider-race',
+          } });
+        }
         await new Promise((resolve, reject) => {
           if (options.signal.aborted) { reject(options.signal.reason); return; }
           options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
@@ -423,4 +662,70 @@ test('real DSH registry and agent-loop emit completed and canceled A2A turns wit
   await ctx.agents.get(target.sessionId).whenIdle();
   assert.equal(ctx.agents.get(target.sessionId).session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason.kind, 'aborted');
   assert.equal(requests.length, 3);
+
+  const failed = await backend.run(target, 'safe-failure', { requestId: 'real-safe-failure', signal: new AbortController().signal });
+  await ctx.agents.get(target.sessionId).whenIdle();
+  const hostReason = ctx.agents.get(target.sessionId).session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(hostReason.kind, 'error');
+  assert.equal(failed.outcome, 'failed');
+  assert.equal(failed.detail, failed.error.message);
+  const optionalFields = ['category', 'providerCode', 'retryable', 'outcomeUnknown', 'origin', 'operationId'];
+  t.diagnostic(JSON.stringify({ sentCode: 'HOST_EXECUTION_ERROR', hostCode: hostReason.error.code,
+    hostErrorFields: Object.keys(hostReason.error).sort(),
+    retainedSafeFields: optionalFields.filter(key => Object.hasOwn(hostReason.error.publicError ?? {}, key)) }));
+  assert.equal(hostReason.error.publicError, undefined);
+  assert.equal(hostReason.error.code, 'HOST_EXECUTION_ERROR');
+  assert.equal(failed.error.category, 'unknown');
+  assert.equal(failed.error.providerCode, undefined);
+  assert.equal(failed.error.outcomeUnknown, false);
+  assert.equal(failed.error.operationId, 'real-safe-failure');
+  assert.equal(requests.length, 4);
+
+  const spoofed = await backend.run(target, 'raw-safe-spoof', { requestId: 'real-spoof', signal: new AbortController().signal });
+  await ctx.agents.get(target.sessionId).whenIdle();
+  const spoofReason = ctx.agents.get(target.sessionId).session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(spoofReason.error.publicError, undefined);
+  assert.equal(spoofed.error.category, 'unknown');
+  assert.equal(spoofed.error.retryable, false);
+  assert.equal(spoofed.error.outcomeUnknown, false);
+  assert.equal(spoofed.error.operationId, 'real-spoof');
+  assert.ok(!JSON.stringify(spoofed).includes('SYNTHETIC_'));
+  assert.equal(requests.length, 5);
+
+  const legacyTarget = await backend.prepare({ cwd });
+  const legacy = await backend.run(legacyTarget, 'host-code-without-public-error', {
+    requestId: 'real-host-code-only', signal: new AbortController().signal,
+  });
+  await ctx.agents.get(legacyTarget.sessionId).whenIdle();
+  const legacyReason = ctx.agents.get(legacyTarget.sessionId).session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason;
+  assert.equal(legacyReason.error.code, 'usageLimitExceeded');
+  assert.equal(legacyReason.error.publicError, undefined);
+  assert.equal(legacy.error.category, 'unknown');
+  assert.equal(legacy.error.providerCode, undefined);
+  assert.equal(legacy.error.operationId, 'real-host-code-only');
+  assert.ok(!JSON.stringify(legacy).includes('SYNTHETIC_'));
+  assert.equal(requests.length, 6);
+
+  const raceStarted = Promise.withResolvers(), raceAbort = new AbortController();
+  notifyHang = () => raceStarted.resolve();
+  const beforeRace = ctx.agents.get(target.sessionId).session.snapshotEvents().length;
+  const raced = backend.run(target, 'hang-quota-race', { requestId: 'real-quota-abort-race', signal: raceAbort.signal });
+  await raceStarted.promise; raceAbort.abort(new Error('SYNTHETIC_CANCEL_SECRET_NOT_REAL'));
+  const raceResult = await raced;
+  await ctx.agents.get(target.sessionId).whenIdle();
+  const ownEvents = ctx.agents.get(target.sessionId).session.snapshotEvents().slice(beforeRace);
+  const raceEnd = ownEvents.findLast(event => event.type === 'turn/end');
+  assert.equal(raceEnd.data.reason.kind, 'aborted');
+  const attempts = ownEvents.filter(event => event.type === 'assistant/attempt' && event.data.turn === raceEnd.data.turn);
+  assert.equal(attempts.length, 1);
+  assert.ok(attempts[0].data.stream.every(frame => frame.chunk?.reason?.failure?.publicError === undefined));
+  t.diagnostic(JSON.stringify({ contract: 'host abort retains canonical current failure without admitting the chunk',
+    turn: raceEnd.data.turn, attemptSeq: attempts[0].seq, admittedChunks: attempts[0].data.stream.length,
+    turnEnd: raceEnd.data.reason.kind, resultError: raceResult.error }));
+  assert.equal(raceEnd.data.reason.failure, undefined);
+  assert.equal(raceResult.error.category, 'cancelled');
+  assert.equal(raceResult.error.outcomeUnknown, true);
+  assert.equal(raceResult.error.operationId, 'real-quota-abort-race');
+  assert.ok(!JSON.stringify(raceResult).includes('SYNTHETIC_CANCEL_SECRET'));
+  assert.equal(requests.length, 7);
 });

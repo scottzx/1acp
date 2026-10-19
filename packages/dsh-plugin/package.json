@@ -52,7 +52,8 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
     "ws": "^8.18.0",
-    "@1agents/acp-service": "workspace:^"
+    "@1agents/acp-service": "workspace:^",
+    "dsh-zod": "npm:zod@4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

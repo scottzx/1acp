@@ -1,10 +1,11 @@
 /** Installable Cordis bundle. Uses only existing Host services and preset registrations. */
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type { SessionId } from '@deepseek-ai/dsh-session';
+import { openDiagnostics } from './diagnostics.js';
 import { AcpAdapter, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
@@ -12,7 +13,7 @@ import { acquireService, resolveServiceOptions, type ServiceOptions } from './se
 import { mountDshA2A, type DshA2AOptions } from './a2a.js';
 export type { DshA2AOptions } from './a2a.js';
 export { name, inject } from '@1agents/acp-service';
-export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions } = {}): Promise<void> {
+export async function apply(ctx: Context, input: Partial<Config & ServiceOptions> & { a2a?: DshA2AOptions; diagnosticsDirectory?: string } = {}): Promise<void> {
   const homePath = ctx.get('dshHomePath') as ((...parts: string[]) => string) | undefined;
   const home = homePath ? homePath() : process.env.DSH_HOME || join(homedir(), '.dsh');
   const service = resolveServiceOptions(input);
@@ -28,11 +29,17 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
   };
   if (config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
   if (!Number.isSafeInteger(config.reconnectAttempts) || config.reconnectAttempts < 0 || !Number.isSafeInteger(config.reconnectDelayMs) || config.reconnectDelayMs < 1) throw new Error('Invalid ACP reconnect policy');
-  const adapter = new AcpAdapter(ctx, config);
+  const diagnosticOwner = await openDiagnostics(resolve(input.diagnosticsDirectory ?? join(config.stateDirectory, 'diagnostics')));
+  const { diagnostics } = diagnosticOwner;
+  let closeA2A: (() => Promise<void>) | undefined;
+  const adapter = new AcpAdapter(ctx, config, diagnostics);
   ctx.effect(() => ctx.llm.registerAdapter(['1agents-acp'], adapter));
   const nativeSessions = new NativeSessions(ctx, adapter, config);
   ctx.provide('oneagentsAcpSessions', nativeSessions);
-  ctx.effect(() => async () => { await Promise.all([nativeSessions.dispose(), adapter.dispose()]); });
+  ctx.effect(() => async () => {
+    try { await closeA2A?.(); await Promise.all([nativeSessions.dispose(), adapter.dispose()]); }
+    finally { await diagnosticOwner.close(); }
+  });
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/api/1agents-acp', handler: async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
@@ -66,5 +73,5 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     });
     ctx.effect(() => dispose);
   }
-  if (input.a2a) await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'));
+  if (input.a2a) closeA2A = await mountDshA2A(ctx, input.a2a, join(home, 'plugins', '1agents-acp', 'a2a'), diagnostics);
 }

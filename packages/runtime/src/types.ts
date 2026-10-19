@@ -142,6 +142,31 @@ export type OutputErrorCode = (typeof OUTPUT_ERROR_CODES)[number];
 export const OUTPUT_ERROR_ORIGINS = ["cli", "runtime", "queue", "acp"] as const;
 export type OutputErrorOrigin = (typeof OUTPUT_ERROR_ORIGINS)[number];
 
+export type SafeErrorCategory =
+  | "quota"
+  | "rate_limit"
+  | "budget"
+  | "auth"
+  | "cancelled"
+  | "timeout"
+  | "permission"
+  | "unknown";
+
+export type SafeErrorOrigin = OutputErrorOrigin | "service" | "transport" | "dsh" | "a2a";
+
+/** A bounded public error projection; never includes provider messages or raw data. */
+export type SafeError = {
+  message: string;
+  category: SafeErrorCategory;
+  providerCode?: string;
+  retryable: boolean;
+  outcomeUnknown: boolean;
+  origin: SafeErrorOrigin;
+  operationId?: string;
+  code?: string;
+  detailCode?: string;
+};
+
 export const QUEUE_ERROR_DETAIL_CODES = [
   "QUEUE_OWNER_CLOSED",
   "QUEUE_OWNER_SHUTTING_DOWN",

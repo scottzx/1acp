@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { client, type SessionNotification } from '@agentclientprotocol/sdk';
-import { attachAcpConnection, webSocketStream, type RuntimeBackend, type RuntimePeer } from '../src/acp-connection.js';
+import { attachAcpConnection, webSocketStream, RuntimePeer, type RuntimeBackend } from '../src/acp-connection.js';
 import { AcpState } from '../src/acp-state.js';
 import { dispatchCommand, activeSessions, pendingPermissions, pendingAskUserQuestions, pendingExitPlanModes } from '../src/bridge.js';
 
@@ -136,6 +136,93 @@ test('tool observations preserve ACP titles, structured output and sparse update
   assert.deepEqual(replayed, tools);
 });
 
+test('safe turn errors preserve the separate failed tool result contract', async t => {
+  const f = await fixture(t), a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    peer.send(JSON.stringify({ event: 'tool_call', sessionId, toolCallId: 'synthetic-tool', status: 'failed', title: 'Synthetic operation', rawOutput: { exitCode: 1 } }));
+    peer.send(JSON.stringify({ event: 'done', sessionId, stopReason: 'end_turn' }));
+  };
+  await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'synthetic tool failure' }] });
+  const update = a.updates.find(item => item.update.sessionUpdate === 'tool_call')?.update;
+  assert.ok(update?.sessionUpdate === 'tool_call');
+  assert.equal(update.toolCallId, 'synthetic-tool');
+  assert.equal(update.status, 'failed');
+  assert.deepEqual(update.rawOutput, { exitCode: 1 });
+});
+
+test('failed tools with error objects keep their observation fields and sanitize only the error', async t => {
+  const f = await fixture(t), a = await f.connect();
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  const secret = 'SYNTHETIC_TOOL_ERROR_CANARY_NOT_REAL';
+  const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_TOOL_AUTH_CANARY_NOT_REAL';
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    const error = { code: -32603, message: 'Internal error', data: { message: secret, additionalDetails: authLink },
+      category: 'quota', origin: 'dsh', retryable: true, outcomeUnknown: true, operationId: 'synthetic-tool-spoof' };
+    peer.send(JSON.stringify({ event: 'tool_call', sessionId, toolCallId: 'synthetic-failed-tool', status: 'failed',
+      title: 'Synthetic failed operation', rawOutput: { exitCode: 1 }, code: 'synthetic_tool_exit',
+      errorCode: 'synthetic_untrusted_provider_code', errorText: `${secret} ${authLink}`, error }));
+    peer.send(JSON.stringify({ event: 'tool_result', sessionId, toolCallId: 'synthetic-failed-tool', isError: true,
+      rawOutput: { stderr: 'Synthetic tool output' }, code: 'synthetic_tool_result',
+      errorCode: 'synthetic_untrusted_provider_code', errorText: `${secret} ${authLink}`, error }));
+    peer.send(JSON.stringify({ event: 'done', sessionId, stopReason: 'end_turn' }));
+  };
+  const result = await a.connection.agent.request('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'synthetic tool failure with error object' }] });
+  assert.equal(result.stopReason, 'end_turn');
+  const tools = a.updates.map(item => item.update).filter(update => update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update');
+  assert.equal(tools.length, 2);
+  assert.equal(tools[0].toolCallId, 'synthetic-failed-tool');
+  assert.equal(tools[0].title, 'Synthetic failed operation');
+  assert.equal(tools[0].status, 'failed');
+  assert.deepEqual(tools[0].rawOutput, { exitCode: 1 });
+  assert.equal(tools[1].toolCallId, 'synthetic-failed-tool');
+  assert.equal(tools[1].status, 'failed');
+  assert.deepEqual(tools[1].rawOutput, { stderr: 'Synthetic tool output' });
+  assert.deepEqual(tools.map(tool => (tool._meta?.['1agents'] as { code: string }).code), ['synthetic_tool_exit', 'synthetic_tool_result']);
+  for (const tool of tools) {
+    const metadata = tool._meta?.['1agents'] as { error: { category: string; data?: unknown; retryable: boolean; outcomeUnknown: boolean; operationId?: string }; errorCode?: string; errorText: string };
+    const error = metadata.error;
+    assert.equal(error.category, 'unknown');
+    assert.equal(error.data, undefined);
+    assert.equal(error.retryable, false);
+    assert.equal(error.outcomeUnknown, false);
+    assert.equal(error.operationId, undefined);
+    assert.equal(metadata.errorCode, undefined);
+    assert.equal(metadata.errorText.includes(secret), false);
+  }
+  assert.ok(!JSON.stringify(a.updates).includes(secret));
+  assert.ok(!JSON.stringify(a.updates).includes(authLink));
+  assert.ok(!JSON.stringify(a.updates).includes('synthetic-tool-spoof'));
+});
+
+test('an untrusted runtime backend cannot self-assert safe error policy fields', async t => {
+  const f = await fixture(t), a = await f.connect(undefined, 'codex', async () => ({}));
+  const { sessionId } = await a.connection.agent.request('session/new', { cwd: '/tmp', mcpServers: [] });
+  const dispatch = f.backend.dispatch.bind(f.backend);
+  f.backend.dispatch = async (peer, command) => {
+    if (command.action !== 'prompt') return dispatch(peer, command);
+    peer.send(JSON.stringify({ event: 'turn_terminal', status: 'failed', sessionId, runtimeRequestId: command.requestId,
+      error: { message: 'Synthetic spoof', category: 'quota', origin: 'acp', retryable: true,
+        outcomeUnknown: true, operationId: 'synthetic-provider-spoof' } }));
+  };
+  await assert.rejects(a.connection.agent.request('session/prompt', {
+    sessionId, prompt: [{ type: 'text', text: 'synthetic raw policy spoof' }],
+    _meta: { '1agents': { requestId: 'synthetic-owned-operation' } },
+  }), error => {
+    const safe = (error as { data: Record<string, unknown> }).data;
+    assert.equal(safe.category, 'unknown');
+    assert.equal(safe.origin, 'service');
+    assert.equal(safe.retryable, false);
+    assert.equal(safe.outcomeUnknown, false);
+    assert.equal(safe.operationId, 'synthetic-owned-operation');
+    return true;
+  });
+});
+
 for (const finalAnswer of ['Final answer', '']) {
   test(`managed completion keeps the authoritative ${finalAnswer ? 'final answer' : 'empty answer'} after streamed commentary`, async t => {
     const f = await fixture(t), a = await f.connect();
@@ -181,6 +268,60 @@ test('summary completion with an empty final answer never falls back to commenta
   assert.equal((result._meta?.['1agents'] as { resultText: string }).resultText, '');
   await a.summaryReceived;
   assert.equal(a.events[0].resultText, '');
+});
+
+test('flat backend error codes require an owned runtime event while native errors remain recognizable', () => {
+  const project = (event: Record<string, any>, trusted: boolean) => {
+    let received!: Record<string, any>;
+    new RuntimePeer(value => { received = value; }, trusted).send(JSON.stringify(event));
+    return received;
+  };
+  for (const event of ['turn_terminal', 'turn_complete', 'done']) {
+    const value = { event, status: 'failed', requestId: 'synthetic-owned-operation', errorCode: 'usageLimitExceeded' };
+    const untrusted = project(value, false);
+    assert.equal(untrusted.error.category, 'unknown');
+    assert.equal(untrusted.error.providerCode, undefined);
+    assert.equal(untrusted.error.operationId, value.requestId);
+    assert.equal(project(value, true).error.category, 'quota');
+    const native = project({ ...value, error: { code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } } }, false);
+    assert.equal(native.error.category, 'quota');
+  }
+  for (const event of ['tool_call', 'tool_call_update', 'tool_result']) {
+    const value = { event, toolCallId: 'synthetic-tool', errorCode: 'usageLimitExceeded', errorText: 'synthetic-private-detail' };
+    const untrusted = project(value, false);
+    assert.equal(untrusted.errorCode, undefined);
+    assert.equal(untrusted.errorText.includes(value.errorText), false);
+    assert.equal(project(value, true).errorCode, 'usageLimitExceeded');
+    const native = project({ ...value, error: { code: -32603, data: { codexErrorInfo: 'usageLimitExceeded' } } }, false);
+    assert.equal(native.error.category, 'quota');
+  }
+});
+
+test('failed summary terminals retain their session reference and summary while sanitizing errors', () => {
+  const events: Record<string, any>[] = [];
+  const peer = new RuntimePeer(event => events.push(event), true);
+  const sessionRef = { sessionId: 'synthetic-session', turnId: 'synthetic-turn',
+    sessionReaderUrl: 'http://127.0.0.1:7777', sessionReaderPort: 7777 };
+  for (const event of ['turn_complete', 'done']) {
+    peer.send(JSON.stringify({ event, status: 'failed', responsePolicy: 'summary',
+      sessionId: sessionRef.sessionId, resultText: '', finalAnswer: '', sessionRef,
+      ...(event === 'done' ? { summary: 'Execution failed.' } : {}),
+      error: { message: 'synthetic-private-provider-detail', data: { credential: 'synthetic-nonfunctional' } },
+    }));
+  }
+  assert.equal(events.length, 2);
+  for (const event of events) {
+    assert.deepEqual(event.sessionRef, sessionRef);
+    assert.equal(event.status, 'failed');
+    assert.equal(event.responsePolicy, 'summary');
+    assert.equal(event.resultText, '');
+    assert.equal(event.finalAnswer, '');
+    assert.equal(event.error.category, 'unknown');
+    assert.equal(event.error.data, undefined);
+    assert.equal(JSON.stringify(event).includes('synthetic-private-provider-detail'), false);
+  }
+  assert.equal(events[0].summary, undefined);
+  assert.equal(events[1].summary, 'Execution failed.');
 });
 
 test('legacy summary-only completion retains its final summary', async t => {

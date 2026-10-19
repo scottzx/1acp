@@ -5,6 +5,9 @@ import { AgentCard, SSE_HEADERS, TaskState, formatSSEEvent, type CancelTaskReque
 import { PushNotificationNotSupportedError, RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import { DefaultExecutionEventBusManager, DefaultRequestHandler, JsonRpcTransportHandler, ServerCallContext, V1PushNotificationSerializer, resolveUserScope, validateVersion, type PushNotificationSender } from '@a2a-js/sdk/server';
 import { A2ASessionExecutor, parseA2AInput, type A2AExecutionOptions } from './executor.js';
+import { Role } from '@a2a-js/sdk';
+import { toSafeError } from '@1agents/acp-service/runtime';
+import { a2aRequestId } from './request-id.js';
 import { FileA2AStore } from './store.js';
 import type { A2ABackend } from './types.js';
 
@@ -168,7 +171,15 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
     defaultInputModes: ['text/plain'], defaultOutputModes: ['text/plain'],
     skills: [{ id: 'dsh-session', name: 'DSH session task', description: 'Create or resume a session using metadata.1agents.cwd, workspace and agentPreset; retain contextId to continue collaboration.', tags: ['dsh', 'project', 'role', 'async'] }] });
   const store = new FileA2AStore(options.stateDirectory);
-  try { await store.recoverInterrupted(); } catch (error) { store.close(); throw error; }
+  try { await store.recoverInterrupted(async (task, context) => {
+    const message = task.history.findLast(message => message.role === Role.ROLE_USER);
+    const target = store.loadTarget(task.contextId, context);
+    if (!message || !target) return;
+    const requestId = a2aRequestId(task.id, message.messageId);
+    const recovered = await options.backend.recover?.(target, { requestId });
+    return toSafeError(recovered, { origin: 'a2a', operationId: requestId,
+      outcomeUnknown: recovered === undefined });
+  }); } catch (error) { store.close(); throw error; }
   const executor = new A2ASessionExecutor(options.backend, store, options);
   const sender = new HttpPushSender(store, origins);
   const requestHandler = new HostRequestHandler(card, store, executor, sender, options, origins);

@@ -1,10 +1,23 @@
 /** Official A2A executor with durable DSH context bindings and independent turns. */
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { Role, Task, TaskState, Message, type SendMessageRequest } from '@a2a-js/sdk';
 import { ContentTypeNotSupportedError, RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import { AgentEvent, type AgentExecutor, type ExecutionEventBus, type RequestContext, resolveUserScope } from '@a2a-js/sdk/server';
+import { a2aRequestId } from './request-id.js';
+import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import type { FileA2AStore } from './store.js';
-import type { A2ABackend, A2APrepareInput } from './types.js';
+import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from './types.js';
+
+const FAILURE_MESSAGES: Record<NonNullable<A2ARunResult['failureReason']>, string> = {
+  'missing-final-answer': 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output',
+  'max-tokens': 'DSH reached the model output token limit',
+  forked: 'DSH task turn was closed by a session fork',
+  'unsupported-ending': 'DSH returned an unsupported turn ending',
+  discarded: 'DSH discarded the queued task before execution',
+  disposed: 'DSH session was disposed before the task finished',
+  aborted: 'DSH task execution was canceled',
+  interrupted: 'DSH task execution was interrupted',
+};
 
 export interface A2AExecutionOptions {
   defaultCwd?: string;
@@ -56,11 +69,17 @@ export class A2ASessionExecutor implements AgentExecutor {
     const done = new Promise<void>(resolve => { finish = resolve; });
     this.active.set(context.taskId, { controller, done });
     let published = false;
-    const status = (state: TaskState, text?: string): void => {
+    let target: A2ATarget | undefined;
+    let returnedError: SafeError | undefined;
+    let returnedFailureMessage: string | undefined;
+    // DSH deduplicates prompts by rpcId across the whole session. A Task can
+    // have several input-required turns, each with its own message identity.
+    const requestId = a2aRequestId(context.taskId, context.userMessage.messageId);
+    const status = (state: TaskState, text?: string, error?: SafeError): void => {
       bus.publish(AgentEvent.statusUpdate({ taskId: context.taskId, contextId: context.contextId,
         status: { state, timestamp: new Date().toISOString(), message: text ? Message.fromJSON({
           messageId: randomUUID(), role: 'ROLE_AGENT', contextId: context.contextId, taskId: context.taskId, parts: [{ text }],
-        }) : undefined }, metadata: undefined }));
+        }) : undefined }, metadata: error ? { '1agents': { ...target, error } } : undefined }));
     };
     try {
       const { prompt, input } = parseA2AInput(context.request, this.options);
@@ -69,7 +88,6 @@ export class A2ASessionExecutor implements AgentExecutor {
       let unlock!: () => void;
       const lock = new Promise<void>(resolve => { unlock = resolve; });
       this.preparing.set(key, lock);
-      let target;
       try {
         await previous;
         controller.signal.throwIfAborted();
@@ -89,21 +107,29 @@ export class A2ASessionExecutor implements AgentExecutor {
       published = true;
       controller.signal.throwIfAborted();
       status(TaskState.TASK_STATE_WORKING);
-      // DSH deduplicates prompts by rpcId across the whole session. A Task can
-      // have several input-required turns, each with its own message identity.
-      const requestId = `a2a-${createHash('sha256').update(JSON.stringify([context.taskId, context.userMessage.messageId])).digest('hex')}`;
       const result = await this.backend.run(target, prompt, { requestId, signal: controller.signal });
+      returnedError = result.outcome === 'failed' && result.error !== undefined
+        ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
+      returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
+        ? FAILURE_MESSAGES[result.failureReason] : undefined;
       controller.signal.throwIfAborted();
       if (result.text) bus.publish(AgentEvent.artifactUpdate({ taskId: context.taskId, contextId: context.contextId,
         artifact: { artifactId: `${context.taskId}-${randomUUID()}`, name: 'DSH response', description: '',
           parts: [{ content: { $case: 'text', value: result.text }, mediaType: 'text/plain', filename: '', metadata: undefined }], metadata: undefined, extensions: [] },
         append: false, lastChunk: true, metadata: undefined }));
       if (result.outcome === 'input-required') this.awaitingInput.set(context.taskId, context.contextId);
-      status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, result.detail);
+      const error = result.outcome === 'failed'
+        ? toSafeError(returnedError, { origin: 'a2a', operationId: requestId }) : undefined;
+      status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? error?.message ?? result.detail, error);
     } catch (error) {
       if (!published) bus.publish(AgentEvent.task(Task.fromJSON({ id: context.taskId, contextId: context.contextId,
         status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() } })));
-      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, error instanceof Error ? error.message : String(error));
+      const projected = controller.signal.aborted && returnedError ? returnedError : toSafeError(error, { origin: 'a2a', operationId: requestId });
+      const cancellationOnly = controller.signal.aborted && !returnedError && error === controller.signal.reason;
+      const safe = toSafeError(cancellationOnly ? new DOMException('A2A task canceled', 'AbortError') : projected, {
+        origin: 'a2a', operationId: requestId, outcomeUnknown: projected.outcomeUnknown,
+      });
+      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? safe.message, safe);
     } finally {
       this.active.delete(context.taskId);
       finish();

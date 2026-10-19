@@ -81,7 +81,11 @@ for (const [mode, passed] of [
       ]);
       const report = parseReport(result.stdout);
       assert.equal(result.code, passed === 4 ? 0 : 1, result.stderr);
-      assert.deepEqual(report.totals, { cases: 4, passed, failed: 4 - passed });
+      assert.deepEqual(
+        report.totals,
+        { cases: 4, passed, failed: 4 - passed },
+        JSON.stringify({ report, stderr: result.stderr }),
+      );
       for (const row of report.results.filter((row) => !row.passed)) {
         assert.match(row.error ?? "", /expected completed filesystem operation/);
       }

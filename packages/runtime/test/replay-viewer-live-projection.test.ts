@@ -163,8 +163,9 @@ for (const resource of ["runs", "run"] as const) {
       );
       assert.equal(recovered?.type, resource === "runs" ? "runs_patch" : "run_snapshot");
 
-      // A real removal must still retire the run, rather than preserving it as a read race.
-      await fs.rm(fixture.runDir, { recursive: true, force: true });
+      // Retire the bundle atomically. Recursive deletion can first remove the
+      // optional live projection, producing a valid intermediate stored state.
+      await fixture.retireRun();
       await waitFor(() =>
         resource === "runs"
           ? applied.some((entry) => entry.updatedAt === undefined)
@@ -259,7 +260,9 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 async function createFixture() {
-  const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-live-projection-"));
+  const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-live-projection-"));
+  const runsDir = path.join(fixtureDir, "runs");
+  await fs.mkdir(runsDir);
   const store = new FlowRunStore(runsDir);
   const runId = "synthetic-held-compute";
   const T0 = "2026-01-01T00:00:00.000Z";
@@ -297,6 +300,9 @@ async function createFixture() {
     runPath,
     storedRun,
     T0,
+    async retireRun() {
+      await fs.rename(runDir, path.join(fixtureDir, "retired"));
+    },
     async heartbeat() {
       state.lastHeartbeatAt = new Date().toISOString();
       await store.writeLive(runDir, state, {
@@ -310,7 +316,7 @@ async function createFixture() {
     },
     async close() {
       store.releaseRun(runDir);
-      await fs.rm(runsDir, { recursive: true, force: true });
+      await fs.rm(fixtureDir, { recursive: true, force: true });
     },
   };
 }
