@@ -362,7 +362,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
       automationPort = await listen(automationServer, gateway.config.automation.port, gateway.config.automation.host);
     }
     const entry = { id: 'a2a-gateway', name: 'DSH 远端智能体', kind: 'agent_runtime' as const,
-      capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http', port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS };
+      capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http' as const, port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS };
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);
     let closing: Promise<void> | undefined;
     return { gateway, port, callbackPort, automationPort, registration, close: async () => {

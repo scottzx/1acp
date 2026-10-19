@@ -1,6 +1,6 @@
 {
   "name": "@1agents/acp-service",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "ACP runtime, CLI, HTTP/WebSocket service and DeepSeek Harness ACP/A2A plugins in one package.",
   "keywords": [
     "dreammate",
@@ -88,8 +88,8 @@
   },
   "dependencies": {
     "@1agents/acp-runtime-sdk": "npm:@agentclientprotocol/sdk@^1.5.0",
-    "@1agents/dreammate-network": "^0.3.1",
-    "@1agents/dreammate-node": "^0.4.0",
+    "@1agents/dreammate-network": "^0.5.0",
+    "@1agents/dreammate-node": "^0.15.0",
     "@a2a-js/sdk": "1.3.0",
     "@agentclientprotocol/sdk": "1.4.0",
     "@openclaw/fs-safe": "^0.20.0",
