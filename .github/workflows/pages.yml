@@ -5,11 +5,12 @@ on:
     branches:
       - main
     paths:
-      - "docs/**"
-      - "scripts/build-docs-site.mjs"
-      - "scripts/docs-site-assets.mjs"
-      - "CNAME"
-      - "package.json"
+      - "packages/runtime/docs/**"
+      - "packages/runtime/scripts/build-docs-site.mjs"
+      - "packages/runtime/scripts/docs-site-assets.mjs"
+      - "packages/runtime/test/docs-site.test.ts"
+      - "packages/runtime/CNAME"
+      - "packages/runtime/package.json"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -30,6 +31,9 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: packages/runtime
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,6 +42,9 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
+
+      - name: Test docs site
+        run: node --experimental-strip-types --test test/docs-site.test.ts
 
       - name: Build docs site
         run: node scripts/build-docs-site.mjs
@@ -48,7 +55,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: dist/docs-site
+          path: packages/runtime/dist/docs-site
 
       - name: Deploy
         id: deployment

@@ -13,8 +13,8 @@ import {
 const root = process.cwd();
 const docsDir = path.join(root, "docs");
 const outDir = path.join(root, "dist", "docs-site");
-const repoBase = "https://github.com/openclaw/acpx";
-const repoEditBase = `${repoBase}/edit/main/docs`;
+const repoBase = "https://github.com/scottzx/1acp";
+const repoEditBase = `${repoBase}/edit/main/packages/runtime/docs`;
 const cname = readCname();
 const siteBase = cname ? `https://${cname}` : "";
 
@@ -82,6 +82,7 @@ const HIGHLIGHT_RULES = {
 // They remain in the repo and are reachable from GitHub.
 const buildExcludes = [
   /^\d{4}-\d{2}-\d{2}-/, // dated architecture notes
+  /^proof-/, // internal live verification records and transcripts
   /^ACPX_ERROR_STRATEGY\.md$/,
   /^json-patch-plus\.md$/,
 ];
