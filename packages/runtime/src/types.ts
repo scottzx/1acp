@@ -33,6 +33,7 @@ export type AcpPermissionRequest = {
 };
 
 export type AcpPermissionDecision =
+  | { outcome: "selected"; optionId: string }
   | { outcome: "allow_once" }
   | { outcome: "allow_always" }
   | { outcome: "reject_once" }
@@ -509,6 +510,7 @@ export type RuntimeTurnResultSnapshot = {
 };
 
 export type SessionAcpxState = {
+  session_origin?: "new" | "resume";
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
   desired_mode_id?: string;

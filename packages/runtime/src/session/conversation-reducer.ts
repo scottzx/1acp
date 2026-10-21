@@ -615,6 +615,7 @@ export function cloneSessionAcpxState(
   }
 
   return {
+    ...(state.session_origin ? { session_origin: state.session_origin } : {}),
     current_mode_id: state.current_mode_id,
     desired_mode_id: state.desired_mode_id,
     desired_config_options: state.desired_config_options
@@ -631,7 +632,7 @@ export function cloneSessionAcpxState(
       : undefined,
     config_options: state.config_options ? deepClone(state.config_options) : undefined,
     session_options: cloneSessionOptions(state.session_options),
-    turn_results: state.turn_results ? deepClone(state.turn_results) : undefined,
+    turn_results: deepClone(state.turn_results),
   };
 }
 

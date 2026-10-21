@@ -40,7 +40,7 @@ Core capabilities:
 - Built-in agent registry plus raw `--agent` escape hatch
 - Claude system prompt override via `--system-prompt` / `--append-system-prompt`
 - Optional ACP filesystem and terminal capability opt-outs via `--no-fs` and `--no-terminal`
-- Tool whitelist (`--allowed-tools`), turn cap (`--max-turns`), retry on transient failures (`--prompt-retries`)
+- Adapter-specific tool approval controls (`--allowed-tools`), turn cap (`--max-turns`), retry on transient failures (`--prompt-retries`)
 - Multi-agent flows via `acpx flow run` and the `acpx/flows` authoring API (`defineFlow`, `decision`, `decisionEdge`, `acp`, `action`, `compute`, `checkpoint`)
 
 ## Install
@@ -107,6 +107,7 @@ Friendly agent names resolve to commands:
 - `kiro` -> `kiro-cli-chat acp`
 - `mcode` -> `mcode acp` (install/authenticate MCode first; prefer `exec` for one-shot work, and require advertised ACP reload support for cross-invocation continuity)
 - `mux` -> `mux acp` via an ACPX-owned npm range
+- `octomind` -> `octomind acp developer:general` (install Octomind and sign in with `octomind login` or provider keys first; see the [Octomind guide](https://github.com/openclaw/acpx/blob/main/agents/Octomind.md))
 - `opencode` -> `npx -y opencode-ai acp`
 - `pool` -> `pool acp`
 - `qoder` -> `qodercli --acp`
@@ -135,6 +136,8 @@ Use `getStatus({ handle }).models.availableModels` when present for native displ
 Use `prepareFreshSession({ handle })` to persist a fresh-session request across restart, then ensure without `resumeSessionId`. Ordinary `close` retains session continuity; explicit remote discard requires the adapter’s optional close capability.
 
 Embedded controls save accepted settings with the current conversation. Turn finalization and one-shot cleanup wait for admitted controls, preserving final output, usage, and selections in the saved session. Ordinary `close` can return before active prompt cancellation finishes; the later save preserves its close/reset markers.
+
+An unprompted persistent session recorded as created through `session/new` may be replaced after an ACP internal load/resume error (`-32603`) so its first prompt or control can run with saved preferences. Explicit native resumes, older records without creation provenance, earlier prompts (including cancelled turns), agent output, legacy resume markers, or imported provenance forbid this recovery; an unsupported or missing session still fails with `SESSION_RESUME_REQUIRED`.
 
 For persistent sessions, compatible `ensureSession` calls may reuse an active record, including from permission callbacks during control reconnects. Changing its working directory, adapter invocation, or resume identity while turns or controls remain unfinished rejects with `ACP_SESSION_INIT_FAILED`; await that work or use a different key. After an active close, await its turn result before reopening. Idle replacement retires the old owner before initializing the successor; other records and distinct one-shot sessions remain independent.
 
@@ -306,7 +309,7 @@ Behavior:
 - `--model <id>`: request an agent model during session creation; non-Claude agents must advertise a model config option or legacy `models` metadata
 - `--system-prompt <text>`: replace the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt`; persisted in `session_options.system_prompt` so reuse keeps the override. Other agents ignore the field.
 - `--append-system-prompt <text>`: append text to the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt.append`; same persistence rules as `--system-prompt`. Both system-prompt flags also apply to persistent and isolated ACP nodes in `flow run`.
-- `--allowed-tools <list>`: comma-separated tool whitelist (use `""` for no tools)
+- `--allowed-tools <list>`: comma-separated tool list forwarded to the adapter; for Claude it pre-approves listed tools (`""` adds no approvals, rather than disabling tools)
 - `--max-turns <count>`: cap session turn count
 - `--prompt-retries <count>`: retry failed prompt turns on transient errors (default `0`); cancelling a queued turn stops remaining attempts, while already-received final responses keep their outcome
 - `--no-fs`: disable ACP filesystem callbacks so compatible agents use their native file operations. This is a protocol callback policy, not an OS sandbox for the agent's own filesystem access.
@@ -487,6 +490,8 @@ For ACP tool permission requests, per-tool policy takes precedence over the perm
 - `--policy <json-or-file>`: match ACP tool permission requests by kind, title, title head, or raw input tool name
 
 An `autoApprove` rule can approve a tool request under `--deny-all`. An `escalate` rule can prompt under `--approve-all` when stdin and stderr are TTYs. Without both TTYs, escalation denies or cancels the current request and adds `_meta.acpx.permissionEscalation` to the ACP response, even when `--non-interactive-permissions fail` is selected.
+
+For Claude, native approvals from `sessionOptions.allowedTools`, skill `allowed-tools`, and other settings can resolve calls before these ACP permission controls; see the [Claude approval boundary](../../agents/Claude.md#permission-approval-boundary) for native enforcement guidance.
 
 Per-tool policies govern `session/request_permission`. ACP filesystem and terminal operations use the client's permission mode separately; a tool approval does not bypass those operation checks.
 

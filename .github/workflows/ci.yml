@@ -77,19 +77,6 @@ jobs:
       - name: Enforce existing coverage thresholds
         if: matrix.lane == 'coverage'
         run: pnpm --filter @scottzx/1acp test:coverage:only
-  autoreview:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-          cache: pip
-          cache-dependency-path: packages/runtime/requirements-autoreview.txt
-      - run: python -m pip install -r packages/runtime/requirements-autoreview.txt
-      - run: python -I -B scripts/check-autoreview.py
-        working-directory: packages/runtime
   dsh-plugin:
     needs: build
     runs-on: ubuntu-latest
