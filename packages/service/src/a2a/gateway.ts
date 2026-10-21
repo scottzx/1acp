@@ -16,6 +16,7 @@ import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.j
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema } from './result-metadata.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
+import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput } from '../execution/ledger.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema,
   type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest } from '../execution/ppt-delivery.js';
@@ -64,6 +65,7 @@ const executionSubmitSchema = z.object({ ...originFields, targetId: string, inpu
   parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(),
   replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional() }).strict();
 const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
+const executionCancelSchema = executionJobSchema.extend({ cascade: z.boolean().optional() }).strict();
 const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
   limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0) }).strict();
 const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional() }).strict();
@@ -75,8 +77,8 @@ const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知时禁止新派发。', parameters: z.toJSONSchema(executionContinueSchema) },
-  execution_cancel: { description: '按任务编号取消当前A2A执行轮次，先记录取消意图再核对后端确认；不支持的角色Provider明确拒绝，不默认级联子任务。', parameters: z.toJSONSchema(executionJobSchema) },
-  execution_get: { description: '读取任务、执行轮次、父子关联与结果。在途/未决历史单列，不把当前轮次终态等同整链停止。', parameters: z.toJSONSchema(executionJobSchema) },
+  execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
+  execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
   execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
   execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
@@ -119,7 +121,10 @@ interface Job {
 interface NoticeRecord { notice: RemoteAgentNotice; target?: string; acknowledged?: boolean; delivered?: boolean; sessionDeliveryId?: string }
 interface ExecutionNotice { noticeId: string; messageId: string; originSessionId: string; jobId: string; attemptId: string;
   executionStatus: string; resultSummary: string; artifactLinks: any[]; createdAt: string; processedAt?: string; text: string }
-interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; pptDeliveries?: any }
+interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean;
+  requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
+  targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
+interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
 const actionable = new Set([...terminal, 'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED']);
 const wire = (task: Task): Record<string, any> => Task.toJSON(task) as Record<string, any>;
@@ -153,6 +158,8 @@ export class RemoteAgentGateway {
   private readonly delivering = new Set<string>();
   private readonly controllers = new Set<AbortController>();
   private readonly operations = new Set<Promise<unknown>>();
+  private readonly advancingDeliveries = new Map<string, Promise<void>>();
+  private readonly canceling = new Map<string, Promise<void>>();
   private reconciling?: Promise<void>;
   private readonly timer: NodeJS.Timeout;
   private closed = false;
@@ -196,6 +203,7 @@ export class RemoteAgentGateway {
       }
       this.state.ledger = this.ledger.snapshot(); this.state.version = 2;
       this.state.executionNotices ??= [];
+      this.state.executionCancellations ??= {};
       this.state.pptDeliveries ??= { version: 1, runs: {} };
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         const attempt = this.ledger.getAttempt(run.attemptId);
@@ -235,7 +243,9 @@ export class RemoteAgentGateway {
     const view = this.ledger.get(originSessionId, jobId);
     const attempt = view.attempts.find(item => item.attemptId === view.currentAttemptId)!;
     const raw = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
-    return { ...view, attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
+    const delivery = this.state.pptDeliveries?.runs[attempt.attemptId] as PptDeliveryRun | undefined;
+    return { ...view, ...(delivery ? { deliveryProgress: deliveryProgress(delivery) } : {}),
+      ...(this.state.executionCancellations?.[attempt.attemptId] ? { cancellation: structuredClone(this.state.executionCancellations[attempt.attemptId]) } : {}), attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
       backendRunRef: attempt.backendRunRef, phase: attempt.phase, stale: attempt.stale,
       resultSummary: view.result?.resultSummary, artifactLinks: view.result?.artifactLinks ?? [],
       resultDigest: view.result?.resultDigest, resultRevision: view.result?.resultRevision,
@@ -246,6 +256,7 @@ export class RemoteAgentGateway {
   private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
     if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+    this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
     const resolved = this.targets.resolve(input.targetId, input.input);
     if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
       throw new Error('Continue must preserve the original remote, cwd and preset');
@@ -278,6 +289,7 @@ export class RemoteAgentGateway {
       // Target changes/disable during asynchronous preflight must win before sending.
       const fresh = this.targets.resolve(input.targetId, input.input);
       if (fresh.configVersion !== resolved.configVersion || fresh.connectionVersion !== resolved.connectionVersion) throw new Error('Execution target changed before dispatch');
+      this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
       this.ledger.markDispatching(attempt.attemptId); sent = true;
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
@@ -294,7 +306,8 @@ export class RemoteAgentGateway {
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
       if (sent) this.ledger.markUnknown(attempt.attemptId, diagnostic);
-      else this.ledger.knownNotSubmitted(attempt.attemptId, { executionStatus: 'rejected', diagnostic });
+      else if (this.ledger.getAttempt(attempt.attemptId).submissionStatus !== 'known_not_submitted')
+        this.ledger.knownNotSubmitted(attempt.attemptId, { executionStatus: 'rejected', diagnostic });
       return { ...this.ledgerView(input.originSessionId, job.jobId), error: diagnostic };
     }
   }
@@ -302,6 +315,12 @@ export class RemoteAgentGateway {
     return this.ledgerView(origin, jobId) as PptDeliveryChild;
   }
   private async advanceDelivery(run: PptDeliveryRun): Promise<void> {
+    const existing = this.advancingDeliveries.get(run.attemptId);
+    if (existing) return existing;
+    const operation = this.advanceDeliveryOnce(run); this.advancingDeliveries.set(run.attemptId, operation);
+    try { await operation; } finally { this.advancingDeliveries.delete(run.attemptId); }
+  }
+  private async advanceDeliveryOnce(run: PptDeliveryRun): Promise<void> {
     const rootOrigin = run.originSessionId;
     const submitChild = async (request: PptDeliveryChildRequest, previous?: PptDeliveryChild) => {
       if (request.parentJobRef.sourceId !== run.sourceId || request.parentJobRef.jobId !== run.jobId || request.parentAttemptId !== run.attemptId) throw new Error('Delivery child parent scope mismatch');
@@ -328,6 +347,7 @@ export class RemoteAgentGateway {
         this.save();
       },
       updateParent: async update => {
+        if (run.cancellationRequestedAt) return;
         this.ledger.observe(run.attemptId, { executionStatus: update.executionStatus, phase: update.phase,
           ...(update.resultSummary ? { resultSummary: update.resultSummary } : {}),
           ...(update.artifactLinks ? { artifactLinks: update.artifactLinks } : {}),
@@ -341,12 +361,126 @@ export class RemoteAgentGateway {
   private executionNotice(run: PptDeliveryRun, resultSummary: string, links: any[]): void {
     const noticeId = createHash('sha256').update(JSON.stringify([run.sourceId, run.jobId, run.attemptId, run.revision, run.executionStatus])).digest('hex');
     if (this.state.executionNotices!.some(item => item.noticeId === noticeId)) return;
+    if (run.executionStatus !== 'completed') {
+      const partial = deliveryException(run, resultSummary);
+      if (!resultSummary.includes('\n\n已完成：')) resultSummary = partial.summary;
+      if (!links.length) links = partial.artifacts;
+    }
     const artifactLinks = links.map(item => ({ url: item.url, mediaType: item.mediaType, sha256: item.sha256, size: item.size }));
-    const text = `[任务交付通知] ${run.executionStatus === 'completed' ? '任务已完成' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
-      artifactLinks.map(item => `[${item.mediaType?.includes('presentation') ? '最终 PPT' : '预览产物'}](${item.url})`).join('\n') +
+    const text = `[任务交付通知] ${run.executionStatus === 'completed' ? '任务已完成' : run.executionStatus === 'canceled' ? '任务已取消' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
+      artifactLinks.map(item => `[${item.mediaType?.includes('presentation') ? (run.executionStatus === 'completed' ? '最终 PPT' : '已有 PPT（未完成最终验收）') : '预览产物'}](${item.url})`).join('\n') +
       `\n\n请通过 a2a-gateway 的 execution_get 或 execution_inbox 读取交付回执；业务接受调用 execution_review，通知处理调用 execution_ack，两者分别记录。\n---\n任务定位信息：\n${JSON.stringify({ noticeId, sourceId: run.sourceId, jobId: run.jobId, attemptId: run.attemptId, originSessionId: run.originSessionId })}`;
     this.state.executionNotices!.push({ noticeId, messageId: `execution-notice:${noticeId}`, originSessionId: run.originSessionId,
       jobId: run.jobId, attemptId: run.attemptId, executionStatus: run.executionStatus, resultSummary, artifactLinks, createdAt: new Date().toISOString(), text });
+    this.save();
+  }
+  private cancellationJobs(origin: string, jobId: string, cascade: boolean): string[] {
+    const found = new Set<string>();
+    const visit = (id: string): void => {
+      if (found.has(id)) return;
+      found.add(id);
+      const job = this.ledger.get(origin, id);
+      if (cascade) for (const child of job.children) visit(child.jobId);
+    };
+    visit(jobId); return [...found].reverse();
+  }
+  private assertDispatchOpen(origin: string, jobId?: string): void {
+    const seen = new Set<string>();
+    while (jobId && !seen.has(jobId)) {
+      seen.add(jobId);
+      if (Object.values(this.state.executionCancellations ?? {}).some(item => item.jobId === jobId)) throw new Error('Job is closing or closed; no further dispatch is allowed');
+      jobId = this.ledger.get(origin, jobId).parentJobRef?.jobId;
+    }
+  }
+  private async cancelExecution(origin: string, jobId: string, cascade?: boolean) {
+    const job = this.ledger.get(origin, jobId), run = this.state.pptDeliveries.runs[job.currentAttemptId] as PptDeliveryRun | undefined;
+    if (run && cascade === false) throw new Error('PPT delivery cancellation must include its child tasks');
+    let record = this.state.executionCancellations![job.currentAttemptId];
+    if (record && cascade === true && !record.cascade) { record.cascade = true; record.status = 'pending'; }
+    if (!record) {
+      record = { jobId, attemptId: job.currentAttemptId, originSessionId: origin, cascade: cascade ?? Boolean(run),
+        requestedAt: new Date().toISOString(), status: 'pending', targets: [], diagnostics: [] };
+      this.state.executionCancellations![record.attemptId] = record;
+    }
+    // Close admission synchronously and durably, before waiting for an in-flight submit or contacting a backend.
+    for (const id of this.cancellationJobs(origin, jobId, record.cascade)) {
+      const view = this.ledger.get(origin, id);
+      for (const attempt of view.attempts) {
+        const delivery = this.state.pptDeliveries.runs[attempt.attemptId] as PptDeliveryRun | undefined;
+        if (delivery && !['completed', 'failed', 'canceled'].includes(delivery.executionStatus)) {
+          delivery.cancellationRequestedAt ??= record.requestedAt;
+          delivery.phase = 'canceling_children'; delivery.updatedAt = new Date().toISOString();
+        }
+      }
+    }
+    this.save();
+    if (!['completed', 'failed', 'canceled', 'rejected'].includes(job.executionStatus)) this.ledger.requestCancellation(job.currentAttemptId);
+    await this.reconcileCancellation(record);
+    return this.ledgerView(origin, jobId);
+  }
+  private async reconcileCancellation(record: ExecutionCancellation): Promise<void> {
+    const existing = this.canceling.get(record.attemptId);
+    if (existing) return existing;
+    const operation = this.performCancellation(record);
+    this.canceling.set(record.attemptId, operation);
+    try { await operation; } finally { this.canceling.delete(record.attemptId); }
+  }
+  private async performCancellation(record: ExecutionCancellation): Promise<void> {
+    if (record.status === 'completed') return;
+    const origin = record.originSessionId;
+    // A send already on the wire may still return a child. Wait for its owner, then enumerate the real ledger again.
+    for (const id of this.cancellationJobs(origin, record.jobId, record.cascade)) {
+      for (const attempt of this.ledger.get(origin, id).attempts) await this.advancingDeliveries.get(attempt.attemptId);
+    }
+    const ids = this.cancellationJobs(origin, record.jobId, record.cascade), localRuns: PptDeliveryRun[] = [];
+    for (const id of ids) {
+      for (const attempt of this.ledger.get(origin, id).attempts) {
+        if (['completed', 'failed', 'canceled', 'rejected'].includes(attempt.executionStatus)) continue;
+        const delivery = this.state.pptDeliveries.runs[attempt.attemptId] as PptDeliveryRun | undefined;
+        if (delivery) {
+          if (['completed', 'failed', 'canceled'].includes(delivery.executionStatus)) {
+            const partial = deliveryException(delivery, delivery.resultSummary ?? delivery.diagnostics.at(-1) ?? 'Delivery terminated');
+            this.ledger.observe(attempt.attemptId, delivery.parentUpdatePending ?? { executionStatus: delivery.executionStatus,
+              phase: delivery.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
+            delete delivery.parentUpdatePending;
+          } else localRuns.push(delivery);
+          continue;
+        }
+        try {
+          const raw = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
+          if (raw) await this.invokeMethod('remote_agent_cancel', { originSessionId: raw.originSessionId, remote: raw.remote, taskId: raw.taskId });
+          else if (attempt.submissionStatus === 'prepared') this.ledger.knownNotSubmitted(attempt.attemptId, { executionStatus: 'canceled', diagnostic: 'Closed before dispatch' });
+          else throw new Error(`Cannot confirm backend admission for ${attempt.attemptId}`);
+        } catch (error) {
+          const diagnostic = error instanceof Error ? error.message : 'Cancellation could not be confirmed';
+          if (!record.diagnostics.includes(diagnostic)) record.diagnostics.push(diagnostic);
+        }
+      }
+    }
+    const localIds = new Set(localRuns.map(run => run.attemptId));
+    const targets = ids.flatMap(id => this.ledger.get(origin, id).attempts).map(attempt => ({ jobId: attempt.jobId, attemptId: attempt.attemptId,
+      executionStatus: attempt.executionStatus, submissionStatus: attempt.submissionStatus }));
+    const unresolved = targets.filter(item => !localIds.has(item.attemptId)
+      && (!['completed', 'failed', 'canceled', 'rejected'].includes(item.executionStatus) || item.submissionStatus === 'submission_unknown'));
+    if (!unresolved.length) for (const run of localRuns) {
+      run.executionStatus = 'canceled'; run.phase = 'user_canceled'; run.updatedAt = new Date().toISOString();
+      delete run.pending; delete run.parentUpdatePending;
+      run.transitions.push({ at: run.updatedAt, stage: run.stage, phase: run.phase, reason: 'User closed task; all delegated executions confirmed terminal' });
+      for (const item of run.children) {
+        const observed = this.ledger.getAttempt(item.child.attemptId);
+        item.child.executionStatus = observed.executionStatus; item.child.submissionStatus = observed.submissionStatus;
+      }
+      if (run.currentChild) run.currentChild.executionStatus = this.ledger.getAttempt(run.currentChild.attemptId).executionStatus;
+      const partial = deliveryException(run, '任务已按用户要求停止；后续派单已关闭，子任务已确认停止。已有产物保留。');
+      run.resultSummary = partial.summary;
+      this.ledger.observe(run.attemptId, { executionStatus: 'canceled', phase: run.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
+      this.executionNotice(run, partial.summary, partial.artifacts);
+    }
+    record.status = unresolved.length ? 'blocked' : 'completed';
+    record.targets = ids.flatMap(id => this.ledger.get(origin, id).attempts).map(attempt => ({ jobId: attempt.jobId, attemptId: attempt.attemptId,
+      executionStatus: attempt.executionStatus, submissionStatus: attempt.submissionStatus }));
+    record.checkedAt = new Date().toISOString();
+    if (record.status === 'completed') record.completedAt = record.checkedAt;
     this.save();
   }
   private async probeTarget(targetId: string) {
@@ -496,8 +630,12 @@ export class RemoteAgentGateway {
         .map(target => this.probeTarget(target.targetId)));
       await Promise.allSettled(this.state.jobs.filter(job => !terminal.has(taskState(job))).map(job => this.refresh(job)));
       if (this.closed) return;
+      for (const cancellation of Object.values(this.state.executionCancellations ?? {})) {
+        if (cancellation.status !== 'completed') await this.reconcileCancellation(cancellation);
+      }
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         if (this.closed) break;
+        if (run.cancellationRequestedAt && run.executionStatus !== 'canceled') continue;
         if (run.executionStatus === 'working' || run.parentUpdatePending) {
           try { await this.advanceDelivery(run); }
           catch (error) { run.diagnostics.push(error instanceof Error ? error.message : 'Delivery reconciliation failed'); this.save(); }
@@ -591,11 +729,8 @@ export class RemoteAgentGateway {
       return this.ledgerView(input.originSessionId, input.jobId);
     }
     if (method === 'execution_cancel') {
-      const input = executionJobSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
-      const raw = this.state.jobs.find(item => item.attemptId === job.currentAttemptId);
-      if (!raw) throw new Error('Cancel is unsupported for this provider or requires admission reconciliation');
-      await this.invokeMethod('remote_agent_cancel', { originSessionId: raw.originSessionId, remote: raw.remote, taskId: raw.taskId });
-      return this.ledgerView(input.originSessionId, input.jobId);
+      const input = executionCancelSchema.parse(params);
+      return this.cancelExecution(input.originSessionId, input.jobId, input.cascade);
     }
     if (method === 'execution_list') {
       const input = executionListSchema.parse(params);

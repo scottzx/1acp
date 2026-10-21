@@ -7,11 +7,14 @@ import test, { type TestContext } from 'node:test';
 import { Task } from '@a2a-js/sdk';
 import { RemoteAgentGateway, type A2AGatewayConfig } from '../src/a2a/gateway.js';
 import { createA2AServer } from '../src/a2a/server.js';
-import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
+import type { A2APreflightInput, A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
 
 class Backend implements A2ABackend {
+  beforePrepare?: () => Promise<void>;
+  async preflight(input: A2APreflightInput) { return { ok: true, cwd: input.cwd, checkedAt: new Date().toISOString(), checks: [{ id: 'fixture-host', ok: true }] }; }
   readonly runs: Array<{ target: A2ATarget; prompt: string; signal: AbortSignal; finish: (result: A2ARunResult) => void }> = [];
   async prepare(input: A2APrepareInput): Promise<A2ATarget> {
+    await this.beforePrepare?.();
     return { sessionId: input.sessionId ?? `session-${Math.random()}`, cwd: input.cwd!, agentPreset: input.agentPreset };
   }
   async run(target: A2ATarget, prompt: string, options: { signal: AbortSignal }): Promise<A2ARunResult> {
@@ -295,4 +298,118 @@ test('version 1 migration creates one legacy job per task and stays idempotent a
   await second.close();
   const third = f.gateway(), final = await third.invoke('execution_list', { originSessionId: 'root' }) as any;
   assert.deepEqual(JSON.parse(JSON.stringify(final)), JSON.parse(JSON.stringify(list)));
+});
+
+test('explicit cascade closes parent and descendants, preserves completed results, and blocks further dispatch', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const parent = await gateway.invoke('execution_submit', submit) as any;
+  const child = await gateway.invoke('execution_submit', { ...submit, parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId }) as any;
+  const grandchild = await gateway.invoke('execution_submit', { ...submit, parentJobRef: { sourceId: child.sourceId, jobId: child.jobId }, parentAttemptId: child.attemptId }) as any;
+  const done = await gateway.invoke('execution_submit', { ...submit, parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId }) as any;
+  const unrelated = await gateway.invoke('execution_submit', submit) as any;
+  await until(async () => f.backend.runs.length, n => n === 5);
+  f.backend.runs[3]!.finish({ outcome: 'completed', text: 'keep this result' });
+  await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: done.jobId }) as Promise<any>, v => v.executionStatus === 'completed');
+  await assert.rejects(gateway.invoke('execution_cancel', { originSessionId: 'outsider', jobId: parent.jobId, cascade: true }), /not found/);
+  const canceled = await gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: parent.jobId, cascade: true }) as any;
+  assert.equal(canceled.cancellation.status, 'completed');
+  for (const item of [parent, child, grandchild]) assert.equal((await gateway.invoke('execution_get', { originSessionId: 'root', jobId: item.jobId }) as any).executionStatus, 'canceled');
+  assert.equal((await gateway.invoke('execution_get', { originSessionId: 'root', jobId: done.jobId }) as any).resultSummary, 'keep this result');
+  assert.equal((await gateway.invoke('execution_get', { originSessionId: 'root', jobId: unrelated.jobId }) as any).executionStatus, 'working');
+  await assert.rejects(gateway.invoke('execution_submit', { ...submit, parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId }), /closing or closed/);
+  await assert.rejects(gateway.invoke('execution_continue', { originSessionId: 'root', jobId: child.jobId, input: { prompt: 'do not restart' } }), /closing or closed/);
+  const repeated = await gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: parent.jobId, cascade: true }) as any;
+  assert.equal(repeated.cancellation.completedAt, canceled.cancellation.completedAt);
+  assert.equal(f.backend.runs.length, 5);
+});
+
+async function pptParent(f: Awaited<ReturnType<typeof fixture>>) {
+  f.config.pptDelivery = { workspaceRoot: join(f.root, 'roles'), publicDirectory: join(f.root, 'public'),
+    publicBaseUrl: 'http://127.0.0.1:1/artifacts', allowedProjectRoots: [f.root], summaryTargetId: 'legacy:local', makerTargetId: 'legacy:local', reviewTargetId: 'legacy:local',
+    runtimeDocument: join(f.root, 'RUNTIME.md'), designSkill: join(f.root, 'SKILL.md'), pythonExecutable: '/usr/bin/python3' };
+  const gateway = f.gateway(); await gateway.reconcile();
+  await gateway.invoke('execution_target_create', { targetId: 'delivery', kind: 'resident_agent', name: 'Delivery', connectionId: 'remote:local', enabled: true,
+    binding: { cwd: f.root, agentPreset: 'standard', roleId: 'delivery', driver: 'ppt_delivery' } });
+  const parent = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'delivery', input: { projectDirectory: f.root, projectName: 'No PPT generation fixture' } }) as any;
+  return { gateway, parent, run: (gateway as any).state.pptDeliveries.runs[parent.attemptId] };
+}
+
+test('PPT parent cancellation defaults to cascading and survives restart without another model dispatch', async t => {
+  const f = await fixture(t), { gateway, parent, run } = await pptParent(f);
+  const child = await gateway.invoke('execution_submit', { ...submit, parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId, purpose: 'project_script' }) as any;
+  run.currentChild = child; run.children.push({ purpose: 'project_script', revision: 1, targetId: 'legacy:local', child });
+  await until(async () => f.backend.runs.length, n => n === 1);
+  await assert.rejects(gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: parent.jobId, cascade: false }), /must include/);
+  const canceled = await gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: parent.jobId }) as any;
+  assert.equal(canceled.executionStatus, 'canceled'); assert.equal(canceled.cancellation.status, 'completed');
+  assert.equal(canceled.deliveryProgress.cancellationRequestedAt, canceled.cancellation.requestedAt);
+  assert.equal(f.backend.runs[0]!.signal.aborted, true);
+  await gateway.close(); const restored = f.gateway(); await restored.reconcile();
+  const view = await restored.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any;
+  assert.equal(view.executionStatus, 'canceled'); assert.equal(view.children.length, 1); assert.equal(f.backend.runs.length, 1);
+  const inbox = await restored.invoke('execution_inbox', { originSessionId: 'root' }) as any;
+  assert.equal(inbox.notices.length, 1); assert.match(inbox.notices[0].resultSummary, /子任务已确认停止/);
+});
+
+test('unknown child admission blocks parent cancellation across restart instead of claiming it stopped', async t => {
+  const f = await fixture(t), { gateway, parent } = await pptParent(f);
+  const child = gateway.ledger.prepare({ originSessionId: 'root', targetSnapshot: { targetId: 'legacy:local', provider: 'a2a' }, input: {},
+    parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId });
+  gateway.ledger.markDispatching(child.attempt.attemptId); gateway.ledger.markUnknown(child.attempt.attemptId);
+  const blocked = await gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: parent.jobId }) as any;
+  assert.equal(blocked.cancellation.status, 'blocked'); assert.notEqual(blocked.executionStatus, 'canceled');
+  assert.ok(blocked.cancellation.targets.some((a: any) => a.submissionStatus === 'submission_unknown'));
+  await gateway.close(); const restored = f.gateway(); await restored.reconcile();
+  assert.equal((await restored.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any).cancellation.status, 'blocked');
+  assert.equal(f.backend.runs.length, 0);
+  restored.ledger.knownNotSubmitted(child.attempt.attemptId, { executionStatus: 'canceled', diagnostic: 'Fixture has confirmed no remote submission' });
+  await restored.reconcile();
+  assert.equal((await restored.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any).executionStatus, 'canceled');
+  assert.equal(f.backend.runs.length, 0);
+});
+
+test('cancel waits for an on-wire child admission, then cancels that child before completing the parent', async t => {
+  const f = await fixture(t), { gateway, parent, run } = await pptParent(f);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.backend.beforePrepare = async () => { entered(); await gate; };
+  run.publicationCheckedAt = new Date().toISOString();
+  const advancing = (gateway as any).advanceDelivery(run) as Promise<void>;
+  await Promise.race([started, new Promise((_, reject) => setTimeout(() => reject(new Error('Fixture send did not reach host prepare')), 3000))]);
+  t.after(() => release());
+  const canceling = gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: parent.jobId });
+  await until(async () => run.cancellationRequestedAt, Boolean);
+  const interim = await gateway.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any;
+  assert.notEqual(interim.executionStatus, 'canceled');
+  assert.equal(interim.cancellation.status, 'pending');
+  release(); await advancing;
+  const canceled = await canceling as any;
+  assert.equal(canceled.executionStatus, 'canceled'); assert.equal(canceled.cancellation.status, 'completed');
+  assert.equal(canceled.children.length, 1); assert.equal(canceled.children[0].executionStatus, 'canceled');
+  await gateway.reconcile();
+  assert.equal(f.backend.runs.length, 1); assert.equal(f.backend.runs[0]!.signal.aborted, true);
+});
+
+test('stage progress is queryable without a root wakeup; failure notice contains existing draft links and acceptance boundaries', async t => {
+  const f = await fixture(t), { gateway, parent, run } = await pptParent(f);
+  run.stage = 'review'; run.phase = 'waiting_children'; run.scriptDigest = 'c'.repeat(64);
+  run.children = [{ purpose: 'project_script', revision: 1, targetId: 'summary', child: { jobId: 'summary', attemptId: 's', executionStatus: 'completed' } },
+    { purpose: 'ppt_production', revision: 1, targetId: 'maker', child: { jobId: 'maker', attemptId: 'm', executionStatus: 'completed' } }];
+  run.validation = { status: 'passed', artifactDigest: 'd'.repeat(64), artifacts: [
+    { path: '/retained/project.pptx', url: 'http://example.invalid/retained.pptx', mediaType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', size: 100, sha256: 'a'.repeat(64) },
+    { path: '/retained/preview.png', url: 'http://example.invalid/preview.png', mediaType: 'image/png', size: 20, sha256: 'b'.repeat(64) }] };
+  (gateway as any).save();
+  const progress = (await gateway.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any).deliveryProgress;
+  assert.deepEqual(progress.completedStages, ['项目总结与脚本', 'PPT制作', '机器校验']);
+  assert.equal(progress.stageCompletionWakeups, false);
+  assert.equal((await gateway.invoke('execution_inbox', { originSessionId: 'root' }) as any).notices.length, 0);
+  run.executionStatus = 'failed'; run.phase = 'failed';
+  (gateway as any).executionNotice(run, 'Independent review failed', []);
+  const inbox = await gateway.invoke('execution_inbox', { originSessionId: 'root' }) as any;
+  assert.equal(inbox.notices.length, 1); assert.equal(inbox.notices[0].artifactLinks.length, 2);
+  assert.match(inbox.notices[0].resultSummary, /已完成：项目总结与脚本、PPT制作、机器校验/);
+  const text = (gateway as any).state.executionNotices[0].text;
+  assert.match(text, /已有 PPT（未完成最终验收）/); assert.match(text, /http:\/\/example.invalid\/retained.pptx/);
+  assert.doesNotMatch(text, /\[最终 PPT\]/);
 });

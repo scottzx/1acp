@@ -5,6 +5,7 @@ import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
+import { deliveryException } from './delivery-progress.js';
 
 const execute = promisify(execFile);
 const absolute = z.string().min(1).refine(isAbsolute, 'Expected an absolute path');
@@ -57,7 +58,7 @@ export interface PptDeliveryReview {
 export interface PptDeliveryRun {
   version: 1; sourceId: string; jobId: string; attemptId: string; originSessionId: string;
   input: PptDeliveryInput; policy: PptDeliveryPolicy; jobDirectory: string; contractPath: string;
-  createdAt: string; updatedAt: string; executionStatus: 'working' | 'input_required' | 'completed' | 'failed';
+  createdAt: string; updatedAt: string; executionStatus: 'working' | 'input_required' | 'completed' | 'failed' | 'canceled';
   stage: 'summary' | 'make' | 'validate' | 'review' | 'finished'; phase: string;
   revision: number; revisionReasons: string[]; revisionExerciseApplied?: boolean;
   executionRetries: Record<string, number>;
@@ -65,6 +66,8 @@ export interface PptDeliveryRun {
   activeTargets: Partial<Record<PptDeliveryChildRequest['purpose'], string>>;
   targetSwitches: { at: string; purpose: PptDeliveryChildRequest['purpose']; fromTargetId: string; toTargetId: string;
     replacesJobRef: { sourceId: string; jobId: string }; failedAttemptId: string; reason: string; policyVersion: string }[];
+  cancellationRequestedAt?: string;
+  artifactHistory?: { revision: number; validation: PptDeliveryValidation }[];
   currentChild?: PptDeliveryChild; validation?: PptDeliveryValidation; review?: PptDeliveryReview;
   /** Saved before submit. Stable request id survives a crash after remote acceptance. */
   pending?: { kind: 'submit' | 'continue'; request: PptDeliveryChildRequest; child?: PptDeliveryChild };
@@ -351,15 +354,20 @@ async function updateParentDurably(run: PptDeliveryRun, adapter: PptDeliveryAdap
   await adapter.updateParent(update); delete run.parentUpdatePending; await adapter.persist(run);
 }
 async function stop(run: PptDeliveryRun, adapter: PptDeliveryAdapter, status: 'failed' | 'input_required', error: string): Promise<void> {
+  if (run.cancellationRequestedAt) return;
   run.executionStatus = status; run.diagnostics.push(error); mark(run, run.stage, status, error);
+  const partial = deliveryException(run, `PPT交付尚未完成：${error}。已保存阶段、子任务、版本和证据，不会盲目重派。`);
   await updateParentDurably(run, adapter, { executionStatus: status, phase: run.phase, error,
-    resultSummary: `PPT交付尚未完成：${error}。已保存阶段、子任务、版本和证据，不会盲目重派。` });
+    resultSummary: partial.summary, artifactLinks: partial.artifacts });
 }
 async function startChild(run: PptDeliveryRun, adapter: PptDeliveryAdapter, previous?: PptDeliveryChild, replacesJobRef?: { sourceId: string; jobId: string }): Promise<void> {
+  if (run.cancellationRequestedAt) return;
   const key = run.stage, retry = run.executionRetries[key] ?? 0;
   if (!run.pending) run.pending = { kind: previous ? 'continue' : 'submit', request: { ...await buildRequest(run, retry),
     ...(replacesJobRef ? { replacesJobRef } : {}) }, ...(previous ? { child: previous } : {}) };
+  if (run.cancellationRequestedAt) return;
   mark(run, run.stage, 'dispatching'); await adapter.persist(run);
+  if (run.cancellationRequestedAt) return;
   try {
     const child = run.pending.kind === 'continue'
       ? (run.metrics.continueCalls++, await adapter.continueChild({ ...run.pending.request, child: run.pending.child! }))
@@ -367,7 +375,7 @@ async function startChild(run: PptDeliveryRun, adapter: PptDeliveryAdapter, prev
     run.currentChild = child; run.children.push({ purpose: run.pending.request.purpose, revision: run.revision, targetId: run.pending.request.targetId, child });
     delete run.pending; mark(run, run.stage, 'waiting_children'); await adapter.persist(run);
     if (child.submissionStatus === 'submission_unknown' || child.executionStatus === 'submission_unknown') await stop(run, adapter, 'input_required', '子任务受理未知；停止新派单，等待核对');
-    else await updateParentDurably(run, adapter, { executionStatus: 'working', phase: 'waiting_children' });
+    else if (!run.cancellationRequestedAt) await updateParentDurably(run, adapter, { executionStatus: 'working', phase: 'waiting_children' });
   } catch (error) {
     if (!run.pending && run.currentChild) {
       run.diagnostics.push(`Accepted child retained; parent progress update deferred: ${String(error)}`);
@@ -378,6 +386,7 @@ async function startChild(run: PptDeliveryRun, adapter: PptDeliveryAdapter, prev
   }
 }
 async function revise(run: PptDeliveryRun, adapter: PptDeliveryAdapter, reasons: string[], exercise = false): Promise<void> {
+  if (run.cancellationRequestedAt) return;
   const exhausted = exercise ? run.metrics.acceptanceExerciseRevisions >= 1 : run.metrics.qualityRevisions >= run.policy.maxRevisionRounds;
   if (exhausted) return stop(run, adapter, 'failed', `${exercise ? '显式演练' : '质量修订'}预算耗尽：${reasons.join('; ')}`);
   const maker = [...run.children].reverse().find(item => item.purpose === 'ppt_production')?.child;
@@ -390,6 +399,7 @@ async function revise(run: PptDeliveryRun, adapter: PptDeliveryAdapter, reasons:
 }
 /** Called by the gateway's existing background reconcile. No main-session polling or long waits. */
 export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDeliveryAdapter): Promise<void> {
+  if (run.cancellationRequestedAt) return;
   run.activeTargets ??= {}; run.targetSwitches ??= [];
   if (run.parentUpdatePending) {
     try { await adapter.updateParent(run.parentUpdatePending); delete run.parentUpdatePending; await adapter.persist(run); }
@@ -412,6 +422,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         run.validation = checked; run.recovery.validationCheckedAt = new Date().toISOString(); await adapter.persist(run);
       } catch (error) { return stop(run, adapter, 'input_required', `恢复停点重新校验未通过，未派新子任务：${String(error)}`); }
     }
+    if (run.cancellationRequestedAt) return;
     if (run.stage === 'validate') {
       run.metrics.machineChecks++;
       try { run.validation = await (adapter.validateCandidate ?? validatePptDeliveryCandidate)(run); }
@@ -419,7 +430,12 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         if (error instanceof PptPublicationError) return stop(run, adapter, 'input_required', `产物发布故障，停止制作返工：${error.message}`);
         return revise(run, adapter, [`确定性验收失败：${error instanceof Error ? error.message : String(error)}`]);
       }
+      if (run.cancellationRequestedAt) return;
+      run.artifactHistory ??= [];
+      if (!run.artifactHistory.some(item => item.revision === run.revision && item.validation.artifactDigest === run.validation!.artifactDigest))
+        run.artifactHistory.push({ revision: run.revision, validation: structuredClone(run.validation) });
       await jsonFile(join(revisionDirectory(run), 'machine-validation.json'), run.validation);
+      if (run.cancellationRequestedAt) return;
       mark(run, 'review', 'preparing'); delete run.currentChild; await adapter.persist(run);
       return;
     }
@@ -429,6 +445,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
     const history = [...run.children].reverse().find(item => item.child.attemptId === child.attemptId);
     if (history) history.child = child;
     await adapter.persist(run);
+    if (run.cancellationRequestedAt) return;
     if (child.submissionStatus === 'submission_unknown' || child.executionStatus === 'submission_unknown') return stop(run, adapter, 'input_required', '子任务受理未知，需核对后恢复');
     if (['input_required', 'auth_required'].includes(child.executionStatus)) return stop(run, adapter, 'input_required', '子任务需要输入或认证，不能自动声称完成');
     if (!terminal(child.executionStatus)) return;
@@ -437,6 +454,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
       try { run.metrics.ackCalls++; await adapter.ackChild(child); history.acknowledged = true; await adapter.persist(run); }
       catch (error) { run.diagnostics.push(`Child notification ack pending: ${String(error)}`); }
     }
+    if (run.cancellationRequestedAt) return;
     if (child.executionStatus !== 'completed') {
       if (child.submissionStatus === 'known_not_submitted' || child.executionStatus === 'rejected') return stop(run, adapter, 'failed', `子任务明确未受理或被拒绝，需修复前置条件：${child.resultSummary ?? child.jobId}`);
       const purpose = purposeFor(run.stage), fallback = run.policy.backupTargets?.[purpose];
@@ -469,6 +487,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         run.executionRetries[key] = retries + 1; run.revisionReasons = [`修复脚本/源回执：${String(error)}`];
         return startChild(run, adapter, child);
       }
+      if (run.cancellationRequestedAt) return;
       mark(run, 'make', 'preparing'); delete run.currentChild; await adapter.persist(run); return;
     }
     if (run.stage === 'make') { mark(run, 'validate', 'checking_artifacts'); delete run.currentChild; await adapter.persist(run); return; }
@@ -490,6 +509,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
       if (rechecked.artifactDigest !== review.artifactDigest) return stop(run, adapter, 'failed', '独立复核后产物发生变化，禁止交付');
       run.validation = rechecked;
       await validateSummary(run);
+      if (run.cancellationRequestedAt) return;
       const makerAttempts = run.children.filter(item => item.purpose === 'ppt_production');
       run.deliveryReceipt = { producer: '1agents/ppt-delivery', parentJobRef: { sourceId: run.sourceId, jobId: run.jobId },
         attemptId: run.attemptId, contractVersion: 'ppt-delivery-contract-v1', resultRevision: revisionName(run),
@@ -505,6 +525,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
       const ppt = rechecked.artifacts.find(item => item.path.endsWith('.pptx'))!, preview = rechecked.artifacts.find(item => item.path.endsWith('/preview.png'))!;
       run.resultSummary = `${run.input.projectName}：6页PPT已完成交付闭环。\n\n[最终可编辑PPT](${ppt.url})\n[预览总览](${preview.url})\n\n机器验收通过；独立会话已核对事实并逐页看图。版本 ${revisionName(run)}；制作执行轮次 ${makerAttempts.length}；产物摘要 ${review.artifactDigest}。${review.limitations.length ? `\n限制：${review.limitations.join('；')}` : ''}\n\n人类业务接受与通知ack分别记录，不作为父任务完成前提。`;
       await jsonFile(join(run.jobDirectory, 'delivery-receipt.json'), run.deliveryReceipt);
+      if (run.cancellationRequestedAt) return;
       run.executionStatus = 'completed'; mark(run, 'finished', 'delivery_ready');
       await updateParentDurably(run, adapter, { executionStatus: 'completed', phase: run.phase,
         resultSummary: run.resultSummary, artifactLinks: rechecked.artifacts, deliveryReceipt: run.deliveryReceipt });

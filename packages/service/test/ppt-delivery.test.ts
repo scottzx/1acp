@@ -282,3 +282,41 @@ test('deterministic validator performs real ZIP, HTTP and byte checks, rejects p
   await writeFile(manifestPath, JSON.stringify({ artifacts })); await writeFile(join(publicDir, 'preview.png'), 'drift');
   await assert.rejects(validatePptDeliveryCandidate(run), /Published bytes differ/);
 });
+
+test('failed review preserves machine-verified draft links and completed stage progress without declaring delivery ready', async t => {
+  const { deliveryProgress } = await import('../src/execution/delivery-progress.js');
+  const f = await fixture(t); await f.untilReview();
+  f.childStates.get(f.run.currentChild!.attemptId)!.executionStatus = 'failed';
+  await f.step();
+  assert.equal(f.run.executionStatus, 'failed');
+  const progress = deliveryProgress(f.run);
+  assert.deepEqual(progress.completedStages, ['项目总结与脚本', 'PPT制作', '机器校验']);
+  assert.deepEqual(progress.remainingStages, ['独立验收']);
+  assert.equal(progress.availableResults[0]!.deliveryReady, false);
+  assert.equal(progress.stageCompletionWakeups, false);
+  assert.ok(f.parents.at(-1)!.artifactLinks!.some(a => a.url.endsWith('final.pptx')));
+  assert.match(f.parents.at(-1)!.resultSummary!, /已有产物.*独立验收状态/s);
+  assert.match(f.parents.at(-1)!.resultSummary!, /尚非最终交付/);
+});
+
+test('revision keeps an earlier verified candidate while current production is working', async t => {
+  const { deliveryProgress } = await import('../src/execution/delivery-progress.js');
+  const f = await fixture(t); await f.untilReview(); await f.completeCurrent('changes_requested');
+  const progress = deliveryProgress(f.run);
+  assert.equal(progress.revision, 'revision-2');
+  assert.equal(progress.availableResults[0]!.revision, 'revision-1');
+  assert.equal(progress.availableResults[0]!.deliveryReady, false);
+  assert.equal(progress.stages.find(s => s.stage === 'make')!.status, 'working');
+});
+
+test('cancellation arriving during publication preflight prevents any child dispatch', async t => {
+  const f = await fixture(t);
+  let started!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.adapter.preflightPublication = async () => { started(); await gate; };
+  const run = f.run, advancing = advancePptDelivery(run, f.adapter);
+  await entered; run.cancellationRequestedAt = new Date().toISOString(); await f.adapter.persist(run); release(); await advancing;
+  assert.equal(f.requests.length, 0);
+  assert.ok(f.parents.every(update => update.executionStatus !== 'completed'));
+});
