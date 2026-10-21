@@ -1,0 +1,45 @@
+{
+  "scope": [
+    "dispatch-preflight",
+    "system-result-metadata",
+    "reproducible-local-deployment"
+  ],
+  "releaseId": "0.8.1-local.ae1a1522931e.e9356a19d742",
+  "deployment": "healthy",
+  "npmPublished": false,
+  "tests": {
+    "passed": 301,
+    "skipped": 10,
+    "failed": 0
+  },
+  "chain": {
+    "jobId": "dreammate-chain-20261021-001",
+    "status": "complete",
+    "outerTaskId": "435effe4-99b0-41ea-9e78-08e909432ba6",
+    "latestInnerTaskId": "fa006529-794d-4efe-8768-a23d31705ab3",
+    "coordinatorNativeTurns": 4,
+    "pptNativeTurns": 2,
+    "samePptContextAndSession": true,
+    "systemMetadataAndArtifacts": "passed",
+    "visualAndSemanticReview": "passed",
+    "dshBusinessReviewAndAck": "passed",
+    "rootQueue": "accepted",
+    "rootNativeWakeup": "passed",
+    "rootFinalTurnId": "01a15a71-1d98-7e52-8646-1f783acc9e2c",
+    "completedAt": "2026-10-20T17:53:16.409590+00:00"
+  },
+  "evidenceDirectory": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/dreammate-chain-20261021-001/evidence",
+  "pptUrl": "http://100.88.227.56:36818/artifacts/dreammate-chain-20261021-001/project-overview.pptx",
+  "pptSha256": "20217b0cd4e735e69d79d30fd96094a1c895a45506cdbc679e29939c767ffc41",
+  "limits": [
+    "Native PowerPoint/Keynote opening not tested",
+    "Frozen package offline reinstall verified; byte-identical clean source rebuild not claimed"
+  ],
+  "unchanged": [
+    "parent-task-completion-semantics",
+    "notification-format",
+    "notification-routing-and-ack-protocol",
+    "global-model-defaults",
+    "DreamMate Node source"
+  ]
+}

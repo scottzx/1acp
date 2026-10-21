@@ -1,0 +1,298 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer, type Server } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { type TestContext } from 'node:test';
+import { Task } from '@a2a-js/sdk';
+import { RemoteAgentGateway, type A2AGatewayConfig } from '../src/a2a/gateway.js';
+import { createA2AServer } from '../src/a2a/server.js';
+import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
+
+class Backend implements A2ABackend {
+  readonly runs: Array<{ target: A2ATarget; prompt: string; signal: AbortSignal; finish: (result: A2ARunResult) => void }> = [];
+  async prepare(input: A2APrepareInput): Promise<A2ATarget> {
+    return { sessionId: input.sessionId ?? `session-${Math.random()}`, cwd: input.cwd!, agentPreset: input.agentPreset };
+  }
+  async run(target: A2ATarget, prompt: string, options: { signal: AbortSignal }): Promise<A2ARunResult> {
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(options.signal.reason);
+      options.signal.addEventListener('abort', abort, { once: true });
+      this.runs.push({ target, prompt, signal: options.signal, finish: result => { options.signal.removeEventListener('abort', abort); resolve(result); } });
+      if (options.signal.aborted) abort();
+    });
+  }
+}
+async function listen(server: Server): Promise<string> {
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  return `http://127.0.0.1:${address.port}`;
+}
+async function stop(server: Server): Promise<void> {
+  const done = new Promise<void>(resolve => server.close(() => resolve())); server.closeAllConnections(); await done;
+}
+async function until<T>(operation: () => Promise<T>, predicate: (result: T) => boolean): Promise<T> {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const value = await operation(); if (predicate(value)) return value;
+    if (Date.now() > deadline) throw new Error('Execution gateway test condition deadline');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+async function fixture(t: TestContext) {
+  const root = await mkdtemp(join(tmpdir(), 'execution-gateway-')), backend = new Backend();
+  let host: Awaited<ReturnType<typeof createA2AServer>>;
+  const server = createServer((req, res) => {
+    if (req.url === '/.well-known/agent-card.json') host.cardHandler(req, res);
+    else void host.handler(req, res);
+  });
+  const url = await listen(server);
+  host = await createA2AServer({ backend, publicUrl: url, stateDirectory: join(root, 'host'), token: 'test-token' });
+  const stateDirectory = join(root, 'client');
+  const config: A2AGatewayConfig = { stateDirectory, port: 0, remotes: { local: { url, token: 'test-token' } }, pollIntervalMs: 60_000 };
+  const gateways = new Set<RemoteAgentGateway>();
+  t.after(async () => {
+    for (const gateway of gateways) await gateway.close();
+    await host.close(); await stop(server); await rm(root, { recursive: true, force: true });
+  });
+  return { root, stateDirectory, backend, config, gateway: () => {
+    const gateway = new RemoteAgentGateway(config); gateways.add(gateway); return gateway;
+  } };
+}
+const submit = { originSessionId: 'root', targetId: 'legacy:local', input: { cwd: '/project', prompt: 'summarize project', agentPreset: 'standard' } };
+const rawSpawn = { originSessionId: 'root', remote: 'local', cwd: '/project', prompt: 'summarize project', agentPreset: 'standard' };
+
+test('explicit PPT checkpoint continuation persists a new parent attempt and idempotently replays without an A2A dispatch', async t => {
+  const f = await fixture(t);
+  f.config.pptDelivery = { workspaceRoot: join(f.root, 'roles'), publicDirectory: join(f.root, 'public'),
+    publicBaseUrl: 'http://127.0.0.1:1/artifacts', allowedProjectRoots: [f.root], summaryTargetId: 'summary', makerTargetId: 'maker', reviewTargetId: 'review',
+    runtimeDocument: join(f.root, 'RUNTIME.md'), designSkill: join(f.root, 'SKILL.md'), pythonExecutable: '/usr/bin/python3' };
+  const gateway = f.gateway();
+  // Let the constructor's first empty reconcile finish; this test exercises durable API admission, not PPT validation.
+  await new Promise(resolve => setTimeout(resolve, 30));
+  await gateway.invoke('execution_target_create', { targetId: 'delivery', kind: 'resident_agent', name: 'Delivery', connectionId: 'remote:local', enabled: true,
+    capabilities: { query: true, cancel: false, continue: true, reconcile: true }, binding: { cwd: f.root, agentPreset: 'standard', roleId: 'delivery', driver: 'ppt_delivery' } });
+  const first = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'delivery', input: { projectDirectory: f.root, projectName: 'Project' } }) as any;
+  const internals = gateway as any, prior = internals.state.pptDeliveries.runs[first.attemptId];
+  // Model a persisted terminal checkpoint produced by the previous policy. Production revalidates exact files before dispatch.
+  prior.executionStatus = 'failed'; prior.stage = 'review'; prior.phase = 'failed';
+  prior.review = { verdict: 'passed', artifactDigest: 'a'.repeat(64), factsChecked: true, allSlidesViewed: true, issues: [], limitations: [], evidence: ['fixture'] };
+  prior.validation = { artifactDigest: 'a'.repeat(64) };
+  prior.currentChild = { jobId: 'review-fixture', attemptId: 'review-attempt', executionStatus: 'completed', submissionStatus: 'accepted' };
+  internals.ledger.observe(first.attemptId, { executionStatus: 'failed', phase: 'failed' });
+  const request = { originSessionId: 'root', jobId: first.jobId, input: {}, clientRequestId: 'recover-parent' };
+  const next = await gateway.invoke('execution_continue', request) as any;
+  assert.equal(next.jobId, first.jobId); assert.notEqual(next.attemptId, first.attemptId);
+  assert.equal(next.attempts[0].executionStatus, 'failed'); assert.equal(next.executionStatus, 'working');
+  assert.equal(next.backendRunRef.provider, 'resident_role'); assert.equal(next.backendRunRef.runId, next.attemptId);
+  assert.equal(internals.state.pptDeliveries.runs[first.attemptId].executionStatus, 'failed');
+  assert.equal(internals.state.pptDeliveries.runs[next.attemptId].recovery.fromAttemptId, first.attemptId);
+  const replay = await gateway.invoke('execution_continue', request) as any;
+  assert.equal(replay.attemptId, next.attemptId); assert.equal(replay.attempts.length, 2); assert.equal(f.backend.runs.length, 0);
+  await assert.rejects(gateway.invoke('execution_continue', { ...request, input: { projectName: 'changed' }, clientRequestId: 'changed-recovery' }), /frozen input/);
+});
+
+test('unified submit/get/list/events persist scope and IDs; replay does not create another backend run', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-submit' }) as any;
+  assert.ok(first.jobId); assert.ok(first.attemptId); assert.ok(first.taskId); assert.ok(first.sessionId);
+  assert.equal(first.submissionStatus, 'accepted');
+  await until(async () => f.backend.runs.length, count => count === 1);
+  const repeated = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-submit' }) as any;
+  assert.equal(repeated.jobId, first.jobId); assert.equal(repeated.attemptId, first.attemptId);
+  assert.equal(f.backend.runs.length, 1);
+  await assert.rejects(gateway.invoke('execution_submit', { ...submit, input: { ...submit.input, prompt: 'changed' }, clientRequestId: 'stable-submit' }), /conflicts/);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'project result' });
+  const completed = await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as Promise<any>, item => item.executionStatus === 'completed');
+  assert.equal(completed.resultSummary, 'project result'); assert.equal(completed.attempts.length, 1);
+  const list = await gateway.invoke('execution_list', { originSessionId: 'root' }) as any;
+  assert.equal(list.jobs.length, 1); assert.equal(list.jobs[0].jobId, first.jobId);
+  assert.deepEqual((await gateway.invoke('execution_list', { originSessionId: 'outsider' }) as any).jobs, []);
+  await assert.rejects(gateway.invoke('execution_get', { originSessionId: 'outsider', jobId: first.jobId }), /not found/);
+  const events = await gateway.invoke('execution_events', { originSessionId: 'root', jobId: first.jobId }) as any;
+  assert.ok(events.events.some((item: any) => item.type === 'job.created'));
+  assert.ok(events.events.some((item: any) => item.type === 'attempt.accepted'));
+  assert.ok(events.events.some((item: any) => item.type === 'attempt.state_changed'));
+  assert.equal(new Set(events.events.map((item: any) => item.eventId)).size, events.events.length);
+  const after = await gateway.invoke('execution_events', { originSessionId: 'root', afterSequence: events.events.at(-1).sequence }) as any;
+  assert.deepEqual(after.events, []);
+  const persisted = JSON.parse(await readFile(join(f.stateDirectory, 'gateway.json'), 'utf8'));
+  assert.equal(persisted.version, 2); assert.equal(persisted.ledger.sourceId, events.sourceId);
+  assert.equal(persisted.jobs[0].ledgerJobId, first.jobId); assert.equal(persisted.jobs[0].attemptId, first.attemptId);
+});
+
+test('legacy spawn fields remain compatible and message creates a new attempt in the same job and session', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, clientRequestId: 'raw-submit' }) as any;
+  for (const key of ['remote', 'taskId', 'contextId', 'originSessionId', 'cwd', 'sessionId', 'state', 'checkedAt', 'jobId', 'attemptId', 'sourceId']) assert.ok(first[key]);
+  assert.equal(first.remote, 'local'); assert.equal(first.cwd, '/project'); assert.equal(first.stale, false);
+  await until(async () => f.backend.runs.length, count => count === 1);
+  const repeated = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, clientRequestId: 'raw-submit' }) as any;
+  assert.equal(repeated.taskId, first.taskId); assert.equal(f.backend.runs.length, 1);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'v1' });
+  await until(() => gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: first.taskId }) as Promise<any>, item => item.state === 'TASK_STATE_COMPLETED');
+  const next = await gateway.invoke('remote_agent_message', { originSessionId: 'root', remote: 'local', taskId: first.taskId, prompt: 'revise only', clientRequestId: 'raw-continue' }) as any;
+  assert.equal(next.jobId, first.jobId); assert.notEqual(next.attemptId, first.attemptId); assert.notEqual(next.taskId, first.taskId);
+  assert.equal(next.contextId, first.contextId); assert.equal(next.sessionId, first.sessionId);
+  await until(async () => f.backend.runs.length, count => count === 2);
+  const view = await gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as any;
+  assert.equal(view.attempts.length, 2); assert.equal(view.attempts[0].executionStatus, 'completed');
+  assert.equal(view.currentAttemptId, next.attemptId);
+});
+
+test('unified explicit continuation uses the same job and session without reopening the old attempt', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('execution_submit', submit) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'v1' });
+  await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as Promise<any>, item => item.executionStatus === 'completed');
+  const next = await gateway.invoke('execution_continue', { originSessionId: 'root', jobId: first.jobId, input: { prompt: 'v2 request' }, clientRequestId: 'continue-v2' }) as any;
+  assert.equal(next.jobId, first.jobId); assert.notEqual(next.attemptId, first.attemptId);
+  assert.equal(next.sessionId, first.sessionId); assert.equal(next.contextId, first.contextId);
+  assert.equal(next.attempts[0].executionStatus, 'completed');
+  const repeated = await gateway.invoke('execution_continue', { originSessionId: 'root', jobId: first.jobId, input: { prompt: 'v2 request' }, clientRequestId: 'continue-v2' }) as any;
+  assert.equal(repeated.attemptId, next.attemptId);
+  await until(async () => f.backend.runs.length, count => count === 2);
+  assert.equal(f.backend.runs.length, 2);
+});
+
+test('replaying an accepted request after target disable returns its original attempt without dispatch', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-before-disable' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  await gateway.invoke('execution_target_update', { targetId: submit.targetId, patch: { enabled: false } });
+  const replay = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-before-disable' }) as any;
+  assert.equal(replay.jobId, first.jobId); assert.equal(replay.attemptId, first.attemptId);
+  assert.equal(replay.attempts[0].targetSnapshot.configVersion, first.attempts[0].targetSnapshot.configVersion);
+  assert.equal(f.backend.runs.length, 1);
+  await assert.rejects(gateway.invoke('execution_submit', { ...submit, clientRequestId: 'new-disabled-request' }), /disabled/);
+});
+
+test('an old continuation request replays after later rounds change inherited fields and while acceptance is unknown', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('execution_submit', submit) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'v1' });
+  await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as Promise<any>, item => item.executionStatus === 'completed');
+  const originalRequest = { originSessionId: 'root', jobId: first.jobId, input: { prompt: 'v2' }, clientRequestId: 'continue-v2-stable' };
+  const second = await gateway.invoke('execution_continue', originalRequest) as any;
+  await until(async () => f.backend.runs.length, count => count === 2);
+  f.backend.runs[1]!.finish({ outcome: 'completed', text: 'v2' });
+  await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as Promise<any>, item => item.executionStatus === 'completed');
+  const third = await gateway.invoke('execution_continue', { originSessionId: 'root', jobId: first.jobId,
+    input: { prompt: 'v3', laterField: 'new inherited value' }, clientRequestId: 'continue-v3' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 3);
+  const replayAfterLater = await gateway.invoke('execution_continue', originalRequest) as any;
+  assert.equal(replayAfterLater.attemptId, second.attemptId); assert.equal(replayAfterLater.requestedAttempt.attemptId, second.attemptId);
+  assert.equal(replayAfterLater.currentAttemptId, third.attemptId); assert.equal(f.backend.runs.length, 3);
+  const originalClient = (gateway as any).client.bind(gateway);
+  (gateway as any).client = async (remote: string) => {
+    const client = await originalClient(remote);
+    return { sendMessage: async (...args: unknown[]) => { await client.sendMessage(...args); throw new Error('lost continuation response'); } };
+  };
+  const unknown = await gateway.invoke('execution_continue', { originSessionId: 'root', jobId: first.jobId,
+    input: { prompt: 'v4', laterField: 'another inherited value' }, clientRequestId: 'continue-v4-lost' }) as any;
+  assert.equal(unknown.submissionStatus, 'submission_unknown');
+  const replayDuringUnknown = await gateway.invoke('execution_continue', originalRequest) as any;
+  assert.equal(replayDuringUnknown.attemptId, second.attemptId); assert.equal(replayDuringUnknown.requestedAttempt.attemptId, second.attemptId);
+  assert.equal(replayDuringUnknown.currentAttemptId, unknown.attemptId); assert.equal(replayDuringUnknown.executionStatus, 'unknown');
+  assert.equal(replayDuringUnknown.attempts.length, 4);
+  await assert.rejects(gateway.invoke('execution_continue', { ...originalRequest, clientRequestId: 'new-during-unknown' }), /submission_unknown/);
+  await assert.rejects(gateway.invoke('execution_continue', { ...originalRequest, input: { prompt: 'conflicting request' } }), /conflicts/);
+  // v4 was received by the real host but remains queued behind v3; replay must not add any fifth round.
+  const list = await gateway.invoke('execution_list', { originSessionId: 'root' }) as any;
+  assert.equal(list.jobs[0].attempts.length, 4);
+});
+
+test('child dispatch pins the parent attempt and does not complete or cancel its parent', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const parent = await gateway.invoke('execution_submit', submit) as any;
+  const child = await gateway.invoke('execution_submit', { ...submit, input: { ...submit.input, prompt: 'child task' },
+    parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId, purpose: 'production' }) as any;
+  assert.equal(child.parentJobRef.jobId, parent.jobId); assert.equal(child.parentAttemptId, parent.attemptId);
+  await until(async () => f.backend.runs.length, count => count === 2);
+  f.backend.runs[1]!.finish({ outcome: 'completed', text: 'child result' });
+  await until(() => gateway.invoke('execution_get', { originSessionId: 'root', jobId: child.jobId }) as Promise<any>, item => item.executionStatus === 'completed');
+  const view = await gateway.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any;
+  assert.equal(view.executionStatus, 'working'); assert.equal(view.children.length, 1); assert.equal(view.children[0].jobId, child.jobId);
+  await assert.rejects(gateway.invoke('execution_submit', { ...submit, originSessionId: 'outsider', parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId }), /not found/);
+  await assert.rejects(gateway.invoke('execution_submit', { ...submit, parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: child.attemptId }), /does not belong/);
+});
+
+test('unified cancel stops an actually running child, records intent and leaves its parent running', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const parent = await gateway.invoke('execution_submit', submit) as any;
+  const child = await gateway.invoke('execution_submit', { ...submit, input: { ...submit.input, prompt: 'child remains running until canceled' },
+    parentJobRef: { sourceId: parent.sourceId, jobId: parent.jobId }, parentAttemptId: parent.attemptId, purpose: 'production' }) as any;
+  await until(async () => f.backend.runs.length, count => count === 2);
+  assert.equal(f.backend.runs[0]!.signal.aborted, false); assert.equal(f.backend.runs[1]!.signal.aborted, false);
+  await assert.rejects(gateway.invoke('execution_cancel', { originSessionId: 'outsider', jobId: child.jobId }), /not found/);
+  assert.equal(f.backend.runs[1]!.signal.aborted, false);
+  const canceled = await gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: child.jobId }) as any;
+  assert.equal(canceled.executionStatus, 'canceled'); assert.equal(canceled.attemptId, child.attemptId);
+  assert.ok(canceled.attempts.find((item: any) => item.attemptId === child.attemptId).cancellationRequestedAt);
+  assert.equal(f.backend.runs[1]!.signal.aborted, true); assert.equal(f.backend.runs[0]!.signal.aborted, false);
+  const parentAfter = await gateway.invoke('execution_get', { originSessionId: 'root', jobId: parent.jobId }) as any;
+  assert.equal(parentAfter.executionStatus, 'working'); assert.equal(parentAfter.attemptId, parent.attemptId);
+  assert.equal(parentAfter.children[0].executionStatus, 'canceled'); assert.equal(parentAfter.children[0].parentAttemptId, parent.attemptId);
+  const events = await gateway.invoke('execution_events', { originSessionId: 'root', jobId: child.jobId }) as any;
+  assert.ok(events.events.some((item: any) => item.type === 'attempt.cancellation_requested'));
+  assert.ok(events.events.some((item: any) => item.type === 'attempt.state_changed'));
+});
+
+test('fixed resident targets cannot be overridden and resolve their configured execution binding', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  await gateway.invoke('execution_target_create', { targetId: 'fixed-ppt', kind: 'resident_agent', name: 'PPT role', connectionId: 'remote:local',
+    binding: { cwd: '/fixed-role', agentPreset: 'ppt-beautifier', roleId: 'ppt' } });
+  for (const override of [{ cwd: '/other' }, { agentPreset: 'standard' }, { roleId: 'other' }]) {
+    await assert.rejects(gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'fixed-ppt', input: { prompt: 'design', ...override } }), /cannot override/);
+  }
+  assert.equal(f.backend.runs.length, 0);
+  const accepted = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'fixed-ppt', input: { prompt: 'design' } }) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  assert.equal(f.backend.runs[0]!.target.cwd, '/fixed-role'); assert.equal(f.backend.runs[0]!.target.agentPreset, 'ppt-beautifier');
+  assert.equal(accepted.attempts[0].targetSnapshot.binding.cwd, '/fixed-role');
+});
+
+test('a lost acceptance response is persisted as unknown and cannot cause another execution round', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  // Execute the real host request, then lose its reply at the adapter boundary.
+  const originalClient = (gateway as any).client.bind(gateway);
+  (gateway as any).client = async (remote: string) => {
+    const client = await originalClient(remote);
+    return { sendMessage: async (...args: unknown[]) => { await client.sendMessage(...args); throw new Error('simulated lost acceptance response'); } };
+  };
+  const first = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'lost-response' }) as any;
+  assert.equal(first.submissionStatus, 'submission_unknown'); assert.equal(first.executionStatus, 'unknown');
+  assert.deepEqual(first.unresolvedAttemptIds, [first.attemptId]);
+  await until(async () => f.backend.runs.length, count => count === 1);
+  const replay = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'lost-response' }) as any;
+  assert.equal(replay.attemptId, first.attemptId); assert.equal(replay.submissionStatus, 'submission_unknown');
+  await assert.rejects(gateway.invoke('execution_continue', { originSessionId: 'root', jobId: first.jobId, input: { prompt: 'retry' }, clientRequestId: 'unsafe-retry' }), /submission_unknown/);
+  assert.equal(f.backend.runs.length, 1);
+  const persisted = JSON.parse(await readFile(join(f.stateDirectory, 'gateway.json'), 'utf8'));
+  assert.equal(persisted.ledger.attempts[first.attemptId].submissionStatus, 'submission_unknown');
+  assert.equal(persisted.ledger.attempts[first.attemptId].backendRunRef, undefined);
+});
+
+test('version 1 migration creates one legacy job per task and stays idempotent across repeated restarts', async t => {
+  const f = await fixture(t);
+  await mkdir(f.stateDirectory, { recursive: true });
+  const jobs = ['legacy-1', 'legacy-2'].map(taskId => ({ originSessionId: 'root', remote: 'local', taskId, contextId: 'shared-context', cwd: '/project',
+    checkedAt: '2026-10-20T00:00:00.000Z', task: Task.toJSON(Task.fromJSON({ id: taskId, contextId: 'shared-context', status: { state: 'TASK_STATE_COMPLETED' },
+      artifacts: [], history: [], metadata: { '1agents': { sessionId: 'shared-session', cwd: '/project' } } })) }));
+  await writeFile(join(f.stateDirectory, 'gateway.json'), JSON.stringify({ version: 1, jobs, notices: [] }));
+  const first = f.gateway(), list = await first.invoke('execution_list', { originSessionId: 'root' }) as any;
+  assert.equal(list.jobs.length, 2); assert.notEqual(list.jobs[0].jobId, list.jobs[1].jobId);
+  for (const job of list.jobs) { assert.equal(job.provenance, 'legacy'); assert.equal(job.createdAt, null); assert.equal(job.attempts.length, 1); assert.equal(job.attempts[0].createdAt, null); }
+  const firstState = JSON.parse(await readFile(join(f.stateDirectory, 'gateway.json'), 'utf8'));
+  assert.equal(firstState.version, 2); assert.ok(firstState.jobs.every((item: any) => item.ledgerJobId && item.attemptId));
+  await first.close();
+  const second = f.gateway(), again = await second.invoke('execution_list', { originSessionId: 'root' }) as any;
+  assert.deepEqual(JSON.parse(JSON.stringify(again)), JSON.parse(JSON.stringify(list)));
+  const secondState = JSON.parse(await readFile(join(f.stateDirectory, 'gateway.json'), 'utf8'));
+  assert.equal(secondState.ledger.sourceId, firstState.ledger.sourceId); assert.deepEqual(secondState.ledger.events, firstState.ledger.events);
+  await second.close();
+  const third = f.gateway(), final = await third.invoke('execution_list', { originSessionId: 'root' }) as any;
+  assert.deepEqual(JSON.parse(JSON.stringify(final)), JSON.parse(JSON.stringify(list)));
+});

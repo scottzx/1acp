@@ -72,13 +72,14 @@ callback 可选；不配置也会由后台 GetTask 查询补齐状态。需要 p
 
 替换可绑定的 IP 与 DSH 可达的 URL，并将 URL 的精确 origin 加入远端 `pushNotificationOrigins`。回调监听器只开放配置的事件路径，不开放工具 `/invoke`；本地工具端口拒绝浏览器 Origin 调用。`originSessionId` 是可信本地调用端使用的通知路由 ID，不是认证凭据。
 
-## 七个调度工具
+## 远端任务工具
 
 DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`params: 参数对象`；先查询服务和方法契约。CLI 则从 stdin 读取同一参数 JSON：
 
 | 方法 | 参数与用途 |
 | --- | --- |
-| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget`；新建远端任务/上下文/DSH 会话 |
+| `remote_agent_preflight` | `remote, originSessionId, cwd`；可选任务目录、必需输入和运行时依赖，仅检查、不创建会话 |
+| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract`；新建远端任务/上下文/DSH 会话 |
 | `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale |
 | `remote_agent_message` | 上述任务定位字段加 `prompt`；复用远端会话，创建新 taskId |
 | `remote_agent_cancel` | 任务定位字段；取消这项任务自己的执行 |
@@ -114,7 +115,48 @@ acp-service a2a invoke remote_agent_ack <<'JSON'
 JSON
 ```
 
-每次 spawn 都创建新会话，即使 cwd 相同。message 复用原 context/cwd/preset，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。当前 gateway 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。
+每次 spawn 都创建新会话，即使 cwd 相同。message 复用原 context/cwd/preset，创建新任务；可排队，但不是对当前轮的原生 interrupt/steer。`remote_agent_*` 没有 `modelId`、`modeId` 或显式恢复任意 DSH session ID 的参数。投递到已存在的主会话使用下面新增的 `session_*` 工具，两类 API 的任务 ID 和会话 ID 不可混用。
+
+## 原会话排队投递（本次新增）
+
+这是本次源码新增的可选 gateway 能力，尚未实际部署，也未用真实会话发送消息。旧部署必须先更新并核对工具契约；没有 `sessionHosts` 和绑定时，既有七个任务工具、webhook 和收件箱行为保持兼容。
+
+gateway 配置中的 `sessionHosts` 按名称定义宿主。`kind: "codex"` 使用原生 `codex queue --thread=<UUID> --message=<原文>`，可配置 `executable`、`remote`、`cwd`、`timeoutMs` 和 `remoteAuthTokenEnv`；进程参数不经 shell。`kind: "dsh"` 使用宿主 origin 的 `/api/session/prompt`，按其 Web Remote envelope 发送 `mode: "queue"` 和稳定 requestId，可配置 `url`、`headers`、`timeoutMs`。这条路径直接使用已有宿主队列，无需另设通知 receiver。
+
+DSH `headers` 是部署所需的 Cookie/Authorization 等受保护配置，不是工具参数；不要把真实值放入 prompt、receipt、日志或文档。DSH UI/宿主凭据与远端 A2A bearer token 是不同用途，不能混用。Codex 的远端认证同样通过配置的环境变量提供。
+
+宿主传输 ID 使用 `sha256([originSessionId, messageId])` 稳定派生，避免不同 origin 的同名消息在宿主发生冲突。DSH requestId/rpcId 使用该派生 ID；外部工具仍用原 messageId 查询和恢复，`hostReceiptId` 以宿主实际回执为准。
+
+| 新增方法 | 参数与用途 |
+| --- | --- |
+| `session_bind` | `originSessionId, host, sessionId`；将 origin 绑定到命名宿主的已有会话。重复同一绑定安全，不能静默换成另一目标 |
+| `session_send` | `originSessionId, messageId, text`；持久化后立即返回投递 receipt。同一 ID 重复正文安全，改正文冲突；禁止保留前缀 `a2a-notice:` |
+| `session_delivery_get` | `originSessionId, messageId`；查询投递状态，不等同于模型执行状态 |
+| `session_delivery_resolve` | `originSessionId, messageId, accepted, note`，可选 `hostReceiptId`；只解决 `unknown/rejected`。确认已受理填 true；有证据确认未入队且已处理阻碍才填 false，使其回到 pending |
+
+CLI 复用现有 `a2a invoke`，DreamMate 使用同名 gateway 方法：
+
+```sh
+acp-service a2a invoke session_bind <<'JSON'
+{"originSessionId":"actual-parent-session-id","host":"codex-local","sessionId":"actual-codex-thread-uuid"}
+JSON
+acp-service a2a invoke session_send <<'JSON'
+{"originSessionId":"actual-parent-session-id","messageId":"handoff-result-001","text":"任务结果已就绪，请核对报告后继续原任务。"}
+JSON
+acp-service a2a invoke session_delivery_get <<'JSON'
+{"originSessionId":"actual-parent-session-id","messageId":"handoff-result-001"}
+JSON
+```
+
+示例需要真实配置和用户授权，文档中的命令未执行。receipt 含 `originSessionId/messageId/host/sessionId/status/attempts/createdAt/updatedAt`，可含 `nextAttemptAt/hostReceiptId/error/processedAt/resolutionNote`。状态为 `pending → dispatching → accepted`，确定未受理的可恢复失败进入 `retrying`；明确拒绝且不可自动恢复进入 `rejected`；超时、断线或崩溃后无法确认受理时进入 `unknown`。DSH 裸 HTTP 429/503 不能证明未受理；仅匹配 rpcId、`result.ok: false` 的明确 RPC 拒绝才可按可恢复错误重试。Codex 与 DSH 均不会盲目重发受理不明的消息。每个 origin 按 FIFO 投递，unknown/rejected 阻塞后续消息。`session_delivery_resolve` 的 note 应记录核对与修复依据。
+
+投递记录写盘失败时停止继续投递，健康检查返回 503。先修复磁盘或目录问题，再重启 gateway，按磁盘中已保存记录恢复；不在不可靠的内存状态上自动续投。重启时，持久化为 dispatching 的消息仍需按 unknown 核对，不能直接重发。
+
+`accepted` 只证明宿主接受排队，不证明模型已运行或完成业务。DSH 的稳定 requestId 不构成 exactly-once 保证。A2A notice 在新建时若 origin 已绑定，会冻结 session 投递路由，使用 `messageId: "a2a-notice:<noticeId>"` 自动进入该层，优先于原 notificationTarget；未绑定的 notice 仍走旧 webhook/inbox，后来绑定不会自动迁移旧 notice。
+
+自动消息先展示最终答复正文及其中的 Markdown 产物链接，随后列出 A2A artifact 明确提供的 HTTP(S) URL，末尾附 notice/task 定位 JSON。任务查询返回 `result` 与 `artifactLinks`，主 Agent 仍可使用 `remote_agent_get` 或 `remote_agent_inbox` 核验完整结果。超过 48 KiB 的正文显示有明确标注的节选，独立产物链接列表最多 8 KiB；完整内容通过查询获取。已持久化的旧通知保留原正文，不因格式升级重发。
+
+notice 继续保留在 inbox；主 Agent 真正处理结果后才调用 `remote_agent_ack`。ack 会记录对应 delivery 的 `processedAt`，并阻止尚未发出的通知再次触发。手工 `session_send` 没有自动业务 ack。`processedAt` 表示调用者确认已处理，不能当作独立验证的模型运行证据。完整配置、状态和恢复步骤见仓库 `docs/session-delivery.md`。
 
 ## 直接使用标准 A2A
 
@@ -174,10 +216,36 @@ gateway 将状态、任务归属和通知原子落盘；通知有稳定 `noticeI
 
 若要通知主 Agent 宿主，在 gateway 配置中增加 `notificationTargets` 名称映射，每项为 `{ "url": "http://host/notice", "token": "protected-token" }`，spawn 时传 `notificationTarget` 名称。这里接收的是 gateway notice（含 originSessionId/taskId/contextId/state/result），不是原始 A2A StreamResponse。
 
-宿主通知使用 Bearer 与稳定 `Idempotency-Key`；失败或 gateway 重启后重试，直到接收端接受或通知被 ack。宿主须先持久化/去重，再注入对应主会话并触发模型执行。HTTP 成功只代表接收，不证明主模型已运行；当前包没有自动唤醒 Codex 下一轮的宿主适配器。
+旧宿主通知使用 Bearer 与稳定 `Idempotency-Key`；失败或 gateway 重启后重试，直到接收端接受或通知被 ack。HTTP 2xx 后停止 HTTP 重投，但通知仍留在 inbox；接收宿主须先持久化/去重，再负责注入与恢复。HTTP 成功只代表接收，不证明主模型已运行。上面的新增 session 绑定提供 Codex/DSH 原会话队列适配；未绑定 origin 继续使用此旧路径。
 
 执行端和 gateway 状态目录各由单个活跃实例拥有，不应手工删除运行中实例的 lock。gateway 重启不取消远端任务；DSH 重启会将中断任务标为 failed，保留已完成结果和 context 映射，新任务可用 context 恢复 DSH 会话，不自动重放中断工作。
 
 ## 共享实现
 
 `@1agents/acp-service/a2a` 导出 `createA2AServer`、`FileA2AStore`、`RemoteAgentGateway`、`serveA2AGateway` 及类型。server 接收 `A2ABackend`，核心不依赖 DSH，工厂本身不创建网络 listener；DSH 通过公开 session-controller API 提供 backend 并挂载路由，独立入口可复用这套实现。
+
+
+## 派单前预检和系统结果元数据
+
+`remote_agent_preflight` 在真实执行宿主完成检查，经 Agent Card 的同源 JSONRPC 地址调用认证的 `/preflight` 扩展。参数除 remote/originSessionId/cwd 外，可含：
+
+```json
+{
+  "jobDirectory": "/tmp/actual-job",
+  "requiredFiles": ["/absolute/input.md"],
+  "python": {"executable": "/absolute/python3", "modules": ["defusedxml"]},
+  "node": {"executable": "/absolute/node", "modules": ["@oai/artifact-tool"], "moduleRoot": "/absolute/node_modules"}
+}
+```
+
+目录须已存在；预检核验真实路径、任务目录属于项目或平台临时目录，并创建随后删除的小文件确认可写。Python/Node 使用指定解释器检查依赖，有超时且不经过 shell。返回 `ok, checkedAt, cwd, jobDirectory, checks`；ok=false 时不得派单。spawn/message 的可选 `preflight` 接收同一检查要求（不带 cwd/remote/originSessionId），gateway 在创建 A2A 任务前检查，DSH backend 在创建原生会话前重检。旧调用保持兼容，DSH 至少检查 cwd。预检是一时刻的检查，无法保证后续磁盘和依赖永不变化。
+
+spawn/message 可传 `resultContract: {jobId, parentTaskId?, parentSessionId?, originSessionId?, artifactManifestPath?}`。身份不由模型填入：get/list 的 `resultMetadata` 来自执行宿主，包含真实 task/context/session/request ID、cwd/preset、起止时间、outcome、预检和验证后的产物。lineage 明确标为调用方声明。manifest 路径及所列文件均须在已通过预检的 jobDirectory 内，严格格式：
+
+```json
+{"artifacts":[{"path":"/tmp/actual-job/final.pptx","url":"http://actual-host/artifacts/job/final.pptx","mediaType":"application/vnd.openxmlformats-officedocument.presentationml.presentation"}]}
+```
+
+宿主计算文件大小和 SHA256，拒绝越界、符号链接和伪造字段；manifest 校验失败会使该轮任务失败，不将模型声称的交付当作成功。公开副本的 URL 由调用方/worker 提供，业务验收仍需下载对比。系统在任务目录写 `result-metadata.<taskId>.json`，已验证 URL 同时进入 A2A artifactLinks。续派返回新 taskId，每轮均有独立系统记录；不改变父任务覆盖范围、通知格式或 ack 机制。
+
+本机完整安装包的来源、校验、离线重装及回滚见工程 `docs/local-reproducible-deployment.md`，不再以单个编译文件的临时替换作为部署来源。

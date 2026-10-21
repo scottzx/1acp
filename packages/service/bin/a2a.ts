@@ -15,8 +15,9 @@ export async function runA2ACli(args: string[]): Promise<void> {
 
 invoke reads a JSON parameters object from stdin. Credentials stay in the
 gateway config file (chmod 600), outside tool arguments. Remote cwd is absolute.
-Methods: remote_agent_spawn, remote_agent_get, remote_agent_message,
-         remote_agent_cancel, remote_agent_list, remote_agent_inbox, remote_agent_ack`);
+Methods: remote_agent_preflight, remote_agent_spawn, remote_agent_get, remote_agent_message,
+         remote_agent_cancel, remote_agent_list, remote_agent_inbox, remote_agent_ack,
+         session_bind, session_send, session_delivery_get, session_delivery_resolve`);
     return;
   }
   if (args[0] === 'gateway') {

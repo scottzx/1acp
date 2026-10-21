@@ -11,12 +11,14 @@ import { DshA2ABackend } from '../dist/a2a-executor.js';
 import { diagnosticsFixture, identity } from './helpers/diagnostics.mjs';
 import { toSafeError } from '@1agents/acp-service/runtime';
 
+const targetIdentity = ({ preflight, ...identity }) => identity;
+
 async function fixture(t) {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), 'dsh-a2a-executor-')));
   const { diagnostics } = await diagnosticsFixture(t, join(cwd, 'diagnostics'));
   const ctx = new Context();
   await ctx.plugin(SessionStore);
-  const agents = new Map(), pending = new Map(), cancels = [], prompts = [];
+  const agents = new Map(), pending = new Map(), cancels = [], prompts = [], creates = [];
   const admitted = Promise.withResolvers();
   let activeListeners = 0, createCount = 0, resolveCount = 0, promptBehavior;
   const observe = (...args) => {
@@ -35,7 +37,7 @@ async function fixture(t) {
   };
   const makeAgent = session => {
     const agent = {
-      id: session.id, session, whenIdle: async () => {}, activeTurn: undefined, ctx: { on: observe },
+      id: session.id, session, whenIdle: async () => {}, activeTurn: undefined, startedTurn: false, ctx: { on: observe },
       inbox: { remove: id => {
         const entry = pending.get(id);
         if (!entry) return false;
@@ -59,11 +61,14 @@ async function fixture(t) {
       return { meta: agent.session.header, events: [] };
     },
     create: async request => {
+      creates.push(request);
       const existing = request.sessionId && agents.get(request.sessionId);
       if (existing) {
         if (existing.session.header.cwd !== request.cwd) throw new Error('Existing session cwd conflicts');
         if (request.agentPreset !== undefined && existing.session.header.agentPreset !== request.agentPreset) throw new Error('Existing session preset conflicts');
-        return { sessionId: existing.id, agentPreset: existing.session.header.agentPreset };
+        // Current DSH create() only reuses blank Sessions. A previously used
+        // identity creates a new Session even after its turn has completed.
+        if (!existing.startedTurn) return { sessionId: existing.id, agentPreset: existing.session.header.agentPreset };
       }
       createCount++;
       const session = ctx.sessions.create(`dsh-a2a-${createCount}`, { meta: { cwd: request.cwd, agentPreset: request.agentPreset ?? 'default-preset' } });
@@ -90,7 +95,7 @@ async function fixture(t) {
       const id = await diagnostics.begin(identity({ sessionId: agent.id, turn, requestIds: [requestId] }));
       await diagnostics.submitted(id); await diagnostics.settle(id, error);
     },
-    cwd, backend, ctx, agents, pending, cancels, prompts, controller, admitted,
+    cwd, backend, ctx, agents, pending, cancels, prompts, creates, controller, admitted,
     get listenerCount() { return activeListeners; },
     get createCount() { return createCount; }, get resolveCount() { return resolveCount; },
     set promptBehavior(value) { promptBehavior = value; },
@@ -98,6 +103,7 @@ async function fixture(t) {
     claim: (agent, requestId, turn) => {
       const message = user(requestId);
       pending.delete(message.id);
+      agent.startedTurn = true;
       agent.activeTurn = turn;
       ctx.emit('agent/inbox/claimed', { agent, message, turn });
     },
@@ -110,11 +116,13 @@ async function fixture(t) {
 test('prepare creates a real DSH Session and adopts its original directory and preset', async t => {
   const f = await fixture(t);
   const created = await f.backend.prepare({ cwd: join(f.cwd, '.'), agentPreset: 'oneagents-acp-codex' });
-  assert.deepEqual(created, { sessionId: 'dsh-a2a-1', cwd: f.cwd, agentPreset: 'oneagents-acp-codex' });
+  assert.deepEqual(targetIdentity(created), { sessionId: 'dsh-a2a-1', cwd: f.cwd, agentPreset: 'oneagents-acp-codex' });
+  assert.equal(created.preflight.ok, true);
   assert.equal(f.agents.get(created.sessionId).session.header.cwd, f.cwd);
   const restored = await f.backend.prepare({ sessionId: created.sessionId });
-  assert.deepEqual(restored, created);
+  assert.deepEqual(targetIdentity(restored), targetIdentity(created));
   assert.equal(f.createCount, 1);
+  assert.equal(f.creates.length, 1, 'even a blank saved Session is resumed without calling create again');
   assert.equal(f.resolveCount, 2);
   await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, agentPreset: 'other' }), /preset conflicts/);
   await assert.rejects(f.backend.prepare({ sessionId: created.sessionId, cwd: tmpdir() }), /cwd conflicts/);
@@ -128,6 +136,84 @@ test('prepare rejects missing sessions and invalid remote directories before cre
   await assert.rejects(f.backend.prepare({ cwd: join(f.cwd, 'missing') }), /ENOENT/);
   await assert.rejects(f.backend.prepare({ sessionId: 'missing-session' }), /not found/);
   assert.equal(f.createCount, 0);
+});
+
+test('host preflight and dispatch reject missing requirements before creating or prompting a session', async t => {
+  const f = await fixture(t);
+  const probe = await f.backend.preflight({ cwd: f.cwd, requiredFiles: [join(f.cwd, 'missing-input')] });
+  assert.equal(probe.ok, false);
+  assert.equal(f.createCount, 0);
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, preflight: {
+    node: { executable: process.execPath, modules: ['__a2a_missing_module__'] },
+  } }), /A2A preflight failed.*Missing Node modules/);
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd, preflight: { jobDirectory: '/' } }), /workspace-write roots/);
+  assert.equal(f.createCount, 0);
+  assert.equal(f.prompts.length, 0);
+});
+
+test('prepare fails closed when inspection is absent or resolution changes the saved identity or metadata', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd, agentPreset: 'role' });
+  const agent = f.agents.get(target.sessionId), inspect = f.controller.inspect;
+  f.controller.inspect = async () => undefined;
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /not found/);
+  f.controller.inspect = async () => null;
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /not found/);
+  f.controller.inspect = async () => ({ meta: { ...agent.session.header, id: 'other-session' } });
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /identity conflicts/);
+  f.controller.inspect = inspect;
+  f.controller.resolveAgent = async () => ({ error: new Error('Cannot restore saved session') });
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /Cannot restore/);
+  f.controller.resolveAgent = async () => ({ agent: { ...agent, id: 'other-session' } });
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /identity conflicts/);
+  f.controller.resolveAgent = async () => ({ agent: { ...agent, session: { id: 'other-session', header: agent.session.header } } });
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /identity conflicts/);
+  f.controller.resolveAgent = async () => ({ agent: { ...agent, session: { id: target.sessionId, header: { ...agent.session.header, cwd: tmpdir() } } } });
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /cwd conflicts/);
+  f.controller.resolveAgent = async () => ({ agent: { ...agent, session: { id: target.sessionId, header: { ...agent.session.header, agentPreset: 'different-role' } } } });
+  await assert.rejects(f.backend.prepare(targetIdentity(target)), /preset conflicts/);
+  assert.equal(f.createCount, 1, 'restoration failures must not silently create replacement Sessions');
+  assert.equal(f.creates.length, 1);
+});
+
+test('preparing an active context preserves its Session and serializes the appended run behind the active turn', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd, agentPreset: 'role' });
+  const agent = f.agents.get(target.sessionId);
+  const first = f.backend.run(target, 'first', { requestId: 'first', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'first', 1);
+  const appended = await f.backend.prepare(targetIdentity(target));
+  assert.deepEqual(targetIdentity(appended), targetIdentity(target));
+  assert.equal(f.createCount, 1);
+  assert.equal(f.creates.length, 1);
+  const second = f.backend.run(appended, 'revision', { requestId: 'revision', signal: new AbortController().signal });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.prompts.map(value => value.request.requestId), ['first'], 'the appended turn must not be admitted concurrently');
+  f.output(agent, 1, 'First answer'); f.finish(agent, 1, { kind: 'completed' });
+  assert.equal((await first).text, 'First answer');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.prompts.map(value => value.request.sessionId), [target.sessionId, target.sessionId]);
+  f.claim(agent, 'revision', 2); f.output(agent, 2, 'Revised answer'); f.finish(agent, 2, { kind: 'completed' });
+  assert.equal((await second).text, 'Revised answer');
+  assert.equal(f.agents.size, 1);
+  assert.equal(f.listenerCount, 0);
+});
+
+test('preparing a completed context resumes the same nonblank Session instead of creating another conversation', async t => {
+  const f = await fixture(t), target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const first = f.backend.run(target, 'first', { requestId: 'first', signal: new AbortController().signal });
+  await f.admitted.promise; f.claim(agent, 'first', 1); f.output(agent, 1, 'Original answer'); f.finish(agent, 1, { kind: 'completed' });
+  assert.equal((await first).text, 'Original answer');
+  const resumed = await f.backend.prepare({ sessionId: target.sessionId });
+  assert.deepEqual(targetIdentity(resumed), targetIdentity(target));
+  assert.equal(f.createCount, 1);
+  assert.equal(f.creates.length, 1);
+  const second = f.backend.run(resumed, 'followup', { requestId: 'followup', signal: new AbortController().signal });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.prompts.map(value => value.request.sessionId), [target.sessionId, target.sessionId]);
+  f.claim(agent, 'followup', 2); f.output(agent, 2, 'Followup answer'); f.finish(agent, 2, { kind: 'completed' });
+  assert.equal((await second).text, 'Followup answer');
+  assert.equal(f.agents.get(resumed.sessionId), agent);
+  assert.equal(f.listenerCount, 0);
 });
 
 test('run follows only its claimed turn and returns the final assistant text without waiting for later UI work', async t => {
@@ -634,7 +720,7 @@ test('official DSH loop preserves lifecycle and cannot authenticate provider-sha
   assert.deepEqual(await backend.run(target, 'real task', { requestId: 'real-task', signal: new AbortController().signal }), {
     outcome: 'completed', text: 'Completed real task',
   });
-  assert.deepEqual(await backend.prepare({ sessionId: target.sessionId }), target);
+  assert.deepEqual(targetIdentity(await backend.prepare({ sessionId: target.sessionId })), targetIdentity(target));
   const abort = new AbortController();
   const canceled = backend.run(target, 'hang', { requestId: 'real-cancel', signal: abort.signal });
   await started.promise; abort.abort();

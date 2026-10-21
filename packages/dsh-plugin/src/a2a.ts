@@ -30,6 +30,7 @@ export async function mountDshA2A(ctx: Context, options: DshA2AOptions, stateDir
     try {
       routes.push(ctx.webServer.register({ kind: 'exact', path: '/.well-known/agent-card.json', handler: server.cardHandler }));
       routes.push(ctx.webServer.register({ kind: 'exact', path: server.path, handler: server.handler }));
+      routes.push(ctx.webServer.register({ kind: 'exact', path: `${server.path}/preflight`, handler: server.handler }));
     } catch (error) {
       for (const dispose of routes.reverse()) dispose();
       await server.close();

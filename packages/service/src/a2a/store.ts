@@ -13,6 +13,7 @@ import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import { DirectoryLease } from './lease.js';
 import type { A2ATarget } from './types.js';
+import { a2aPreflightReportSchema } from './preflight.js';
 
 interface Scope { tenant: string; owner: string }
 type Kind = 'task' | 'push' | 'target';
@@ -92,7 +93,8 @@ function parseTarget(value: unknown): A2ATarget {
   const cwd = text(source.cwd, 'working directory');
   if (!isAbsolute(cwd)) throw new Error('Invalid A2A working directory: expected an absolute path');
   const agentPreset = source.agentPreset === undefined ? undefined : text(source.agentPreset, 'agent preset');
-  return { sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }) };
+  const preflight = source.preflight === undefined ? undefined : a2aPreflightReportSchema.parse(source.preflight);
+  return { sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), ...(preflight === undefined ? {} : { preflight }) };
 }
 
 function validatePushUrl(value: unknown): string {

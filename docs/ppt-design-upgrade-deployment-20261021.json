@@ -1,0 +1,71 @@
+{
+  "role": "ppt-beautifier",
+  "version": "0.2.0",
+  "archivePath": "/Users/scott/.local/share/1agents/ppt-beautifier/state/design-releases/design-role-0.2.0.tar.gz",
+  "archiveManifest": "/Users/scott/.local/share/1agents/ppt-beautifier/state/design-releases/design-role-0.2.0.manifest.json",
+  "archiveBytes": 49596619,
+  "archiveSha256": "80a25240c6e0be1adb1a67ad8fff17bd8657870595729fcf2ba1535afabc5921",
+  "activatedPreset": {
+    "roleVersion": "0.2.0",
+    "preset": {
+      "id": "ppt-beautifier",
+      "name": "PPT 美化大师",
+      "description": "接收 PPT 合同，默认采用AI价值主线报告模板与原生图形，交付可编辑 PPTX、预览和设计来源记录，经原主会话验收。",
+      "order": 10,
+      "isDefault": false
+    },
+    "defaultBefore": {
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "reasoningEffort": "high"
+    },
+    "defaultAfter": {
+      "provider": "deepseek-account",
+      "model": "deepseek-flash",
+      "reasoningEffort": "high"
+    },
+    "reloaded": true
+  },
+  "skillReview": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/template-design-20261021-001/evidence/skill-review.json",
+  "taskId": "c48d9511-634f-4b12-9814-d83c1267682b",
+  "contextId": "91c9080e-b2af-4dda-a898-a01717ded02e",
+  "executionSessionId": "session-c8aa2002-b916-4c43-9f50-d990117a83a6",
+  "stage": "complete",
+  "roleVersion": "0.2.0",
+  "firstTaskId": "c48d9511-634f-4b12-9814-d83c1267682b",
+  "finalTaskId": "a83fe693-bcd2-4d13-b8ba-e8200f72eeeb",
+  "finalAcceptance": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/template-design-20261021-001/evidence/final-acceptance.json",
+  "finalPptxSha256": "fc9328b07160a9f9e159f1f4f0b62b4bbef898cc64513c2c249db1285309433b",
+  "artifactUrls": [
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/dreammate-node-redesigned.pptx",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/preview.png",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/slide-1.png",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/slide-2.png",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/slide-3.png",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/slide-4.png",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/slide-5.png",
+    "http://100.88.227.56:36818/artifacts/template-design-20261021-001/slide-6.png"
+  ],
+  "sourceTemplateConversationId": "01a156fc-998b-7a11-b811-fecbf1d5c139",
+  "sourceTemplateConversationTitle": "围绕AI价值主线修订报告",
+  "primaryTemplateSha256": "7240b9d1b941e38c30f8449aff578089b85fa5cd3fcf0b9d9d50fc5f59af543d",
+  "chartFullSha256": "8c7fc1a40ae334ff507a53044e5a37e71b84a2320e75d57e2d0c834592fedb60",
+  "curatedChartPages": [
+    3,
+    9,
+    19,
+    43,
+    50,
+    51,
+    52,
+    109
+  ],
+  "noticeAcked": true,
+  "verifiedFinalizerReceipt": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/template-design-20261021-001/evidence/upstream-finalization.validation.json",
+  "sourceChangesInThisRun": [
+    "examples/ppt-beautifier/cordis.patch.yml",
+    "examples/ppt-beautifier/package.json",
+    "examples/ppt-beautifier/README.md"
+  ],
+  "gatewayCoreChangedInThisRun": false
+}
