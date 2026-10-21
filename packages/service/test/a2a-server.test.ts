@@ -14,7 +14,7 @@ import {
 import { ClientFactory, ClientFactoryOptions, type Client, type RequestOptions } from '@a2a-js/sdk/client';
 import { ServerCallContext } from '@a2a-js/sdk/server';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
-import { createA2AServer, FileA2AStore, type A2AServerOptions } from '../src/a2a/index.js';
+import { createA2AServer, FileA2AStore, runA2APreflight, type A2AServerOptions } from '../src/a2a/index.js';
 import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '../src/a2a/types.js';
 
 const token = 'a2a-test-bearer';
@@ -87,7 +87,7 @@ async function fixture(t: TestContext, options: Partial<Omit<A2AServerOptions, '
   let host: Awaited<ReturnType<typeof createA2AServer>> | undefined;
   const server = createServer((req, res) => {
     if (!host) { res.writeHead(503); res.end(); return; }
-    const handler = req.url === '/.well-known/agent-card.json' ? host.cardHandler : req.url === host.path ? host.handler : undefined;
+    const handler = req.url === '/.well-known/agent-card.json' ? host.cardHandler : (req.url === host.path || req.url === `${host.path}/preflight`) ? host.handler : undefined;
     if (!handler) { res.writeHead(404); res.end(); return; }
     void handler(req, res).catch(error => { res.destroy(error); });
   });
@@ -189,6 +189,30 @@ test('official A2A client discovers the card and returns a Task before execution
   assert.deepEqual(listed.tasks.map(item => item.id), [task.id]);
   await assert.rejects(f.client.resubscribeTask(SubscribeToTaskRequest.fromJSON({ id: task.id }), authenticated).next(), /terminal|subscribed|Unsupported/i);
   await assert.rejects(f.client.sendMessage(message('reopen', { taskId: task.id }), authenticated), /terminal|modified|Unsupported/i);
+});
+
+test('authenticated host preflight checks requirements without allocating a task or session', async t => {
+  class PreflightBackend extends DeferredBackend {
+    checks = 0;
+    async preflight(input: Parameters<typeof runA2APreflight>[0]) { this.checks++; return runA2APreflight(input); }
+  }
+  const backend = new PreflightBackend(), f = await fixture(t, {}, backend);
+  const request = (value: unknown, authorized = true) => fetch(`${f.origin}/a2a/preflight`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...(authorized ? { Authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(value),
+  });
+  assert.equal((await request({ cwd: tmpdir() }, false)).status, 401);
+  assert.equal(backend.checks, 0);
+  assert.equal((await request({ cwd: 'relative' })).status, 400);
+  const good = await request({ cwd: tmpdir() });
+  assert.equal(good.status, 200);
+  assert.equal((await good.json() as { ok: boolean }).ok, true);
+  const bad = await request({ cwd: '/__a2a_missing_preflight_cwd__' });
+  assert.equal(bad.status, 200, 'a valid probe returns a failed report, rather than a transport error');
+  assert.equal((await bad.json() as { ok: boolean }).ok, false);
+  assert.equal(backend.preparations.length, 0);
+  assert.equal(backend.runs.length, 0);
+  const tasks = await f.client.listTasks(ListTasksRequest.fromJSON({}), authenticated);
+  assert.equal(tasks.tasks.length, 0);
 });
 
 test('a disconnected SendStreamingMessage continues execution and saves its final result', { timeout: 10000 }, async t => {

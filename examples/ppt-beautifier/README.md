@@ -1,0 +1,116 @@
+# PPT 美化大师常驻角色
+
+这是 DSH 角色 bundle，永久声明 `ppt-beautifier` 角色及其作用域内的模型路由。宿主持续运行，每份上游 A2A 派单创建独立任务会话；同一 `contextId` 的后续指令复用该任务会话。该 bundle 只增加角色，不更改现有默认预设，不启用 A2A，也不携带凭据。
+
+## 部署目录
+
+- 角色 bundle：`/Users/scott/.local/share/1agents/ppt-beautifier/agent-bundle`
+- 专属技能目录：`/Users/scott/.local/share/1agents/ppt-beautifier/skills`
+- 工作根目录：`/Users/scott/.local/share/1agents/ppt-beautifier/workspace`
+
+角色只挂载专属模型路由、persona、原生 bash、文件读写及搜索、专属技能提供器和 skill 工具。`includeDefaultRoots: false` 避免将全局技能目录混入这个角色。技能目录中的 PPT 能力应由 skill-manager 检索确认后部署，并包含 Presentations 技能的 artifact-tool 实现、模板处理及验证指引和可用运行时路径。
+
+## 0.2.0 设计绑定
+
+`0.2.0` 让角色先读取专属 `ppt-report-design` 与 `artifact-template-ai-value-report`。用户或合同显式指定的模板优先，否则从模板 manifest 导入15页参考的 master、layout、背景及页面骨架。默认视觉为米白、墨绿、赭金、砖红，不能仅换配色后继续使用旧蓝白稿。业务内容与机构品牌来自当前合同，不复制原报告的业务结论、机构名或图表库示例数字。
+
+本次主模板来自聊天“围绕AI价值主线修订报告”（`01a156fc-998b-7a11-b811-fecbf1d5c139`）的 T12 最终交付快照“环节说明版”，共15页，SHA256 为 `7240b9d1b941e38c30f8449aff578089b85fa5cd3fcf0b9d9d50fc5f59af543d`。T12/E449记录最终文件和15页渲染，E451记录同hash交付，E452为最终答复。桌面同名文件后来被修改为18页，不作为此快照。
+
+专属技能与资产布局：
+
+```text
+skills/
+  artifact-template-ai-value-report/
+    SKILL.md
+    artifact-template.json
+    assets/reference.pptx
+    assets/preview.png
+  ppt-report-design/
+    SKILL.md
+    references/design-profile.md
+    references/design-profile.json
+    references/output-records.md
+    references/chart-library-index.md
+    references/chart-library-provenance.json
+    assets/curated-native-8-pages.pptx
+    assets/curated-preview.png
+```
+
+图表原库实际202页（200张素材加封面、结尾），没有数据绑定Chart。精选8页对应原页3/9/19/43/50/51/52/109；只借用原生形状、文本、连接线与自定义几何，按语义选型后统一到主模板的字体、配色和间距。源库示例数据不是业务事实，整页截图不是可编辑图形。只有合同提供真实数据且适合数据图时，才创建数据绑定Chart。
+
+本次部署由主控将 personal 模板目录完整复制至角色专属同名技能目录，再安装 `ppt-report-design`、设计档案、索引、精选原生PPTX及预览；部署记录位于 `/Users/scott/.local/share/1agents/ppt-beautifier/state/design-binding-0.2.0.json`，记录来源、hash、备份与文件清单。素材及模板均由明确路径复制，不自动遍历本机目录。该复制部署独立于bundle安装；部署其他机器时须重新提供授权素材路径与运行时说明。
+
+Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`。Node与依赖位置以工作根目录 `RUNTIME.md` 为准，不使用系统 `python3` 猜测依赖。原模板微软雅黑在当前runtime不可用，采用已验证的 `PingFang SC` 并记录字体替换，不能声称精确雅黑保真。
+
+每job额外交付 `design-plan.json`、`design-usage.json`，逐页记录模板页、原库页/精选页、native shape origins、输出对象映射及实际改造。最终PPT逐页与对应主源比较，复核可编辑性、示例内容清理与内容覆盖；6页合同须检查全部6页。新任务使用fresh session，同一任务的message续派复用原session，node、profile、模型路由和A2A协议保持现有行为。
+
+## 本地设计版本备份与恢复
+
+`0.2.0` 设计快照保存在 `/Users/scott/.local/share/1agents/ppt-beautifier/state/design-releases/design-role-0.2.0.tar.gz`，同目录 `design-role-0.2.0.manifest.json` 记录归档SHA256、大小、白名单文件清单及逐文件校验结果。归档只含 `agent-bundle`、`skills/ppt-report-design`、`skills/artifact-template-ai-value-report`、`workspace/RUNTIME.md` 和 `state/design-binding-0.2.0.json`。binding的 `files` 覆盖两技能、bundle与RUNTIME；归档manifest另外记录binding自身hash。符号链接、凭据、其他技能、任务、日志、产物和node_modules不进入归档。
+
+备份在references修订和独立技能检查完成后制作，文件按相对路径排序，tar元数据与gzip时间戳固定，重复生成可核对相同SHA256。它是角色设计文件的版本快照；现有DSH宿主、Presentations运行时、依赖、认证和网关仍需单独配置。
+
+恢复时先对照manifest校验归档SHA256并查看成员列表，再解压到新的检查目录，逐文件核对hash。仅在确认目标角色没有运行中任务且获得恢复授权后，先备份现有白名单目标，再将检查后的同名目录与文件恢复到角色根目录，复核文件hash及RUNTIME中的本机路径。随后按既有安装与验证流程决定是否重载；备份包与这些说明均不会自动恢复文件、改网关或重启宿主。
+
+设计增量 `0.2.1` 增加角色专属 `references/layout-planning.md` 并更新设计指令与记录要求；bundle版本仍为 `0.2.0`，新任务读取更新后的技能即可，无需重启、重装或更改模型及网关。变更来源记录在 `state/layout-upgrade-20261021/change-report.json`，新绑定为 `state/design-binding-0.2.1.json`。
+
+对应快照为同一 `state/design-releases` 目录下的 `design-role-0.2.1.tar.gz` 与 `design-role-0.2.1.manifest.json`，沿用上述白名单并包含新增布局参考，归档内使用 `design-binding-0.2.1.json`。恢复时选择同一设计版本的归档、manifest与binding；原 `0.2.0` 绑定和备份保持原样，可按上述授权恢复流程回退。
+
+## 角色专属模型
+
+`0.2.0` 沿用 `0.1.2` 的模型路由实现：`model-route.js` 在该预设作用域注册 `system-prompt/assemble` 与 `agent/request` waterfall，使用已配置的 `minimax-cn/MiniMax-M3`。两处都先调用 `next()`，再同步 prompt 变量与实际请求路由，保留其余请求控制项并清除前一模型的 reasoning effort。它不调用 `session/selectModel`、不读取或保存宿主默认模型，不注册任何根作用域事件。其他预设不加载此插件。
+
+`node --test model-route.test.mjs` 检查请求配置保留、默认模型无访问、作用域分离、与会话模型选择 waterfall 的组合及卸载清理。模拟测试不代替真实宿主的请求日志检查。安装后检查新 PPT 会话的实际 request header 为预期 provider/model。
+
+## 安装与验证
+
+通过当前 DSH Web 宿主的已授权 Remote API 安装角色 bundle，不能把 HTTP 成功或包安装成功当成预设已激活。
+
+```json
+{
+  "type": "client-request",
+  "rpcId": "<INSTALL_REQUEST_ID>",
+  "method": "pluginManager/installBundle",
+  "payload": {
+    "args": {
+      "spec": "/Users/scott/.local/share/1agents/ppt-beautifier/agent-bundle",
+      "options": { "enabled": true }
+    }
+  }
+}
+```
+
+向 `/api/pluginManager/installBundle` POST 该消息，认证由部署进程在内存中读取既有受保护凭据后附加，不写入 bundle、命令行参数或报告。检查 `result.ok: true` 和 `result.value.application`。若为 `applied`，继续查询预设；若为 `restart-required`，先确认宿主没有运行中的会话，再重启受管理的 DSH Web。实际部署返回过 `restart-required`，不能假定热加载成功。随后调用 `/api/agentPresets/list` 确认 `ppt-beautifier` 无 `broken`，并以新会话的请求头验证角色版本和模型路由。已有任务保留旧预设 revision，新任务使用当前 revision。
+
+本地 bundle 安装后通过链接引用源目录。更新已安装 bundle 不应重复添加安装项；重复安装可能返回 `already-installed`。更新源文件后仍须按宿主要求重载，并通过上述预设查询和实际请求日志确认生效。
+
+宿主提供 `read_image`，但实际模型 route 必须声明图片输入才能逐页视觉检查。请给执行会话配置可读图模型；若采用文本模型，应明确将预览交上游实际检查，不能宣称角色已看图。
+
+## A2A 接入
+
+`a2a-host.patch.example.yml` 是独立的宿主配置示例，**不属于角色 bundle 的自动安装内容**。应用前保留现有 `oneagents-acp` 的全部配置字段，替换 callback origin，安全提供宿主 token。`tokenEnv` 仅在该变量真实存在于受管理 DSH Web 进程环境时有效。也可以由部署过程将随机 token 写入权限 600 的既有宿主配置；不得把真实 token 保存到此示例。
+
+在网关中添加指向本机 DSH A2A 的 remote，凭据只进入受保护网关配置。上游通过现有 `remote_agent_spawn` 派单：
+
+```json
+{
+  "remote": "ppt-beautifier",
+  "originSessionId": "<REAL_PARENT_SESSION_ID>",
+  "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/<JOB_ID>",
+  "agentPreset": "ppt-beautifier",
+  "title": "PPT 美化任务",
+  "prompt": "请读取 <ABSOLUTE_CONTRACT_PATH>，按合同导入原稿并美化，输出可编辑 PPTX，逐页渲染并实际检查，最终答复附已存在的 PPTX 与预览链接。"
+}
+```
+
+父会话须提前完成 `session_bind`。网关沿现有持久任务、状态查询、最终答复通知和 ack 链路回传，不由这个角色另行推送。原主会话读取实际产物、保存验收结论后再调用 `remote_agent_ack`。
+
+`defaultAgentPreset` 是宿主默认值，现有通用 A2A API 仍允许调用者显式指定其他预设；角色职责约束和技能目录配置不等于操作系统级沙箱。
+
+## 合同最低信息
+
+合同应提供任务目标、源 PPTX 绝对路径、输出目录、页数、受众、语言、需要保留的内容、设计方向、最终格式及验收要求。可附上每页的文字和数据清单，便于核验无遗漏。所有路径必须在本任务授权范围内。用户明确要求美化时允许更改原稿样式，严格模板要求则应在合同中明确。
+
+如未明确指定模板，使用上述默认设计绑定；另有模板时在合同中给出路径与使用要求。设计来源与业务资料分别记录，模板中的报告内容和素材库中的示例数据不能补成业务事实。
+
+真实验收应覆盖：A2A 派单返回 taskId，状态进入 WORKING，模型实际读取合同与技能并导入原稿，最终可编辑 PPTX 真实存在，各页已渲染并实际检查，自动通知包含最终答复与产物链接，原主会话读取并确认产物后 ack。各阶段分别保留可核验记录。

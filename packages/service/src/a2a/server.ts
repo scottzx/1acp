@@ -10,6 +10,7 @@ import { toSafeError } from '@1agents/acp-service/runtime';
 import { a2aRequestId } from './request-id.js';
 import { FileA2AStore } from './store.js';
 import type { A2ABackend } from './types.js';
+import { a2aPreflightInputSchema } from './preflight.js';
 
 /** Remote execution is explicitly enabled with a host-owned bearer credential. */
 export interface A2AServerOptions extends A2AExecutionOptions {
@@ -200,6 +201,29 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
       res.writeHead(401, { 'WWW-Authenticate': 'Bearer', 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
     }
     if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); res.end(); return; }
+    // A host extension with the same credential boundary as execution. Probing
+    // does not allocate a Task, context or session and never enters the model.
+    if (req.url === `${path}/preflight`) {
+      if (!options.backend.preflight) {
+        res.writeHead(501, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Host preflight is not supported' })); return;
+      }
+      try {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of req) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += buffer.length;
+          if (size > 65536) throw new Error('Preflight body exceeds 64 KiB');
+          chunks.push(buffer);
+        }
+        const input = a2aPreflightInputSchema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        const report = await options.backend.preflight(input);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(report));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Invalid preflight request' }));
+      }
+      return;
+    }
     res.setHeader('A2A-Version', '1.0');
     let id: string | number | null = null;
     try {

@@ -2,9 +2,16 @@
 export { createA2AServer } from './server.js';
 export type { A2AServerOptions } from './server.js';
 export { FileA2AStore } from './store.js';
-export type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from './types.js';
+export type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport } from './types.js';
+export { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema, A2APreflightError, runA2APreflight } from './preflight.js';
+export { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetadata, saveA2AResultMetadata } from './result-metadata.js';
+export type { A2AResultContract, A2AVerifiedArtifact, A2AResultMetadata } from './result-metadata.js';
 export { RemoteAgentGateway, serveA2AGateway, REMOTE_AGENT_METHODS } from './gateway.js';
 export type { A2AGatewayConfig, RemoteAgentNotice } from './gateway.js';
 export { A2AAutomation } from './automation.js';
 export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';
 export { DirectoryLease } from './lease.js';
+export { SessionDelivery } from './session-delivery.js';
+export type { SessionBinding, SessionDeliveryReceipt, SessionDeliveryStatus } from './session-delivery.js';
+export { sessionHostSchema, deliverSessionMessage, SessionDeliveryError } from './session-hosts.js';
+export type { SessionHost } from './session-hosts.js';

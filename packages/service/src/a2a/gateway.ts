@@ -6,10 +6,20 @@ import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { CancelTaskRequest, GetTaskRequest, SendMessageRequest, Task } from '@a2a-js/sdk';
 import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, type Client } from '@a2a-js/sdk/client';
-import { reportAndHoldRegistration } from '@1agents/dreammate-node/client';
+import { reportAndHoldRegistration, reportToAgent } from '@1agents/dreammate-node/client';
 import { z } from 'zod';
 import { FileA2AStore } from './store.js';
 import { A2AAutomation, automationConfigSchema, createAutomationServer } from './automation.js';
+import { sessionHostSchema } from './session-hosts.js';
+import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
+import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
+import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
+import { a2aResultContractSchema } from './result-metadata.js';
+import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
+import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput } from '../execution/ledger.js';
+import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema,
+  type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest } from '../execution/ppt-delivery.js';
+export type { RemoteAgentNotice } from './notices.js';
 
 const string = z.string().trim().min(1).max(512);
 const endpoint = z.string().url().refine(value => {
@@ -22,8 +32,10 @@ const configSchema = z.object({
   remotes: z.record(string, z.object({ url: endpoint, token: string }).strict()),
   callback: z.object({ host: string, port: z.number().int().min(0).max(65535), url: endpoint, token: string }).strict().optional(),
   notificationTargets: z.record(string, z.object({ url: endpoint, token: string }).strict()).default({}),
+  sessionHosts: z.record(string, sessionHostSchema).default({}),
   automation: automationConfigSchema.optional(),
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
+  pptDelivery: pptDeliveryPolicySchema.optional(),
 }).strict().superRefine((config, ctx) => {
   for (const [id, schedule] of Object.entries(config.automation?.schedules ?? {})) {
     if (!Object.hasOwn(config.remotes, schedule.remote)) ctx.addIssue({ code: 'custom', path: ['automation', 'schedules', id, 'remote'], message: 'Unknown automation remote' });
@@ -39,13 +51,42 @@ const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.t
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   cwd: string.refine(value => path.posix.isAbsolute(value), 'cwd must be an absolute remote path'),
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
+  preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
+  clientRequestId: string.optional(),
 }).strict();
+const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional() }).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
+const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
+  clientRequestId: string.optional(), title: string.optional(), parentJobRef: z.object({ sourceId: string, jobId: string }).strict().optional(),
+  parentAttemptId: string.optional(), purpose: string.optional(), resultRevision: string.optional(),
+  replacesJobRef: z.object({ sourceId: string, jobId: string }).strict().optional() }).strict();
+const executionJobSchema = z.object({ ...originFields, jobId: string }).strict();
+const executionListSchema = z.object({ ...originFields, targetId: string.optional(), executionStatus: string.optional(),
+  limit: z.number().int().min(1).max(200).default(50), offset: z.number().int().min(0).default(0) }).strict();
+const executionContinueSchema = executionJobSchema.extend({ input: z.record(z.string(), z.unknown()), clientRequestId: string.optional() }).strict();
+const executionEventsSchema = z.object({ ...originFields, jobId: string.optional(), afterSequence: z.number().int().nonnegative().optional(),
+  limit: z.number().int().min(1).max(500).default(100) }).strict();
+const executionReviewSchema = executionJobSchema.extend({ attemptId: string, resultRevision: string, resultDigest: string,
+  reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
+const EXECUTION_METHODS = {
+  ...TARGET_METHODS,
+  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。', parameters: z.toJSONSchema(executionSubmitSchema) },
+  execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知时禁止新派发。', parameters: z.toJSONSchema(executionContinueSchema) },
+  execution_cancel: { description: '按任务编号取消当前A2A执行轮次，先记录取消意图再核对后端确认；不支持的角色Provider明确拒绝，不默认级联子任务。', parameters: z.toJSONSchema(executionJobSchema) },
+  execution_get: { description: '读取任务、执行轮次、父子关联与结果。在途/未决历史单列，不把当前轮次终态等同整链停止。', parameters: z.toJSONSchema(executionJobSchema) },
+  execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
+  execution_events: { description: '读取本来源范围内持久任务事件，不派单。', parameters: z.toJSONSchema(executionEventsSchema) },
+  execution_review: { description: '保存绑定当前执行轮次、结果版本和hash的业务接受/退回；不等于通知ack。', parameters: z.toJSONSchema(executionReviewSchema) },
+  execution_inbox: { description: '读取领域交付任务的完成/需决策通知；旧A2A收件箱保持原合同。', parameters: z.toJSONSchema(inboxSchema) },
+  execution_ack: { description: '确认已处理领域交付通知，不修改业务验收或执行状态。', parameters: z.toJSONSchema(ackSchema) },
+};
 
 export const REMOTE_AGENT_METHODS = {
+  ...EXECUTION_METHODS,
+  remote_agent_preflight: { description: '在执行宿主检查真实 cwd、任务可写目录和指定运行时依赖，不创建会话、不调用模型。ok=false 时修复检查项后再派单；spawn 的 preflight 还会在受理前重检。', parameters: z.toJSONSchema(preflightSchema) },
   remote_agent_spawn: { description: '在配置的远端 DSH 工作目录中派发独立任务，立即返回 taskId。prompt 必须包含完整上下文。cwd 是远端绝对路径；每次 spawn 创建新会话。完成事件进入 originSessionId 的持久收件箱。', parameters: z.toJSONSchema(spawnSchema) },
   remote_agent_get: { description: '查询当前主会话派发的远端任务。离线时返回缓存与 stale 标记，离线不等于任务失败。', parameters: z.toJSONSchema(taskSchema) },
   remote_agent_cancel: { description: '取消指定远端任务，只取消这项任务自己的执行。', parameters: z.toJSONSchema(taskSchema) },
@@ -53,10 +94,15 @@ export const REMOTE_AGENT_METHODS = {
   remote_agent_list: { description: '列出当前主会话派发的远端任务。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_inbox: { description: '读取当前主会话未确认的完成或需要输入通知。读取不删除；处理后调用 remote_agent_ack。', parameters: z.toJSONSchema(inboxSchema) },
   remote_agent_ack: { description: '确认主会话已处理指定通知。noticeId 稳定，重复确认安全。', parameters: z.toJSONSchema(ackSchema) },
+  session_bind: { description: '将主会话绑定到配置的 Codex 或 DSH 宿主及其已有会话 ID。同一归属不可静默换目标；在派任务前绑定可自动接收其完成通知。', parameters: z.toJSONSchema(sessionBindSchema) },
+  session_send: { description: '向已绑定的主会话可靠投递消息。messageId 是稳定幂等键；立即返回持久投递回执，通过 session_delivery_get 查询。accepted 仅表示宿主已接收入队。', parameters: z.toJSONSchema(sessionSendSchema) },
+  session_delivery_get: { description: '查询本主会话的消息投递状态。unknown 必须先核实宿主是否已接收，不能盲目重发。', parameters: z.toJSONSchema(sessionMessageSchema) },
+  session_delivery_resolve: { description: '核实 unknown 或处理 rejected 投递并记录依据。accepted=true 表示已确认入队；false 仅用于已证实未入队且已处理阻碍后释放重试。note 必填，不等于任务业务处理确认。', parameters: z.toJSONSchema(sessionResolveSchema) },
 };
 
 interface Job {
   remote: string;
+  remoteEndpoint?: string;
   originSessionId: string;
   taskId: string;
   contextId: string;
@@ -67,22 +113,13 @@ interface Job {
   task: unknown;
   checkedAt: string;
   stale?: boolean;
+  ledgerJobId?: string;
+  attemptId?: string;
 }
-export interface RemoteAgentNotice {
-  noticeId: string;
-  originSessionId: string;
-  remote: string;
-  taskId: string;
-  contextId: string;
-  cwd: string;
-  agentPreset?: string;
-  title?: string;
-  state: string;
-  result: string;
-  createdAt: string;
-}
-interface NoticeRecord { notice: RemoteAgentNotice; target?: string; acknowledged?: boolean; delivered?: boolean }
-interface State { version: 1; jobs: Job[]; notices: NoticeRecord[] }
+interface NoticeRecord { notice: RemoteAgentNotice; target?: string; acknowledged?: boolean; delivered?: boolean; sessionDeliveryId?: string }
+interface ExecutionNotice { noticeId: string; messageId: string; originSessionId: string; jobId: string; attemptId: string;
+  executionStatus: string; resultSummary: string; artifactLinks: any[]; createdAt: string; processedAt?: string; text: string }
+interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; pptDeliveries?: any }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
 const actionable = new Set([...terminal, 'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED']);
 const wire = (task: Task): Record<string, any> => Task.toJSON(task) as Record<string, any>;
@@ -103,10 +140,15 @@ function atomicJson(file: string, value: unknown): void {
 export class RemoteAgentGateway {
   readonly config: Config;
   readonly automation?: A2AAutomation;
+  readonly sessions: SessionDelivery;
+  readonly targets: TargetDirectory;
+  readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
   private readonly stateFile: string;
   private readonly state: State;
   private readonly clients = new Map<string, Promise<Client>>();
+  private readonly probeCards = new Map<string, { until: number; result: Promise<unknown> }>();
+  private readonly probeFailures = new Map<string, number>();
   private readonly refreshing = new Map<string, Promise<void>>();
   private readonly delivering = new Set<string>();
   private readonly controllers = new Set<AbortController>();
@@ -125,7 +167,7 @@ export class RemoteAgentGateway {
     this.stateFile = path.join(this.config.stateDirectory, 'gateway.json');
     try {
       this.state = JSON.parse(readFileSync(this.stateFile, 'utf8')) as State;
-      if (this.state.version !== 1 || !Array.isArray(this.state.jobs) || !Array.isArray(this.state.notices)) throw new Error('Invalid gateway state');
+      if (![1, 2].includes(this.state.version) || !Array.isArray(this.state.jobs) || !Array.isArray(this.state.notices)) throw new Error('Invalid gateway state');
       for (const job of this.state.jobs) {
         string.parse(job.originSessionId); string.parse(job.remote); string.parse(job.taskId);
         if (Task.fromJSON(job.task).id !== job.taskId) throw new Error('Invalid gateway task ID');
@@ -134,18 +176,216 @@ export class RemoteAgentGateway {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { this.lease.close(); throw error; }
       this.state = { version: 1, jobs: [], notices: [] };
     }
-    try { if (this.config.automation) this.automation = new A2AAutomation(this, this.config.automation); }
+    try {
+      this.sessions = new SessionDelivery(this.config.stateDirectory, this.config.sessionHosts);
+      this.targets = new TargetDirectory(this.config.stateDirectory, this.config.remotes);
+      this.targets.ensureLegacyRemotes();
+      this.ledger = new JobLedger(this.state.ledger, next => {
+        atomicJson(this.stateFile, { ...this.state, version: 2, ledger: next });
+        this.state.ledger = next; this.state.version = 2;
+      });
+      this.ledger.recoverAfterRestart();
+      this.ledger.migrateLegacy(this.state.jobs.filter(job => !job.ledgerJobId).map(job => ({ ...job,
+        executionStatus: this.standardState(taskState(job)), providerState: taskState(job), createdAt: null,
+        sessionId: Task.fromJSON(job.task).metadata?.['1agents']?.sessionId,
+        resultSummary: resultText(Task.fromJSON(job.task)), artifactLinks: artifactLinks(Task.fromJSON(job.task)),
+        targetSnapshot: this.legacySnapshot(job) })));
+      for (const job of this.state.jobs) {
+        const migrated = this.ledger.findByBackend(job.originSessionId, { remote: job.remote, taskId: job.taskId });
+        if (!job.ledgerJobId && migrated) { job.ledgerJobId = migrated.job.jobId; job.attemptId = migrated.attempt.attemptId; }
+      }
+      this.state.ledger = this.ledger.snapshot(); this.state.version = 2;
+      this.state.executionNotices ??= [];
+      this.state.pptDeliveries ??= { version: 1, runs: {} };
+      for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
+        const attempt = this.ledger.getAttempt(run.attemptId);
+        if (attempt.submissionStatus === 'prepared') this.ledger.markDispatching(attempt.attemptId);
+        if (this.ledger.getAttempt(attempt.attemptId).submissionStatus !== 'accepted') {
+          // The durable local run is positive admission evidence, never a remote retry.
+          this.ledger.accept(attempt.attemptId, { provider: 'resident_role', runId: attempt.attemptId },
+            { executionStatus: run.executionStatus, phase: run.phase });
+        }
+      }
+      this.save();
+      if (this.config.automation) this.automation = new A2AAutomation(this, this.config.automation);
+    }
     catch (error) { this.lease.close(); throw error; }
-    this.timer = setInterval(() => { void this.reconcile(); }, this.config.pollIntervalMs);
+    this.timer = setInterval(() => { void this.reconcile().catch(() => {}); }, this.config.pollIntervalMs);
     this.timer.unref();
-    void this.reconcile();
+    void this.reconcile().catch(() => {});
   }
 
   private save(): void { atomicJson(this.stateFile, this.state); }
-  private client(remote: string): Promise<Client> {
-    const config = this.config.remotes[remote];
-    if (!config) throw new Error(`Unknown remote: ${remote}`);
-    let pending = this.clients.get(remote);
+  private standardState(value: string): ExecutionStatus {
+    return ({ TASK_STATE_SUBMITTED: 'submitted', TASK_STATE_WORKING: 'working', TASK_STATE_INPUT_REQUIRED: 'input_required',
+      TASK_STATE_AUTH_REQUIRED: 'auth_required', TASK_STATE_COMPLETED: 'completed', TASK_STATE_FAILED: 'failed',
+      TASK_STATE_CANCELED: 'canceled', TASK_STATE_REJECTED: 'rejected' } as Record<string, ExecutionStatus>)[value] ?? 'unknown';
+  }
+  private legacySnapshot(job: Job) {
+    try { return this.targetSnapshot(this.targets.resolve(`legacy:${job.remote}`, { cwd: job.cwd, prompt: 'Legacy task migration', ...(job.agentPreset ? { agentPreset: job.agentPreset } : {}) })); }
+    catch { return { targetId: `legacy:${job.remote}`, provider: 'a2a', remote: job.remote, cwd: job.cwd, agentPreset: job.agentPreset, historicalConfigUnknown: true }; }
+  }
+  private targetSnapshot(resolved: ExecutionTargetSnapshot) {
+    return { targetId: resolved.target.targetId, configVersion: resolved.configVersion, connectionId: resolved.connection.connectionId,
+      connectionVersion: resolved.connectionVersion, provider: resolved.target.binding.driver === 'ppt_delivery' ? 'resident_role' : 'a2a',
+      roleId: resolved.target.binding.roleId, binding: resolved.target.binding, remote: resolved.remote, endpoint: resolved.endpoint, cwd: resolved.cwd,
+      agentPreset: resolved.agentPreset, capabilities: resolved.target.capabilities };
+  }
+  private ledgerView(originSessionId: string, jobId: string) {
+    const view = this.ledger.get(originSessionId, jobId);
+    const attempt = view.attempts.find(item => item.attemptId === view.currentAttemptId)!;
+    const raw = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
+    return { ...view, attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
+      backendRunRef: attempt.backendRunRef, phase: attempt.phase, stale: attempt.stale,
+      resultSummary: view.result?.resultSummary, artifactLinks: view.result?.artifactLinks ?? [],
+      resultDigest: view.result?.resultDigest, resultRevision: view.result?.resultRevision,
+      ...(raw ? { remote: raw.remote, taskId: raw.taskId, contextId: raw.contextId,
+        sessionId: Task.fromJSON(raw.task).metadata?.['1agents']?.sessionId,
+        resultMetadata: Task.fromJSON(raw.task).metadata?.['1agents']?.result } : {}) };
+  }
+  private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
+    const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
+    if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+    const resolved = this.targets.resolve(input.targetId, input.input);
+    if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
+      throw new Error('Continue must preserve the original remote, cwd and preset');
+    }
+    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: this.targetSnapshot(resolved),
+      operation: options.jobId ? 'continue' : 'submit' });
+    if (prepared.idempotent) return this.ledgerView(input.originSessionId, prepared.job.jobId);
+    const { job, attempt } = prepared;
+    let sent = false;
+    try {
+      if (resolved.target.binding.driver === 'ppt_delivery') {
+        if (options.jobId && !options.deliveryRecovery) throw new Error('PPT continuation requires an independently passed recovery checkpoint');
+        const roleInput = pptDeliveryInputSchema.parse(input.input);
+        if (!this.config.pptDelivery) throw new Error('PPT delivery role policy is not configured');
+        const run = options.deliveryRecovery ? await recoverPptDeliveryRun(options.deliveryRecovery, attempt.attemptId)
+          : await createPptDeliveryRun({ sourceId: this.ledger.sourceId, jobId: job.jobId, attemptId: attempt.attemptId,
+            originSessionId: input.originSessionId, input: roleInput, policy: this.config.pptDelivery });
+        this.state.pptDeliveries.runs[attempt.attemptId] = run;
+        this.ledger.markDispatching(attempt.attemptId);
+        this.ledger.accept(attempt.attemptId, { provider: 'resident_role', runId: attempt.attemptId }, { executionStatus: 'working', phase: 'preparing' });
+        return this.ledgerView(input.originSessionId, job.jobId);
+      }
+      const fields = resolved.input;
+      const preflight = fields.preflight === undefined ? undefined : a2aPreflightRequirementsSchema.parse(fields.preflight);
+      const requirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
+      const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
+      const resultContract = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
+      await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
+      const client = await this.client(resolved.remote, resolved.endpoint);
+      // Target changes/disable during asynchronous preflight must win before sending.
+      const fresh = this.targets.resolve(input.targetId, input.input);
+      if (fresh.configVersion !== resolved.configVersion || fresh.connectionVersion !== resolved.connectionVersion) throw new Error('Execution target changed before dispatch');
+      this.ledger.markDispatching(attempt.attemptId); sent = true;
+      const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
+        ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
+        metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
+          ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}) } },
+        configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
+          authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
+      if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
+      this.accept(task, { remote: resolved.remote, remoteEndpoint: resolved.endpoint, originSessionId: options.notificationOrigin ?? input.originSessionId, cwd: resolved.cwd!,
+        agentPreset: resolved.agentPreset, title: input.title ?? (typeof fields.title === 'string' ? fields.title : undefined),
+        notificationTarget: typeof fields.notificationTarget === 'string' ? fields.notificationTarget : undefined,
+        ledgerJobId: job.jobId, attemptId: attempt.attemptId });
+      return this.ledgerView(input.originSessionId, job.jobId);
+    } catch (error) {
+      const diagnostic = error instanceof Error ? error.message : 'Execution dispatch failed';
+      if (sent) this.ledger.markUnknown(attempt.attemptId, diagnostic);
+      else this.ledger.knownNotSubmitted(attempt.attemptId, { executionStatus: 'rejected', diagnostic });
+      return { ...this.ledgerView(input.originSessionId, job.jobId), error: diagnostic };
+    }
+  }
+  private childView(origin: string, jobId: string): PptDeliveryChild {
+    return this.ledgerView(origin, jobId) as PptDeliveryChild;
+  }
+  private async advanceDelivery(run: PptDeliveryRun): Promise<void> {
+    const rootOrigin = run.originSessionId;
+    const submitChild = async (request: PptDeliveryChildRequest, previous?: PptDeliveryChild) => {
+      if (request.parentJobRef.sourceId !== run.sourceId || request.parentJobRef.jobId !== run.jobId || request.parentAttemptId !== run.attemptId) throw new Error('Delivery child parent scope mismatch');
+      if (![run.policy.summaryTargetId, run.policy.makerTargetId, run.policy.reviewTargetId, ...Object.values(run.policy.backupTargets ?? {})].includes(request.targetId)) throw new Error('Delivery child target is outside frozen policy');
+      if (this.ledger.get(rootOrigin, run.jobId).currentAttemptId !== run.attemptId) throw new Error('Delivery attempt is no longer current');
+      const raw = previous ? this.state.jobs.find(item => item.attemptId === previous.attemptId) : undefined;
+      if (previous && !raw) throw new Error('Previous delivery child has no A2A backend reference');
+      const originalChild = previous ? this.ledger.get(rootOrigin, previous.jobId) : undefined;
+      if (originalChild && originalChild.parentJobRef?.jobId !== run.jobId) throw new Error('Recovered child belongs to another parent');
+      // Reusing an existing child never reparents its Job. The new parent round records reuse in its recovery receipt.
+      return await this.submitExecution({ ...request, originSessionId: rootOrigin,
+        ...(originalChild ? { parentJobRef: originalChild.parentJobRef, parentAttemptId: originalChild.parentAttemptId } : {}) }, { notificationOrigin: request.originSessionId,
+        ...(previous ? { jobId: previous.jobId, previous: raw } : {}) }) as PptDeliveryChild;
+    };
+    await advancePptDelivery(run, {
+      persist: async saved => { this.state.pptDeliveries.runs[saved.attemptId] = saved; this.save(); },
+      submitChild: request => submitChild(request),
+      continueChild: request => submitChild(request, request.child),
+      getChild: async child => this.childView(rootOrigin, child.jobId),
+      ackChild: async child => {
+        const raw = this.state.jobs.find(item => item.attemptId === child.attemptId);
+        if (!raw) return;
+        for (const record of this.state.notices.filter(item => item.notice.taskId === raw.taskId && item.notice.originSessionId === raw.originSessionId)) record.acknowledged = true;
+        this.save();
+      },
+      updateParent: async update => {
+        this.ledger.observe(run.attemptId, { executionStatus: update.executionStatus, phase: update.phase,
+          ...(update.resultSummary ? { resultSummary: update.resultSummary } : {}),
+          ...(update.artifactLinks ? { artifactLinks: update.artifactLinks } : {}),
+          ...(update.deliveryReceipt ? { structuredResultRef: update.deliveryReceipt,
+            resultDigest: String(update.deliveryReceipt.resultDigest ?? run.validation?.artifactDigest ?? ''), resultRevision: `revision-${run.revision}` } : {}),
+          ...(update.error ? { diagnostic: update.error } : {}) });
+        if (update.executionStatus !== 'working') this.executionNotice(run, update.resultSummary ?? update.error ?? 'PPT delivery requires attention', update.artifactLinks ?? []);
+      },
+    });
+  }
+  private executionNotice(run: PptDeliveryRun, resultSummary: string, links: any[]): void {
+    const noticeId = createHash('sha256').update(JSON.stringify([run.sourceId, run.jobId, run.attemptId, run.revision, run.executionStatus])).digest('hex');
+    if (this.state.executionNotices!.some(item => item.noticeId === noticeId)) return;
+    const artifactLinks = links.map(item => ({ url: item.url, mediaType: item.mediaType, sha256: item.sha256, size: item.size }));
+    const text = `[任务交付通知] ${run.executionStatus === 'completed' ? '任务已完成' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
+      artifactLinks.map(item => `[${item.mediaType?.includes('presentation') ? '最终 PPT' : '预览产物'}](${item.url})`).join('\n') +
+      `\n\n请通过 a2a-gateway 的 execution_get 或 execution_inbox 读取交付回执；业务接受调用 execution_review，通知处理调用 execution_ack，两者分别记录。\n---\n任务定位信息：\n${JSON.stringify({ noticeId, sourceId: run.sourceId, jobId: run.jobId, attemptId: run.attemptId, originSessionId: run.originSessionId })}`;
+    this.state.executionNotices!.push({ noticeId, messageId: `execution-notice:${noticeId}`, originSessionId: run.originSessionId,
+      jobId: run.jobId, attemptId: run.attemptId, executionStatus: run.executionStatus, resultSummary, artifactLinks, createdAt: new Date().toISOString(), text });
+    this.save();
+  }
+  private async probeTarget(targetId: string) {
+    const target = this.targets.getTarget(targetId), connection = this.targets.getConnection(target.connectionId);
+    if (!target.enabled || !connection.enabled || target.kind === 'workflow') return this.targets.invoke('execution_target_probe', { targetId });
+    const checkedAt = new Date().toISOString(), baseTtl = connection.probePolicy?.ttlMs ?? 60_000;
+    const checkedScope = ['agent_card']; let connectionStatus: 'reachable' | 'unreachable' = 'reachable';
+    let targetStatus: 'ready' | 'misconfigured' | 'unavailable' = 'ready'; let reasonCode: string | undefined;
+    try {
+      const key = `${connection.connectionId}:${connection.connectionVersion}`;
+      let probe = this.probeCards.get(key);
+      if (!probe || probe.until <= Date.now()) {
+        const result = this.client(connection.remote, connection.endpoint).then(client => client.getAgentCard(this.auth(connection.remote)));
+        probe = { until: Date.now() + baseTtl, result }; this.probeCards.set(key, probe);
+      }
+      await probe.result;
+      if (target.binding.cwd) {
+        const report = await this.preflight(connection.remote, { cwd: target.binding.cwd,
+          ...(target.binding.allowedDirectories ? { allowedDirectories: target.binding.allowedDirectories } : {}) }, connection.endpoint);
+        checkedScope.push('cwd_realpath_permissions', ...(target.binding.allowedDirectories ? ['directory_scope'] : []));
+        if (!report.ok) { targetStatus = 'misconfigured'; reasonCode = 'remote_preflight_failed'; }
+      }
+    } catch { connectionStatus = 'unreachable'; targetStatus = 'unavailable'; reasonCode = 'read_only_probe_failed'; }
+    const failureKey = `${targetId}:${target.configVersion}:${connection.connectionVersion}`;
+    const failureCount = targetStatus === 'ready' ? 0 : (this.probeFailures.get(failureKey) ?? 0) + 1;
+    this.probeFailures.set(failureKey, failureCount);
+    const ttl = targetStatus === 'ready' ? baseTtl : Math.min(600_000, baseTtl * 2 ** Math.min(failureCount, 6));
+    const health = { targetId, configVersion: target.configVersion, connectionId: target.connectionId,
+      connectionVersion: connection.connectionVersion, checkedAt, validUntil: new Date(Date.now() + ttl).toISOString(), checkedScope,
+      connectionStatus, targetStatus, failureCount, ...(reasonCode ? { reasonCode } : {}) };
+    this.targets.recordProbe(health);
+    return { ...this.targets.invoke('execution_target_probe', { targetId }) as any, performed: true, health,
+      unverified: ['arbitrary_task_success', 'model_quota', ...(target.binding.agentPreset ? ['preset_existence'] : [])] };
+  }
+  private client(remote: string, pinnedEndpoint?: string): Promise<Client> {
+    const configured = this.config.remotes[remote];
+    if (!configured) throw new Error(`Unknown remote: ${remote}`);
+    const config = { ...configured, url: pinnedEndpoint ?? configured.url }, key = `${remote}:${config.url}`;
+    let pending = this.clients.get(key);
     if (!pending) {
       const fetchImpl: typeof fetch = async (input, init) => {
         if (this.closed) throw new Error('Gateway is closed');
@@ -159,12 +399,36 @@ export class RemoteAgentGateway {
       };
       pending = new ClientFactory({ transports: [new JsonRpcTransportFactory({ fetchImpl })],
         cardResolver: new DefaultAgentCardResolver({ fetchImpl }), clientConfig: { polling: true } }).createFromUrl(config.url);
-      this.clients.set(remote, pending);
-      void pending.catch(() => { if (this.clients.get(remote) === pending) this.clients.delete(remote); });
+      this.clients.set(key, pending);
+      void pending.catch(() => { if (this.clients.get(key) === pending) this.clients.delete(key); });
     }
     return pending;
   }
   private auth(remote: string) { return { serviceParameters: { Authorization: `Bearer ${this.config.remotes[remote]!.token}` } }; }
+  private async preflight(remote: string, input: z.output<typeof a2aPreflightInputSchema>, pinnedEndpoint?: string) {
+    const configured = this.config.remotes[remote];
+    const config = configured ? { ...configured, url: pinnedEndpoint ?? configured.url } : undefined;
+    if (!config) throw new Error(`Unknown remote: ${remote}`);
+    const client = await this.client(remote, config.url), card = await client.getAgentCard(this.auth(remote));
+    const endpoint = card.supportedInterfaces.find(value => value.protocolBinding === 'JSONRPC')?.url;
+    if (!endpoint) throw new Error('Remote does not advertise a JSONRPC endpoint');
+    const url = new URL(endpoint);
+    if (url.origin !== new URL(config.url).origin || url.username || url.password) throw new Error('Preflight endpoint must use the configured remote origin');
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/preflight`; url.search = ''; url.hash = '';
+    const controller = new AbortController(); this.controllers.add(controller);
+    try {
+      const response = await fetch(url, { method: 'POST', redirect: 'error',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.token}` },
+        body: JSON.stringify(input), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]) });
+      if (!response.ok) { await response.body?.cancel(); throw new Error(`Remote preflight failed (HTTP ${response.status})`); }
+      return a2aPreflightReportSchema.parse(await response.json());
+    } finally { this.controllers.delete(controller); }
+  }
+  private async checkDispatch(remote: string, cwd: string, requirements?: z.output<typeof a2aPreflightRequirementsSchema>, pinnedEndpoint?: string): Promise<void> {
+    if (!requirements) return;
+    const report = await this.preflight(remote, { cwd, ...requirements }, pinnedEndpoint);
+    if (!report.ok) throw new Error(`Remote preflight rejected dispatch: ${report.checks.filter(check => !check.ok).map(check => check.id).join(', ')}`);
+  }
   private job(params: z.output<typeof taskSchema>): Job {
     const job = this.state.jobs.find(value => value.remote === params.remote && value.taskId === params.taskId && value.originSessionId === params.originSessionId);
     if (!job) throw new Error('Task not found for this origin session');
@@ -173,8 +437,10 @@ export class RemoteAgentGateway {
   private view(job: Job) {
     const task = Task.fromJSON(job.task);
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
+      ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
       cwd: job.cwd, agentPreset: job.agentPreset, sessionId: task.metadata?.['1agents']?.sessionId,
-      state: taskState(job), result: resultText(task), checkedAt: job.checkedAt, stale: Boolean(job.stale) };
+      preflight: task.metadata?.['1agents']?.preflight, resultMetadata: task.metadata?.['1agents']?.result,
+      state: taskState(job), result: resultText(task), artifactLinks: artifactLinks(task), checkedAt: job.checkedAt, stale: Boolean(job.stale) };
   }
   private accept(task: Task, fields: Omit<Job, 'task' | 'taskId' | 'contextId' | 'checkedAt'>): Job {
     const target = task.metadata?.['1agents'] as Record<string, unknown> | undefined;
@@ -194,19 +460,30 @@ export class RemoteAgentGateway {
     const state = taskState(job);
     if (actionable.has(state)) {
       const noticeId = createHash('sha256').update(JSON.stringify([job.remote, job.taskId, state, task.status?.timestamp])).digest('hex');
-      if (!this.state.notices.some(value => value.notice.noticeId === noticeId)) this.state.notices.push({ target: job.notificationTarget,
+      if (!this.state.notices.some(value => value.notice.noticeId === noticeId)) this.state.notices.push({
+        ...(this.sessions.hasBinding(job.originSessionId) ? { sessionDeliveryId: `a2a-notice:${noticeId}` } : { target: job.notificationTarget }),
         notice: { noticeId, originSessionId: job.originSessionId, remote: job.remote, taskId: job.taskId, contextId: job.contextId,
-          cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: resultText(task), createdAt: new Date().toISOString() } });
+          cwd: job.cwd, agentPreset: job.agentPreset, title: job.title, state, result: resultText(task),
+          ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}), createdAt: new Date().toISOString() } });
     }
-    this.save();
+    if (job.attemptId) {
+      const metadata = task.metadata?.['1agents']?.result as any;
+      const observed = { executionStatus: this.standardState(state), providerState: state, stale: false,
+        resultSummary: resultText(task), artifactLinks: artifactLinks(task),
+        ...(metadata ? { structuredResultRef: metadata.recordPath } : {}) };
+      if (this.ledger.getAttempt(job.attemptId).submissionStatus !== 'accepted') this.ledger.accept(job.attemptId,
+        { provider: 'a2a', remote: job.remote, endpoint: job.remoteEndpoint, taskId: task.id, contextId: task.contextId, sessionId: task.metadata?.['1agents']?.sessionId }, observed);
+      else this.ledger.observe(job.attemptId, observed);
+    } else this.save();
   }
   private async refresh(job: Job): Promise<void> {
     const key = `${job.remote}:${job.taskId}`;
     const previous = this.refreshing.get(key);
     if (previous) return previous;
     const pending = (async () => {
-      try { const client = await this.client(job.remote); this.update(job, await client.getTask(GetTaskRequest.fromJSON({ id: job.taskId }), this.auth(job.remote))); }
-      catch { job.stale = true; this.save(); }
+      try { const client = await this.client(job.remote, job.remoteEndpoint); this.update(job, await client.getTask(GetTaskRequest.fromJSON({ id: job.taskId }), this.auth(job.remote))); }
+      catch { job.stale = true;
+        if (job.attemptId) this.ledger.observe(job.attemptId, { stale: true }); else this.save(); }
     })();
     this.refreshing.set(key, pending);
     try { await pending; } finally { this.refreshing.delete(key); }
@@ -215,8 +492,38 @@ export class RemoteAgentGateway {
     if (this.closed) return;
     if (this.reconciling) return this.reconciling;
     const pending = (async () => {
+      await Promise.allSettled(this.targets.listTargets().filter(target => target.enabled && target.kind !== 'workflow' && !this.targets.getHealth(target.targetId))
+        .map(target => this.probeTarget(target.targetId)));
       await Promise.allSettled(this.state.jobs.filter(job => !terminal.has(taskState(job))).map(job => this.refresh(job)));
       if (this.closed) return;
+      for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
+        if (this.closed) break;
+        if (run.executionStatus === 'working' || run.parentUpdatePending) {
+          try { await this.advanceDelivery(run); }
+          catch (error) { run.diagnostics.push(error instanceof Error ? error.message : 'Delivery reconciliation failed'); this.save(); }
+        }
+        if (run.executionStatus !== 'working' && !run.parentUpdatePending) this.executionNotice(run,
+          run.resultSummary ?? this.ledgerView(run.originSessionId, run.jobId).resultSummary ?? run.diagnostics.at(-1) ?? 'PPT delivery requires attention', run.validation?.artifacts ?? []);
+      }
+      // The persisted notice owns its route. Later bindings must not double-deliver old webhooks.
+      if (this.sessions.healthy) for (const record of this.state.notices) {
+        if (!record.sessionDeliveryId) continue;
+        if (record.acknowledged) { this.sessions.acknowledgeNotice(record.notice.originSessionId, record.notice.noticeId); continue; }
+        const notice = record.notice;
+        // Keep already-persisted queue text immutable across notification format upgrades.
+        if (this.sessions.hasDelivery(notice.originSessionId, record.sessionDeliveryId)) continue;
+        this.sessions.enqueue({ originSessionId: notice.originSessionId, messageId: record.sessionDeliveryId,
+          text: formatNotice(notice) });
+      }
+      if (this.sessions.healthy) await this.sessions.reconcile();
+      if (this.sessions.healthy) {
+        for (const notice of this.state.executionNotices ?? []) {
+          if (!notice.processedAt && this.sessions.hasBinding(notice.originSessionId) && !this.sessions.hasDelivery(notice.originSessionId, notice.messageId)) {
+            this.sessions.enqueue({ originSessionId: notice.originSessionId, messageId: notice.messageId, text: notice.text });
+          }
+        }
+        await this.sessions.reconcile();
+      }
       await Promise.allSettled(this.state.notices.filter(record => record.target && !record.delivered && !record.acknowledged).map(record => this.deliver(record)));
       await this.automation?.reconcileAcknowledgements();
     })();
@@ -244,34 +551,129 @@ export class RemoteAgentGateway {
     try { return await operation; } finally { this.operations.delete(operation); }
   }
   private async invokeMethod(method: string, params: unknown): Promise<unknown> {
+    if (Object.hasOwn(TARGET_METHODS, method)) {
+      if (method === 'execution_target_probe') return this.probeTarget(z.object({ targetId: string }).strict().parse(params).targetId);
+      return this.targets.invoke(method, params);
+    }
+    if (method === 'execution_submit') return this.submitExecution(executionSubmitSchema.parse(params));
+    if (method === 'execution_continue') {
+      const input = executionContinueSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
+      const replay = this.ledger.replay({ originSessionId: input.originSessionId, jobId: job.jobId,
+        operation: 'continue', title: job.title, targetSnapshot: { targetId: job.targetId },
+        input: input.input, requestDigestInput: input.input, clientRequestId: input.clientRequestId });
+      if (replay) return { ...this.ledgerView(input.originSessionId, job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
+      const attempt = job.attempts.find(item => item.attemptId === job.currentAttemptId)!;
+      if (job.unresolvedAttemptIds.length) throw new Error('Job has submission_unknown or unresolved attempts; reconcile before continuing');
+      const delivery = this.state.pptDeliveries.runs[attempt.attemptId];
+      if (delivery) {
+        if (Object.keys(input.input).length) throw new Error('PPT checkpoint recovery preserves the frozen input; use an empty input object');
+        if (job.inFlightAttemptIds.length) throw new Error('PPT parent still has in-flight execution rounds');
+        assertPptDeliveryRecoverable(delivery);
+        const current = this.targets.resolve(job.targetId, attempt.input as Record<string, unknown>);
+        if (!current.target.capabilities?.continue) throw new Error('PPT target does not enable checkpoint continuation');
+        const snapshot = attempt.targetSnapshot;
+        if (current.remote !== snapshot.remote || current.endpoint !== snapshot.endpoint || current.cwd !== snapshot.cwd
+            || current.agentPreset !== snapshot.agentPreset || current.target.binding.roleId !== snapshot.roleId
+            || current.target.binding.driver !== 'ppt_delivery') throw new Error('PPT checkpoint recovery cannot change its host or role');
+        return this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
+          input: attempt.input as Record<string, unknown>, clientRequestId: input.clientRequestId },
+          { jobId: job.jobId, deliveryRecovery: delivery, requestDigestInput: input.input });
+      }
+      const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
+      if (!previous) throw new Error('Continue is unsupported for this provider');
+      return this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
+        input: { ...(attempt.input as Record<string, unknown>), ...input.input }, clientRequestId: input.clientRequestId }, { jobId: job.jobId, previous, requestDigestInput: input.input });
+    }
+    if (method === 'execution_get') {
+      const input = executionJobSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
+      const raw = this.state.jobs.find(item => item.attemptId === job.currentAttemptId);
+      if (raw) await this.refresh(raw);
+      return this.ledgerView(input.originSessionId, input.jobId);
+    }
+    if (method === 'execution_cancel') {
+      const input = executionJobSchema.parse(params), job = this.ledger.get(input.originSessionId, input.jobId);
+      const raw = this.state.jobs.find(item => item.attemptId === job.currentAttemptId);
+      if (!raw) throw new Error('Cancel is unsupported for this provider or requires admission reconciliation');
+      await this.invokeMethod('remote_agent_cancel', { originSessionId: raw.originSessionId, remote: raw.remote, taskId: raw.taskId });
+      return this.ledgerView(input.originSessionId, input.jobId);
+    }
+    if (method === 'execution_list') {
+      const input = executionListSchema.parse(params);
+      const jobs = this.ledger.list(input.originSessionId).filter(job => (!input.targetId || job.targetId === input.targetId) && (!input.executionStatus || job.executionStatus === input.executionStatus));
+      return { jobs: jobs.slice(input.offset, input.offset + input.limit), total: jobs.length, offset: input.offset, limit: input.limit };
+    }
+    if (method === 'execution_events') {
+      const input = executionEventsSchema.parse(params);
+      const events = this.ledger.events(input.originSessionId, input.jobId, input.afterSequence), page = events.slice(0, input.limit);
+      return { sourceId: this.ledger.sourceId, events: page, hasMore: events.length > page.length, nextSequence: page.at(-1)?.sequence };
+    }
+    if (method === 'execution_review') {
+      const { originSessionId, jobId, ...review } = executionReviewSchema.parse(params);
+      return this.ledger.acceptance(originSessionId, jobId, review);
+    }
+    if (method === 'execution_inbox') {
+      const { originSessionId } = inboxSchema.parse(params);
+      return { notices: this.state.executionNotices!.filter(item => item.originSessionId === originSessionId && !item.processedAt)
+        .map(({ text: _text, ...notice }) => notice) };
+    }
+    if (method === 'execution_ack') {
+      const input = ackSchema.parse(params), notice = this.state.executionNotices!.find(item => item.originSessionId === input.originSessionId && item.noticeId === input.noticeId);
+      if (!notice) throw new Error('Execution notice not found in origin scope');
+      notice.processedAt ??= new Date().toISOString(); this.save();
+      this.sessions.acknowledgeMessage(input.originSessionId, notice.messageId);
+      return { acknowledged: true, noticeId: notice.noticeId, processedAt: notice.processedAt };
+    }
+    if (method === 'remote_agent_preflight') {
+      const { remote, originSessionId: _origin, ...input } = preflightSchema.parse(params);
+      return this.preflight(remote, input);
+    }
+    if (method === 'session_bind') return this.sessions.bind(sessionBindSchema.parse(params));
+    if (method === 'session_send') {
+      const input = sessionSendSchema.parse(params);
+      if (input.messageId.startsWith('a2a-notice:') || input.messageId.startsWith('execution-notice:')) throw new Error('The a2a-notice: and execution-notice: message ID namespaces are reserved for task notifications');
+      const result = this.sessions.enqueue(input);
+      void this.reconcile().catch(() => {});
+      return result;
+    }
+    if (method === 'session_delivery_get') return this.sessions.get(sessionMessageSchema.parse(params));
+    if (method === 'session_delivery_resolve') {
+      const result = this.sessions.resolve(sessionResolveSchema.parse(params));
+      void this.reconcile().catch(() => {});
+      return result;
+    }
     if (method === 'remote_agent_spawn') {
       const input = spawnSchema.parse(params);
       if (input.notificationTarget && !this.config.notificationTargets[input.notificationTarget]) throw new Error('Unknown notificationTarget');
-      const client = await this.client(input.remote);
-      const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: randomUUID(), role: 'ROLE_USER', parts: [{ text: input.prompt }] },
-        metadata: { '1agents': { cwd: input.cwd, ...(input.agentPreset ? { agentPreset: input.agentPreset } : {}) } },
-        configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
-          authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(input.remote));
-      if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
-      return this.view(this.accept(task, { remote: input.remote, originSessionId: input.originSessionId, cwd: input.cwd, agentPreset: input.agentPreset, title: input.title, notificationTarget: input.notificationTarget }));
+      const { originSessionId, remote, clientRequestId, title, ...fields } = input;
+      const submitted = await this.submitExecution({ originSessionId, targetId: `legacy:${remote}`, input: fields, clientRequestId, title });
+      if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
+      const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
+      if (!raw) throw new Error(`Task admission unresolved; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
+      return this.view(raw);
     }
     if (method === 'remote_agent_get' || method === 'remote_agent_cancel') {
       const job = this.job(taskSchema.parse(params));
       if (method === 'remote_agent_cancel') {
-        const client = await this.client(job.remote);
+        if (job.attemptId) this.ledger.requestCancellation(job.attemptId);
+        const client = await this.client(job.remote, job.remoteEndpoint);
         this.update(job, await client.cancelTask(CancelTaskRequest.fromJSON({ id: job.taskId }), this.auth(job.remote)));
       } else await this.refresh(job);
       return this.view(job);
     }
     if (method === 'remote_agent_message') {
       const input = messageSchema.parse(params), previous = this.job(input);
-      const client = await this.client(input.remote);
-      const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: randomUUID(), role: 'ROLE_USER', contextId: previous.contextId, parts: [{ text: input.prompt }] },
-        configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
-          authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(input.remote));
-      if (!('id' in task)) throw new Error('Remote did not return an A2A Task');
-      return this.view(this.accept(task, { remote: previous.remote, originSessionId: previous.originSessionId, cwd: previous.cwd, agentPreset: previous.agentPreset,
-        title: previous.title, notificationTarget: previous.notificationTarget }));
+      if (!previous.ledgerJobId) throw new Error('Task has no unified job association');
+      const record = this.ledger.get(input.originSessionId, previous.ledgerJobId);
+      const target = this.targets.getTarget(record.targetId);
+      const submitted = await this.submitExecution({ originSessionId: input.originSessionId, targetId: record.targetId,
+        clientRequestId: input.clientRequestId, title: previous.title,
+        input: { ...(target.kind === 'agent_host' ? { cwd: previous.cwd, ...(previous.agentPreset ? { agentPreset: previous.agentPreset } : {}) } : {}), prompt: input.prompt,
+          ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
+          ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
+      if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
+      const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);
+      if (!raw) throw new Error(`Task admission unresolved; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
+      return this.view(raw);
     }
     if (method === 'remote_agent_list' || method === 'remote_agent_inbox') {
       const { originSessionId } = inboxSchema.parse(params);
@@ -282,7 +684,9 @@ export class RemoteAgentGateway {
       const input = ackSchema.parse(params);
       const notice = this.state.notices.find(record => record.notice.originSessionId === input.originSessionId && record.notice.noticeId === input.noticeId);
       if (!notice) throw new Error('Notice not found for this origin session');
-      notice.acknowledged = true; this.save(); return { acknowledged: true, noticeId: input.noticeId };
+      notice.acknowledged = true; this.save();
+      this.sessions.acknowledgeNotice(input.originSessionId, input.noticeId);
+      return { acknowledged: true, noticeId: input.noticeId };
     }
     throw new Error(`Unknown method: ${method}`);
   }
@@ -298,6 +702,7 @@ export class RemoteAgentGateway {
     if (this.closed) return;
     this.closed = true; clearInterval(this.timer);
     for (const controller of this.controllers) controller.abort();
+    await this.sessions.close();
     await Promise.allSettled([...this.refreshing.values(), ...this.operations, ...(this.reconciling ? [this.reconciling] : [])]);
     // Delivery promises release their controllers after abort; HTTP requests
     // may have already succeeded, so any retry keeps the stable notice ID.
@@ -333,7 +738,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
   const gateway = new RemoteAgentGateway(input);
   const server = http.createServer((req, res) => { void (async () => {
     try {
-      if (req.method === 'GET' && req.url === '/health') return json(res, 200, { status: 'ok', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes) });
+      if (req.method === 'GET' && req.url === '/health') return json(res, gateway.sessions.healthy ? 200 : 503, { status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes), sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable' });
       if (req.method !== 'POST' || req.url !== '/invoke') return json(res, 404, { error: 'No route' });
       // Local tools are trusted. The separate tailnet receiver below never exposes /invoke.
       if (req.headers.origin) return json(res, 403, { error: 'Browser-origin invocation is not allowed' });
@@ -362,11 +767,16 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
       automationPort = await listen(automationServer, gateway.config.automation.port, gateway.config.automation.host);
     }
     const entry = { id: 'a2a-gateway', name: 'DSH 远端智能体', kind: 'agent_runtime' as const,
-      capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http' as const, port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS };
+      capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http' as const, port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS,
+      metadata: { local_only_methods: Object.keys(TARGET_METHODS) } };
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);
+    // Node's directory is ephemeral. Re-report after a Node restart; this never registers new execution targets.
+    const reporting = options.report === false ? undefined : setInterval(() => { void reportToAgent(entry).catch(() => {}); }, 15_000);
+    reporting?.unref();
     let closing: Promise<void> | undefined;
     return { gateway, port, callbackPort, automationPort, registration, close: async () => {
       closing ??= (async () => {
+        if (reporting) clearInterval(reporting);
         // Stop accepting requests and drain their ledger writes while this instance
         // still owns the storage lease. Automation continuations and its admission
         // queue can outlive the gateway operation they awaited.
