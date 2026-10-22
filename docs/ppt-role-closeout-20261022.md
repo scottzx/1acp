@@ -25,3 +25,10 @@
 网关与 DSH 从同一干净提交构建完整本地发布包；角色 bundle、固定规则、设计技能及运行时说明另存私有可恢复快照。机器私密配置、模型设置与任务存储沿用既有配置。其他进行中的人工审核/工作台开发不纳入本轮提交或发布，不发布 npm。
 
 预定本地发布目录：`/Users/scott/.local/share/1agents/a2a-gateway/releases/20261022-ppt-role-closeout-01`。部署回执与验证结果放在该目录 `evidence/`；角色归档和同步清单放在 `/Users/scott/.local/share/1agents/ppt-beautifier/state/closeout-20261022`。
+
+## 已完成的同步结果
+
+- 实现提交：`fdc9045`，已推送 `origin/main`。干净独立 checkout 完整构建与服务类型检查通过；交付、网关与账本回归 **59/59**，其中 PPT 交付 **29/29**；角色设计技能 quick_validate 通过。
+- 当前本地 releaseId：`0.8.3-local.21bbd1cb92b6.99c75afce751`，源码 dirty=false。网关、DSH 已激活同一完整包，健康检查、Agent Card 及角色预设均通过；切换前确认共享宿主无运行会话。
+- 角色 `0.3.0` 的 persona、固定规则、设计技能、运行时说明、当前绑定和调用方参考已同步；完整角色快照含 150 个文件，归档 SHA256 `2be5c9daeafe70a54c872fa0ee90bb04339e473c42248ee09d18a9b0ca163901`，证据保存在上述私有 state 目录。
+- 本轮没有提交、继续或重试任何模型任务，没有修改业务 PPT/预览，也没有更改历史任务状态；没有实跑新版本制作任务，遵从本次只收尾决定。
