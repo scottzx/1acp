@@ -161,7 +161,7 @@ Agent 输入包含 prompt、远端 cwd 和可选 preset；工作流使用结构�
 
 ### 4.5 临时任务 PWD 探查与一键导入（Session Reader 可选集成）
 
-**2026-10-23 源码进展**：基于项目/PWD 元数据的角色候选发现已实现可选 Reader CLI 适配，支持手动或显式定频探查；对应 `execution_project_scan/list`、`execution_discovery_config_get/update`，默认 manual。只读目录元数据及角色 profile 结构，快照落在 `.1agents/state/a2a-gateway/project-discovery/discovery.json`，失败保留旧快照并标 partial/stale；不读会话正文、不加载角色代码、不创建任务、不注册目标或唤醒主会话。Reader 当前提供 projects CLI，没有同名 HTTP 接口。此处记录源码能力，不代表已部署或已通过实机验收。**一键填入任务 cwd 与自动注册仍未实现**；后文的选择与导入流程属于后续规划。
+**2026-10-23 源码进展**：基于项目/PWD 元数据的角色候选发现已实现可选 Reader CLI 适配，支持手动或显式定频探查；对应 `execution_project_scan/list`、`execution_discovery_config_get/update`，默认 manual。只读目录元数据及角色 profile 结构，快照落在 `.1agents/state/a2a-gateway/project-discovery/discovery.json`，失败保留旧快照并标 partial/stale；不读会话正文、不加载角色代码、不创建任务、不注册目标或唤醒主会话。Reader 当前提供 projects CLI，没有同名 HTTP 接口。当前网关已部署，真实 Reader 手动探查通过；定频由隔离后台测试验证，生产保持 manual，见[探查验收记录](project-role-discovery-20261023.md)。**一键填入任务 cwd 与自动注册仍未实现**；后文的选择与导入流程属于后续规划。
 
 后续一键导入流程为：选择通用宿主目标 → 显式发起“从 Session Reader 获取工作目录” → 手动选择具体目录 → 一键填入本次任务 cwd → 正常提交任务。这里的导入仅辅助填写工作目录，不导入历史上下文，不创建固定职能 Agent 或自动启动任务。
 
