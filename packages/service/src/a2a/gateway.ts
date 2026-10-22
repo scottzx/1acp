@@ -16,6 +16,7 @@ import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.j
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
 import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
+import { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema } from '../execution/project-discovery.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
@@ -38,6 +39,7 @@ const configSchema = z.object({
   notificationTargets: z.record(string, z.object({ url: endpoint, token: string }).strict()).default({}),
   sessionHosts: z.record(string, sessionHostSchema).default({}),
   automation: automationConfigSchema.optional(),
+  projectDiscovery: projectDiscoveryConfigSchema.optional(),
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
   reportReview: reportReviewPolicySchema.optional(),
@@ -87,6 +89,7 @@ const executionReviewSchema = executionJobSchema.extend({ attemptId: string, res
   reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
+  ...DISCOVERY_METHODS,
   execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
@@ -159,6 +162,7 @@ export class RemoteAgentGateway {
   readonly automation?: A2AAutomation;
   readonly sessions: SessionDelivery;
   readonly targets: TargetDirectory;
+  readonly projectDiscovery?: ProjectRoleDiscovery;
   readonly ledger: JobLedger;
   private readonly lease: FileA2AStore;
   private readonly stateFile: string;
@@ -236,8 +240,12 @@ export class RemoteAgentGateway {
       }
       this.save();
       if (this.config.automation) this.automation = new A2AAutomation(this, this.config.automation);
+      if (this.config.projectDiscovery) {
+        this.projectDiscovery = new ProjectRoleDiscovery({ stateDirectory: path.join(this.config.stateDirectory, 'project-discovery'), config: this.config.projectDiscovery });
+        this.projectDiscovery.start();
+      }
     }
-    catch (error) { this.lease.close(); throw error; }
+    catch (error) { void this.projectDiscovery?.close().catch(() => {}); this.lease.close(); throw error; }
     this.timer = setInterval(() => { void this.reconcile().catch(() => {}); }, this.config.pollIntervalMs);
     this.timer.unref();
     void this.reconcile().catch(() => {});
@@ -828,6 +836,10 @@ export class RemoteAgentGateway {
     try { return await operation; } finally { this.operations.delete(operation); }
   }
   private async invokeMethod(method: string, params: unknown): Promise<unknown> {
+    if (Object.hasOwn(DISCOVERY_METHODS, method)) {
+      if (!this.projectDiscovery) throw new Error('Project discovery is disabled; configure projectDiscovery in the trusted gateway configuration');
+      return this.projectDiscovery.invoke(method, params);
+    }
     if (Object.hasOwn(TARGET_METHODS, method)) {
       if (method === 'execution_target_probe') return this.probeTarget(z.object({ targetId: string }).strict().parse(params).targetId);
       return this.targets.invoke(method, params);
@@ -1036,6 +1048,7 @@ export class RemoteAgentGateway {
     if (this.closed) return;
     this.closed = true; clearInterval(this.timer);
     for (const controller of this.controllers) controller.abort();
+    await this.projectDiscovery?.close();
     await this.workbenchQueue;
     await this.sessions.close();
     await Promise.allSettled([...this.refreshing.values(), ...this.operations, ...this.advancingDeliveries.values(), ...(this.reconciling ? [this.reconciling] : [])]);
@@ -1126,7 +1139,7 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     }
     const entry = { id: 'a2a-gateway', name: 'DSH 远端智能体', kind: 'agent_runtime' as const,
       capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http' as const, port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS,
-      metadata: { local_only_methods: Object.keys(TARGET_METHODS) } };
+      metadata: { local_only_methods: [...Object.keys(TARGET_METHODS), ...Object.keys(DISCOVERY_METHODS)] } };
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);
     // Node's directory is ephemeral. Re-report after a Node restart; this never registers new execution targets.
     const reporting = options.report === false ? undefined : setInterval(() => { void reportToAgent(entry).catch(() => {}); }, 15_000);
@@ -1135,6 +1148,8 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     return { gateway, port, callbackPort, automationPort, registration, close: async () => {
       closing ??= (async () => {
         if (reporting) clearInterval(reporting);
+        // Stop the Reader before draining HTTP requests that may be awaiting a scan.
+        await gateway.projectDiscovery?.close();
         // Stop accepting requests and drain their ledger writes while this instance
         // still owns the storage lease. Automation continuations and its admission
         // queue can outlive the gateway operation they awaited.

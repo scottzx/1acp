@@ -1,0 +1,9 @@
+{
+  "projectDiscovery": {
+    "readerExecutable": "/opt/homebrew/bin/1session",
+    "allowedRoots": ["/absolute/projects"],
+    "explicitRoots": ["/absolute/projects/1acp"],
+    "timeoutMs": 15000,
+    "maxProjects": 200
+  }
+}

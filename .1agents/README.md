@@ -10,8 +10,10 @@
 1acp/.1agents/
   README.md                     # Git：目录与维护约定
   roles/ppt-beautifier/          # Git：角色说明、技能引用和版本策略
+  roles/wechat-stock-replenisher/ # Git：AP感应式角色说明及声明示例
   config/
     role-skills.example.json    # Git：更新配置示例
+    project-discovery.example.json # Git：可选项目探查配置示例
     role-skills.local.json      # 本机配置，忽略提交
   skills/ppt/                   # 独立维护的完整技能源，忽略提交
   cache/roles/                  # 本机版本缓存，忽略提交
@@ -28,13 +30,33 @@
     workspace/                  # 执行 PWD、任务目录及产物
     state/                      # 角色绑定、A2A 会话关联与版本归档
   state/a2a-gateway/             # 项目网关登记、任务账本与通知，忽略提交
+    project-discovery/discovery.json # 目录候选快照、探查模式与诊断
 ```
 
 Git 只跟踪角色声明、说明及示例配置。技能包、缓存、素材、任务数据、产物、状态和本机私密配置不提交。共享宿主安装包、登录凭据、全局模型配置及原生 DSH/Codex 会话库仍由宿主管理；本目录保存项目的会话关联、任务回执和产物，其角色绑定指向上述目录。
 
+[公众号补库专员](roles/wechat-stock-replenisher/ROLE.md)是AP流程角色，使用 `role.example.json` 描述规则和依赖；它不是网络模型角色的原生 `profile.json`，不参与该格式的自动探查或A2A目标注册。当前仅规则演练草稿通过模拟测试，真实库存和自动生产尚未接通。
+
 本机 macOS 的 launchd 不能打开 Documents 目录内的服务启动日志，三个启动器的 stdout/stderr 保存在 `~/Library/Logs/1agents/`，权限为目录 0700、文件 0600。该系统日志例外不改变角色任务的实际 PWD、技能缓存或产物位置。
 
 本地完整技能源在 `.1agents/skills/ppt` 维护；发布投影和运行快照都是可校验缓存，不能把修改缓存作为更新技能的方式。旧私有 skills 目录仅作历史备份。缓存丢失可重新获取当前版本；历史版本恢复依赖保留的任务锁、技能包和资产，不自动删除这些版本。
+
+## 可选项目与角色探查
+
+网关可通过已安装的 Session Reader CLI 读取项目目录元数据，再只读检查项目中的 `.1agents/roles/*/profile.json` 结构，从项目/PWD 目录元数据形成角色候选。Reader 当前提供 `1session projects --json` CLI；不假设其 HTTP 服务存在 projects 接口。不安装 Reader，不读取会话正文、ROLE、技能脚本或执行角色代码。
+
+参考 [project-discovery.example.json](config/project-discovery.example.json)，将其中 `projectDiscovery` 合入受保护网关配置，替换为本机真实可执行文件和允许根目录。`allowedRoots` 为非空绝对路径列表；`explicitRoots` 可补充已知项目根。默认 `timeoutMs=15000`、`maxProjects=200`，探查范围与单次数量有界。未配置时接口明确返回未启用，不自行扫描。示例文件不会被自动加载，也不代表当前服务已配置或部署。
+
+| 可信管理接口 | 参数与作用 |
+| --- | --- |
+| `execution_project_scan` | `{}`；手动执行一次探查并保存候选快照，不创建任务或目标 |
+| `execution_project_list` | `{}`；只读已保存快照，不隐式触发扫描 |
+| `execution_discovery_config_get` | `{}`；只读持久的 manual/interval 模式与 intervalMs，不扫描 |
+| `execution_discovery_config_update` | `{mode:"manual"}` 或 `{mode:"interval",intervalMs:60000}`；切换手动/定频模式 |
+
+默认 `manual`。定频模式必须显式提供 `intervalMs`，范围为 60 秒至 24 小时，由网关后台维护；主会话不循环 scan/list，不等待目录变化，也不因目录更新被唤醒。切回 manual 停止周期探查，保留已有候选。执行范围和 Reader 路径由可信网关配置决定，普通任务参数不能覆盖。
+
+快照位于 `.1agents/state/a2a-gateway/project-discovery/discovery.json`；Reader 失败或结果不完整时保留旧候选并标明 partial/stale 与诊断，不把旧快照冒记为最新成功。发现角色 profile 只说明存在候选，不代表宿主映射、技能加载、目录权限或模型已经就绪。登记角色/目标仍需显式管理操作；一键填入临时任务 cwd 和自动注册不在本次范围。Reader 缺失不影响手填目录或普通派单。
 
 ## 统一更新
 

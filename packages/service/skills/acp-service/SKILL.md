@@ -1,6 +1,6 @@
 ---
 name: acp-service
-description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通过 A2A 调用固定角色、派发临时任务、查询父子任务和执行轮次、记录业务验收及处理通知，并回投 Codex/DSH 原会话。也用于角色目标登记、网络技能缓存和更新接口接入；不用于无关的系统巡检或模型配置。
+description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通过 A2A 调用固定角色、派发临时任务、查询父子任务和执行轮次、记录业务验收及处理通知，并回投 Codex/DSH 原会话。也用于项目/角色候选探查、目标登记、网络技能缓存和更新接口接入；不用于无关的系统巡检或模型配置。
 ---
 
 # ACP Service
@@ -14,6 +14,7 @@ description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通�
 | 在当前主机运行 Codex、Claude 等 Agent，管理命名会话、队列或流程 | `acp-service <agent> ...` | [ACP CLI 与服务](references/acp.md) |
 | 从客户端连接常驻 Agent 服务，使用标准会话与流式交互 | `acp-service serve`，ACP over WebSocket | [ACP CLI 与服务](references/acp.md) |
 | 在 DSH 界面使用外部 Agent、原生模型和模式控制 | DSH 中安装同一个包，选择 `ACP · Agent` 预设 | [DSH 插件](references/dsh.md) |
+| 手动或定频从本机项目目录发现角色候选 | 可选 Reader CLI 适配，`execution_project_scan/list` 与 `execution_discovery_config_*` | [候选探查](references/roles-and-tasks.md#可选项目与角色候选探查) |
 | 创建或调整固定角色，接入网络技能及版本缓存 | 可用时用 `resident-agent` 完成角色管理；API 登记用 `execution_target_*` | [角色管理与任务调用](references/roles-and-tasks.md) |
 | 调用已登记的固定角色 | `execution_submit`，指定 resident_agent 的 targetId | [角色管理与任务调用](references/roles-and-tasks.md) |
 | 派发一次性临时任务，无需创建角色 | 向 agent_host 目标 `execution_submit`；兼容 `remote_agent_spawn` | [角色管理与任务调用](references/roles-and-tasks.md) |
@@ -22,6 +23,8 @@ description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通�
 | 为其他 A2A 客户端开放 DSH 能力 | DSH `a2a` 配置、Agent Card、标准 JSON-RPC/SSE | [A2A 调度与收件箱](references/a2a.md) |
 
 先检查现有服务和安装版本；服务已经可用时直接复用。需要哪种入口就读对应引用文件。不要为了派发一次远端任务重新安装或重启正常运行的服务。
+
+项目探查默认手动，仅读取受控目录元数据和 profile 结构；候选不自动登记为可执行目标，不创建任务、不加载角色代码，也不唤醒主会话。定频由网关后台显式配置，不将主会话轮询作为探查流程。
 
 ACP 管理 Agent 会话、交互与工具权限；A2A 管理跨 Agent 的任务、状态、结果及订阅通知。A2A 指向 DSH 后，DSH 的预设决定由标准 Agent 还是外部 ACP Agent 执行。
 

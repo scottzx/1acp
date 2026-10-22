@@ -12,6 +12,23 @@
 
 没有一条 `role_create` API 可完成全部创建与部署。`execution_target_create` 只登记目标，不生成 persona/profile、不安装技能、不配置宿主、不证明模型能执行。固定角色的持久配置可反复接单，每个独立任务仍创建独立执行上下文；同目录不等于同会话。
 
+## 可选项目与角色候选探查
+
+已配置 `projectDiscovery` 时，网关通过 Session Reader 的 `1session projects --json` CLI 读取项目/PWD 元数据，并只读检查 `.1agents/roles/*/profile.json` 结构。Reader 没有 projects HTTP 接口；不臆造该接口，不安装 Reader，不读会话全文、ROLE 或脚本，不加载角色代码。能力为可选集成，缺失时保留手填目录。
+
+可信网关配置为 `projectDiscovery:{readerExecutable,allowedRoots,explicitRoots?,timeoutMs?,maxProjects?}`：readerExecutable 指向已安装 CLI，allowedRoots 为非空绝对路径列表，explicitRoots 可补充已知项目根，timeoutMs 默认 15000、maxProjects 默认 200。任务参数不能更换可执行文件或扩展根目录范围。公开配置示例位于工程 `.1agents/config/project-discovery.example.json`，示例本身不自动激活服务；未配置时接口明确返回未启用，不隐式扫描。
+
+| 可信管理接口 | 参数与行为 |
+| --- | --- |
+| `execution_project_scan` | `{}`；显式扫描一次，返回并保存有界候选与诊断 |
+| `execution_project_list` | `{}`；读取已保存快照，不触发 Reader |
+| `execution_discovery_config_get` | `{}`；读取持久的 manual/interval 模式与 intervalMs，不扫描 |
+| `execution_discovery_config_update` | `{mode:"manual"}` 或 `{mode:"interval",intervalMs:60000}`；intervalMs 在定频模式必须显式填写，范围 60000–86400000 |
+
+默认 manual；用户选择定频后，由网关后台扫描，切回 manual 停止周期扫描。目录探查不派模型任务、不创建或注册目标、不产生任务完成通知、不唤醒原主会话；主会话只执行用户要求的一次管理动作，不循环 scan/list 等待变化。
+
+快照及模式保存在 `.1agents/state/a2a-gateway/project-discovery/discovery.json`，失败时保留旧候选并标 partial/stale。依据诊断与读取时间使用候选，不能把陈旧目录当作当前可执行位置；本机路径也不能默认当作远端 cwd。角色候选仍需完成宿主映射、运行环境和目标登记，目录权限由实际执行端接单验证。本次只实现发现；一键填入任务 cwd、自动注册目标及新工作台 UI 不属于本次能力。
+
 ## 创建与更新角色（管理阶段）
 
 1. 复用当前网关、宿主及认证配置，明确职责、工具权限、读写目录、输入和交付。技能通过能力网络检索，精确记录来源及名称/标识；发现结果不等于实际加载。
