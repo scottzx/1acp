@@ -39,7 +39,7 @@ async function fixture(t: TestContext) {
   const policy = { workspaceRoot: join(root, 'jobs'), publicDirectory: join(root, 'public'), publicBaseUrl: 'http://example.invalid/artifacts',
     allowedProjectRoots: [project], summaryTargetId: 'summary', makerTargetId: 'maker', reviewTargetId: 'review',
     runtimeDocument: join(root, 'RUNTIME.md'), designSkill: join(root, 'fallback-SKILL.md'), pythonExecutable: '/usr/bin/python3',
-    maxExecutionRetries: 0, roleSkills: { profilePath, cacheRoot } };
+    requireHumanReview: false, maxExecutionRetries: 0, roleSkills: { profilePath, cacheRoot } };
   const create = async (jobId = 'parent', attemptId = 'parent-attempt') => {
     const run = await createPptDeliveryRun({ sourceId: 'source', jobId, attemptId, originSessionId: 'root-session',
       input: { projectDirectory: project, projectName: 'Project', slideCount: 2 }, policy });

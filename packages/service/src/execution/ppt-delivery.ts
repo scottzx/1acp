@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import { deliveryException } from './delivery-progress.js';
 import { resolveRoleSkills } from '../roles/index.js';
+import { createHumanReview, humanReviewPreviewSchema, markHumanReviewApplied, supersedeHumanReview, type HumanReviewRequest } from './human-review.js';
 
 const execute = promisify(execFile);
 const absolute = z.string().min(1).refine(isAbsolute, 'Expected an absolute path');
@@ -37,6 +38,7 @@ export const pptDeliveryPolicySchema = z.object({
   maxRevisionRounds: z.number().int().min(0).max(3).default(1),
   maxExecutionRetries: z.number().int().min(0).max(2).default(1),
   maxDurationMs: z.number().int().min(60000).max(24 * 3600000).default(3600000),
+  requireHumanReview: z.boolean().default(true), humanReviewerId: identifier.default('local-owner'),
   httpTimeoutMs: z.number().int().min(100).max(60000).default(15000),
 }).strict();
 export type PptDeliveryPolicy = z.infer<typeof pptDeliveryPolicySchema>;
@@ -89,6 +91,9 @@ export interface PptDeliveryRun {
   parentUpdatePending?: PptDeliveryParentUpdate;
   projectSnapshot?: { gitHead: string; gitStatus: string; trackedDiffDigest: string };
   scriptDigest?: string; sourceManifestDigest?: string;
+  scriptRevision?: number; humanReviews?: HumanReviewRequest[];
+  humanWaitStartedAt?: string; humanWaitingMs?: number; humanRevisionRounds?: number;
+  summaryRevisionPending?: { reviewId: string; authorJobId: string; authorAttemptId: string; reasons: string[] };
   publicationCheckedAt?: string;
   recovery?: { fromAttemptId: string; recoveredAt: string; contractPath: string;
     reusedChildren: { jobId: string; attemptId: string }[]; validationCheckedAt?: string;
@@ -115,6 +120,9 @@ const clock = (adapter: PptDeliveryAdapter): number => adapter.now?.() ?? Date.n
 const terminal = (state: string): boolean => ['completed', 'failed', 'canceled', 'cancelled', 'rejected', 'submission_failed'].includes(state);
 const purposeFor = (stage: PptDeliveryRun['stage']): PptDeliveryChildRequest['purpose'] => stage === 'summary' ? 'project_script' : stage === 'review' ? 'independent_review' : 'ppt_production';
 const revisionName = (run: PptDeliveryRun): string => `revision-${run.revision}`;
+export const scriptRevisionName = (run: PptDeliveryRun): string => `script-v${run.scriptRevision ?? 1}`;
+export const scriptDirectory = (run: PptDeliveryRun): string => run.policy.requireHumanReview
+  ? join(run.jobDirectory, 'coordinator', scriptRevisionName(run)) : join(run.jobDirectory, 'coordinator');
 const revisionDirectory = (run: PptDeliveryRun): string => join(run.jobDirectory, revisionName(run));
 const publicRevisionDirectory = (run: PptDeliveryRun): string => join(run.policy.publicDirectory, run.jobId, revisionName(run));
 const publicUrl = (run: PptDeliveryRun, filename: string): string => `${run.policy.publicBaseUrl.replace(/\/$/, '')}/${encodeURIComponent(run.jobId)}/${revisionName(run)}/${filename}`;
@@ -186,7 +194,8 @@ export async function createPptDeliveryRun(input: {
   const now = new Date().toISOString();
   const run: PptDeliveryRun = { version: 1, ...input, input: task, policy, jobDirectory,
     contractPath: join(jobDirectory, 'contract.json'), createdAt: now, updatedAt: now,
-    executionStatus: 'working', stage: 'summary', phase: 'preparing', revision: 1,
+    executionStatus: 'working', stage: 'summary', phase: 'preparing', revision: 1, scriptRevision: 1,
+    humanReviews: [], humanWaitingMs: 0, humanRevisionRounds: 0,
     ...(roleSkillLockPath ? { roleSkillLockPath } : {}),
     revisionReasons: [], executionRetries: {}, children: [], activeTargets: {}, targetSwitches: [], diagnostics: [], transitions: [],
     metrics: { submitCalls: 0, continueCalls: 0, queryCalls: 0, ackCalls: 0, machineChecks: 0,
@@ -215,10 +224,12 @@ function commonPrompt(run: PptDeliveryRun): string {
 const reviewReportPath = (run: PptDeliveryRun): string => join(revisionDirectory(run),
   run.recovery?.mode === 'review_only' ? `independent-review.${run.attemptId}.json` : 'independent-review.json');
 async function buildRequest(run: PptDeliveryRun, retry: number): Promise<PptDeliveryChildRequest> {
-  const summary = join(run.jobDirectory, 'coordinator'), revision = revisionDirectory(run);
+  const summary = scriptDirectory(run), revision = revisionDirectory(run);
   await mkdir(revision, { recursive: true });
+  await mkdir(summary, { recursive: true });
   await mkdir(publicRevisionDirectory(run), { recursive: true });
-  const common = commonPrompt(run) + (retry > 0 ? `\n上次阶段需要修复：${run.revisionReasons.join('; ')}` : '');
+  const common = commonPrompt(run) + (retry > 0 ? `\n上次阶段需要修复：${run.revisionReasons.join('; ')}` : '')
+    + (run.stage === 'summary' && run.humanRevisionRounds ? `\n本次是人工要求的文字稿修订，继续原作者会话。具体意见：${run.revisionReasons.join('; ')}。读取上一版与意见，只将新稿写入${summary}，不得覆盖之前script-v目录。` : '');
   let prompt: string;
   let targetId: string;
   let cwd: string | undefined;
@@ -237,6 +248,11 @@ async function buildRequest(run: PptDeliveryRun, retry: number): Promise<PptDeli
     }));
     const scriptPath = join(summary, 'slide-script.json');
     const scriptBytes = await readFile(scriptPath);
+    if (run.scriptDigest !== digest(scriptBytes)) throw new Error('Frozen script changed before production dispatch');
+    if (run.policy.requireHumanReview && !run.humanReviews?.some(review => review.status === 'approved'
+      && review.attemptId === run.attemptId && review.revision === scriptRevisionName(run) && review.digest === run.scriptDigest)) {
+      throw new Error('Production requires approval of the exact current script version');
+    }
     await jsonFile(revisionContract, { schema: 'ppt-production-contract-v1', parentContract: run.contractPath, resultRevision: revisionName(run),
       scriptPath, scriptSha256: digest(scriptBytes), slideCount, artifacts, manifestPath, sourcePptx: null,
       finalizerReceiptPath: join(revision, 'finalizer-validation.json'),
@@ -269,14 +285,14 @@ async function buildRequest(run: PptDeliveryRun, retry: number): Promise<PptDeli
           moduleRoot: run.policy.nodeModuleRoot, modules: ['@oai/artifact-tool'] } } : {}) } : {}) },
     resultContract: { jobId: run.jobId, parentSessionId: `ppt-delivery:${run.jobId}`, originSessionId: run.originSessionId,
       ...(manifestPath ? { artifactManifestPath: manifestPath } : {}) } },
-    clientRequestId: `${run.jobId}:${run.attemptId}:${purpose}:r${run.revision}:retry${retry}:route${digest(targetId).slice(0,16)}`,
+    clientRequestId: `${run.jobId}:${run.attemptId}:${purpose}:r${run.revision}${run.stage === 'summary' && run.policy.requireHumanReview ? `:${scriptRevisionName(run)}` : ''}:retry${retry}:route${digest(targetId).slice(0,16)}`,
     parentJobRef: { sourceId: run.sourceId, jobId: run.jobId }, parentAttemptId: run.attemptId,
-    purpose, resultRevision: revisionName(run), originSessionId: `ppt-delivery:${run.jobId}`,
+    purpose, resultRevision: run.stage === 'summary' && run.policy.requireHumanReview ? scriptRevisionName(run) : revisionName(run), originSessionId: `ppt-delivery:${run.jobId}`,
     ...(replacement ? { replacesJobRef: replacement } : {}) };
 }
 
 async function readSlideScript(run: PptDeliveryRun) {
-  const bytes = await readFile(join(join(run.jobDirectory, 'coordinator'), 'slide-script.json'));
+  const bytes = await readFile(join(scriptDirectory(run), 'slide-script.json'));
   if (run.scriptDigest && digest(bytes) !== run.scriptDigest) throw new Error('Frozen source/script manifest changed');
   const script = z.object({ title: z.string().min(1), slides: z.array(z.object({ title: z.string().min(1),
     message: z.string(), body: z.array(z.string()), visual: z.string(), sources: z.array(z.string()).min(1),
@@ -286,7 +302,7 @@ async function readSlideScript(run: PptDeliveryRun) {
 }
 
 async function validateSummary(run: PptDeliveryRun): Promise<void> {
-  const root = join(run.jobDirectory, 'coordinator');
+  const root = scriptDirectory(run);
   const scriptDigest = digest(await readFile(join(root, 'slide-script.json')));
   const sourceManifestDigest = digest(await readFile(join(root, 'source-manifest.json')));
   if ((run.scriptDigest && run.scriptDigest !== scriptDigest) || (run.sourceManifestDigest && run.sourceManifestDigest !== sourceManifestDigest)) throw new Error('Frozen source/script manifest changed');
@@ -454,6 +470,66 @@ async function revise(run: PptDeliveryRun, adapter: PptDeliveryAdapter, reasons:
   mark(run, 'make', 'revision_requested', reasons.join('; ')); await adapter.persist(run);
   await startChild(run, adapter, maker);
 }
+function finishHumanWait(run: PptDeliveryRun, adapter: PptDeliveryAdapter): void {
+  if (!run.humanWaitStartedAt) return;
+  run.humanWaitingMs = (run.humanWaitingMs ?? 0) + Math.max(0, clock(adapter) - Date.parse(run.humanWaitStartedAt));
+  delete run.humanWaitStartedAt;
+}
+/** Decision and continuation intent share the durable parent run; no process is kept waiting. */
+async function applyHumanDecision(run: PptDeliveryRun, adapter: PptDeliveryAdapter): Promise<void> {
+  const review = run.humanReviews?.find(item => item.resume?.status === 'pending');
+  if (!review?.resume) return;
+  if (review.attemptId !== run.attemptId || review.revision !== scriptRevisionName(run) || review.digest !== run.scriptDigest) {
+    throw new Error('Human continuation does not match the current frozen script');
+  }
+  const action = review.resume.action;
+  if (action === 'approve') {
+    await validateSummary(run);
+    finishHumanWait(run, adapter); run.executionStatus = 'working';
+    delete run.currentChild;
+    mark(run, 'make', 'human_approved', `Approved ${review.revision}`);
+  } else if (action === 'changes_requested') {
+    const author = run.children.find(item => item.child.jobId === review.authorJobId && item.child.attemptId === review.authorAttemptId);
+    if (!author || author.purpose !== 'project_script' || author.child.executionStatus !== 'completed'
+      || childSession(author.child) !== review.authorSessionId) throw new Error('Original script author cannot be verified');
+    finishHumanWait(run, adapter); run.executionStatus = 'working';
+    run.humanRevisionRounds = (run.humanRevisionRounds ?? 0) + 1;
+    run.scriptRevision = (run.scriptRevision ?? 1) + 1;
+    run.revisionReasons = [review.history.find(item => item.decisionId === review.resume!.decisionId)!.note!];
+    run.summaryRevisionPending = { reviewId: review.reviewId, authorJobId: author.child.jobId, authorAttemptId: author.child.attemptId, reasons: [...run.revisionReasons] };
+    run.activeTargets.project_script = author.targetId;
+    delete run.scriptDigest; delete run.sourceManifestDigest; delete run.currentChild;
+    mark(run, 'summary', 'human_revision_requested', run.revisionReasons.join('; '));
+  } else {
+    finishHumanWait(run, adapter); run.executionStatus = 'canceled';
+    mark(run, run.stage, 'canceled', 'Task abandoned by its human reviewer');
+  }
+  const index = run.humanReviews!.findIndex(item => item.reviewId === review.reviewId);
+  run.humanReviews![index] = markHumanReviewApplied(review, review.resume.decisionId);
+  await updateParentDurably(run, adapter, { executionStatus: run.executionStatus, phase: run.phase,
+    ...(action === 'cancel' ? { resultSummary: '用户已放弃任务；已有产物与审核历史保留。' } : {}) });
+}
+async function requestHumanReview(run: PptDeliveryRun, adapter: PptDeliveryAdapter, child: PptDeliveryChild): Promise<void> {
+  const sessionId = childSession(child);
+  if (!sessionId) return stop(run, adapter, 'input_required', '文字稿原作者会话身份缺失，无法创建可修订审核');
+  const bytes = await readFile(join(scriptDirectory(run), 'slide-script.json'));
+  if (digest(bytes) !== run.scriptDigest) throw new Error('Script changed before the review preview was frozen');
+  const preview = humanReviewPreviewSchema.parse(JSON.parse(bytes.toString('utf8')));
+  run.humanReviews ??= [];
+  const existing = run.humanReviews.find(item => item.attemptId === run.attemptId && item.revision === scriptRevisionName(run));
+  if (existing && existing.digest !== run.scriptDigest) throw new Error('Human review content changed within the same revision');
+  if (!existing) {
+    run.humanReviews = run.humanReviews.map(item => supersedeHumanReview(item));
+    run.humanReviews.push(createHumanReview({ jobId: run.jobId, attemptId: run.attemptId, stage: 'summary',
+      authorJobId: child.jobId, authorAttemptId: child.attemptId, authorSessionId: sessionId,
+      revision: scriptRevisionName(run), digest: run.scriptDigest!, title: `${run.input.projectName}：${preview.slides.length}页文字稿`,
+      preview, reviewerId: run.policy.humanReviewerId }, new Date(clock(adapter)).toISOString()));
+  }
+  run.humanWaitStartedAt ??= new Date(clock(adapter)).toISOString(); run.executionStatus = 'input_required';
+  mark(run, 'summary', 'awaiting_human', `Waiting for review of ${scriptRevisionName(run)}`);
+  await updateParentDurably(run, adapter, { executionStatus: 'input_required', phase: run.phase,
+    resultSummary: `${run.input.projectName}：${preview.slides.length}页文字稿 ${scriptRevisionName(run)} 已形成，等待人工确认；通过后开始设计制作。` });
+}
 /** Called by the gateway's existing background reconcile. No main-session polling or long waits. */
 export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDeliveryAdapter): Promise<void> {
   if (run.cancellationRequestedAt) return;
@@ -462,11 +538,25 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
     try { await adapter.updateParent(run.parentUpdatePending); delete run.parentUpdatePending; await adapter.persist(run); }
     catch { return; }
   }
+  try { await applyHumanDecision(run, adapter); }
+  catch (error) {
+    const diagnostic = `Human continuation deferred: ${error instanceof Error ? error.message : String(error)}`;
+    if (run.diagnostics.at(-1) !== diagnostic) run.diagnostics.push(diagnostic);
+    await adapter.persist(run); return;
+  }
   if (run.executionStatus !== 'working') return;
-  const roundElapsed = Math.max(0, clock(adapter) - Date.parse(run.recovery?.mode === 'review_only' ? run.recovery.recoveredAt : run.createdAt));
+  const roundElapsed = Math.max(0, clock(adapter) - Date.parse(run.recovery?.mode === 'review_only' ? run.recovery.recoveredAt : run.createdAt)
+    - (run.recovery?.mode === 'review_only' ? 0 : run.humanWaitingMs ?? 0));
   run.metrics.elapsedMs = (run.recovery?.mode === 'review_only' ? run.recovery.previousElapsedMs ?? 0 : 0) + roundElapsed;
   if (roundElapsed > run.policy.maxDurationMs) return stop(run, adapter, 'input_required', '总时长预算耗尽，保留可能仍在运行的子任务，不声称取消');
   try {
+    if (run.summaryRevisionPending) {
+      const intent = run.summaryRevisionPending, author = run.children.find(item => item.child.jobId === intent.authorJobId && item.child.attemptId === intent.authorAttemptId);
+      if (!author) throw new Error('Revision author no longer exists');
+      await startChild(run, adapter, author.child);
+      if (run.currentChild && !run.pending) { delete run.summaryRevisionPending; await adapter.persist(run); }
+      return;
+    }
     if (!run.publicationCheckedAt) {
       try { await (adapter.preflightPublication ?? preflightPptPublication)(run); }
       catch (error) { return stop(run, adapter, 'input_required', String(error)); }
@@ -548,6 +638,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         return startChild(run, adapter, child);
       }
       if (run.cancellationRequestedAt) return;
+      if (run.policy.requireHumanReview) return requestHumanReview(run, adapter, child);
       mark(run, 'make', 'preparing'); delete run.currentChild; await adapter.persist(run); return;
     }
     if (run.stage === 'make') { mark(run, 'validate', 'checking_artifacts'); delete run.currentChild; await adapter.persist(run); return; }
@@ -587,6 +678,8 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         selectedReview: { jobId: child.jobId, attemptId: child.attemptId, sessionId: childSession(child) },
         deliveryReadiness: 'ready', policyVersion: run.policy.version, limitations: review.limitations,
         humanAcceptance: 'not_requested', notificationAcknowledged: false, metrics: run.metrics,
+        ...(run.humanReviews?.length ? { approvedScript: run.humanReviews.find(item => item.status === 'approved' && item.digest === run.scriptDigest),
+          scriptRevision: scriptRevisionName(run), scriptDigest: run.scriptDigest, humanRevisionRounds: run.humanRevisionRounds, humanWaitingMs: run.humanWaitingMs } : {}),
         targetSwitches: run.targetSwitches,
         ...(run.roleSkillLockPath ? { roleSkillLockPath: run.roleSkillLockPath } : {}),
         ...(run.recovery ? { recovery: run.recovery } : {}),

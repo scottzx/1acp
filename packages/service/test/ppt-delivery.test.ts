@@ -26,7 +26,7 @@ async function fixture(t: TestContext, extra: Record<string, unknown> = {}) {
     policy: { workspaceRoot: join(root, 'jobs'), publicDirectory: join(root, 'public'), publicBaseUrl: 'http://127.0.0.1:1/artifacts',
       allowedProjectRoots: [project], summaryTargetId: 'summary', makerTargetId: 'maker', reviewTargetId: 'review',
       runtimeDocument: join(root, 'RUNTIME.md'), designSkill: join(root, 'SKILL.md'), pythonExecutable: python,
-      maxRevisionRounds: 1, maxExecutionRetries: 0 } });
+      maxRevisionRounds: 1, maxExecutionRetries: 0, requireHumanReview: false } });
   for (const path of [run.policy.runtimeDocument, run.policy.designSkill]) await writeFile(path, 'fixture');
   const coordinator = join(run.jobDirectory, 'coordinator');
   await writeFile(join(coordinator, 'slide-script.json'), JSON.stringify({ title: 'Project', slides: Array.from({ length: run.input.slideCount ?? 6 }, (_, i) => ({ ...files[i % files.length] })).map((file, i) => ({ title: `Page ${i}`, message: 'message', body: ['fact'], visual: 'diagram', sources: [`${file.path}:1`], facts: [`project fact ${i}`], notes: '' })) }));

@@ -18,8 +18,10 @@ import { a2aResultContractSchema } from './result-metadata.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput } from '../execution/ledger.js';
+import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
+import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
-  type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
+  scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 export type { RemoteAgentNotice } from './notices.js';
 
 const string = z.string().trim().min(1).max(512);
@@ -37,7 +39,14 @@ const configSchema = z.object({
   automation: automationConfigSchema.optional(),
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
+  workbench: z.object({ token: string, reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
+    allowedOrigins: z.array(string).optional() }).strict().optional(),
 }).strict().superRefine((config, ctx) => {
+  const machineTokens = [...Object.values(config.remotes).map(remote => remote.token), config.callback?.token,
+    ...Object.values(config.notificationTargets).map(target => target.token), config.automation?.token];
+  if (config.workbench && machineTokens.includes(config.workbench.token)) {
+    ctx.addIssue({ code: 'custom', path: ['workbench', 'token'], message: 'Workbench requires a separate credential from agent remotes' });
+  }
   for (const [id, schedule] of Object.entries(config.automation?.schedules ?? {})) {
     if (!Object.hasOwn(config.remotes, schedule.remote)) ctx.addIssue({ code: 'custom', path: ['automation', 'schedules', id, 'remote'], message: 'Unknown automation remote' });
     if (schedule.notificationTarget && !Object.hasOwn(config.notificationTargets, schedule.notificationTarget)) ctx.addIssue({ code: 'custom', path: ['automation', 'schedules', id, 'notificationTarget'], message: 'Unknown automation notificationTarget' });
@@ -162,6 +171,7 @@ export class RemoteAgentGateway {
   private readonly advancingDeliveries = new Map<string, Promise<void>>();
   private readonly canceling = new Map<string, Promise<void>>();
   private reconciling?: Promise<void>;
+  private workbenchQueue: Promise<void> = Promise.resolve();
   private readonly timer: NodeJS.Timeout;
   private closed = false;
 
@@ -235,7 +245,8 @@ export class RemoteAgentGateway {
     catch { return { targetId: `legacy:${job.remote}`, provider: 'a2a', remote: job.remote, cwd: job.cwd, agentPreset: job.agentPreset, historicalConfigUnknown: true }; }
   }
   private targetSnapshot(resolved: ExecutionTargetSnapshot) {
-    return { targetId: resolved.target.targetId, configVersion: resolved.configVersion, connectionId: resolved.connection.connectionId,
+    return { targetId: resolved.target.targetId, targetKind: resolved.target.kind, targetName: resolved.target.name,
+      configVersion: resolved.configVersion, connectionId: resolved.connection.connectionId,
       connectionVersion: resolved.connectionVersion, provider: resolved.target.binding.driver === 'ppt_delivery' ? 'resident_role' : 'a2a',
       roleId: resolved.target.binding.roleId, binding: resolved.target.binding, remote: resolved.remote, endpoint: resolved.endpoint, cwd: resolved.cwd,
       agentPreset: resolved.agentPreset, capabilities: resolved.target.capabilities };
@@ -274,7 +285,8 @@ export class RemoteAgentGateway {
         if (!this.config.pptDelivery) throw new Error('PPT delivery role policy is not configured');
         const run = options.deliveryRecovery ? await recoverPptDeliveryRun(options.deliveryRecovery, attempt.attemptId, options.deliveryRecoveryInput)
           : await createPptDeliveryRun({ sourceId: this.ledger.sourceId, jobId: job.jobId, attemptId: attempt.attemptId,
-            originSessionId: input.originSessionId, input: roleInput, policy: this.config.pptDelivery });
+            originSessionId: input.originSessionId, input: roleInput, policy: { ...this.config.pptDelivery,
+              ...(this.config.workbench ? { humanReviewerId: this.config.workbench.reviewerId } : {}) } });
         this.state.pptDeliveries.runs[attempt.attemptId] = run;
         this.ledger.markDispatching(attempt.attemptId);
         this.ledger.accept(attempt.attemptId, { provider: 'resident_role', runId: attempt.attemptId }, { executionStatus: 'working', phase: 'preparing' });
@@ -366,7 +378,10 @@ export class RemoteAgentGateway {
     });
   }
   private executionNotice(run: PptDeliveryRun, resultSummary: string, links: any[]): void {
-    const noticeId = createHash('sha256').update(JSON.stringify([run.sourceId, run.jobId, run.attemptId, run.revision, run.executionStatus])).digest('hex');
+    const pendingReview = run.executionStatus === 'input_required' && run.phase === 'awaiting_human' && !run.cancellationRequestedAt
+      ? run.humanReviews?.find(review => review.status === 'pending' && review.attemptId === run.attemptId && review.revision === scriptRevisionName(run)) : undefined;
+    const noticeId = createHash('sha256').update(JSON.stringify([run.sourceId, run.jobId, run.attemptId, run.revision, run.executionStatus,
+      ...(pendingReview ? [pendingReview.reviewId] : [])])).digest('hex');
     if (this.state.executionNotices!.some(item => item.noticeId === noticeId)) return;
     if (run.executionStatus !== 'completed') {
       const partial = deliveryException(run, resultSummary);
@@ -374,8 +389,12 @@ export class RemoteAgentGateway {
       if (!links.length) links = partial.artifacts;
     }
     const artifactLinks = links.map(item => ({ url: item.url, mediaType: item.mediaType, sha256: item.sha256, size: item.size }));
-    const text = `[任务交付通知] ${run.executionStatus === 'completed' ? '任务已完成' : run.executionStatus === 'canceled' ? '任务已取消' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
+    const reviewUrl = this.config.workbench?.publicBaseUrl ? new URL(this.config.workbench.publicBaseUrl) : undefined;
+    if (reviewUrl && pendingReview) reviewUrl.hash = `acp/tasks/${encodeURIComponent(run.jobId)}?review=${encodeURIComponent(pendingReview.reviewId)}`;
+    const reviewEntry = pendingReview ? `\n\n${reviewUrl ? `[打开文字稿审核](${reviewUrl.href})` : '请用户打开 1agents「任务工作台 → 待我确认」。'}\n审核版本：${pendingReview.revision}；审核请求：${pendingReview.reviewId}。\n人工决定必须在审核页记录，execution_review 和通知已读均不能替代。` : '';
+    const text = `[任务交付通知] ${pendingReview ? '文字稿待人工确认' : run.executionStatus === 'completed' ? '任务已完成' : run.executionStatus === 'canceled' ? '任务已取消' : '任务需要处理'}\n${run.input.projectName} PPT\n\n${resultSummary}\n\n` +
       artifactLinks.map(item => `[${item.mediaType?.includes('presentation') ? (run.executionStatus === 'completed' ? '最终 PPT' : '已有 PPT（未完成最终验收）') : '预览产物'}](${item.url})`).join('\n') +
+      reviewEntry +
       `\n\n请通过 a2a-gateway 的 execution_get 或 execution_inbox 读取交付回执；业务接受调用 execution_review，通知处理调用 execution_ack，两者分别记录。\n---\n任务定位信息：\n${JSON.stringify({ noticeId, sourceId: run.sourceId, jobId: run.jobId, attemptId: run.attemptId, originSessionId: run.originSessionId })}`;
     this.state.executionNotices!.push({ noticeId, messageId: `execution-notice:${noticeId}`, originSessionId: run.originSessionId,
       jobId: run.jobId, attemptId: run.attemptId, executionStatus: run.executionStatus, resultSummary, artifactLinks, createdAt: new Date().toISOString(), text });
@@ -396,7 +415,10 @@ export class RemoteAgentGateway {
     while (jobId && !seen.has(jobId)) {
       seen.add(jobId);
       if (Object.values(this.state.executionCancellations ?? {}).some(item => item.jobId === jobId)) throw new Error('Job is closing or closed; no further dispatch is allowed');
-      jobId = this.ledger.get(origin, jobId).parentJobRef?.jobId;
+      const job = this.ledger.get(origin, jobId), run = this.state.pptDeliveries?.runs[job.currentAttemptId] as PptDeliveryRun | undefined;
+      if (job.executionStatus === 'canceled' || run?.cancellationRequestedAt || run?.executionStatus === 'canceled'
+        || run?.humanReviews?.some(review => review.status === 'canceled')) throw new Error('Job is closing or closed; no further dispatch is allowed');
+      jobId = job.parentJobRef?.jobId;
     }
   }
   private async cancelExecution(origin: string, jobId: string, cascade?: boolean) {
@@ -416,7 +438,13 @@ export class RemoteAgentGateway {
         const delivery = this.state.pptDeliveries.runs[attempt.attemptId] as PptDeliveryRun | undefined;
         if (delivery && !['completed', 'failed', 'canceled'].includes(delivery.executionStatus)) {
           delivery.cancellationRequestedAt ??= record.requestedAt;
+          if (delivery.humanWaitStartedAt) {
+            delivery.humanWaitingMs = (delivery.humanWaitingMs ?? 0) + Math.max(0, Date.parse(record.requestedAt) - Date.parse(delivery.humanWaitStartedAt));
+            delete delivery.humanWaitStartedAt;
+          }
           delivery.phase = 'canceling_children'; delivery.updatedAt = new Date().toISOString();
+          delivery.humanReviews = delivery.humanReviews?.map(review => review.status === 'pending'
+            ? { ...review, status: 'canceled', updatedAt: delivery.updatedAt } : review);
         }
       }
     }
@@ -643,7 +671,7 @@ export class RemoteAgentGateway {
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
         if (this.closed) break;
         if (run.cancellationRequestedAt && run.executionStatus !== 'canceled') continue;
-        if (run.executionStatus === 'working' || run.parentUpdatePending) {
+        if (run.executionStatus === 'working' || run.parentUpdatePending || run.humanReviews?.some(review => review.resume?.status === 'pending')) {
           try { await this.advanceDelivery(run); }
           catch (error) { run.diagnostics.push(error instanceof Error ? error.message : 'Delivery reconciliation failed'); this.save(); }
         }
@@ -852,12 +880,57 @@ export class RemoteAgentGateway {
     if (!taskId) throw new Error('Missing A2A event task ID');
     await Promise.allSettled(this.state.jobs.filter(job => job.taskId === taskId).map(job => this.refresh(job)));
   }
+  private workbenchProjection() {
+    const config = this.config.workbench;
+    if (!config) throw new Error('Workbench is not configured');
+    const runs = Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[];
+    return workbenchSnapshot({ ledger: this.ledger.snapshot(), runs, reviews: runs.flatMap(run => run.humanReviews ?? []),
+      actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
+  }
+  workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
+  workbenchTask(jobId: string) { return getWorkbenchTask(this.workbenchProjection(), jobId); }
+  /** Only the dedicated HTTP workbench calls this; it is deliberately absent from the agent tool catalogue. */
+  async decideWorkbenchReview(jobId: string, reviewId: string, input: unknown) {
+    const operation = this.workbenchQueue.then(async () => {
+      if (this.closed) throw new Error('Gateway is closed');
+      const scope = this.workbenchTask(jobId), config = this.config.workbench!;
+      await this.advancingDeliveries.get(scope.currentAttemptId);
+      const run = this.state.pptDeliveries.runs[scope.currentAttemptId] as PptDeliveryRun | undefined;
+      const review = run?.humanReviews?.find(item => item.reviewId === reviewId && item.jobId === jobId);
+      if (!run || !review) throw new Error('Review not found in authorized task');
+      const decision = humanReviewDecisionSchema.parse(input);
+      const replay = review.history.some(item => item.clientRequestId === decision.clientRequestId);
+      if (!replay && (run.cancellationRequestedAt || ['completed', 'failed', 'canceled'].includes(run.executionStatus))) {
+        throw new HumanReviewError('already_decided', 'Task is no longer awaiting a human decision');
+      }
+      let currentDigest = run.scriptDigest ?? '';
+      if (!replay && review.revision === scriptRevisionName(run)) {
+        try { currentDigest = createHash('sha256').update(readFileSync(path.join(scriptDirectory(run), 'slide-script.json'))).digest('hex'); }
+        catch { throw new HumanReviewError('version_conflict', 'The reviewed content snapshot is unavailable'); }
+      }
+      const result = decideHumanReview(review, decision, { id: config.reviewerId,
+        ...(config.reviewerName ? { displayName: config.reviewerName } : {}), source: '1agents-web' },
+      { attemptId: scope.currentAttemptId, revision: scriptRevisionName(run), digest: currentDigest });
+      if (!result.idempotent) {
+        const nextRun = { ...run, humanReviews: run.humanReviews!.map(item => item.reviewId === reviewId ? result.review : item) };
+        const nextDeliveries = { ...this.state.pptDeliveries, runs: { ...this.state.pptDeliveries.runs, [run.attemptId]: nextRun } };
+        atomicJson(this.stateFile, { ...this.state, pptDeliveries: nextDeliveries });
+        this.state.pptDeliveries = nextDeliveries;
+      }
+      const current = this.state.pptDeliveries.runs[run.attemptId] as PptDeliveryRun;
+      if (current.humanReviews?.some(item => item.resume?.status === 'pending')) void this.advanceDelivery(current).catch(() => {});
+      return this.workbenchTask(jobId);
+    });
+    this.workbenchQueue = operation.then(() => {}, () => {});
+    return operation;
+  }
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true; clearInterval(this.timer);
     for (const controller of this.controllers) controller.abort();
+    await this.workbenchQueue;
     await this.sessions.close();
-    await Promise.allSettled([...this.refreshing.values(), ...this.operations, ...(this.reconciling ? [this.reconciling] : [])]);
+    await Promise.allSettled([...this.refreshing.values(), ...this.operations, ...this.advancingDeliveries.values(), ...(this.reconciling ? [this.reconciling] : [])]);
     // Delivery promises release their controllers after abort; HTTP requests
     // may have already succeeded, so any retry keeps the stable notice ID.
     this.lease.close();
@@ -893,6 +966,29 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
   const server = http.createServer((req, res) => { void (async () => {
     try {
       if (req.method === 'GET' && req.url === '/health') return json(res, gateway.sessions.healthy ? 200 : 503, { status: gateway.sessions.healthy ? 'ok' : 'degraded', service: 'a2a-gateway', remotes: Object.keys(gateway.config.remotes), sessionDelivery: gateway.sessions.healthy ? 'ok' : 'storage-unavailable' });
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      if (url.pathname.startsWith('/workbench/')) {
+        if (!gateway.config.workbench) return json(res, 503, { error: 'Workbench is not configured' });
+        if (!authenticated(req, gateway.config.workbench.token)) return json(res, 401, { error: 'Unauthorized' });
+        if (req.headers.origin) return json(res, 403, { error: 'Use the authenticated application workbench' });
+        if (req.method === 'GET' && url.pathname === '/workbench/tasks') {
+          const query = z.object({ filter: z.enum(['all', 'pending', 'working', 'failed']).optional(),
+            limit: z.coerce.number().int().min(1).max(200).optional(), offset: z.coerce.number().int().min(0).optional() }).strict().parse(Object.fromEntries(url.searchParams));
+          return json(res, 200, gateway.workbenchList(query));
+        }
+        const route = /^\/workbench\/tasks\/([^/]+)(?:\/reviews\/([^/]+)\/decisions)?$/.exec(url.pathname);
+        if (!route || url.search) return json(res, 404, { error: 'No workbench route' });
+        const jobId = decodeURIComponent(route[1]!);
+        try {
+          if (req.method === 'GET' && !route[2]) return json(res, 200, gateway.workbenchTask(jobId));
+          if (req.method === 'POST' && route[2]) return json(res, 200, await gateway.decideWorkbenchReview(jobId, decodeURIComponent(route[2]), await body(req)));
+          return json(res, 405, { error: 'Method not allowed' });
+        } catch (error) {
+          if (error instanceof HumanReviewError) return json(res, error.code === 'forbidden' ? 403 : 409, { error: error.code, message: error.message });
+          if (error instanceof z.ZodError) return json(res, 400, { error: 'Invalid workbench parameters' });
+          return json(res, 404, { error: error instanceof Error ? error.message : 'Task not found' });
+        }
+      }
       if (req.method !== 'POST' || req.url !== '/invoke') return json(res, 404, { error: 'No route' });
       // Local tools are trusted. The separate tailnet receiver below never exposes /invoke.
       if (req.headers.origin) return json(res, 403, { error: 'Browser-origin invocation is not allowed' });
