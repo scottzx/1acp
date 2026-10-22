@@ -1,0 +1,79 @@
+{
+  "repository": "scottzx/session-reader",
+  "reportDate": "2026-10-16",
+  "manualBackfill": true,
+  "timeZone": "Asia/Shanghai",
+  "verifiedAt": "2026-10-17T03:20:31.185Z",
+  "dispatchFlowId": "eBCQENkUUHtfcLkCX7HWa",
+  "dispatchRunId": "zTDmFJR3dvWsnrZ3uIKYo",
+  "dispatchEnvironment": "TESTING",
+  "dispatchStatus": "DISABLED",
+  "resultFlowId": "MxRYejmepQheDGPhCEAbD",
+  "resultRunId": "pqYpvzh06icC3fRfyIuOs",
+  "resultEnvironment": "PRODUCTION",
+  "execution": {
+    "runId": "71c6c4fc-521e-480e-81f2-8ca3d01e67ce",
+    "taskId": "af89ce6e-96cc-49a8-8cae-535685d7ac4a",
+    "contextId": "0616dbef-545b-4cb7-9e1f-9e5f1a9273e8",
+    "sessionId": "session-0d5832f6-711f-47f7-ad32-53aa5fe9f0f7",
+    "journal": "/home/scott/.dsh/sessions/--home-scott-session-reader-daily-reports--/session-0d5832f6-711f-47f7-ad32-53aa5fe9f0f7/session.v4.jsonl.zstd",
+    "turnEndedAt": "2026-10-17T03:20:28.864Z",
+    "a2aCompletedAt": "2026-10-17T03:20:28.875Z"
+  },
+  "notification": {
+    "noticeId": "4b083bffd9d649972bffefbfb43399aa2f8f3f90d4406ffb506d3343db9b57be",
+    "businessCompletedAt": "2026-10-17T03:20:30.733Z",
+    "gatewayAcknowledgedAt": "2026-10-17T03:20:30.753Z"
+  },
+  "facts": {
+    "actualCollectedAt": "2026-10-17T03:19:40.235Z",
+    "commits": 5,
+    "mergedPullRequests": 0,
+    "metrics": {
+      "stars": 0,
+      "forks": 0,
+      "starsDelta": null,
+      "forksDelta": null,
+      "baseline": "首次采集，没有可靠历史快照",
+      "url": "https://github.com/scottzx/session-reader"
+    },
+    "sessionCount": 1,
+    "trendingCapturedAt": "2026-10-17T03:14:20.740508Z"
+  },
+  "erp": {
+    "name": "7ni3lpg0e5",
+    "title": "Git 开发日报 · scottzx/session-reader · 2026-10-16",
+    "project": "PROJ-0009",
+    "parentProject": "PROJ-0007",
+    "parentNote": "3acjflt958",
+    "public": 0,
+    "modifiedAt": "2026-10-17 11:20:30.592275",
+    "hash": "f202e1054591615768d591c1a8dcdb23d195532855f20116ba7230e556394a25",
+    "noteCount": 1,
+    "updatedExistingNote": false
+  },
+  "checks": {
+    "dispatchSucceeded": true,
+    "resultFlowSucceeded": true,
+    "finalAnswerMatchesReport": true,
+    "progressPreservedInLog": true,
+    "progressExcludedFromReport": true,
+    "erpSavedBeforeAck": true,
+    "turnEndedBeforeCompletion": true,
+    "sameRepositoryDateHasOneNote": true,
+    "projectHierarchyMatches": true,
+    "diaryAssociationMatches": true,
+    "repeatSaveUpdatedSameNote": true,
+    "browserParentProjectLinksVisible": true,
+    "browserChildProjectDiaryVisible": true,
+    "browserDiaryReportLinkVisible": true,
+    "browserReportBodyVisible": true,
+    "browserReturnToDiaryVisible": true,
+    "browserReportNotDirty": true
+  },
+  "repeatSave": {
+    "name": "7ni3lpg0e5",
+    "created": false,
+    "hash": "f202e1054591615768d591c1a8dcdb23d195532855f20116ba7230e556394a25"
+  }
+}
