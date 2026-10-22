@@ -22,6 +22,7 @@ import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '
 import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
   scriptDirectory, scriptRevisionName, type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
+import { advanceReportReview, createReportReviewRun, reportBindingDigest, reportRevision, reportReviewInputSchema, reportReviewPolicySchema, type ReportReviewRun } from '../execution/report-review.js';
 export type { RemoteAgentNotice } from './notices.js';
 
 const string = z.string().trim().min(1).max(512);
@@ -39,6 +40,7 @@ const configSchema = z.object({
   automation: automationConfigSchema.optional(),
   pollIntervalMs: z.number().int().min(50).max(60_000).default(3000),
   pptDelivery: pptDeliveryPolicySchema.optional(),
+  reportReview: reportReviewPolicySchema.optional(),
   workbench: z.object({ token: string, reviewerId: string.default('local-owner'), reviewerName: string.optional(), publicBaseUrl: endpoint.optional(),
     allowedOrigins: z.array(string).optional() }).strict().optional(),
 }).strict().superRefine((config, ctx) => {
@@ -85,7 +87,7 @@ const executionReviewSchema = executionJobSchema.extend({ attemptId: string, res
   reviewStatus: z.enum(['pending', 'accepted', 'changes_requested']), note: string.optional() }).strict();
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
-  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。', parameters: z.toJSONSchema(executionSubmitSchema) },
+  execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。临时报告可用input.reportReview:{fileName}，机器文件检查与人工最终通过后父任务才完成。', parameters: z.toJSONSchema(executionSubmitSchema) },
   execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
   execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
@@ -134,7 +136,7 @@ interface ExecutionNotice { noticeId: string; messageId: string; originSessionId
 interface ExecutionCancellation { jobId: string; attemptId: string; originSessionId: string; cascade: boolean;
   requestedAt: string; checkedAt?: string; completedAt?: string; status: 'pending' | 'blocked' | 'completed';
   targets: { jobId: string; attemptId: string; executionStatus: string; submissionStatus: string }[]; diagnostics: string[] }
-interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any }
+interface State { version: 1 | 2; jobs: Job[]; notices: NoticeRecord[]; ledger?: LedgerState; executionNotices?: ExecutionNotice[]; executionCancellations?: Record<string, ExecutionCancellation>; pptDeliveries?: any; reportReviews?: Record<string, ReportReviewRun> }
 const terminal = new Set(['TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED']);
 const actionable = new Set([...terminal, 'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED']);
 const wire = (task: Task): Record<string, any> => Task.toJSON(task) as Record<string, any>;
@@ -220,6 +222,7 @@ export class RemoteAgentGateway {
       }
       this.state.ledger = this.ledger.snapshot(); this.state.version = 2;
       this.state.executionNotices ??= [];
+      this.state.reportReviews ??= {};
       this.state.executionCancellations ??= {};
       this.state.pptDeliveries ??= { version: 1, runs: {} };
       for (const run of Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[]) {
@@ -262,7 +265,9 @@ export class RemoteAgentGateway {
     const attempt = view.attempts.find(item => item.attemptId === view.currentAttemptId)!;
     const raw = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
     const delivery = this.state.pptDeliveries?.runs[attempt.attemptId] as PptDeliveryRun | undefined;
+    const report = this.state.reportReviews?.[attempt.attemptId];
     return { ...view, ...(delivery ? { deliveryProgress: deliveryProgress(delivery) } : {}),
+      ...(report ? { reportProgress: { stage: report.stage, phase: report.phase, reportPath: report.reportPath, fileCheck: report.fileCheck, humanReview: report.humanReviews.at(-1) } } : {}),
       ...(this.state.executionCancellations?.[attempt.attemptId] ? { cancellation: structuredClone(this.state.executionCancellations[attempt.attemptId]) } : {}), attemptId: attempt.attemptId, submissionStatus: attempt.submissionStatus,
       backendRunRef: attempt.backendRunRef, phase: attempt.phase, stale: attempt.stale,
       resultSummary: view.result?.resultSummary, artifactLinks: view.result?.artifactLinks ?? [],
@@ -279,12 +284,25 @@ export class RemoteAgentGateway {
     if (options.previous && (options.previous.remote !== resolved.remote || (options.previous.remoteEndpoint && options.previous.remoteEndpoint !== resolved.endpoint) || options.previous.cwd !== resolved.cwd || options.previous.agentPreset !== resolved.agentPreset)) {
       throw new Error('Continue must preserve the original remote, cwd and preset');
     }
-    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: this.targetSnapshot(resolved),
+    const reportRequest = input.input.reportReview;
+    if (reportRequest !== undefined && (options.jobId || resolved.target.kind !== 'agent_host' || !this.config.reportReview || !this.config.workbench)) throw new Error('Report review requires a new temporary agent_host task and configured report/workbench policy');
+    if (reportRequest !== undefined) reportReviewInputSchema.parse(reportRequest);
+    const prepared = this.ledger.prepare({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, targetSnapshot: { ...this.targetSnapshot(resolved), ...(reportRequest !== undefined ? { provider: 'report_review', targetKind: 'workflow', driver: 'report_review' } : {}) },
       operation: options.jobId ? 'continue' : 'submit' });
     if (prepared.idempotent) return this.ledgerView(input.originSessionId, prepared.job.jobId);
     const { job, attempt } = prepared;
     let sent = false;
     try {
+      if (reportRequest !== undefined) {
+        const { reportReview: _review, ...authorInput } = resolved.input;
+        const run = await createReportReviewRun({ sourceId: this.ledger.sourceId, jobId: job.jobId, attemptId: attempt.attemptId,
+          originSessionId: input.originSessionId, title: input.title ?? '项目架构分析报告', targetId: input.targetId, remote: resolved.remote,
+          cwd: resolved.cwd!, authorInput, reviewerId: this.config.workbench!.reviewerId }, this.config.reportReview!, reportReviewInputSchema.parse(reportRequest));
+        this.state.reportReviews![attempt.attemptId] = run;
+        this.ledger.markDispatching(attempt.attemptId);
+        this.ledger.accept(attempt.attemptId, { provider: 'report_review', runId: attempt.attemptId }, { executionStatus: 'working', phase: run.phase });
+        return this.ledgerView(input.originSessionId, job.jobId);
+      }
       if (resolved.target.binding.driver === 'ppt_delivery') {
         if (options.jobId && !options.deliveryRecovery) throw new Error('PPT continuation requires a verified recovery checkpoint');
         const roleInput = pptDeliveryInputSchema.parse(input.input);
@@ -406,6 +424,65 @@ export class RemoteAgentGateway {
       jobId: run.jobId, attemptId: run.attemptId, executionStatus: run.executionStatus, resultSummary, artifactLinks, createdAt: new Date().toISOString(), text });
     this.save();
   }
+  private async advanceReport(run: ReportReviewRun): Promise<void> {
+    const existing = this.advancingDeliveries.get(run.attemptId);
+    if (existing) return existing;
+    const operation = advanceReportReview(run, {
+      persist: value => { this.state.reportReviews![value.attemptId] = value; this.save(); },
+      child: attemptId => this.ledger.getAttempt(attemptId),
+      submit: async (value, prompt, previous) => {
+        this.assertDispatchOpen(value.originSessionId, value.jobId);
+        const prior = previous ? this.state.jobs.find(job => job.attemptId === previous.attemptId) : undefined;
+        if (previous && !prior) throw new Error('Original report author session is unavailable');
+        const result = await this.submitExecution({ originSessionId: value.originSessionId, targetId: value.targetId,
+          title: `${value.title}：临时执行`, input: { ...value.authorInput, cwd: value.directory, prompt },
+          clientRequestId: `${value.jobId}:${reportRevision(value)}:author`,
+          parentJobRef: { sourceId: value.sourceId, jobId: value.jobId }, parentAttemptId: value.attemptId, purpose: 'architecture_report' },
+          { ...(prior ? { jobId: previous!.jobId, previous: prior } : {}), notificationOrigin: `report-review:${value.jobId}` });
+        return { jobId: result.jobId, attemptId: result.attemptId };
+      },
+      update: value => this.updateReport(value),
+    });
+    this.advancingDeliveries.set(run.attemptId, operation);
+    try { await operation; } finally { this.advancingDeliveries.delete(run.attemptId); }
+  }
+  private updateReport(run: ReportReviewRun): void {
+    this.ledger.observe(run.attemptId, { executionStatus: run.executionStatus, phase: run.phase, resultSummary: run.resultSummary,
+      ...(run.digest ? { resultDigest: run.digest, resultRevision: reportRevision(run), structuredResultRef: {
+        reportPath: run.reportPath, snapshotPath: run.snapshotPath, fileCheck: run.fileCheck,
+        humanReview: run.humanReviews.at(-1),
+      } } : {}) });
+    // Only final task outcomes reach the delegator; child completion and human waiting stay in the workbench.
+    if (!['completed', 'failed', 'canceled'].includes(run.executionStatus)) return;
+    const noticeId = createHash('sha256').update(JSON.stringify([run.sourceId, run.jobId, run.attemptId, reportRevision(run), run.executionStatus])).digest('hex');
+    if (this.state.executionNotices!.some(notice => notice.noticeId === noticeId)) return;
+    const text = `[报告任务通知] ${run.executionStatus === 'completed' ? '人工已确认，任务完成' : '任务未完成'}\n${run.title}\n${run.resultSummary ?? ''}\n报告：${run.reportPath}\n请单次读取 execution_get 回执，记录结论后 execution_ack。\n---\n${JSON.stringify({ noticeId, sourceId: run.sourceId, jobId: run.jobId, attemptId: run.attemptId, originSessionId: run.originSessionId })}`;
+    this.state.executionNotices!.push({ noticeId, messageId: `execution-notice:${noticeId}`, originSessionId: run.originSessionId,
+      jobId: run.jobId, attemptId: run.attemptId, executionStatus: run.executionStatus, resultSummary: run.resultSummary ?? '', artifactLinks: [], createdAt: new Date().toISOString(), text });
+    this.save();
+  }
+  private async decideReportReview(run: ReportReviewRun, reviewId: string, input: unknown) {
+    const review = run.humanReviews.find(item => item.reviewId === reviewId);
+    if (!review) throw new Error('Review not found in authorized task');
+    const decision = humanReviewDecisionSchema.parse(input), replay = review.history.some(item => item.clientRequestId === decision.clientRequestId);
+    if (!replay && (this.state.executionCancellations?.[run.attemptId] || ['completed', 'failed', 'canceled'].includes(run.executionStatus))) throw new HumanReviewError('already_decided', 'Report task is no longer awaiting a decision');
+    let digest = run.digest ?? '';
+    if (!replay && decision.action === 'approve') {
+      try { digest = await reportBindingDigest(run); }
+      catch { throw new HumanReviewError('version_conflict', 'Report bytes changed or are unavailable; this version cannot be approved'); }
+    }
+    const config = this.config.workbench!;
+    const result = decideHumanReview(review, decision, { id: config.reviewerId, displayName: config.reviewerName, source: '1agents-web' },
+      { attemptId: run.attemptId, revision: reportRevision(run), digest });
+    if (!result.idempotent) {
+      const next = { ...run, humanReviews: run.humanReviews.map(item => item.reviewId === reviewId ? result.review : item) };
+      const reportReviews = { ...this.state.reportReviews, [run.attemptId]: next };
+      atomicJson(this.stateFile, { ...this.state, reportReviews }); this.state.reportReviews = reportReviews;
+    }
+    const current = this.state.reportReviews![run.attemptId]!;
+    if (current.humanReviews.some(item => item.resume?.status === 'pending')) void this.advanceReport(current).catch(() => {});
+    return this.workbenchTask(run.jobId);
+  }
   private cancellationJobs(origin: string, jobId: string, cascade: boolean): string[] {
     const found = new Set<string>();
     const visit = (id: string): void => {
@@ -429,11 +506,12 @@ export class RemoteAgentGateway {
   }
   private async cancelExecution(origin: string, jobId: string, cascade?: boolean) {
     const job = this.ledger.get(origin, jobId), run = this.state.pptDeliveries.runs[job.currentAttemptId] as PptDeliveryRun | undefined;
+    if (this.state.reportReviews?.[job.currentAttemptId] && cascade === false) throw new Error('Report cancellation must include its child task');
     if (run && cascade === false) throw new Error('PPT delivery cancellation must include its child tasks');
     let record = this.state.executionCancellations![job.currentAttemptId];
     if (record && cascade === true && !record.cascade) { record.cascade = true; record.status = 'pending'; }
     if (!record) {
-      record = { jobId, attemptId: job.currentAttemptId, originSessionId: origin, cascade: cascade ?? Boolean(run),
+      record = { jobId, attemptId: job.currentAttemptId, originSessionId: origin, cascade: cascade ?? Boolean(run || this.state.reportReviews?.[job.currentAttemptId]),
         requestedAt: new Date().toISOString(), status: 'pending', targets: [], diagnostics: [] };
       this.state.executionCancellations![record.attemptId] = record;
     }
@@ -473,10 +551,12 @@ export class RemoteAgentGateway {
     for (const id of this.cancellationJobs(origin, record.jobId, record.cascade)) {
       for (const attempt of this.ledger.get(origin, id).attempts) await this.advancingDeliveries.get(attempt.attemptId);
     }
-    const ids = this.cancellationJobs(origin, record.jobId, record.cascade), localRuns: PptDeliveryRun[] = [];
+    const ids = this.cancellationJobs(origin, record.jobId, record.cascade), localRuns: PptDeliveryRun[] = [], localReports: ReportReviewRun[] = [];
     for (const id of ids) {
       for (const attempt of this.ledger.get(origin, id).attempts) {
         if (['completed', 'failed', 'canceled', 'rejected'].includes(attempt.executionStatus)) continue;
+        const report = this.state.reportReviews?.[attempt.attemptId];
+        if (report) { localReports.push(report); continue; }
         const delivery = this.state.pptDeliveries.runs[attempt.attemptId] as PptDeliveryRun | undefined;
         if (delivery) {
           if (['completed', 'failed', 'canceled'].includes(delivery.executionStatus)) {
@@ -498,7 +578,7 @@ export class RemoteAgentGateway {
         }
       }
     }
-    const localIds = new Set(localRuns.map(run => run.attemptId));
+    const localIds = new Set([...localRuns, ...localReports].map(run => run.attemptId));
     const targets = ids.flatMap(id => this.ledger.get(origin, id).attempts).map(attempt => ({ jobId: attempt.jobId, attemptId: attempt.attemptId,
       executionStatus: attempt.executionStatus, submissionStatus: attempt.submissionStatus }));
     const unresolved = targets.filter(item => !localIds.has(item.attemptId)
@@ -516,6 +596,11 @@ export class RemoteAgentGateway {
       run.resultSummary = partial.summary;
       this.ledger.observe(run.attemptId, { executionStatus: 'canceled', phase: run.phase, resultSummary: partial.summary, artifactLinks: partial.artifacts });
       this.executionNotice(run, partial.summary, partial.artifacts);
+    }
+    if (!unresolved.length) for (const run of localReports) {
+      run.executionStatus = 'canceled'; run.phase = 'user_canceled'; run.updatedAt = new Date().toISOString();
+      run.humanReviews = run.humanReviews.map(review => review.status === 'pending' ? { ...review, status: 'canceled', updatedAt: run.updatedAt } : review);
+      this.save(); this.updateReport(run);
     }
     record.status = unresolved.length ? 'blocked' : 'completed';
     record.targets = ids.flatMap(id => this.ledger.get(origin, id).attempts).map(attempt => ({ jobId: attempt.jobId, attemptId: attempt.attemptId,
@@ -689,6 +774,14 @@ export class RemoteAgentGateway {
         if (run.executionStatus !== 'working' && !run.parentUpdatePending) this.executionNotice(run,
           run.resultSummary ?? this.ledgerView(run.originSessionId, run.jobId).resultSummary ?? run.diagnostics.at(-1) ?? 'PPT delivery requires attention', run.validation?.artifacts ?? []);
       }
+      for (const run of Object.values(this.state.reportReviews ?? {})) {
+        if (this.closed) break;
+        if (this.state.executionCancellations?.[run.attemptId]) continue;
+        if (run.executionStatus === 'working' || run.humanReviews.some(review => review.resume?.status === 'pending') || ['completed', 'failed', 'canceled'].includes(run.executionStatus)) {
+          try { await this.advanceReport(run); }
+          catch (error) { run.resultSummary = `报告协调器等待处理：${error instanceof Error ? error.message : 'unknown error'}`; this.save(); }
+        }
+      }
       // The persisted notice owns its route. Later bindings must not double-deliver old webhooks.
       if (this.sessions.healthy) for (const record of this.state.notices) {
         if (!record.sessionDeliveryId) continue;
@@ -748,6 +841,7 @@ export class RemoteAgentGateway {
       if (replay) return { ...this.ledgerView(input.originSessionId, job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
       const attempt = job.attempts.find(item => item.attemptId === job.currentAttemptId)!;
       if (job.unresolvedAttemptIds.length) throw new Error('Job has submission_unknown or unresolved attempts; reconcile before continuing');
+      if (this.state.reportReviews?.[attempt.attemptId]) throw new Error('Report workflow continues only through its version-bound human review');
       const delivery = this.state.pptDeliveries.runs[attempt.attemptId];
       if (delivery) {
         this.assertDispatchOpen(input.originSessionId, job.jobId);
@@ -895,7 +989,8 @@ export class RemoteAgentGateway {
     const config = this.config.workbench;
     if (!config) throw new Error('Workbench is not configured');
     const runs = Object.values(this.state.pptDeliveries.runs) as PptDeliveryRun[];
-    return workbenchSnapshot({ ledger: this.ledger.snapshot(), runs, reviews: runs.flatMap(run => run.humanReviews ?? []),
+    const reportRuns = Object.values(this.state.reportReviews ?? {});
+    return workbenchSnapshot({ ledger: this.ledger.snapshot(), runs, reportRuns, reviews: [...runs.flatMap(run => run.humanReviews ?? []), ...reportRuns.flatMap(run => run.humanReviews)],
       actorId: config.reviewerId, ...(config.allowedOrigins ? { allowedOrigins: config.allowedOrigins } : {}) });
   }
   workbenchList(query: WorkbenchListQuery = {}) { return listWorkbenchTasks(this.workbenchProjection(), query); }
@@ -906,6 +1001,8 @@ export class RemoteAgentGateway {
       if (this.closed) throw new Error('Gateway is closed');
       const scope = this.workbenchTask(jobId), config = this.config.workbench!;
       await this.advancingDeliveries.get(scope.currentAttemptId);
+      const report = this.state.reportReviews?.[scope.currentAttemptId];
+      if (report) return this.decideReportReview(report, reviewId, input);
       const run = this.state.pptDeliveries.runs[scope.currentAttemptId] as PptDeliveryRun | undefined;
       const review = run?.humanReviews?.find(item => item.reviewId === reviewId && item.jobId === jobId);
       if (!run || !review) throw new Error('Review not found in authorized task');

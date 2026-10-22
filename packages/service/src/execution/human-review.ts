@@ -9,7 +9,12 @@ export const humanReviewPreviewSchema = z.object({
   slides: z.array(z.object({ title: z.string().min(1), message: z.string(), body: z.array(z.string()),
     visual: z.string(), sources: z.array(z.string()).min(1), facts: z.array(z.string()).min(1), notes: z.string() }).strict()).length(6),
 }).strict();
-export type HumanReviewPreview = z.infer<typeof humanReviewPreviewSchema>;
+const markdownReviewPreviewSchema = z.object({
+  kind: z.literal('markdown'), title: z.string().min(1), markdown: z.string().min(1).max(256 * 1024),
+  reportPath: z.string().min(1), slides: z.array(z.never()).length(0),
+}).strict();
+const reviewPreviewSchema = z.union([humanReviewPreviewSchema, markdownReviewPreviewSchema]);
+export type HumanReviewPreview = z.infer<typeof reviewPreviewSchema>;
 export const humanReviewActorSchema = z.object({ id, displayName: z.string().trim().min(1).max(200).optional(), source: z.literal('1agents-web') }).strict();
 export type HumanReviewActor = z.infer<typeof humanReviewActorSchema>;
 export const humanReviewDecisionSchema = z.object({
@@ -26,7 +31,7 @@ export interface HumanReviewDecision extends HumanReviewDecisionInput {
   decisionId: string; actor: HumanReviewActor; at: string;
 }
 export interface HumanReviewRequest {
-  reviewId: string; jobId: string; attemptId: string; stage: 'summary';
+  reviewId: string; jobId: string; attemptId: string; stage: 'summary' | 'report';
   authorJobId: string; authorAttemptId: string; authorSessionId: string;
   revision: string; digest: string; title: string; preview: HumanReviewPreview;
   reviewerId: string; status: HumanReviewStatus; createdAt: string; updatedAt: string;
@@ -42,9 +47,9 @@ export class HumanReviewError extends Error {
 const timestamp = () => new Date().toISOString();
 
 export function createHumanReview(input: HumanReviewCreateInput, at = timestamp()): HumanReviewRequest {
-  const parsed = z.object({ reviewId: id.optional(), jobId: id, attemptId: id, stage: z.literal('summary'),
+  const parsed = z.object({ reviewId: id.optional(), jobId: id, attemptId: id, stage: z.enum(['summary', 'report']),
     authorJobId: id, authorAttemptId: id, authorSessionId: id, revision: id, digest: sha256, title: z.string().min(1),
-    preview: humanReviewPreviewSchema, reviewerId: id }).strict().parse(input);
+    preview: reviewPreviewSchema, reviewerId: id }).strict().parse(input);
   return { ...parsed, reviewId: parsed.reviewId ?? randomUUID(), status: 'pending', createdAt: at, updatedAt: at, history: [] };
 }
 

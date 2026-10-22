@@ -1,0 +1,74 @@
+{
+  "test": "temporary Markdown author → deterministic file check → final human approval → coordinator notification",
+  "date": "2026-10-22",
+  "displayTimezone": "Asia/Shanghai",
+  "evidenceSource": "Saved admission and one completion execution_get receipt, human decision history, execution_ack receipt, and frozen artifact snapshot from this session; no new live task query.",
+  "sourceId": "4b00a5d8-3edc-4a5b-a7bf-8ae2bea967e4",
+  "completedTrial": {
+    "jobId": "dd42f3f2-c736-4dba-b334-d1c14e60b113",
+    "attemptId": "16e2ba4b-c050-4592-9832-eef8567375a1",
+    "childJobId": "1e52e397-9475-41ef-b8c7-a862262a0562",
+    "childAttemptId": "af211797-c644-4974-b8e3-d89ce96966a9",
+    "executionStatus": "completed",
+    "resultRevision": "report-v1",
+    "createdAt": "2026-10-22T15:08:57.352Z",
+    "childCompletedAt": "2026-10-22T15:09:31.184Z",
+    "fileCheck": {
+      "passed": true,
+      "checkedAt": "2026-10-22T15:09:33.285Z",
+      "size": 1791,
+      "sha256": "d4d0f2df3d5617bafa2c5d9f38b219293c796712b589f7ac327f504bdf1803b0"
+    },
+    "artifact": {
+      "workspaceRelativePath": "dd42f3f2-c736-4dba-b334-d1c14e60b113/16e2ba4b-c050-4592-9832-eef8567375a1/report-v1/README.en.md",
+      "savedSnapshot": "README.en.md"
+    },
+    "humanReview": {
+      "reviewId": "3979ec81-9a3a-41c8-ac38-efab4282b241",
+      "status": "approved",
+      "revision": "report-v1",
+      "digest": "d4d0f2df3d5617bafa2c5d9f38b219293c796712b589f7ac327f504bdf1803b0",
+      "action": "approve",
+      "note": "过",
+      "actor": "Scott",
+      "source": "1agents-web",
+      "decidedAt": "2026-10-22T15:10:50.135Z",
+      "resume": {
+        "status": "applied",
+        "action": "approve",
+        "decisionId": "76284c16-2de1-4cb1-a45a-8c2087472868",
+        "appliedAt": "2026-10-22T15:10:50.188Z"
+      }
+    },
+    "parentCompletedAt": "2026-10-22T15:10:50.208Z",
+    "noticeId": "ac65b92e045095639dc7f776811f84e7ec90b51449cc51b61d98668d138ed401",
+    "processedAt": "2026-10-22T15:11:30.964Z",
+    "acknowledged": true,
+    "acknowledgedAt": "2026-10-22T15:11:31.100Z",
+    "inFlightAttemptIds": [],
+    "unresolvedAttemptIds": []
+  },
+  "canceledTrial": {
+    "jobId": "8a12255d-9026-4f20-a58a-443fde48591e",
+    "attemptId": "d40838dd-a010-4c21-bc79-0350057bdc64",
+    "executionStatus": "canceled",
+    "reason": "Output was outside the author workspace-write boundary; user canceled before retrying the simpler README task.",
+    "cancellationStatus": "completed",
+    "completedAt": "2026-10-22T15:05:11.541Z",
+    "targets": [
+      {
+        "jobId": "5109be6a-f5fd-4bda-a2a2-1e4895c420ff",
+        "attemptId": "f63956db-0c09-4897-aa8a-72ae3576ddda",
+        "executionStatus": "canceled",
+        "submissionStatus": "accepted"
+      },
+      {
+        "jobId": "8a12255d-9026-4f20-a58a-443fde48591e",
+        "attemptId": "d40838dd-a010-4c21-bc79-0350057bdc64",
+        "executionStatus": "canceled",
+        "submissionStatus": "accepted"
+      }
+    ],
+    "acknowledgedAt": "2026-10-22T15:09:27.930Z"
+  }
+}

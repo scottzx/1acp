@@ -1,5 +1,6 @@
 /** Human-readable projections of the execution ledger. Reading never dispatches or acknowledges work. */
 import type { JobRef, LedgerAttempt, LedgerEvent, LedgerJob, LedgerState } from './ledger.js';
+import type { ReportReviewRun } from './report-review.js';
 import type { PptDeliveryRun } from './ppt-delivery.js';
 import { deliveryProgress } from './delivery-progress.js';
 import type { HumanReviewRequest, HumanReviewStatus } from './human-review.js';
@@ -34,7 +35,7 @@ export interface AcpTaskDetail extends AcpTaskSummary {
   artifacts: { revision: string; digest?: string; artifacts: unknown[] }[];
 }
 export interface WorkbenchSource { ledger: LedgerState; runs: readonly PptDeliveryRun[]; reviews: readonly HumanReviewRequest[];
-  actorId: string; allowedOrigins?: readonly string[]; now?: number }
+  reportRuns?: readonly ReportReviewRun[]; actorId: string; allowedOrigins?: readonly string[]; now?: number }
 export interface WorkbenchSnapshot { sourceId: string; tasks: AcpTaskSummary[]; details: Record<string, AcpTaskDetail> }
 export interface WorkbenchListQuery { filter?: 'all' | 'pending' | 'working' | 'failed'; limit?: number; offset?: number }
 const stageNames: Record<string, string> = { summary: '文稿生成', human_review: '人工审核', make: '设计制作', validate: '机器校验', review: '独立验收', finished: '交付完成' };
@@ -77,7 +78,7 @@ function serviceView(attempt: LedgerAttempt | undefined, snapshot: Record<string
   const backend = attempt?.backendRunRef;
   const connectionAlias = metadataText(backend?.remote) ?? metadataText(snapshot.remote);
   const alias = connectionAlias ? { connectionAlias } : {};
-  const recordedWorkflow = workflow || backend?.provider === 'resident_role' && Boolean(metadataText(backend.runId));
+  const recordedWorkflow = workflow || backend?.provider === 'report_review' || backend?.provider === 'resident_role' && Boolean(metadataText(backend.runId));
   if (recordedWorkflow || binding.driver === 'ppt_delivery') return { kind: 'gateway_workflow', source: recordedWorkflow ? 'workflow_run' : 'target_snapshot', ...alias };
   const provider = metadataText(backend?.provider) ?? metadataText(snapshot.provider) ?? metadataText(attempt?.provider);
   const kind: WorkbenchServiceInfo['kind'] = provider === 'a2a' ? 'a2a' : provider === 'activepieces' ? 'activepieces' : 'unknown';
@@ -224,6 +225,22 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
           ...(review.resume ? { resumeStatus: review.resume.status } : {}), ...(resumeError ? { resumeError: resumeError.slice('Human continuation deferred:'.length).trim() } : {}) };
       }),
       events: [...ledger.events.filter(event => event.jobId === job.jobId).map(eventView), ...humanEvents].sort((a, b) => a.observedAt.localeCompare(b.observedAt)), dependencies, artifacts };
+  }
+  for (const report of source.reportRuns ?? []) {
+    const detail = details[report.jobId], task = summaries.get(report.jobId);
+    if (!detail || !task || detail.currentAttemptId !== report.attemptId) continue;
+    const pending = report.humanReviews.at(-1), author = report.child;
+    const stages: WorkbenchStage[] = [
+      { stage: 'research', name: '临时智能体分析', status: author ? ledger.attempts[author.attemptId]?.executionStatus ?? 'unknown' : 'not_started', planned: !author,
+        ...(author ? { jobId: author.jobId, attemptId: author.attemptId } : {}) },
+      { stage: 'file_check', name: '报告文件检查', status: report.fileCheck ? report.fileCheck.passed ? 'completed' : 'failed' : 'not_started', planned: !report.fileCheck },
+      { stage: 'human_review', name: '人工最终确认', status: pending?.status ?? 'not_started', planned: !pending, jobId: report.jobId, attemptId: report.attemptId },
+    ];
+    task.progressSummary = report.resultSummary ?? '临时智能体正在分析项目，输出报告后进行文件检查与人工最终确认。';
+    detail.progressSummary = task.progressSummary;
+    detail.progress = { stage: report.stage, phase: report.phase, stages,
+      completedStages: stages.filter(stage => ['completed', 'approved'].includes(stage.status)).map(stage => stage.name),
+      remainingStages: stages.filter(stage => !['completed', 'approved'].includes(stage.status)).map(stage => stage.name), updatedAt: report.updatedAt };
   }
   return structuredClone({ sourceId: ledger.sourceId, tasks: byNewest([...summaries.values()]), details });
 }
