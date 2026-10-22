@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
-function mount(preset, writable = true) {
+function mount(preset, writable = true, assistantChildren) {
   let client, command;
   const slots = new Map();
   const calls = [], blocks = new Map(), cleanups = [];
   const nativeAssistant = { options: { key: 'assistant-step', priority: 0 }, locale: 'conversation',
-    inject: () => ({ hooks: { presentation: {} } }), component: () => null };
+    inject: () => ({ hooks: { presentation: {} } }), component: () => null,
+    ...(assistantChildren ? { children: assistantChildren } : {}) };
   const nativeBash = { options: { key: 'bash' }, component: () => null };
   const entries = key => key === 'conversation.chat.node' ? [nativeAssistant] : [nativeBash];
   const native = { writable, blocked: writable ? undefined : 'active-writer', configOptions: [{ id: 'native-model', category: 'model', type: 'select', currentValue: 'b', options: [{ group: 'family', name: 'Family', options: [{ value: 'b', name: 'Native B' }] }] }] };
@@ -123,4 +124,39 @@ test('standard messages delegate to DSH; an ACP original is hidden only when an 
       useChat: selector => selector({ nodes: { values: () => [] } }) });
     assert.equal(unmatched.type, f.nativeAssistant.component);
   }
+});
+
+test('native assistant child slots use the host content factories without redeclaring owned slots', async () => {
+  const children = {
+    'conversation.chat.reasoning.body': { kind: 'single', scope: 'session' },
+    'conversation.chat.message.images': { kind: 'single', scope: 'session' },
+  };
+  const f = mount('oneagents-acp-codex', true, children);
+  const entry = f.slots.get('assistant-step');
+  assert.equal(entry.options.children, undefined);
+  assert.equal(f.nativeAssistant.children, children);
+  assert.equal(entry.options.inject, f.nativeAssistant.inject);
+  assert.equal(entry.options.locale, f.nativeAssistant.locale);
+  const calls = [];
+  const renderFactorySlot = (name, owner) => { calls.push({ name, owner }); return name; };
+  const owner = { sessionId: 's', renderFactorySlot, node: { data: { turn: 1, step: 1 } },
+    useChat: selector => selector({ nodes: { values: () => [] } }) };
+  const standard = entry.component(owner);
+  assert.equal(standard.type, f.nativeAssistant.component);
+  const reasoning = { text: 'Thinking', running: true };
+  const images = { images: [{ attachment: 'image' }], loadImage: () => {}, align: 'start' };
+  assert.equal(standard.props.renderSlot('conversation.chat.reasoning.body', reasoning), 'conversation.chat.reasoning.content');
+  assert.equal(standard.props.renderSlot('conversation.chat.message.images', images), 'conversation.images.content');
+  assert.equal(calls[0].owner, reasoning);
+  assert.equal(calls[1].owner, images);
+  const transcript = entry.component({ ...owner, node: { data: { acpTranscript: { groups: [
+    { kind: 'reasoning', key: 'think', text: 'Thinking' },
+  ] } } } }).children[0][0];
+  assert.equal(transcript.type, f.nativeAssistant.component);
+  transcript.props.renderSlot('conversation.chat.reasoning.body', reasoning);
+  assert.equal(calls[2].name, 'conversation.chat.reasoning.content');
+  assert.equal((await f.command.ui.options({ sessionId: 's' }))[0].label, 'Native B');
+  f.dispose();
+  assert.equal(f.slots.has('assistant-step'), false);
+  assert.equal(f.nativeAssistant.children, children);
 });

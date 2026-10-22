@@ -2,6 +2,10 @@
 import React from 'react';
 const h = React.createElement;
 const toolKeys = { Bash: 'bash', Read: 'read', Edit: 'edit', Write: 'write', Search: 'search', Fetch: 'web_fetch' };
+const assistantContentFactories = {
+  'conversation.chat.reasoning.body': 'conversation.chat.reasoning.content',
+  'conversation.chat.message.images': 'conversation.images.content',
+};
 
 function ToolGroup({ roots, owner, renderTool, label }) {
   const { expanded, toggle } = owner.useDisclosure();
@@ -16,7 +20,12 @@ function ToolGroup({ roots, owner, renderTool, label }) {
 export function installTranscriptView(ctx) {
   ctx.slots.inject('conversation.chat.node', () => {
     const native = [...ctx.slots.entries('conversation.chat.node')].reverse().find(entry => entry.options.key === 'assistant-step');
-    if (!native || native.children) throw new Error('DSH native assistant renderer is unavailable');
+    if (!native) throw new Error('DSH native assistant renderer is unavailable');
+    // Newer DSH renderers own child slots. Delegate their bodies through the
+    // public Content Factories; redeclaring those slots would collide with DSH.
+    const renderAssistant = props => h(native.component, native.children ? { ...props,
+      renderSlot: (key, owner) => props.renderFactorySlot(assistantContentFactories[key], owner),
+    } : props);
     const tTool = ctx.locale.bind('conversation');
     const t = ctx.locale.bind('oneagentsAcp');
     const renderTool = (root, owner) => {
@@ -39,11 +48,11 @@ export function installTranscriptView(ctx) {
           label: count => t('toolGroup').replace('{count}', String(count)) });
         const node = { ...props.node, data: { ...props.node.data, acpTranscript: undefined,
           blocks: [{ kind: group.kind, text: group.text }] } };
-        return h(native.component, { ...props, key: group.key, node, groupPart: undefined, turnProcess: undefined });
+        return renderAssistant({ ...props, key: group.key, node, groupPart: undefined, turnProcess: undefined });
       }));
       const preset = ctx.sessions.binding(props.sessionId)?.session.projections.faceOf('agentPreset').getSnapshot();
       return projected && typeof preset === 'string' && preset.startsWith('oneagents-acp-')
-        ? h('span', { hidden: true, 'data-oneagents-acp-original': '' }) : h(native.component, props);
+        ? h('span', { hidden: true, 'data-oneagents-acp-original': '' }) : renderAssistant(props);
     }
     // Public keyed replacement retains the original renderer registration. Its
     // locale and presentation Hook are also used for the ACP native components.
