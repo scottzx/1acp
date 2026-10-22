@@ -47,7 +47,9 @@
 - 预览：<http://100.88.227.56:36818/artifacts/234da254-7b9c-4c10-b020-ed084841382e/revision-2/preview.png>
 - 原报告：`/tmp/1agents-ppt-delivery/234da254-7b9c-4c10-b020-ed084841382e/15c42d94-c5d4-475e-98fc-ffebc47eca65/revision-2/independent-review.e5e28344-71c6-40a0-b906-4417cc03a82c.json`，另复制到最终发布 evidence/independent-review.json。
 
-异常通知 `530aeac204219badf0cb2e68146527e199336f7042ce1b29b8532785d271be2c` 包含问题和 8 个已有产物链接。原 Codex 会话队列受理 accepted、投递次数 1，messageId 固定，hostReceiptId=`01a1628a-514b-7c61-b974-7aa477620b4e`。保存处理结论后调用 execution_ack，inbox 已无该 notice。ack 只代表通知已处理。当前根轮次尚在运行，本轮未观察到该 notice 在原生会话开启后续新轮次，故只证明队列受理，不声称已完成本次自动唤醒验收。
+异常通知 `530aeac204219badf0cb2e68146527e199336f7042ce1b29b8532785d271be2c` 包含问题和 8 个已有产物链接。原 Codex 会话队列受理 accepted、投递次数 1，messageId 固定，hostReceiptId=`01a1628a-514b-7c61-b974-7aa477620b4e`。保存处理结论后调用 execution_ack，inbox 已无该 notice。ack 只代表通知已处理。
+
+首次检查时根轮次仍在运行，证据仅能证明队列受理。根轮次结束后，该通知真实进入原主会话并触发本次后续处理：原生 transcript 中找到包含相同 noticeId 的 user message 及后续新轮次事件，`notification-native-wake.json` 已更新为 actualNativeWakeVerified=true。延迟通知到达后再次 execution_get 核对：新父轮次仍 input_required、原失败轮次保留、第二轮仍 canceled。保存幂等处理结论后再次 ack，无重复派单、改稿或业务接受；“已 ack 后才收到宿主队列中的消息”不作为失败或重新派发的依据。
 
 最终 DSH 宿主在全部会话空闲后切换至同一最终完整发布包并启动，验收会话未被中断；只读目标探测 ready。取消的第二轮保持原 canceled 和 completed 关闭回执，未新增轮次。
 
