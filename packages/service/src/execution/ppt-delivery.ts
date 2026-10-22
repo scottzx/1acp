@@ -6,6 +6,7 @@ import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { deliveryException } from './delivery-progress.js';
+import { resolveRoleSkills } from '../roles/index.js';
 
 const execute = promisify(execFile);
 const absolute = z.string().min(1).refine(isAbsolute, 'Expected an absolute path');
@@ -31,6 +32,7 @@ export const pptDeliveryPolicySchema = z.object({
   backupTargets: z.object({ project_script: identifier.optional(), ppt_production: identifier.optional(), independent_review: identifier.optional() }).strict().optional(),
   maxTargetSwitches: z.number().int().min(0).max(3).default(1),
   runtimeDocument: absolute, designSkill: absolute, pythonExecutable: absolute,
+  roleSkills: z.object({ profilePath: absolute, cacheRoot: absolute }).strict().optional(),
   nodeExecutable: absolute.optional(), nodeModuleRoot: absolute.optional(),
   maxRevisionRounds: z.number().int().min(0).max(3).default(1),
   maxExecutionRetries: z.number().int().min(0).max(2).default(1),
@@ -82,6 +84,8 @@ export interface PptDeliveryRun {
     reviewRounds: number; qualityRevisions: number; acceptanceExerciseRevisions: number; elapsedMs: number;
     modelUsage: 'unknown'; modelUsageReason: string };
   resultSummary?: string; deliveryReceipt?: Record<string, unknown>;
+  /** One parent-task skill lock shared by production, review, retries and recovery. */
+  roleSkillLockPath?: string;
   parentUpdatePending?: PptDeliveryParentUpdate;
   projectSnapshot?: { gitHead: string; gitStatus: string; trackedDiffDigest: string };
   scriptDigest?: string; sourceManifestDigest?: string;
@@ -175,10 +179,15 @@ export async function createPptDeliveryRun(input: {
   const jobDirectory = join(policy.workspaceRoot, input.jobId, input.attemptId);
   await mkdir(join(jobDirectory, 'coordinator'), { recursive: true });
   await mkdir(join(policy.publicDirectory, input.jobId), { recursive: true });
+  let roleSkillLockPath: string | undefined;
+  if (policy.roleSkills) {
+    roleSkillLockPath = join(policy.roleSkills.cacheRoot, 'locks', `ppt-${digest(JSON.stringify([input.sourceId, input.jobId]))}.json`);
+  }
   const now = new Date().toISOString();
   const run: PptDeliveryRun = { version: 1, ...input, input: task, policy, jobDirectory,
     contractPath: join(jobDirectory, 'contract.json'), createdAt: now, updatedAt: now,
     executionStatus: 'working', stage: 'summary', phase: 'preparing', revision: 1,
+    ...(roleSkillLockPath ? { roleSkillLockPath } : {}),
     revisionReasons: [], executionRetries: {}, children: [], activeTargets: {}, targetSwitches: [], diagnostics: [], transitions: [],
     metrics: { submitCalls: 0, continueCalls: 0, queryCalls: 0, ackCalls: 0, machineChecks: 0,
       reviewRounds: 0, qualityRevisions: 0, acceptanceExerciseRevisions: 0, elapsedMs: 0,
@@ -186,6 +195,7 @@ export async function createPptDeliveryRun(input: {
   run.projectSnapshot = await projectSnapshot(project);
   await jsonFile(run.contractPath, { schema: 'ppt-delivery-contract-v1', sourceId: run.sourceId, jobId: run.jobId,
     attemptId: run.attemptId, input: task, policy, jobDirectory, projectSnapshot: run.projectSnapshot,
+    ...(roleSkillLockPath ? { roleSkillLockPath } : {}),
     completion: 'Final bytes pass deterministic validation and independent fact/visual review; notification ack and human acceptance are separate' });
   return run;
 }
@@ -251,6 +261,7 @@ async function buildRequest(run: PptDeliveryRun, retry: number): Promise<PptDeli
     ? [run.contractPath, revisionContract, join(summary, 'slide-script.json'), run.policy.runtimeDocument, run.policy.designSkill]
     : [run.contractPath, join(revision, 'machine-validation.json'), join(revision, 'preview.png')];
   return { targetId, input: { title: `${run.input.projectName}：${purpose} ${revisionName(run)}`, prompt,
+    ...(run.stage !== 'summary' && run.roleSkillLockPath ? { roleLockPath: run.roleSkillLockPath } : {}),
     ...(run.stage === 'summary' ? { agentPreset: run.policy.summaryAgentPreset } : {}),
     ...(cwd ? { cwd } : {}), preflight: { jobDirectory: run.jobDirectory, requiredFiles,
       ...(run.stage === 'make' ? { python: { executable: run.policy.pythonExecutable, modules: ['defusedxml'] },
@@ -398,6 +409,15 @@ async function stop(run: PptDeliveryRun, adapter: PptDeliveryAdapter, status: 'f
 }
 async function startChild(run: PptDeliveryRun, adapter: PptDeliveryAdapter, previous?: PptDeliveryChild, replacesJobRef?: { sourceId: string; jobId: string }): Promise<void> {
   if (run.cancellationRequestedAt) return;
+  if (run.roleSkillLockPath && run.policy.roleSkills) {
+    try {
+      const lock = await resolveRoleSkills({ ...run.policy.roleSkills, lockPath: run.roleSkillLockPath });
+      if (!lock.entryGuidePath) throw new Error('PPT role profile requires an entrySkill');
+      run.policy.designSkill = lock.entryGuidePath;
+      await adapter.persist(run);
+    }
+    catch (error) { return stop(run, adapter, 'input_required', `任务锁定的技能缓存不可用：${String(error)}`); }
+  }
   const key = run.stage, retry = run.executionRetries[key] ?? 0;
   if (!run.pending) run.pending = { kind: previous ? 'continue' : 'submit', request: { ...await buildRequest(run, retry),
     ...(replacesJobRef ? { replacesJobRef } : {}) }, ...(previous ? { child: previous } : {}) };
@@ -455,6 +475,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
     if (run.recovery && !run.recovery.validationCheckedAt) {
       try {
         await validateSummary(run);
+        if (run.roleSkillLockPath && run.policy.roleSkills) await resolveRoleSkills({ ...run.policy.roleSkills, lockPath: run.roleSkillLockPath });
         const checked = await (adapter.validateCandidate ?? validatePptDeliveryCandidate)(run); run.metrics.machineChecks++;
         if (checked.artifactDigest !== (run.recovery.mode === 'review_only' ? run.recovery.artifactDigest : run.review!.artifactDigest)) throw new Error('Recovered checkpoint bytes differ from frozen artifact digest');
         run.validation = checked; run.recovery.validationCheckedAt = new Date().toISOString(); await adapter.persist(run);
@@ -549,6 +570,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
       try {
         rechecked = await (adapter.validateCandidate ?? validatePptDeliveryCandidate)(run); run.metrics.machineChecks++;
         await validateSummary(run);
+        if (run.roleSkillLockPath && run.policy.roleSkills) await resolveRoleSkills({ ...run.policy.roleSkills, lockPath: run.roleSkillLockPath });
       } catch (error) {
         if (run.recovery?.mode === 'review_only') return stop(run, adapter, 'input_required', `只重试验收的交付前复核失败，不派新任务：${String(error)}`);
         throw error;
@@ -566,6 +588,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         deliveryReadiness: 'ready', policyVersion: run.policy.version, limitations: review.limitations,
         humanAcceptance: 'not_requested', notificationAcknowledged: false, metrics: run.metrics,
         targetSwitches: run.targetSwitches,
+        ...(run.roleSkillLockPath ? { roleSkillLockPath: run.roleSkillLockPath } : {}),
         ...(run.recovery ? { recovery: run.recovery } : {}),
         productionAttemptCount: makerAttempts.length };
       const ppt = rechecked.artifacts.find(item => item.path.endsWith('.pptx'))!, preview = rechecked.artifacts.find(item => item.path.endsWith('/preview.png'))!;

@@ -30,6 +30,10 @@
       "import": "./dist/src/package.js"
     },
     "./package.json": "./package.json",
+    "./roles": {
+      "types": "./dist/src/roles/index.d.ts",
+      "import": "./dist/src/roles/index.js"
+    },
     "./runtime": {
       "types": "./vendor/runtime/dist/runtime.d.ts",
       "import": "./vendor/runtime/dist/runtime.js"

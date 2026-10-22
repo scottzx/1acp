@@ -9,3 +9,5 @@ release/
 .corepack/
 packages/service/vendor/
 .dsh-build-cache.tgz
+.cache/roles/
+roles/local-update.json

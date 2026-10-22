@@ -52,12 +52,13 @@ const prompt = z.string().min(1).max(256 * 1024).refine(value => Boolean(value.t
 const spawnSchema = z.object({ ...originFields, remote: string, prompt,
   cwd: string.refine(value => path.posix.isAbsolute(value), 'cwd must be an absolute remote path'),
   agentPreset: string.optional(), notificationTarget: string.optional(), title: string.optional(),
+  roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(),
   preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional(),
   clientRequestId: string.optional(),
 }).strict();
 const preflightSchema = a2aPreflightInputSchema.extend({ ...originFields, remote: string }).strict();
 const taskSchema = z.object(taskFields).strict();
-const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional() }).strict();
+const messageSchema = z.object({ ...taskFields, prompt, clientRequestId: string.optional(), roleId: string.optional(), roleLockPath: string.refine(path.isAbsolute).optional(), preflight: a2aPreflightRequirementsSchema.optional(), resultContract: a2aResultContractSchema.optional() }).strict();
 const inboxSchema = z.object(originFields).strict();
 const ackSchema = z.object({ ...originFields, noticeId: string }).strict();
 const executionSubmitSchema = z.object({ ...originFields, targetId: string, input: z.record(z.string(), z.unknown()),
@@ -284,6 +285,11 @@ export class RemoteAgentGateway {
       const requirements = resolved.directoryPolicy ? { ...preflight, allowedDirectories: resolved.directoryPolicy.allowedDirectories } : preflight;
       const declaredContract = fields.resultContract === undefined ? undefined : a2aResultContractSchema.parse(fields.resultContract);
       const resultContract = declaredContract && options.notificationOrigin ? { ...declaredContract, jobId: job.jobId } : declaredContract;
+      const networkRole = resolved.target.binding.skillPolicy === 'network_pinned' ? resolved.target.binding.roleId : undefined;
+      if (resolved.target.binding.skillPolicy && !networkRole) throw new Error('Network skill policy requires a fixed roleId');
+      const explicitRole = resolved.target.kind === 'agent_host' && fields.roleId !== undefined ? string.parse(fields.roleId) : undefined;
+      const roleLockPath = fields.roleLockPath === undefined ? undefined
+        : z.string().min(1).refine(path.isAbsolute, 'Expected an absolute role lock path').parse(fields.roleLockPath);
       await this.checkDispatch(resolved.remote, resolved.cwd!, requirements, resolved.endpoint);
       const client = await this.client(resolved.remote, resolved.endpoint);
       // Target changes/disable during asynchronous preflight must win before sending.
@@ -294,6 +300,7 @@ export class RemoteAgentGateway {
       const task = await client.sendMessage(SendMessageRequest.fromJSON({ message: { messageId: attempt.attemptId, role: 'ROLE_USER',
         ...(options.previous ? { contextId: options.previous.contextId } : {}), parts: [{ text: prompt.parse(fields.prompt) }] },
         metadata: { '1agents': { ...(!options.previous ? { cwd: resolved.cwd, ...(resolved.agentPreset ? { agentPreset: resolved.agentPreset } : {}) } : {}),
+          ...(explicitRole ? { roleId: explicitRole } : !options.previous && networkRole ? { roleId: networkRole } : {}), ...(roleLockPath ? { roleLockPath } : {}),
           ...(requirements ? { preflight: requirements } : {}), ...(resultContract ? { resultContract } : {}) } },
         configuration: { returnImmediately: true, ...(this.config.callback ? { taskPushNotificationConfig: { url: this.config.callback.url,
           authentication: { scheme: 'Bearer', credentials: this.config.callback.token } } } : {}) } }), this.auth(resolved.remote));
@@ -815,6 +822,7 @@ export class RemoteAgentGateway {
         clientRequestId: input.clientRequestId, title: previous.title,
         input: { ...(target.kind === 'agent_host' ? { cwd: previous.cwd, ...(previous.agentPreset ? { agentPreset: previous.agentPreset } : {}) } : {}), prompt: input.prompt,
           ...(input.preflight ? { preflight: input.preflight } : {}), ...(input.resultContract ? { resultContract: input.resultContract } : {}),
+          ...(input.roleId ? { roleId: input.roleId } : {}), ...(input.roleLockPath ? { roleLockPath: input.roleLockPath } : {}),
           ...(previous.notificationTarget ? { notificationTarget: previous.notificationTarget } : {}) } }, { jobId: previous.ledgerJobId, previous });
       if ('error' in submitted) throw new Error(`${submitted.error}; jobId=${submitted.jobId}; attemptId=${submitted.attemptId}`);
       const raw = this.state.jobs.find(item => item.attemptId === submitted.attemptId);

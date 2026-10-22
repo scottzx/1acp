@@ -13,6 +13,7 @@ import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import { toSafeError, type SafeError } from '@1agents/acp-service/runtime';
 import { DirectoryLease } from './lease.js';
 import type { A2ATarget } from './types.js';
+import { a2aRoleSkillsSchema } from './types.js';
 import { a2aPreflightReportSchema } from './preflight.js';
 
 interface Scope { tenant: string; owner: string }
@@ -94,7 +95,11 @@ function parseTarget(value: unknown): A2ATarget {
   if (!isAbsolute(cwd)) throw new Error('Invalid A2A working directory: expected an absolute path');
   const agentPreset = source.agentPreset === undefined ? undefined : text(source.agentPreset, 'agent preset');
   const preflight = source.preflight === undefined ? undefined : a2aPreflightReportSchema.parse(source.preflight);
-  return { sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), ...(preflight === undefined ? {} : { preflight }) };
+  const roleSkills = source.roleSkills === undefined ? undefined : a2aRoleSkillsSchema.parse(source.roleSkills);
+  const roleId = source.roleId === undefined ? undefined : text(source.roleId, 'role identity');
+  if ((roleId !== undefined) !== (roleSkills !== undefined)) throw new Error('A2A role identity and skill lock must be stored together');
+  return { sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), ...(preflight === undefined ? {} : { preflight }),
+    ...(roleSkills === undefined ? {} : { roleId, roleSkills }) };
 }
 
 function validatePushUrl(value: unknown): string {

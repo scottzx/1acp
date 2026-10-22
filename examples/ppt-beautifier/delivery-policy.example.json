@@ -3,12 +3,16 @@
   "workspaceRoot": "/tmp/1agents-ppt-delivery",
   "publicDirectory": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts",
   "publicBaseUrl": "http://100.88.227.56:36818/artifacts",
-  "allowedProjectRoots": ["/Users/scott/Documents/01-开发项目/1agents"],
+  "allowedProjectRoots": [
+    "/Users/scott/Documents/01-开发项目/1agents"
+  ],
   "summaryTargetId": "dsh-project-summary",
   "summaryAgentPreset": "standard",
   "makerTargetId": "ppt-beautifier",
   "reviewTargetId": "ppt-independent-review",
-  "backupTargets": { "ppt_production": "ppt-beautifier-backup" },
+  "backupTargets": {
+    "ppt_production": "ppt-beautifier-backup"
+  },
   "maxTargetSwitches": 1,
   "runtimeDocument": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/RUNTIME.md",
   "designSkill": "/Users/scott/.local/share/1agents/ppt-beautifier/skills/ppt-report-design/SKILL.md",
@@ -18,5 +22,9 @@
   "maxRevisionRounds": 1,
   "maxExecutionRetries": 1,
   "maxDurationMs": 5400000,
-  "httpTimeoutMs": 15000
+  "httpTimeoutMs": 15000,
+  "roleSkills": {
+    "profilePath": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/roles/ppt-beautifier/profile.json",
+    "cacheRoot": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.cache/roles"
+  }
 }

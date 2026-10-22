@@ -118,3 +118,7 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 ## 固定角色与页数
 
 角色规则以 [ROLE.md](ROLE.md) 为准，同步到角色 workspace/ROLE.md。页数可通过交付输入 `slideCount` 指定；省略时由事实脚本按内容规划，后续制作、预览、机器校验及独立验收按冻结脚本的实际 N 页执行。既有六页合同与产物不变。
+
+## 网络技能与缓存（0.4.0）
+
+当前角色说明和技能引用由 [roles/ppt-beautifier](../../roles/ppt-beautifier) 维护。persona 只保留接单与加载规则；设计方法通过能力网络统一更新。旧私有 skills 目录作为历史备份保留，新任务使用宿主注入的任务锁和 `1acp/.cache/roles` 内的版本快照。完整源独立迁至 `~/.local/share/1agents/skill-library/ppt`；操作及恢复规则见 [角色与缓存说明](../../roles/README.md)。上文 0.2.x 本地复制方式为历史部署记录。

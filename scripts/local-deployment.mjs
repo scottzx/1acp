@@ -83,7 +83,7 @@ export function verifyInstalledPackage(packageDirectory) {
 }
 function sourceFiles(root) {
   return execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: root }).toString().split('\0').filter(Boolean)
-    .filter(path => /^(?:packages\/|scripts\/|examples\/ppt-beautifier\/|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|\.gitignore$|README\.md$)/.test(path))
+    .filter(path => /^(?:packages\/|scripts\/|roles\/|examples\/ppt-beautifier\/|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|\.gitignore$|README\.md$)/.test(path))
     .filter(path => !/(?:^|\/)(?:node_modules|dist|dist-test|coverage|vendor|\.git)(?:\/|$)/.test(path) && !forbidden(path)).sort();
 }
 function snapshotSources(root, destination) {

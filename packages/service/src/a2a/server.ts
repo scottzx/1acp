@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { AgentCard, SSE_HEADERS, TaskState, formatSSEEvent, type CancelTaskRequest, type Message, type SendMessageRequest, type StreamResponse, type Task, type TaskPushNotificationConfig } from '@a2a-js/sdk';
 import { PushNotificationNotSupportedError, RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import { DefaultExecutionEventBusManager, DefaultRequestHandler, JsonRpcTransportHandler, ServerCallContext, V1PushNotificationSerializer, resolveUserScope, validateVersion, type PushNotificationSender } from '@a2a-js/sdk/server';
-import { A2ASessionExecutor, parseA2AInput, type A2AExecutionOptions } from './executor.js';
+import { A2ASessionExecutor, parseA2AInput, validateA2AExecutionOptions, type A2AExecutionOptions } from './executor.js';
 import { Role } from '@a2a-js/sdk';
 import { toSafeError } from '@1agents/acp-service/runtime';
 import { a2aRequestId } from './request-id.js';
@@ -155,6 +155,7 @@ export async function createA2AServer(options: A2AServerOptions): Promise<{
   close: () => Promise<void>;
 }> {
   if (!options.token?.trim()) throw new Error('A2A requires a bearer token');
+  validateA2AExecutionOptions(options);
   const path = options.path ?? '/a2a';
   if (!/^\/[a-z0-9/_-]+$/i.test(path) || path.endsWith('/')) throw new Error('Invalid A2A route path');
   const publicUrl = new URL(options.publicUrl);

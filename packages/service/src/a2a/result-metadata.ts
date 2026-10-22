@@ -45,6 +45,9 @@ export interface A2AResultMetadata {
   sessionId?: string;
   cwd?: string;
   agentPreset?: string;
+  roleId?: string;
+  /** Resolved by the execution host, independently from caller-declared lineage. */
+  roleSkills?: A2ATarget['roleSkills'];
   startedAt: string;
   finishedAt: string;
   outcome: 'completed' | 'failed' | 'input-required' | 'canceled';
@@ -125,7 +128,8 @@ export async function createA2AResultMetadata(input: {
   const metadata: A2AResultMetadata = {
     version: 1, producer: '1agents/a2a-host', taskId: input.taskId, contextId: input.contextId,
     requestId: input.requestId, ...(target ? { sessionId: target.sessionId, cwd: target.cwd,
-      ...(target.agentPreset ? { agentPreset: target.agentPreset } : {}) } : {}),
+      ...(target.agentPreset ? { agentPreset: target.agentPreset } : {}),
+      ...(target.roleSkills ? { roleId: target.roleId, roleSkills: structuredClone(target.roleSkills) } : {}) } : {}),
     startedAt: input.startedAt, finishedAt: new Date().toISOString(), outcome: input.outcome,
     ...(contract ? { lineage: { ...contract, source: 'caller-declared' } } : {}),
     ...(target?.preflight || input.preflight ? { preflight: target?.preflight ?? input.preflight } : {}), artifacts: [],

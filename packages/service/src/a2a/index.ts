@@ -2,7 +2,9 @@
 export { createA2AServer } from './server.js';
 export type { A2AServerOptions } from './server.js';
 export { FileA2AStore } from './store.js';
-export type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport } from './types.js';
+export type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget, A2APreflightInput, A2APreflightRequirements, A2APreflightReport, A2ARoleSkills } from './types.js';
+export { a2aRoleSkillsSchema } from './types.js';
+export type { A2AExecutionOptions } from './executor.js';
 export { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema, A2APreflightError, runA2APreflight } from './preflight.js';
 export { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetadata, saveA2AResultMetadata } from './result-metadata.js';
 export type { A2AResultContract, A2AVerifiedArtifact, A2AResultMetadata } from './result-metadata.js';

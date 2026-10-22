@@ -1,5 +1,18 @@
 /** Execution interfaces shared by DSH and future standalone A2A hosts. */
 import type { SafeError } from '@1agents/acp-service/runtime';
+import { isAbsolute } from 'node:path';
+import { z } from 'zod';
+
+const roleText = z.string().min(1).max(4096).refine(value => !value.includes('\0'));
+const rolePath = roleText.refine(isAbsolute, 'Expected an absolute role cache path');
+/** Host-authored summary of a verified, immutable role/skill lock. */
+export const a2aRoleSkillsSchema = z.object({
+  roleId: roleText, roleVersion: roleText, lockPath: rolePath, roleDirectory: rolePath,
+  entryGuidePath: rolePath.optional(),
+  skills: z.array(z.object({ key: roleText, skillId: roleText, sourceId: roleText, name: roleText,
+    revision: z.string().regex(/^[a-f0-9]{64}$/), directory: rolePath, guidePath: rolePath }).strict()).min(1).max(100),
+}).strict();
+export type A2ARoleSkills = z.infer<typeof a2aRoleSkillsSchema>;
 
 /** Explicit host-side requirements checked without creating an agent session. */
 export interface A2APreflightRequirements {
@@ -23,6 +36,9 @@ export interface A2ATarget {
   cwd: string;
   agentPreset?: string;
   preflight?: A2APreflightReport;
+  /** Logical host binding; several bindings may use one canonical skill profile. */
+  roleId?: string;
+  roleSkills?: A2ARoleSkills;
 }
 
 /** Omitted location and preset reuse a saved context or the host defaults. */
@@ -31,6 +47,10 @@ export interface A2APrepareInput {
   cwd?: string;
   agentPreset?: string;
   preflight?: A2APreflightRequirements;
+  /** Only selects a host-configured profile; clients cannot supply profile or cache configuration. */
+  roleId?: string;
+  /** Optional existing parent lock under the host cache's locks directory. */
+  roleLockPath?: string;
 }
 
 /** A single DSH turn's output, without transport or host dependencies. */

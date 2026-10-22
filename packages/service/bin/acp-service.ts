@@ -59,6 +59,7 @@ function printUnifiedHelp(binName: string) {
     );
 
   const serverCommands = `Commands:
+  roles sync --profile <file>            Resolve current network skills into a versioned task lock
   a2a gateway --config <file>             Start persistent remote-agent tools and completion inbox
   a2a invoke <method>                     Invoke local remote-agent tools (JSON params on stdin)
   serve [options]                         Start DreamMate Network ACP runtime daemon (HTTP + WS)`;
@@ -133,6 +134,11 @@ async function runServer(options: { port?: number; host?: string; report?: boole
 }
 
 async function main() {
+  if (rawArgs[0] === 'roles') {
+    const { runRolesCli } = await import('./roles.js');
+    await runRolesCli(rawArgs.slice(1));
+    return;
+  }
   if (rawArgs.includes('--skill')) {
     const { maybeHandleSkillflag } = await import('skillflag');
     const packageRoot = path.dirname(require.resolve('@1agents/acp-service/package.json'));
