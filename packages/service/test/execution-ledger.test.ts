@@ -157,6 +157,74 @@ test('acceptance binds exact result bytes and revision, is separate from executi
   assert.equal(ledger.getAttempt(id).executionStatus, 'completed'); assert.equal(retry.attempt.executionStatus, 'not_started');
 });
 
+test('completed results acquire stable versions and host artifact hashes participate in the digest', () => {
+  const f = fixture(), first = running(f.ledger), id = first.attempt.attemptId;
+  const observation = { resultSummary: 'published package', artifactLinks: ['https://example.invalid/article.html'],
+    resultArtifacts: [{ path: '/output/article.html', size: 100, sha256: 'a'.repeat(64) }] };
+  f.ledger.observe(id, observation);
+  assert.equal(f.ledger.getAttempt(id).result?.resultRevision, undefined);
+  f.ledger.observe(id, { ...observation, executionStatus: 'completed' });
+  const original = f.ledger.get('root', first.job.jobId).result!;
+  assert.equal(original.resultRevision, 'result-1'); assert.match(original.resultDigest!, /^[a-f0-9]{64}$/);
+  f.ledger.acceptance('root', first.job.jobId, { attemptId: id, resultRevision: original.resultRevision!, resultDigest: original.resultDigest!, reviewStatus: 'accepted' });
+  const events = f.ledger.events('root').length;
+  const ledger = new JobLedger(f.saved(), () => {});
+  ledger.observe(id, { ...observation, checkedAt: '2026-10-22T12:00:00.000Z', resultArtifacts: [{ sha256: 'a'.repeat(64), size: 100, path: '/output/article.html' }] });
+  let view = ledger.get('root', first.job.jobId);
+  assert.equal(view.result?.resultRevision, original.resultRevision); assert.equal(view.result?.resultDigest, original.resultDigest);
+  assert.equal(view.resultHistory.length, 1); assert.equal(ledger.events('root').length, events);
+  assert.equal(view.businessAcceptance?.reviewStatus, 'accepted');
+  ledger.observe(id, { resultArtifacts: [{ path: '/output/article.html', size: 100, sha256: 'b'.repeat(64) }] });
+  view = ledger.get('root', first.job.jobId);
+  assert.equal(view.result?.resultRevision, 'result-2'); assert.notEqual(view.result?.resultDigest, original.resultDigest);
+  assert.deepEqual(view.resultHistory[0], original); assert.equal(view.resultHistory.length, 2);
+  assert.equal(view.businessAcceptance, undefined); assert.equal(view.acceptanceHistory.length, 1);
+  assert.throws(() => ledger.acceptance('root', first.job.jobId, { attemptId: id, resultRevision: original.resultRevision!, resultDigest: original.resultDigest!, reviewStatus: 'accepted' }), /does not match/);
+  ledger.observe(id, observation);
+  view = ledger.get('root', first.job.jobId);
+  assert.equal(view.result?.resultDigest, original.resultDigest); assert.equal(view.result?.resultRevision, 'result-3');
+  assert.equal(view.businessAcceptance, undefined);
+  view.resultHistory[0]!.resultSummary = 'mutated';
+  assert.equal(ledger.get('root', first.job.jobId).resultHistory[0]?.resultSummary, original.resultSummary);
+});
+
+test('explicit revisions cannot overwrite history, stale observations cannot change versions and old rounds cannot be reviewed', () => {
+  const { ledger } = fixture(), first = running(ledger), id = first.attempt.attemptId;
+  const observation = { executionStatus: 'completed' as const, resultSummary: 'v1', resultRevision: 'revision-1', resultDigest: 'artifact-digest-1' };
+  ledger.observe(id, observation);
+  const original = ledger.get('root', first.job.jobId).result!;
+  assert.throws(() => ledger.observe(id, { resultSummary: 'different', resultRevision: 'revision-1', resultDigest: 'artifact-digest-1' }), /cannot be overwritten/);
+  assert.deepEqual(ledger.get('root', first.job.jobId).result, original);
+  ledger.observe(id, { executionStatus: 'working', resultSummary: 'late progress' });
+  assert.equal(ledger.get('root', first.job.jobId).resultHistory.length, 1);
+  assert.deepEqual(ledger.get('root', first.job.jobId).result, original);
+  ledger.observe(id, { resultSummary: 'v2', resultRevision: 'revision-2', resultDigest: 'artifact-digest-2' });
+  assert.throws(() => ledger.observe(id, observation), /cannot be overwritten/);
+  ledger.prepare({ ...input, jobId: first.job.jobId });
+  assert.throws(() => ledger.acceptance('root', first.job.jobId, { attemptId: id, resultRevision: 'revision-2', resultDigest: 'artifact-digest-2', reviewStatus: 'accepted' }), /current completed attempt/);
+});
+
+test('unavailable results cannot be accepted and do not display an earlier acceptance', () => {
+  const { ledger } = fixture(), first = running(ledger), id = first.attempt.attemptId;
+  ledger.observe(id, { executionStatus: 'completed', resultSummary: 'done' });
+  const result = ledger.get('root', first.job.jobId).result!;
+  const review = { attemptId: id, resultRevision: result.resultRevision!, resultDigest: result.resultDigest!, reviewStatus: 'accepted' as const };
+  ledger.acceptance('root', first.job.jobId, review);
+  ledger.observe(id, { resultAvailable: false });
+  assert.equal(ledger.get('root', first.job.jobId).businessAcceptance, undefined);
+  assert.throws(() => ledger.acceptance('root', first.job.jobId, review), /available result/);
+});
+
+test('a provisional domain revision can complete with its final receipt without publishing the waiting state as a version', () => {
+  const { ledger } = fixture(), first = running(ledger), id = first.attempt.attemptId;
+  ledger.observe(id, { executionStatus: 'input_required', resultSummary: 'waiting for human review', resultRevision: 'report-v1', resultDigest: 'report-digest' });
+  assert.equal(ledger.get('root', first.job.jobId).resultHistory.length, 0);
+  ledger.observe(id, { executionStatus: 'completed', resultSummary: 'human approved', resultRevision: 'report-v1', resultDigest: 'report-digest' });
+  const view = ledger.get('root', first.job.jobId);
+  assert.equal(view.result?.resultRevision, 'report-v1'); assert.equal(view.resultHistory.length, 1);
+  assert.equal(view.resultHistory[0]?.resultSummary, 'human approved');
+});
+
 test('legacy migration is idempotent per task and never groups a reused context or fabricates creation times', () => {
   const { ledger } = fixture();
   const records = ['a', 'b'].map(taskId => ({ originSessionId: 'root', remote: 'dsh', taskId, contextId: 'shared', executionStatus: 'completed' as const }));

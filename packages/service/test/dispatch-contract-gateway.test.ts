@@ -67,5 +67,13 @@ test('gateway forwards result contracts, exposes authoritative metadata and emit
   assert.equal(final.resultMetadata.artifacts[0].size, 13);
   assert.equal(final.resultMetadata.validation.status, 'passed');
   assert.ok(final.artifactLinks.some((link: any) => link.url === 'https://example.test/result.pptx'));
+  const completed = await f.gateway.invoke('execution_get', { originSessionId, jobId: task.jobId }) as any;
+  assert.equal(completed.resultRevision, 'result-1'); assert.match(completed.resultDigest, /^[a-f0-9]{64}$/);
+  assert.equal(completed.resultDigest, final.resultDigest);
+  assert.deepEqual(completed.result.resultArtifacts, final.resultMetadata.artifacts);
+  assert.deepEqual(completed.resultHistory[0].resultArtifacts, final.resultMetadata.artifacts);
+  const review = await f.gateway.invoke('execution_review', { originSessionId, jobId: task.jobId, attemptId: task.attemptId,
+    resultRevision: completed.resultRevision, resultDigest: completed.resultDigest, reviewStatus: 'accepted' }) as any;
+  assert.equal(review.reviewStatus, 'accepted');
   await assert.rejects(f.gateway.invoke('remote_agent_spawn', { originSessionId, remote, cwd: f.root, prompt: 'run', resultContract: { jobId: 'fake', taskId: 'spoof' } }));
 });

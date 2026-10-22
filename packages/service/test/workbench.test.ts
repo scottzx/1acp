@@ -52,8 +52,27 @@ test('authorized origins constrain all reads, and execution input and unsafe art
   const author = getWorkbenchTask(snapshot, f.author.job.jobId);
   assert.equal('input' in author.attempts[0]!, false); assert.equal('targetSnapshot' in author.attempts[0]!, false);
   assert.deepEqual(author.attempts[0]?.result?.artifactLinks, ['https://example.invalid/script.md']);
+  assert.deepEqual(author.attempts[0]?.resultHistory?.[0]?.artifactLinks, ['https://example.invalid/script.md']);
   assert.deepEqual(author.artifacts[0]?.artifacts, ['https://example.invalid/script.md']);
   author.title = 'mutated'; assert.notEqual(getWorkbenchTask(snapshot, f.author.job.jobId).title, 'mutated');
+});
+
+test('historical result versions apply the same receipt and artifact filtering as the current result', () => {
+  const f = fixture();
+  f.ledger.observe(f.author.attempt.attemptId, { structuredResultRef: { internal: 'private receipt' }, resultArtifacts: [
+    { path: '/private/local-only', sha256: 'a'.repeat(64), size: 42 },
+    { path: '/output/script.md', url: 'https://example.invalid/script.md', sha256: 'b'.repeat(64), size: 100, internal: 'omit' },
+  ] });
+  const source = f.ledger.snapshot(), before = structuredClone(source);
+  const detail = getWorkbenchTask(workbenchSnapshot({ ledger: source, runs: [], reviews: [], actorId: 'owner' }), f.author.job.jobId);
+  const attempt = detail.attempts[0]!;
+  assert.equal(attempt.resultHistory?.length, 2);
+  for (const result of [attempt.result!, ...attempt.resultHistory!]) {
+    assert.equal(result.structuredResultRef, undefined);
+    assert.deepEqual(result.artifactLinks, ['https://example.invalid/script.md']);
+    if (result.resultArtifacts) assert.deepEqual(result.resultArtifacts, [{ path: '/output/script.md', url: 'https://example.invalid/script.md', sha256: 'b'.repeat(64), size: 100 }]);
+  }
+  assert.deepEqual(source, before);
 });
 
 test('human decisions appear in the event timeline without changing the ledger', () => {
