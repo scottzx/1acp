@@ -28,8 +28,10 @@
 
 ## 验证与部署
 
-服务全量测试 272/272；DSH 158 通过、10 跳过；发布、更新事务和部署辅助测试 27/27。另有 PPT 锁定集成测试，覆盖受理不联网、后台加载、制作/复核同父锁、旧父离线/新父新版、缓存坏停止派单及只验收恢复。独立审查发现并修复了更新失败未回滚及普通任务首回执兼容问题。
+基于主线隔离后的服务全量测试 244/244；DSH 158 通过、10 跳过；发布、更新事务和部署辅助测试 27/27；模型路由 4/4。另有 PPT 锁定集成测试，覆盖受理不联网、后台加载、制作/复核同父锁、旧父离线/新父新版、缓存坏停止派单及只验收恢复。独立审查发现并修复了更新失败未回滚及普通任务首回执兼容问题。实现独立整理在主线基础上，不包含工作台检查点 `bdb7ae4`。
 
 本轮不派真实模型任务，不重跑 PPT。DSH/Codex 共用宿主加载路径的行为由真实 HTTP A2A 配合无模型测试后端验证；不冒称执行过新版本模型制作。
 
-部署目标：当前 A2A 网关与 DSH，共用完整本地包。部署前确认宿主空闲，保留既有任务存储、通知、模型、工作台策略与历史产物；同步薄 persona、角色当前绑定、运行时及调用技能。完整证据放在 `/Users/scott/.local/share/1agents/a2a-gateway/releases/20261022-network-skills-01/evidence`，私密备份保留在 role state 和 release private。
+已部署到当前 A2A 网关与 DSH，共用从干净源码 `6c41c1e` 构建的完整本地包（服务包仍为 0.8.3，角色 bundle 为 0.4.0）。部署前真实 RPC 确认宿主无运行中会话，保留既有任务存储、通知、模型与历史产物；已同步薄 persona、角色当前绑定、运行时及调用技能。网关 health 为 ok，DSH PPT preset 未 broken，A2A agent-card 正常。
+
+三个固定目标 ppt-beautifier / ppt-independent-review / ppt-codex-backup 已通过管理 API 更新为 network_pinned，分别对应宿主 ppt-maker / ppt-reviewer / ppt-backup；三个逻辑角色共用一个 profile，通用 preset 不新增隐式绑定。当前已部署 CLI 成功校验四技能和现有锁，未调用模型。完整证据放在 `/Users/scott/.local/share/1agents/a2a-gateway/releases/20261022-network-skills-01/evidence`，包括完整独立技能源清单与归档哈希、热更回执、旧锁离线证据、构建/测试日志及目标绑定；私密备份保留在 role state 和 release private。
