@@ -1,0 +1,23 @@
+{
+  "name": "@1agents/piece-erpnext-daily-report",
+  "version": "0.1.3",
+  "private": true,
+  "description": "Private Activepieces action for saving 1acp final daily reports to ERPNext.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.cjs"
+  },
+  "dependencies": {
+    "@activepieces/pieces-framework": "0.32.0",
+    "markdown-it": "14.1.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "14.1.2",
+    "@types/node": "22.10.2",
+    "typescript": "5.7.2"
+  }
+}

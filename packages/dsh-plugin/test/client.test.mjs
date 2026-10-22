@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
-function mount(preset, writable = true) {
+function mount(preset, writable = true, customFetch) {
   let client, command;
+  const remoteHandlers = new Map();
+  const presets = new Map();
   const slots = new Map();
   const calls = [], blocks = new Map(), cleanups = [];
   const nativeAssistant = { options: { key: 'assistant-step', priority: 0 }, locale: 'conversation',
@@ -12,10 +14,11 @@ function mount(preset, writable = true) {
   const nativeBash = { options: { key: 'bash' }, component: () => null };
   const entries = key => key === 'conversation.chat.node' ? [nativeAssistant] : [nativeBash];
   const native = { writable, blocked: writable ? undefined : 'active-writer', configOptions: [{ id: 'native-model', category: 'model', type: 'select', currentValue: 'b', options: [{ group: 'family', name: 'Family', options: [{ value: 'b', name: 'Native B' }] }] }] };
-  runInNewContext(readFileSync(new URL('../dist/client.js', import.meta.url), 'utf8'), {
+  runInNewContext(readFileSync(process.env.ACP_CLIENT_BUNDLE ?? new URL('../dist/client.js', import.meta.url), 'utf8'), {
+    AbortController,
     window: { __ModuleLoader__: { load: module => { client = module.factory(() => ({ createElement: (type, props, ...children) => ({ type, props, children }) })); } } },
     document: { createElement: () => ({ remove() {} }), head: { append() {} } },
-    fetch: async (url, options) => { calls.push([url, options]); return { ok: true, json: async () => native }; },
+    fetch: async (url, options) => { calls.push([url, options]); if (customFetch) return customFetch(url, options); return { ok: true, json: async () => native }; },
   });
   const ctx = {
     uiConversation: { events: { register: () => {} } },
@@ -27,15 +30,15 @@ function mount(preset, writable = true) {
       const key = options.key ?? options.name; slots.set(key, { options, component });
       return () => slots.delete(key);
     } },
-    sessions: { binding: () => ({ session: { projections: { faceOf: () => ({ getSnapshot: () => preset }) } } }), subagentAddress: () => undefined },
-    remote: { $on: () => {}, session: {
+    sessions: { binding: id => ({ session: { projections: { faceOf: () => ({ getSnapshot: () => presets.get(id) ?? preset }) } } }), subagentAddress: () => undefined },
+    remote: { $on: (name, handler) => remoteHandlers.set(name, handler), session: {
       modelCatalog: async () => ({ ok: true, value: { groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'dsh-model', name: 'DSH model' }] }] } }),
       selectModel: async value => { calls.push(value); return { ok: true }; },
     } },
     commandUi: { register: value => { command = value; } },
   };
   client.apply(ctx);
-  return { command, calls, slots, blocks, native, nativeAssistant, nativeBash, dispose: () => { for (const cleanup of cleanups) cleanup(); } };
+  return { command, calls, slots, blocks, native, nativeAssistant, nativeBash, emitRemote: (name, ...args) => remoteHandlers.get(name)?.(...args), setPreset: (id, value) => presets.set(id, value), dispose: () => { for (const cleanup of cleanups) cleanup(); } };
 }
 
 test('/model in ACP sessions uses native grouped options and forwards the native config id', async () => {
@@ -123,4 +126,43 @@ test('standard messages delegate to DSH; an ACP original is hidden only when an 
       useChat: selector => selector({ nodes: { values: () => [] } }) });
     assert.equal(unmatched.type, f.nativeAssistant.component);
   }
+});
+
+test('standard selection clears ACP loading before the projection catches up', async () => {
+  const f = mount('oneagents-acp-codex');
+  const context = { sessionId: 'switching' };
+  await f.command.ui.options(context);
+  f.emitRemote('agent-preset/selected', context.sessionId, 'standard');
+  assert.equal(f.blocks.get(context.sessionId), undefined);
+  f.setPreset(context.sessionId, 'standard');
+  assert.equal((await f.command.ui.options(context))[0].label, 'DSH model');
+  f.dispose();
+});
+
+test('an in-flight ACP failure cannot restore a block after switching to standard', async () => {
+  let rejectFetch;
+  const response = new Promise((resolve, reject) => { rejectFetch = reject; });
+  const f = mount('oneagents-acp-codex', true, () => response);
+  const context = { sessionId: 'pending-switch' };
+  const loading = f.command.ui.options(context).catch(error => error);
+  assert.equal(f.blocks.get(context.sessionId).reason, 'loading');
+  f.emitRemote('agent-preset/selected', context.sessionId, 'standard');
+  const atSelection = f.blocks.get(context.sessionId);
+  f.setPreset(context.sessionId, 'standard');
+  rejectFetch(new Error('old ACP request failed'));
+  await loading;
+  assert.equal(atSelection, undefined);
+  assert.equal(f.blocks.get(context.sessionId), undefined);
+  f.dispose();
+});
+
+test('preset selection invalidates only the selected session', async () => {
+  const f = mount('oneagents-acp-codex', false);
+  await f.command.ui.options({ sessionId: 'first' });
+  await f.command.ui.options({ sessionId: 'second' });
+  assert.equal(f.blocks.get('second').reason, 'activeWriter');
+  f.emitRemote('agent-preset/selected', 'first', 'standard');
+  assert.equal(f.blocks.get('first'), undefined);
+  assert.equal(f.blocks.get('second').reason, 'activeWriter');
+  f.dispose();
 });
