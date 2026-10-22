@@ -2,6 +2,8 @@
 
 角色定义与技能独立维护。`ppt-beautifier/profile.json` 声明所需技能的名称、来源、网络入口和角色说明；领域方法、脚本、模板与素材由 Skill Manager 发布。普通派单仍立即交接，技能解析在执行宿主后台完成，不增加主会话轮询或验收步骤。
 
+创建角色、调用固定角色和派发临时任务的入口与参数见随包 [acp-service 技能](../packages/service/skills/acp-service/SKILL.md)及其 [API 路由](../packages/service/skills/acp-service/references/roles-and-tasks.md)。`resident-agent` 技能负责角色创建/维护；目标登记 API 不代替完整部署。
+
 ## 目录
 
 ```text

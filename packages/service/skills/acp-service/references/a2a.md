@@ -2,7 +2,7 @@
 
 ## 默认调用边界
 
-日常主会话按 [通知驱动调用](async-caller.md) 执行：开发部署先完成，派单保存回执后立即结束本轮；实际通知唤醒后只读一次回执/新报告、保存结论并 ack。以下 get/list/inbox 示例是接口说明，只用于真实通知后的单次读取或用户明确要求的单次状态查询，不能组成主会话轮询。后台网关核对照常运行，主会话不读子日志、不等待、不重复产物验收。
+日常主会话按 [角色与任务路由](roles-and-tasks.md) 选择管理、固定角色或临时任务入口：开发部署先完成，派单保存回执后立即结束本轮；实际通知唤醒后只读一次回执/新报告、保存结论并按通知类型 ack。现稿 PPT 只验收计步才使用 [专用脚本](async-caller.md)。以下 get/list/inbox 示例是接口说明，只用于真实通知后的单次读取或用户明确要求的单次状态查询，不能组成主会话轮询。后台网关核对照常运行，主会话不读子日志、不等待、不重复产物验收。
 
 ## 链路与入口
 
@@ -83,9 +83,9 @@ DreamMate 调用参数为 `service_id: "a2a-gateway"`、`method: 方法名`、`p
 | 方法 | 参数与用途 |
 | --- | --- |
 | `remote_agent_preflight` | `remote, originSessionId, cwd`；可选任务目录、必需输入和运行时依赖，仅检查、不创建会话 |
-| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract`；新建远端任务/上下文/DSH 会话 |
+| `remote_agent_spawn` | 必填 `remote, originSessionId, cwd, prompt`；可选 `agentPreset, title, notificationTarget, preflight, resultContract, clientRequestId, roleId, roleLockPath`；新建远端任务/上下文/DSH 会话 |
 | `remote_agent_get` | `remote, originSessionId, taskId`；当前状态、结果；离线返回缓存与 stale |
-| `remote_agent_message` | 上述任务定位字段加 `prompt`；复用远端会话，创建新 taskId |
+| `remote_agent_message` | 上述任务定位字段加 `prompt`；可选 `clientRequestId, preflight, resultContract, roleId, roleLockPath`；复用远端会话，创建新 taskId；已有角色/锁不能更换 |
 | `remote_agent_cancel` | 任务定位字段；取消这项任务自己的执行 |
 | `remote_agent_list` | `originSessionId`；列出该主会话派发的任务 |
 | `remote_agent_inbox` | `originSessionId`；读取未确认的完成/需要输入通知 |
@@ -183,9 +183,9 @@ notice 继续保留在 inbox；主 Agent 真正处理结果后才调用 `remote_
 }
 ```
 
-响应在 `result.task`，包含 `id`、`contextId`、`metadata.1agents.sessionId/cwd/agentPreset`。`returnImmediately: true` 等待会话准备后返回任务 ID；省略则默认等待终态或需要输入状态。
+响应在 `result.task`，包含 `id`、`contextId` 和已有的 `metadata.1agents.sessionId/cwd/agentPreset`。`returnImmediately: true` 返回受理任务；配置网络角色的冷下载和会话准备可在受理后进行，首回执可能尚无 sessionId。普通无角色任务保持会话准备后返回的时序；省略则默认等待终态或需要输入状态。
 
-`metadata.1agents` 只接受 `cwd`、`workspace`、`agentPreset`；cwd 和 workspace 不可同时传，cwd 为远端现有绝对目录，workspace 为配置别名。省略位置与预设时按远端 A2A 默认值处理。
+`metadata.1agents` 的调用输入支持 `cwd/workspace/agentPreset/preflight/resultContract/roleId/roleLockPath`。cwd 和 workspace 不可同时传，cwd 为远端现有绝对目录，workspace 为配置别名；省略位置与预设按远端默认值处理。roleId 必须在宿主可信映射中；roleLockPath 仅接受宿主缓存 locks 目录内已存在、身份与字节校验通过的父锁，不能通过任务参数覆盖 profile、网络或缓存根。
 
 同一会话的新任务在 `message.contextId` 传已保存 context ID；保存的 cwd/preset 不能改变。已完成 task 不可重新打开。原 task 为 input-required 时可传 `message.taskId`，配合新的 `messageId` 继续；活跃 task 上的 follow-up 被拒绝。
 

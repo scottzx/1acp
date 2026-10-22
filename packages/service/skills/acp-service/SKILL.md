@@ -1,6 +1,6 @@
 ---
 name: acp-service
-description: 使用 @1agents/acp-service 的 ACP CLI、HTTP/WebSocket 服务和 DSH 插件，通过 A2A 向远端 DSH 派发任务、查询状态及处理完成收件箱，或经 gateway 将消息排队投递到已绑定的 Codex/DSH 原会话。适用于接入和使用这些能力；不用于一般系统巡检或与该包无关的模型配置。
+description: 使用 @1agents/acp-service 管理 ACP 会话与 DSH 插件，通过 A2A 调用固定角色、派发临时任务、查询父子任务和执行轮次、记录业务验收及处理通知，并回投 Codex/DSH 原会话。也用于角色目标登记、网络技能缓存和更新接口接入；不用于无关的系统巡检或模型配置。
 ---
 
 # ACP Service
@@ -14,7 +14,10 @@ description: 使用 @1agents/acp-service 的 ACP CLI、HTTP/WebSocket 服务和 
 | 在当前主机运行 Codex、Claude 等 Agent，管理命名会话、队列或流程 | `acp-service <agent> ...` | [ACP CLI 与服务](references/acp.md) |
 | 从客户端连接常驻 Agent 服务，使用标准会话与流式交互 | `acp-service serve`，ACP over WebSocket | [ACP CLI 与服务](references/acp.md) |
 | 在 DSH 界面使用外部 Agent、原生模型和模式控制 | DSH 中安装同一个包，选择 `ACP · Agent` 预设 | [DSH 插件](references/dsh.md) |
-| 像远端子任务一样调用 WSL/其他主机上的 DSH，立即取回任务 ID | A2A gateway 的 `remote_agent_*` 工具 | [A2A 调度与收件箱](references/a2a.md) |
+| 创建或调整固定角色，接入网络技能及版本缓存 | 可用时用 `resident-agent` 完成角色管理；API 登记用 `execution_target_*` | [角色管理与任务调用](references/roles-and-tasks.md) |
+| 调用已登记的固定角色 | `execution_submit`，指定 resident_agent 的 targetId | [角色管理与任务调用](references/roles-and-tasks.md) |
+| 派发一次性临时任务，无需创建角色 | 向 agent_host 目标 `execution_submit`；兼容 `remote_agent_spawn` | [角色管理与任务调用](references/roles-and-tasks.md) |
+| 查询任务/执行轮次、续派、关闭、记录验收、处理通知 | `execution_*`；按通知类型选择 ack | [角色管理与任务调用](references/roles-and-tasks.md) |
 | 把消息或 A2A 完成通知送回已存在的 Codex/DSH 主会话 | 配置 gateway `sessionHosts`，使用 `session_bind`、`session_send` 和投递查询工具 | [原会话排队投递](references/a2a.md#原会话排队投递本次新增) |
 | 为其他 A2A 客户端开放 DSH 能力 | DSH `a2a` 配置、Agent Card、标准 JSON-RPC/SSE | [A2A 调度与收件箱](references/a2a.md) |
 
@@ -49,7 +52,9 @@ acp-service --skill install acp-service --agent codex --scope repo
 
 常驻角色可由宿主按能力网络加载并锁定技能版本。任务使用宿主回执中的角色/技能锁与缓存入口，不在主会话另行检索、下载或复验；同一任务续派沿用原锁。更新与缓存管理在派单前的独立部署阶段完成，详见项目 `roles/README.md`；`acp-service roles sync --help` 可查看显式缓存入口。
 
-开发、部署与回归先独立完成。日常派单使用 [通知驱动调用入口](references/async-caller.md)：提交并保存回执后必须立即结束本轮；只有实际通知唤醒后才单次读取回执、记录结论、ack 并答复。禁止主会话主动轮询 get/list/inbox、sleep/wait 等完成、读取子会话日志/进程，或重复文件/hash/图像/事实验收。用户明确要求单次查询/取消时只执行该动作；受理未知不自动重派。此纪律限定主会话调用，不关闭后台网关的状态核对能力。
+开发、部署与回归先独立完成。所有任务提交并保存回执后必须立即结束本轮；只有实际通知唤醒后才单次读取回执、记录结论、ack 并答复。禁止主会话主动轮询 get/list/inbox、sleep/wait 等完成、读取子会话日志/进程，或重复文件/hash/图像/事实验收。用户明确要求单次查询/取消时只执行该动作；受理未知不自动重派。此纪律限定主会话调用，不关闭后台网关的状态核对能力。
+
+普通固定角色/临时任务按下面及 [API 路由](references/roles-and-tasks.md) 直接提交。`scripts/a2a-caller.py` 是现稿 PPT 独立只验收与 Codex 计步专用入口，仅该场景读取 [只验收计步流程](references/async-caller.md)；不要为普通任务伪造 PPT 报告字段或沿用其“不接受原稿”的结论。
 
 ## 远端任务的最短工作流
 
@@ -57,10 +62,10 @@ acp-service --skill install acp-service --agent codex --scope repo
 
 1. 取得当前主会话的稳定 ID，作为 `originSessionId`；保留真实会话归属，不使用每次随机生成的 ID。
    如需自动回投，先将该 ID 用 `session_bind` 绑定到已配置宿主和真实原会话 ID；未绑定时保留原收件箱/webhook 路径。
-2. 明确远端节点名、远端绝对目录、预设和完整任务说明。远端会话不会自动继承主会话上下文。
+2. 固定角色使用已登记 target 绑定的执行位置和预设；临时任务明确 agent_host target、远端绝对目录及预设。完整任务说明均需自包含，远端会话不会自动继承主会话上下文。
 3. 调用已登记目标的 `execution_submit`（或兼容 `remote_agent_spawn`），保存 job/attempt/task/context/session 与实际预设；受理不等于完成。随后立即结束本轮。
-4. 真实通知唤醒后，只读取一次交付回执及新报告，核对身份与版本绑定，保存处理结论，再 ack。独立角色的验收不由主会话重复执行。
-5. 要继续同一远端会话，使用 `remote_agent_message`；需要全新上下文则再次 spawn。取消时传入准确的任务 ID。
+4. 真实通知唤醒后，只读取一次交付回执及本次合同要求的新报告，核对身份与版本绑定，保存处理结论，再按通知类型 ack。需要业务接受时另记 `execution_review`。独立角色的验收不由主会话重复执行。
+5. 统一账本任务使用 `execution_continue` 保留 job、新建 attempt；独立工作重新 submit。兼容流程用 `remote_agent_message` 复用远端会话并返回新 taskId。关闭父任务用 `execution_cancel`，需要时指定 cascade，详见 API 路由。
 
 ```json
 {
@@ -93,7 +98,7 @@ acp-service --skill install acp-service --agent codex --scope repo
 - 网络离线可能返回缓存与 `stale: true`，不等于远端任务失败。SendMessage 响应不明确时先核对，不盲目重发。
 - DSH 的直接 webhook 为尽力投递；gateway 的持久收件箱和后台查询负责补齐，配置宿主通知接收端后还能重试投递。
 - 本次源码新增的 `session_*` 工具通过 Codex 原生 `queue` 或 DSH 宿主 `queue` 投递到原会话；需先配置和绑定，不能假设已安装旧版本或现有部署包含它。普通 MCP 连接本身不提供回投，且此包没有接管 Codex 原生 `spawn_subagent`。
-- 投递 `accepted` 只代表宿主接受排队，不代表模型执行、业务处理或 A2A 通知已确认。处理完结果后才调用 `remote_agent_ack`，自动回投不自动业务 ack。
+- 投递 `accepted` 只代表宿主接受排队，不代表模型执行、业务处理或通知已确认。处理完结果后按实际通知类型调用 `remote_agent_ack` 或 `execution_ack`；自动回投不自动记录业务接受。
 - `session_delivery_get` 返回 `unknown` 时先核对宿主是否已入队；`rejected` 表示已明确拒绝，需要先排除阻碍。两者均不自动重发，并阻塞同一 origin 后续投递。`session_delivery_resolve` 只处理这两种状态；`accepted: false` 必须表示确认未受理且可重新尝试，不能表示“还没处理”。
 - 同一 `originSessionId/messageId` 只能对应同一正文；重试复用原 ID。公开 `session_send` 禁止使用保留前缀 `a2a-notice:`。DSH 的稳定 requestId 有助于幂等，不能据此承诺 exactly-once 或跨重启无重复。
 - 宿主传输 ID 稳定派生自 `sha256([originSessionId, messageId])`，隔离不同 origin 的同名消息；工具仍使用原 messageId，`hostReceiptId` 由宿主回执决定。
