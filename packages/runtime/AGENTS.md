@@ -183,9 +183,11 @@ Harness documentation synchronization policy:
   runtime logic.
 - Changelog entries should cover user-facing changes only. Do not add internal
   release-process or meta-only notes.
-- Changelog placement: add new entries under [`CHANGELOG.md`](CHANGELOG.md)
-  `## Unreleased`, appending to the end of the target section (`### Changes`,
-  `### Breaking`, or `### Fixes`) instead of inserting at the top.
+- In this 1acp workspace, follow the root [Agent changelog policy](../../AGENTS.md#变更日志维护):
+  add local changes to `../../changelog/YYYY-MM-DD.md` using the actual date in
+  `Asia/Shanghai`. Append to the existing daily file or create the next day's file.
+  Keep [`CHANGELOG.md`](CHANGELOG.md) as upstream/version history; do not append
+  new local entries to its `Unreleased` section.
 - Changelog attribution: use concise `Thanks @author` attribution and avoid
   repeating multiple attribution styles in the same line.
 - Pure test-only changes generally do not need a changelog entry unless they
