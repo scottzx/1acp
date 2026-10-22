@@ -534,10 +534,16 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
       if (review.verdict !== 'passed' || review.issues.length || !review.factsChecked || !review.allSlidesViewed) return revise(run, adapter, review.issues.length ? review.issues : ['独立事实或逐页视觉验收尚未完成']);
       if (run.input.revisionRequest && !run.revisionExerciseApplied) return revise(run, adapter, [`调用方预先指定的显式返工验收演练（不是质量失败）：${run.input.revisionRequest}`], true);
       // Recheck exact bytes immediately before selection. A reviewer cannot silently replace the reviewed version.
-      const rechecked = await (adapter.validateCandidate ?? validatePptDeliveryCandidate)(run); run.metrics.machineChecks++;
+      let rechecked: PptDeliveryValidation;
+      try {
+        rechecked = await (adapter.validateCandidate ?? validatePptDeliveryCandidate)(run); run.metrics.machineChecks++;
+        await validateSummary(run);
+      } catch (error) {
+        if (run.recovery?.mode === 'review_only') return stop(run, adapter, 'input_required', `只重试验收的交付前复核失败，不派新任务：${String(error)}`);
+        throw error;
+      }
       if (rechecked.artifactDigest !== review.artifactDigest) return stop(run, adapter, 'failed', '独立复核后产物发生变化，禁止交付');
       run.validation = rechecked;
-      await validateSummary(run);
       if (run.cancellationRequestedAt) return;
       const makerAttempts = run.children.filter(item => item.purpose === 'ppt_production');
       run.deliveryReceipt = { producer: '1agents/ppt-delivery', parentJobRef: { sourceId: run.sourceId, jobId: run.jobId },

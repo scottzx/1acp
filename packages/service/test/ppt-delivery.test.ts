@@ -154,6 +154,8 @@ test('recovery rejects unresolved/live children and stops on checkpoint byte cha
 
 test('review-only recovery uses a fresh independent child and parent round, preserving failed history and original version', async t => {
   const f = await fixture(t); await f.untilReview();
+  const oldReport = join(f.run.jobDirectory, `revision-${f.run.revision}`, 'independent-review.json');
+  await writeFile(oldReport, 'original failed-review evidence');
   f.childStates.get(f.run.currentChild!.attemptId)!.executionStatus = 'failed'; await f.step();
   assert.equal(f.run.executionStatus, 'failed');
   const old = structuredClone(f.run), originalContract = await readFile(old.contractPath, 'utf8');
@@ -175,6 +177,7 @@ test('review-only recovery uses a fresh independent child and parent round, pres
   assert.equal(f.run.deliveryReceipt!.productionAttemptCount, 1);
   assert.match(String(f.run.deliveryReceipt!.independentReviewRef), /independent-review.review-only-parent.json$/);
   assert.equal(f.run.validation!.artifactDigest, old.validation!.artifactDigest);
+  assert.equal(await readFile(oldReport, 'utf8'), 'original failed-review evidence');
   assert.equal(old.executionStatus, 'failed'); assert.ok(f.run.metrics.elapsedMs >= old.metrics.elapsedMs);
 });
 
@@ -203,7 +206,8 @@ test('review-only verifies frozen source snapshot and exact candidate before dis
   f.run = await recoverPptDeliveryRun(old, 'source-snapshot-review', options); await f.step();
   assert.equal(f.requests.length, before + 1); assert.match(String(f.requests.at(-1)!.input.prompt), /原始字节快照/);
   await writeFile(join(snapshot, 'source-0.md'), 'tampered snapshot'); await f.completeCurrent();
-  assert.notEqual(f.run.executionStatus, 'completed'); assert.ok(f.run.diagnostics.some(item => item.includes('Source hash mismatch')));
+  assert.equal(f.run.executionStatus, 'input_required'); assert.ok(f.run.diagnostics.some(item => item.includes('Source hash mismatch')));
+  await f.step(); assert.equal(f.requests.length, before + 1);
 });
 
 test('review-only rejects canceled parents, live/unknown children and changed script/source manifests', async t => {
