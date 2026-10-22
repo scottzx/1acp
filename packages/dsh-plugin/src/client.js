@@ -1,13 +1,13 @@
 /** Browser controls for native ACP configuration and ordinary DSH models. */
-import { createElement as h, useEffect, useState, useSyncExternalStore } from 'react';
+import { createElement as h, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { toolConversationDefinition } from './tool-conversation.js';
 import { installTranscriptView } from './transcript-view.js';
 
 export const inject = ['slots', 'sessions', 'commandUi', 'remote', 'remote.session', 'locale', 'uiConversation', 'conversation'];
 
 const dictionaries = {
-  zh: { toolGroup: '已调用 {count} 个工具', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。' },
-  en: { toolGroup: '{count} tool calls', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.' },
+  zh: { toolGroup: '已调用 {count} 个工具', model: '模型', choose: '选择模型', loading: '正在连接 Agent…', loadingModels: '正在加载模型…', retry: '重试', mode: '模式', command: 'Agent 指令', effort: '思考强度', unsupported: 'Agent 未提供可切换的模型', description: '选择当前 Agent 的模型', error: '连接失败', noCommands: 'Agent 尚未提供指令', native: 'ACP 设置', activeWriter: '原会话正在其他客户端运行，可查看历史；占用解除后自动恢复输入。' },
+  en: { toolGroup: '{count} tool calls', model: 'Model', choose: 'Select model', loading: 'Connecting to Agent…', loadingModels: 'Loading models…', retry: 'Retry', mode: 'Mode', command: 'Agent commands', effort: 'Reasoning effort', unsupported: 'This Agent does not advertise model selection', description: 'Select this Agent’s model', error: 'Connection failed', noCommands: 'No commands advertised', native: 'ACP settings', activeWriter: 'The original session is running in another client. History is available; input resumes when it is released.' },
 };
 
 /** Preserve Agent-owned group labels and option ids. */
@@ -17,10 +17,11 @@ export function choices(option) {
     : [item]);
 }
 
-async function acpRequest(sessionId, change) {
+async function acpRequest(sessionId, change, signal) {
   const response = await fetch(`/api/1agents-acp/session?id=${encodeURIComponent(sessionId)}`, {
     ...(change ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(change) } : {}),
     credentials: 'same-origin',
+    ...(signal ? { signal } : {}),
   });
   const value = await response.json();
   if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
@@ -46,36 +47,84 @@ export function apply(ctx) {
   const pending = new Map();
   const listeners = new Map();
   const blockedSessions = new Set();
+  const revisions = new Map();
+  const selectedPresets = new Map();
   let disposed = false;
-  const presetOf = id => ctx.sessions.binding(id)?.session.projections.faceOf('agentPreset').getSnapshot();
+  const revisionOf = id => revisions.get(id) ?? 0;
+  const presetOf = id => {
+    const projected = ctx.sessions.binding(id)?.session.projections.faceOf('agentPreset').getSnapshot();
+    const selected = selectedPresets.get(id);
+    if (selected === undefined) return projected;
+    // The selection event and the projection arrive on separate streams.
+    if (projected === selected) selectedPresets.delete(id);
+    return selected;
+  };
   const isAcp = id => String(presetOf(id) ?? '').startsWith('oneagents-acp-');
   const block = (id, reason) => {
-    if (disposed) return;
+    if (disposed || (!reason && !blockedSessions.has(id))) return;
     if (reason) blockedSessions.add(id); else blockedSessions.delete(id);
     ctx.conversation.blocks.set(id, reason ? { reason } : undefined);
   };
-  ctx.effect(() => () => { disposed = true; for (const id of blockedSessions) ctx.conversation.blocks.set(id, undefined); });
+  const notify = id => { for (const fn of listeners.get(id) ?? []) fn(); };
+  ctx.effect(() => () => {
+    disposed = true;
+    for (const request of pending.values()) request.controller.abort();
+    pending.clear();
+    for (const id of blockedSessions) ctx.conversation.blocks.set(id, undefined);
+    blockedSessions.clear();
+  });
   const publish = (id, value) => {
     native.set(id, value);
     block(id, value?.writable === false ? t(value.blocked === 'active-writer' ? 'activeWriter' : 'error') : undefined);
-    for (const fn of listeners.get(id) ?? []) fn();
+    notify(id);
   };
   const load = id => {
+    if (!isAcp(id)) { block(id, undefined); return Promise.resolve(undefined); }
     if (!pending.has(id)) {
+      const revision = revisionOf(id);
+      const preset = presetOf(id);
+      const controller = new AbortController();
+      const request = { controller, operation: undefined };
+      const current = () => !disposed && revision === revisionOf(id) && preset === presetOf(id);
       if (!native.has(id)) block(id, t('loading'));
-      const operation = acpRequest(id).then(value => { publish(id, value); return value; }).catch(error => {
-        block(id, `${t('error')}: ${error.message}`); throw error;
-      }).finally(() => pending.delete(id));
-      pending.set(id, operation);
+      request.operation = acpRequest(id, undefined, controller.signal).then(value => {
+        if (!current()) return undefined;
+        publish(id, value);
+        return value;
+      }).catch(error => {
+        if (!current() || controller.signal.aborted) return undefined;
+        block(id, t('error') + ': ' + error.message);
+        throw error;
+      }).finally(() => { if (pending.get(id) === request) pending.delete(id); });
+      pending.set(id, request);
     }
-    return pending.get(id);
+    return pending.get(id).operation;
   };
-  const configure = async (id, configId, value) => { const updated = await acpRequest(id, { configId, value }); publish(id, updated); };
+  const configure = async (id, configId, value) => {
+    const revision = revisionOf(id);
+    const preset = presetOf(id);
+    const current = () => !disposed && revision === revisionOf(id) && preset === presetOf(id) && isAcp(id);
+    try {
+      const updated = await acpRequest(id, { configId, value });
+      if (current()) publish(id, updated);
+    } catch (error) { if (current()) throw error; }
+  };
+  const invalidate = (id, selectedPreset) => {
+    const tracked = native.has(id) || pending.has(id) || blockedSessions.has(id) || listeners.has(id);
+    revisions.set(id, revisionOf(id) + 1);
+    if (selectedPreset !== undefined) selectedPresets.set(id, selectedPreset);
+    const request = pending.get(id);
+    pending.delete(id);
+    request?.controller.abort();
+    native.delete(id);
+    block(id, tracked && isAcp(id) ? t('loading') : undefined);
+    notify(id);
+  };
   const reset = () => {
-    for (const id of native.keys()) block(id, isAcp(id) ? t('loading') : undefined);
-    native.clear(); for (const set of listeners.values()) for (const fn of set) fn();
+    selectedPresets.clear();
+    for (const id of new Set([...native.keys(), ...pending.keys(), ...blockedSessions, ...listeners.keys()])) invalidate(id);
   };
-  ctx.remote.$on('agent-preset/selected', reset);
+  ctx.remote.$on('agent-preset/selected', (sessionId, agentPreset) => invalidate(sessionId, agentPreset));
   ctx.on('connection/reset', reset);
 
   function ModelControls({ sessionId, locked }) {
@@ -95,25 +144,46 @@ export function apply(ctx) {
     const [loadError, setLoadError] = useState('');
     const [busy, setBusy] = useState(false);
     const [expanded, setExpanded] = useState(false);
+    const changeSequence = useRef(0);
     const refresh = async () => {
+      const revision = revisionOf(sessionId);
+      const current = () => !disposed && revision === revisionOf(sessionId) && presetOf(sessionId) === presetId;
       try {
         if (external) await load(sessionId);
         else {
+          block(sessionId, undefined);
           const result = await ctx.remote.session.modelCatalog();
+          if (!current()) return;
           if (!result.ok) throw new Error(result.error.message);
           setCatalog(result.value);
         }
-        setLoadError('');
-      } catch (error) { setLoadError(String(error.message ?? error)); }
+        if (current()) setLoadError('');
+      } catch (error) { if (current()) setLoadError(String(error.message ?? error)); }
     };
-    useEffect(() => { void refresh(); }, [sessionId, presetId]);
+    useEffect(() => {
+      if (!external) block(sessionId, undefined);
+      setError('');
+      setLoadError('');
+      changeSequence.current += 1;
+      setBusy(false);
+      void refresh();
+    }, [sessionId, presetId]);
     // Configuration updates can arrive while the remote Agent is working.
     useEffect(() => {
       if (!external) return;
       const timer = setInterval(() => { if (document.visibilityState === 'visible') void refresh(); }, 5000);
       return () => clearInterval(timer);
     }, [external, sessionId, presetId]);
-    const change = async action => { setBusy(true); setError(''); try { await action(); } catch (error) { setError(String(error.message ?? error)); } finally { setBusy(false); } };
+    const change = async action => {
+      const operation = ++changeSequence.current;
+      const revision = revisionOf(sessionId);
+      const current = () => !disposed && operation === changeSequence.current && revision === revisionOf(sessionId) && presetOf(sessionId) === presetId;
+      setBusy(true);
+      setError('');
+      try { await action(); }
+      catch (error) { if (current()) setError(String(error.message ?? error)); }
+      finally { if (operation === changeSequence.current) setBusy(false); }
+    };
     const disabled = locked || busy || (external && capabilities?.writable === false);
     const controls = [];
     if (external && capabilities) {
@@ -137,7 +207,7 @@ export function apply(ctx) {
       controls.push(h(Select, { key: 'dsh-model', title: t('model'), value: current?.provider === '1agents-acp' ? '' : JSON.stringify([current?.provider, current?.model]), rows, disabled, placeholder: t('choose'), onSelect: value => change(() => select(...JSON.parse(value))) }));
       const model = catalog.groups.find(g => g.id === current?.provider)?.models.find(m => m.id === current?.model);
       if (model?.reasoning) controls.push(h(Select, { key: 'effort', title: t('effort'), value: current.reasoningEffort ?? model.reasoning.defaultEffort, rows: model.reasoning.efforts.map(e => ({ value: e.id, name: e.name })), disabled, onSelect: value => change(() => select(current.provider, current.model, value)) }));
-    } else if (!error && !loadError) controls.push(h('span', { key: 'loading', style: { fontSize: 12 } }, t('loading')));
+    } else if (!error && !loadError) controls.push(h('span', { key: 'loading', style: { fontSize: 12 } }, t(external ? 'loading' : 'loadingModels')));
     if (error || loadError) controls.push(h('span', { key: 'error', role: 'alert', style: { color: '#c64b45', fontSize: 12, maxWidth: 360 } }, error || loadError, ' ', h('button', { type: 'button', onClick: () => { setError(''); void refresh(); } }, t('retry'))));
     return h('div', { 'data-oneagents-acp-controls': external ? 'acp' : 'dsh', style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 } }, controls);
   }
@@ -151,7 +221,8 @@ export function apply(ctx) {
       options: async ({ sessionId }) => {
         if (isAcp(sessionId)) {
           const capabilities = await load(sessionId);
-          const model = capabilities?.configOptions.find(option => option.category === 'model' || option.id === 'model');
+          if (!capabilities) return [];
+          const model = capabilities.configOptions.find(option => option.category === 'model' || option.id === 'model');
           if (!model) throw new Error(t('unsupported'));
           return choices(model).map(option => ({ id: JSON.stringify([model.id, option.value]), label: option.name, detail: option.description, active: option.value === model.currentValue }));
         }
