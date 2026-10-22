@@ -15,7 +15,7 @@
 ## 创建与更新角色（管理阶段）
 
 1. 复用当前网关、宿主及认证配置，明确职责、工具权限、读写目录、输入和交付。技能通过能力网络检索，精确记录来源及名称/标识；发现结果不等于实际加载。
-2. 创建薄 `ROLE.md` 与网络技能 profile。profile 原生字段为 `id/version/instructionsPath/network/skills/entrySkill`；skills 每项包含 `key/name`，可用 `sourceId/skillId` 消除歧义，并可声明 `nodeUrl/assetsManifest`。不要把登记清单误当原生 profile，也不要把领域脚本和模板写入 persona。源码示例见工程 `roles/ppt-beautifier`。
+2. 创建薄 `ROLE.md` 与网络技能 profile。profile 原生字段为 `id/version/instructionsPath/network/skills/entrySkill`；skills 每项包含 `key/name`，可用 `sourceId/skillId` 消除歧义，并可声明 `nodeUrl/assetsManifest`。不要把登记清单误当原生 profile，也不要把领域脚本和模板写入 persona。源码示例见工程 `.1agents/roles/ppt-beautifier`；项目运行数据统一放在 `./.1agents/`。
 3. 在执行宿主 `a2a.roleSkills` 配置可信的 `cacheRoot`、`profiles: {逻辑roleId:绝对profile路径}`；可选 `presetRoles` 仅为专用 preset 自动绑定。通用 preset 不隐式改成某领域角色。DSH/Codex 共用宿主加载入口；运行依赖和工具仍由宿主管理。
 4. 有专用预设时安装/更新该预设；也可使用已可用的通用预设配合目标绑定的 roleId。凭据只在受保护宿主/网关配置。需要重载共享宿主时先确认没有运行中会话。
 5. 复用已登记 connection，通过可信本机管理入口登记或更新 resident_agent target。最小登记参数如下，值均需替换为真实部署值：
@@ -39,7 +39,9 @@
 
 6. 在管理阶段预热并校验完整技能包、资源及资产，核验宿主配置；只有用户授权实际试单时才测试模型执行和通知闭环。HTTP 200、目标已登记或 preset 可见仅证明对应管理步骤。
 
-工程统一更新入口：`node scripts/update-role-skills.mjs --config roles/local-update.json`。部署环境也可用 `acp-service roles sync --profile PROFILE --cache-root CACHE [--lock EXISTING]` 管理缓存。新任务解析当前版本；同任务续派、返工与恢复使用原锁。更新不会安装二进制依赖或隐式派模型任务。
+目录约定：角色定义为 `.1agents/roles/<role>`，技能缓存与锁为 `.1agents/cache/roles`，本地技能源为 `.1agents/skills`，角色 bundle/工作目录/产物/状态为 `.1agents/runtime/<role>`，项目网关账本与通知为 `.1agents/state/a2a-gateway`；私密配置在 `.1agents/config`，不提交 Git。
+
+工程统一更新入口：`node scripts/update-role-skills.mjs --config .1agents/config/role-skills.local.json`。部署环境也可用 `acp-service roles sync --profile PROFILE --cache-root CACHE [--lock EXISTING]` 管理缓存。新任务解析当前版本；同任务续派、返工与恢复使用原锁。更新不会安装二进制依赖或隐式派模型任务。
 
 ## 调用固定角色
 

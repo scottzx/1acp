@@ -129,8 +129,10 @@ export class A2ASessionExecutor implements AgentExecutor {
       const info = await lstat(existingPath);
       const actual = await realpath(existingPath), tail = relative(lockRoot, actual);
       if (!info.isFile() || info.isSymbolicLink() || tail === '' || tail === '..' || tail.startsWith(`..${sep}`) || isAbsolute(tail)) throw new Error('Role lock must be an existing regular file inside the host locks directory');
-      lockPath = actual;
-      if (saved?.roleSkills && input.roleLockPath && await realpath(input.roleLockPath) !== lockPath) throw new Error('An existing context cannot change its role lock');
+      // Preserve a saved summary byte-for-byte when a migrated cache retains
+      // the old root as a compatible alias. Fresh contexts use canonical paths.
+      lockPath = saved?.roleSkills?.lockPath ?? actual;
+      if (saved?.roleSkills && input.roleLockPath && await realpath(input.roleLockPath) !== actual) throw new Error('An existing context cannot change its role lock');
     } else {
       lockPath = join(lockRoot, `a2a-${createHash('sha256').update(contextKey).digest('hex')}.json`);
     }

@@ -9,5 +9,14 @@ release/
 .corepack/
 packages/service/vendor/
 .dsh-build-cache.tgz
-.cache/roles/
-roles/local-update.json
+/.cache/roles
+/roles
+
+# Project-owned Agent runtime data; declarative roles and examples stay tracked.
+.1agents/cache/
+.1agents/skills/
+.1agents/runtime/
+.1agents/state/
+.1agents/config/*
+!.1agents/config/*.example.json
+!.1agents/config/*.example.yml

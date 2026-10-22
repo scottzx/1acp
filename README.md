@@ -57,6 +57,8 @@ The runtime and service can be used outside DSH. Installing the npm package star
 
 One published package contains the runtime, CLI, service and DSH plugin. The upstream runtime and DSH plugin remain private source modules in one repository with one pnpm lockfile. The DSH plugin communicates with the service through ACP JSON-RPC, while a managed child process loads the service when a local endpoint needs starting.
 
+Project-owned roles, skill caches, workspaces and runtime state live under [`.1agents/`](.1agents/README.md). Role definitions and public examples are tracked; local data and credentials are excluded from Git.
+
 | Directory             | npm package            | Responsibility                                                               |
 | --------------------- | ---------------------- | ---------------------------------------------------------------------------- |
 | `packages/runtime`    | Private workspace only | Upstream agent runtime and CLI, embedded in the service                      |

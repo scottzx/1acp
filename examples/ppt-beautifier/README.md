@@ -2,13 +2,17 @@
 
 这是 DSH 角色 bundle，永久声明 `ppt-beautifier` 角色及其作用域内的模型路由。宿主持续运行，每份上游 A2A 派单创建独立任务会话；同一 `contextId` 的后续指令复用该任务会话。该 bundle 只增加角色，不更改现有默认预设，不启用 A2A，也不携带凭据。
 
-## 部署目录
+## 当前部署目录
 
-- 角色 bundle：`/Users/scott/.local/share/1agents/ppt-beautifier/agent-bundle`
-- 专属技能目录：`/Users/scott/.local/share/1agents/ppt-beautifier/skills`
-- 工作根目录：`/Users/scott/.local/share/1agents/ppt-beautifier/workspace`
+- 角色定义：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/roles/ppt-beautifier`
+- 角色 bundle：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/agent-bundle`
+- 技能完整源：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/skills/ppt`
+- 锁定技能缓存：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/cache/roles`
+- 执行工作目录：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace`
+- 角色状态及归档：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/state`
+- 项目网关登记、任务账本与通知：`/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/state/a2a-gateway`
 
-角色只挂载专属模型路由、persona、原生 bash、文件读写及搜索、专属技能提供器和 skill 工具。`includeDefaultRoots: false` 避免将全局技能目录混入这个角色。技能目录中的 PPT 能力应由 skill-manager 检索确认后部署，并包含 Presentations 技能的 artifact-tool 实现、模板处理及验证指引和可用运行时路径。
+当前角色挂载专属模型路由、薄 persona、原生 bash、文件读写及搜索；技能由宿主按网络版本加载并冻结到本任务锁。目录和维护规则见 [项目 Agent 数据目录](../../.1agents/README.md)。下文 0.2.x 设计绑定、复制部署和归档路径为历史记录；新任务使用宿主注入的锁定指南入口。
 
 ## 0.2.0 设计绑定
 
@@ -73,7 +77,7 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
   "method": "pluginManager/installBundle",
   "payload": {
     "args": {
-      "spec": "/Users/scott/.local/share/1agents/ppt-beautifier/agent-bundle",
+      "spec": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/agent-bundle",
       "options": { "enabled": true }
     }
   }
@@ -96,7 +100,7 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 {
   "remote": "ppt-beautifier",
   "originSessionId": "<REAL_PARENT_SESSION_ID>",
-  "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/<JOB_ID>",
+  "cwd": "/Users/scott/Documents/01-开发项目/1agents/1agents_app/modules/1acp/.1agents/runtime/ppt-beautifier/workspace/<JOB_ID>",
   "agentPreset": "ppt-beautifier",
   "title": "PPT 美化任务",
   "prompt": "请读取 <ABSOLUTE_CONTRACT_PATH>，按合同导入原稿并美化，输出可编辑 PPTX，逐页渲染并实际检查，最终答复附已存在的 PPTX 与预览链接。"
@@ -121,4 +125,4 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 
 ## 网络技能与缓存（0.4.0）
 
-当前角色说明和技能引用由 [roles/ppt-beautifier](../../roles/ppt-beautifier) 维护。persona 只保留接单与加载规则；设计方法通过能力网络统一更新。旧私有 skills 目录作为历史备份保留，新任务使用宿主注入的任务锁和 `1acp/.cache/roles` 内的版本快照。完整源独立迁至 `~/.local/share/1agents/skill-library/ppt`；操作及恢复规则见 [角色与缓存说明](../../roles/README.md)。上文 0.2.x 本地复制方式为历史部署记录。
+当前角色说明和技能引用由 [.1agents/roles/ppt-beautifier](../../.1agents/roles/ppt-beautifier) 维护。persona 只保留接单与加载规则；设计方法通过能力网络统一更新。旧私有 skills 目录作为历史备份保留，新任务使用宿主注入的任务锁和 `.1agents/cache/roles` 内的版本快照。完整源在 `.1agents/skills/ppt` 独立维护；操作及恢复规则见 [角色与缓存说明](../../.1agents/README.md)。上文 0.2.x 本地复制方式为历史部署记录。

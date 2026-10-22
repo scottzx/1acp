@@ -11,6 +11,17 @@ const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 async function exists(path) {
   try { return await lstat(path); } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
 }
+async function sameDirectory(left, right) {
+  if (typeof left !== 'string' || !left.trim()) return false;
+  if (resolve(left) === right) return true;
+  try {
+    const [actualLeft, actualRight] = await Promise.all([realpath(left), realpath(right)]);
+    return actualLeft === actualRight;
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error.code)) return false;
+    throw error;
+  }
+}
 async function plainDirectory(path) {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
@@ -76,7 +87,7 @@ export async function updateRoleSkills(config, resolver) {
         const sources = await request('/skills/sources');
         if (!Array.isArray(sources.sources)) throw new Error('Unexpected skill sources response');
         previousSource = sources.sources.find(source => source.id === sourceId);
-        if (previousSource && resolve(previousSource.dir ?? '') !== catalogue) throw new Error('Existing source points to another directory');
+        if (previousSource && !await sameDirectory(previousSource.dir, catalogue)) throw new Error('Existing source points to another directory');
         publication = await publishRoleSkills({ sourceDirectory: config.sourceDirectory, outputDirectory: catalogue,
           publicDirectory: config.publicDirectory, publicBaseUrl: config.publicBaseUrl });
         publicationFingerprint = await treeFingerprint(catalogue);
@@ -122,7 +133,7 @@ export async function updateRoleSkills(config, resolver) {
             if (!Array.isArray(sources.sources)) throw new Error('Cannot verify new skill source registration');
             const actual = sources.sources.find(source => source.id === sourceId);
             if (actual) {
-              if (resolve(actual.dir ?? '') !== catalogue) throw new Error('New source was replaced outside this update; refusing to remove it');
+              if (!await sameDirectory(actual.dir, catalogue)) throw new Error('New source was replaced outside this update; refusing to remove it');
               await request(`/skills/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' });
             }
             rollback.sourceRemoved = true;
@@ -155,7 +166,7 @@ export async function updateRoleSkills(config, resolver) {
 
 async function main() {
   const { values } = parseArgs({ options: { config: { type: 'string' }, help: { type: 'boolean', short: 'h' } }, strict: true });
-  if (values.help) { console.log('Usage: node scripts/update-role-skills.mjs --config roles/local-update.json\nPublishes guides/assets, refreshes Skill Manager and warms new role locks in .cache/roles. Existing task locks are never replaced. Run pnpm build first.'); return; }
+  if (values.help) { console.log('Usage: node scripts/update-role-skills.mjs --config .1agents/config/role-skills.local.json\nPublishes guides/assets, refreshes Skill Manager and warms new role locks in .1agents/cache/roles. Existing task locks are never replaced. Run pnpm build first.'); return; }
   if (!values.config) throw new Error('--config is required');
   const config = JSON.parse(await readFile(resolve(values.config), 'utf8'));
   const { resolveRoleSkills } = await import(new URL('../packages/service/dist/src/roles/index.js', import.meta.url));

@@ -81,9 +81,14 @@ export function verifyInstalledPackage(packageDirectory) {
   assert.ok(client.includes(`id:"${manifest.name}"`), 'Client registration must match package name');
   return manifest;
 }
-function sourceFiles(root) {
+export function sourceFiles(root) {
+  const tracked = new Set(execFileSync('git', ['ls-files', '-z', '--cached'], { cwd: root }).toString().split('\0').filter(Boolean));
   return execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], { cwd: root }).toString().split('\0').filter(Boolean)
-    .filter(path => /^(?:packages\/|scripts\/|roles\/|examples\/ppt-beautifier\/|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|\.gitignore$|README\.md$)/.test(path))
+    // .1agents mixes source definitions and private live data: only explicitly
+    // tracked role definitions, the guide and the public config example belong in a release.
+    .filter(path => path.startsWith('.1agents/')
+      ? tracked.has(path) && /^\.1agents\/(?:README\.md|roles\/[A-Za-z0-9][A-Za-z0-9._:-]*\/(?:profile\.json|ROLE\.md)|config\/role-skills\.example\.json)$/.test(path)
+      : /^(?:packages\/|scripts\/|examples\/ppt-beautifier\/|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|\.gitignore$|README\.md$)/.test(path))
     .filter(path => !/(?:^|\/)(?:node_modules|dist|dist-test|coverage|vendor|\.git)(?:\/|$)/.test(path) && !forbidden(path)).sort();
 }
 function snapshotSources(root, destination) {

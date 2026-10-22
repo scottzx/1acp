@@ -13,3 +13,10 @@
 - `packages/runtime/CHANGELOG.md` 保留已有上游与版本历史。本工作区后续 runtime 变更同样写入根 `changelog/` 的当日文件，不继续扩张该历史文件。
 
 格式与入口见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 项目 Agent 目录
+
+- 角色定义、技能引用及本机运行数据统一放在项目根 `./.1agents/`。角色声明使用 `.1agents/roles/<role>/`；统一入口见 [.1agents/README.md](.1agents/README.md)。
+- 缓存和任务锁放 `.1agents/cache/roles/`，本地技能源放 `.1agents/skills/`，角色 bundle、工作目录、产物和角色状态放 `.1agents/runtime/<role>/`，项目网关账本与通知放 `.1agents/state/a2a-gateway/`。
+- Git 只跟踪角色声明、说明和示例配置；缓存、技能包、任务/会话数据、产物、状态与本机私密配置不提交。本机配置使用 `.1agents/config/*.local.*`，示例使用 `*.example.json` 或 `*.example.yml`。
+- 宿主安装包、登录凭据和全局模型设置仍由共享宿主管理；项目配置指向上述目录。历史路径迁移须保留原任务锁、版本字节及兼容入口，不直接重写旧回执或冻结合同。

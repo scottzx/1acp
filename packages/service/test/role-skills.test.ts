@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { resolveRoleSkills, skillContentRevision } from '../src/roles/index.js';
 
@@ -84,6 +84,43 @@ test('new tasks resolve refreshed skills and role instructions; existing tasks r
   assert.deepEqual(await resolveRoleSkills(f.options), old);
   assert.equal(await readFile(old.instructionsPath!, 'utf8'), '# PPT role');
   assert.equal(await readFile(next.instructionsPath!, 'utf8'), '# Updated role');
+});
+
+test('physical cache/profile migration with old root aliases reuses an unchanged task lock offline', async t => {
+  const f = await fixture(t), old = await resolveRoleSkills(f.options);
+  const original = await readFile(f.options.lockPath), calls = f.requests;
+  const cacheRoot = join(f.root, '.1agents/cache/roles'), profilePath = join(f.root, '.1agents/roles/ppt/profile.json');
+  await mkdir(dirname(cacheRoot), { recursive: true }); await mkdir(dirname(profilePath), { recursive: true });
+  await rename(f.options.cacheRoot, cacheRoot); await symlink(cacheRoot, f.options.cacheRoot, 'dir');
+  await rename(f.profilePath, profilePath); await symlink(profilePath, f.profilePath);
+  await cp(join(f.root, 'ROLE.md'), join(dirname(profilePath), 'ROLE.md'));
+  f.online = false;
+  assert.deepEqual(await resolveRoleSkills({ ...f.options, cacheRoot, profilePath }), old);
+  assert.deepEqual(await readFile(f.options.lockPath), original); assert.equal(f.requests, calls);
+  assert.equal(await readFile(old.skills[0]!.guidePath, 'utf8'), f.skills[0]!.files.get('SKILL.md')!.toString());
+  f.online = true;
+  const fresh = await resolveRoleSkills({ profilePath, cacheRoot, lockPath: join(cacheRoot, 'locks', 'new-task.json') });
+  assert.equal(fresh.profilePath, profilePath); assert.equal(fresh.cacheRoot, cacheRoot);
+  assert.ok(fresh.entryGuidePath!.startsWith(cacheRoot + '/'));
+  assert.deepEqual(await readFile(f.options.lockPath), original);
+});
+
+test('an old lock cannot bind a different physical cache or an identical but unrelated profile', async t => {
+  const f = await fixture(t); await resolveRoleSkills(f.options);
+  const cacheRoot = join(f.root, '.1agents/cache/roles'), profilePath = join(f.root, 'unrelated/profile.json');
+  await cp(f.options.cacheRoot, cacheRoot, { recursive: true });
+  await assert.rejects(resolveRoleSkills({ ...f.options, cacheRoot }), /cache binding mismatch/);
+  await mkdir(dirname(profilePath), { recursive: true }); await cp(f.profilePath, profilePath);
+  await assert.rejects(resolveRoleSkills({ ...f.options, profilePath }), /another profile/);
+});
+
+test('root alias compatibility does not permit a skill subdirectory symlink escape', async t => {
+  const f = await fixture(t), old = await resolveRoleSkills(f.options);
+  const cacheRoot = join(f.root, '.1agents/cache/roles'); await mkdir(dirname(cacheRoot), { recursive: true });
+  await rename(f.options.cacheRoot, cacheRoot); await symlink(cacheRoot, f.options.cacheRoot, 'dir');
+  const files = join(old.skills[0]!.cacheDirectory, 'files'), outside = join(f.root, 'outside-files');
+  await rename(files, outside); await symlink(outside, files, 'dir');
+  await assert.rejects(resolveRoleSkills({ ...f.options, cacheRoot }), /symlink or non-directory/);
 });
 
 test('provider UTF-8 decoding that strips a BOM still yields the exact original package bytes', async t => {

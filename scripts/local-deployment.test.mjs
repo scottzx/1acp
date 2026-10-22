@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { activateStage, fileInventory, inventoryHash, rollbackActivation, sha256, stageRelease, verifyDependencies, verifyInstalledPackage, verifyRelease, verifyStage, versionSatisfies } from './local-deployment.mjs';
+import { activateStage, fileInventory, inventoryHash, rollbackActivation, sha256, sourceFiles, stageRelease, verifyDependencies, verifyInstalledPackage, verifyRelease, verifyStage, versionSatisfies } from './local-deployment.mjs';
 const sourceManifest = JSON.parse(readFileSync(new URL('../packages/service/package.json', import.meta.url), 'utf8'));
 const save = (path, value) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, value); };
 const saveJSON = (path, value) => save(path, JSON.stringify(value));
@@ -36,6 +36,22 @@ test('direct dependency ranges reject mismatches and unknown syntax, including n
   assert.equal(verifyDependencies(f.dependencies, { dependencies: { sample: '^1.2.3' } })[0].version, '1.3.0');
   assert.throws(() => verifyDependencies(f.dependencies, { dependencies: { sample: '^2.0.0' } }), /does not satisfy/);
   assert.throws(() => verifyDependencies(f.dependencies, { dependencies: { sample: 'npm:other@^1.2.3' } }), /alias/);
+});
+test('source capture includes tracked .1agents definitions and excludes private live data even when tracked', t => {
+  const root = mkdtempSync(join(tmpdir(), '1acp-project-role-source-test-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  execFileSync('git', ['init', '--quiet'], { cwd: root });
+  const definitions = ['.1agents/README.md', '.1agents/roles/ppt-beautifier/profile.json', '.1agents/roles/ppt-beautifier/ROLE.md', '.1agents/config/role-skills.example.json'];
+  const privateFiles = ['.1agents/config/role-skills.local.json', '.1agents/config/credentials.json', '.1agents/cache/roles/locks/task.json', '.1agents/state/a2a-gateway/targets.json', '.1agents/workspaces/ppt-beautifier/artifacts/final.pptx', '.1agents/roles/ppt-beautifier/.env'];
+  for (const path of [...definitions, ...privateFiles]) save(join(root, path), 'fixture');
+  const legacyRole = 'roles/ppt-beautifier/profile.json';
+  save(join(root, legacyRole), 'legacy source before directory migration');
+  execFileSync('git', ['add', '--', ...definitions, ...privateFiles, legacyRole], { cwd: root });
+  rmSync(join(root, 'roles'), { recursive: true });
+  symlinkSync('.1agents/roles', join(root, 'roles'), 'dir');
+  save(join(root, '.1agents/roles/untracked/profile.json'), 'not yet reviewed source');
+  save(join(root, 'scripts/entry.mjs'), 'source');
+  assert.deepEqual(sourceFiles(root), [...definitions, 'scripts/entry.mjs'].sort());
 });
 test('input fingerprints reflect file bytes and executable bits, reject external symlinks and chains', t => {
   const f=fixture(t), directory=join(f.root,'fingerprint'); save(join(directory,'input.txt'),'original');

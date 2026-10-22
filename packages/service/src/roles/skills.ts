@@ -223,9 +223,14 @@ async function loadAssets(root: string, directory: string, wanted: z.infer<typeo
   }
   return manifest.assets;
 }
-async function validateLock(root: string, lock: RoleSkillLock): Promise<RoleSkillLock> {
+async function validateLock(trustedRoot: string, lock: RoleSkillLock): Promise<RoleSkillLock> {
+  // A migration may preserve the lock's original paths through a root alias.
+  // Only that root alias may differ: every descendant keeps the same exact
+  // binding and the existing directory/file symlink checks below still apply.
+  const root = lock.cacheRoot;
+  if (root !== trustedRoot && await realpath(root) !== trustedRoot) throw new Error('Role lock cache binding mismatch');
   const roleDirectory = join(root, 'roles', lock.roleId, snapshotId(lock));
-  if (lock.cacheRoot !== root || lock.roleDirectory !== roleDirectory || new Set(lock.skills.map(skill => skill.key)).size !== lock.skills.length) throw new Error('Role lock cache binding mismatch');
+  if (lock.roleDirectory !== roleDirectory || new Set(lock.skills.map(skill => skill.key)).size !== lock.skills.length) throw new Error('Role lock cache binding mismatch');
   const profileBytes = await regularBytes(root, join(roleDirectory, 'profile.json'));
   if (hash(profileBytes) !== lock.profileSha256) throw new Error('Cached role profile byte/hash mismatch');
   const profile = roleSkillProfileSchema.parse(JSON.parse(profileBytes.toString('utf8')));
@@ -261,7 +266,7 @@ export async function resolveRoleSkills(options: { profilePath: string; cacheRoo
   if (await exists(lockPath)) {
     const info = await lstat(lockPath); if (!info.isFile() || info.isSymbolicLink()) throw new Error('Role lock is not a regular file');
     const lock = roleSkillLockSchema.parse(JSON.parse(await readFile(lockPath, 'utf8')));
-    if (lock.profilePath !== profilePath) throw new Error('Role lock belongs to another profile');
+    if (lock.profilePath !== profilePath && await realpath(lock.profilePath) !== await realpath(profilePath)) throw new Error('Role lock belongs to another profile');
     return validateLock(root, lock);
   }
   options.signal?.throwIfAborted();

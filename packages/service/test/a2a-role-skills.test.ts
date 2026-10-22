@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { SendMessageRequest, TaskState } from '@a2a-js/sdk';
 import { ClientFactory } from '@a2a-js/sdk/client';
@@ -176,6 +176,33 @@ test('new contexts get hot updates while continued and restarted contexts stay f
   assert.equal(continued.final.status?.state, TaskState.TASK_STATE_COMPLETED); assert.equal(f.calls, calls);
   assert.deepEqual(f.runs[2]!.target.roleSkills, old); assert.match(f.runs[2]!.prompt, /# Canonical PPT role/);
   assert.equal(f.runs[2]!.target.sessionId, f.runs[0]!.target.sessionId);
+});
+
+test('saved contexts keep their exact role summary and lock bytes after physical directory migration', async t => {
+  const f = await fixture(t), first = await f.execute({ roleId: 'maker' });
+  const old = structuredClone(f.runs[0]!.target.roleSkills!), bytes = await readFile(old.lockPath), calls = f.calls;
+  const cacheRoot = join(f.root, '.1agents/cache/roles'), profilePath = join(f.root, '.1agents/roles/ppt/profile.json');
+  await mkdir(dirname(cacheRoot), { recursive: true }); await mkdir(dirname(profilePath), { recursive: true });
+  await rename(f.cacheRoot, cacheRoot); await symlink(cacheRoot, f.cacheRoot, 'dir');
+  await rename(f.profilePath, profilePath); await symlink(profilePath, f.profilePath);
+  await cp(join(f.root, 'ROLE.md'), join(dirname(profilePath), 'ROLE.md'));
+  f.options.roleSkills!.cacheRoot = cacheRoot;
+  f.options.roleSkills!.profiles.maker = profilePath;
+  f.options.roleSkills!.profiles.reviewer = profilePath;
+  f.online = false; await f.restart();
+  const resumed = await f.execute(undefined, first.contextId);
+  assert.equal(resumed.final.status?.state, TaskState.TASK_STATE_COMPLETED);
+  assert.equal(f.calls, calls); assert.equal(f.runs[1]!.target.sessionId, f.runs[0]!.target.sessionId);
+  assert.equal(JSON.stringify(f.runs[1]!.target.roleSkills), JSON.stringify(old));
+  assert.deepEqual(await readFile(old.lockPath), bytes); assert.deepEqual(f.target(first.contextId)!.roleSkills, old);
+  const other = join(cacheRoot, 'locks', 'different.json'); await writeFile(other, bytes);
+  const changed = await f.execute({ roleLockPath: other }, first.contextId);
+  assert.equal(changed.final.status?.state, TaskState.TASK_STATE_FAILED); assert.equal(f.runs.length, 2);
+  f.online = true;
+  const fresh = await f.execute({ roleId: 'maker' });
+  assert.equal(fresh.final.status?.state, TaskState.TASK_STATE_COMPLETED);
+  assert.ok(f.runs[2]!.target.roleSkills!.lockPath.startsWith(cacheRoot + '/locks/'));
+  assert.ok(f.runs[2]!.target.roleSkills!.roleDirectory.startsWith(cacheRoot + '/roles/'));
 });
 
 test('separate maker/reviewer contexts can pin one parent lock despite newer published skills', async t => {
