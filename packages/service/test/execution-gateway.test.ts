@@ -137,6 +137,8 @@ test('unified submit/get/list/events persist scope and IDs; replay does not crea
   const first = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-submit' }) as any;
   assert.ok(first.jobId); assert.ok(first.attemptId); assert.ok(first.taskId); assert.ok(first.sessionId);
   assert.equal(first.submissionStatus, 'accepted');
+  assert.equal(first.attempts[0].targetSnapshot.targetKind, 'agent_host');
+  assert.equal(first.attempts[0].targetSnapshot.targetName, 'Legacy A2A local');
   await until(async () => f.backend.runs.length, count => count === 1);
   const repeated = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-submit' }) as any;
   assert.equal(repeated.jobId, first.jobId); assert.equal(repeated.attemptId, first.attemptId);
@@ -292,6 +294,8 @@ test('fixed resident targets cannot be overridden and resolve their configured e
   await until(async () => f.backend.runs.length, count => count === 1);
   assert.equal(f.backend.runs[0]!.target.cwd, '/fixed-role'); assert.equal(f.backend.runs[0]!.target.agentPreset, 'ppt-beautifier');
   assert.equal(accepted.attempts[0].targetSnapshot.binding.cwd, '/fixed-role');
+  assert.equal(accepted.attempts[0].targetSnapshot.targetKind, 'resident_agent');
+  assert.equal(accepted.attempts[0].targetSnapshot.targetName, 'PPT role');
 });
 
 test('a lost acceptance response is persisted as unknown and cannot cause another execution round', async t => {

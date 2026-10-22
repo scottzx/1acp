@@ -244,7 +244,8 @@ export class RemoteAgentGateway {
     catch { return { targetId: `legacy:${job.remote}`, provider: 'a2a', remote: job.remote, cwd: job.cwd, agentPreset: job.agentPreset, historicalConfigUnknown: true }; }
   }
   private targetSnapshot(resolved: ExecutionTargetSnapshot) {
-    return { targetId: resolved.target.targetId, configVersion: resolved.configVersion, connectionId: resolved.connection.connectionId,
+    return { targetId: resolved.target.targetId, targetKind: resolved.target.kind, targetName: resolved.target.name,
+      configVersion: resolved.configVersion, connectionId: resolved.connection.connectionId,
       connectionVersion: resolved.connectionVersion, provider: resolved.target.binding.driver === 'ppt_delivery' ? 'resident_role' : 'a2a',
       roleId: resolved.target.binding.roleId, binding: resolved.target.binding, remote: resolved.remote, endpoint: resolved.endpoint, cwd: resolved.cwd,
       agentPreset: resolved.agentPreset, capabilities: resolved.target.capabilities };

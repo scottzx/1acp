@@ -4,12 +4,22 @@ import type { PptDeliveryRun } from './ppt-delivery.js';
 import { deliveryProgress } from './delivery-progress.js';
 import type { HumanReviewRequest, HumanReviewStatus } from './human-review.js';
 
+export interface WorkbenchServiceInfo {
+  kind: 'a2a' | 'gateway_workflow' | 'activepieces' | 'unknown';
+  source: 'backend_run' | 'target_snapshot' | 'workflow_run' | 'unrecorded';
+  host?: string; port?: number; locality?: 'loopback' | 'network'; connectionAlias?: string;
+}
+export interface WorkbenchExecution {
+  kind: 'temporary' | 'resident' | 'workflow' | 'unknown'; targetId: string; targetName?: string;
+  roleId?: string; agentPreset?: string; presetStatus: 'recorded' | 'host_default' | 'unknown' | 'not_applicable';
+  service?: string; serviceInfo?: WorkbenchServiceInfo; provider?: string; connectionId?: string;
+}
 export interface AcpTaskSummary {
   sourceId: string; jobId: string; title: string; originSessionId: string; parentJobRef?: JobRef;
   parentAttemptId?: string; purpose?: string; targetId: string; currentAttemptId: string;
   executionStatus: string; displayStatus: string; phase: string; createdAt: string | null; updatedAt: string;
   stale: boolean; reviewStatus?: HumanReviewStatus; pendingReviewId?: string; progressSummary: string;
-  inFlightAttemptIds: string[]; unresolvedAttemptIds: string[];
+  inFlightAttemptIds: string[]; unresolvedAttemptIds: string[]; execution: WorkbenchExecution;
 }
 export interface WorkbenchStage { stage: string; name: string; status: string; planned: boolean; jobId?: string; attemptId?: string }
 export interface WorkbenchProgress { stage: string; phase: string; stages: WorkbenchStage[]; completedStages: string[];
@@ -17,7 +27,7 @@ export interface WorkbenchProgress { stage: string; phase: string; stages: Workb
   availableResults?: ReturnType<typeof deliveryProgress>['availableResults'] }
 export interface WorkbenchDependency { from: string; to: string; kind: 'parent' | 'depends_on' | 'replaces'; label: string; parentAttemptId?: string }
 export type WorkbenchReview = HumanReviewRequest & { canReview: boolean; resumeStatus?: 'pending' | 'applied'; resumeError?: string };
-export type WorkbenchAttempt = Omit<LedgerAttempt, 'input' | 'targetSnapshot' | 'backendRunRef'> & { backendRunRef?: Record<string, string> };
+export type WorkbenchAttempt = Omit<LedgerAttempt, 'input' | 'targetSnapshot' | 'backendRunRef'> & { backendRunRef?: Record<string, string>; execution: WorkbenchExecution };
 export interface AcpTaskDetail extends AcpTaskSummary {
   attempts: WorkbenchAttempt[]; children: AcpTaskSummary[]; ancestors: AcpTaskSummary[];
   progress: WorkbenchProgress; reviews: WorkbenchReview[]; events: LedgerEvent[]; dependencies: WorkbenchDependency[];
@@ -43,6 +53,65 @@ function byNewest<T extends { updatedAt: string }>(items: T[]): T[] { return ite
 function latestReview(reviews: readonly HumanReviewRequest[], job: LedgerJob): HumanReviewRequest | undefined {
   return byNewest(reviews.filter(r => r.jobId === job.jobId && r.attemptId === job.currentAttemptId).map(r => structuredClone(r)).reverse())[0];
 }
+function metadataText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.trim();
+  return text && text.length <= 512 && !/[\u0000-\u001f\u007f]/.test(text) ? text : undefined;
+}
+function metadataObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+function serviceEndpoint(value: unknown): Pick<WorkbenchServiceInfo, 'host' | 'port' | 'locality'> | undefined {
+  if (typeof value !== 'string' || value.length > 8192 || /[\u0000-\u001f\u007f]/.test(value)) return undefined;
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return undefined;
+    const host = metadataText(url.hostname.replace(/^\[|\]$/g, ''));
+    if (!host) return undefined;
+    const locality = host === 'localhost' || host === '::1' || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(host) ? 'loopback' : 'network';
+    return { host, port: url.port ? Number(url.port) : url.protocol === 'https:' ? 443 : 80, locality };
+  } catch { return undefined; }
+}
+/** Separate a connection alias from the service this attempt was recorded against. */
+function serviceView(attempt: LedgerAttempt | undefined, snapshot: Record<string, unknown>, binding: Record<string, unknown>, workflow: boolean): WorkbenchServiceInfo {
+  const backend = attempt?.backendRunRef;
+  const connectionAlias = metadataText(backend?.remote) ?? metadataText(snapshot.remote);
+  const alias = connectionAlias ? { connectionAlias } : {};
+  const recordedWorkflow = workflow || backend?.provider === 'resident_role' && Boolean(metadataText(backend.runId));
+  if (recordedWorkflow || binding.driver === 'ppt_delivery') return { kind: 'gateway_workflow', source: recordedWorkflow ? 'workflow_run' : 'target_snapshot', ...alias };
+  const provider = metadataText(backend?.provider) ?? metadataText(snapshot.provider) ?? metadataText(attempt?.provider);
+  const kind: WorkbenchServiceInfo['kind'] = provider === 'a2a' ? 'a2a' : provider === 'activepieces' ? 'activepieces' : 'unknown';
+  const actual = serviceEndpoint(backend?.endpoint), configured = serviceEndpoint(snapshot.endpoint);
+  return { kind, source: actual ? 'backend_run' : configured ? 'target_snapshot' : 'unrecorded', ...(actual ?? configured), ...alias };
+}
+/** Historical identities come only from this execution's frozen facts, never today's target directory. */
+function executionView(attempt: LedgerAttempt | undefined, targetId: string, workflow = false): WorkbenchExecution {
+  const snapshot: Record<string, unknown> = attempt?.targetSnapshot ?? {}, binding = metadataObject(snapshot.binding);
+  const serviceInfo = serviceView(attempt, snapshot, binding, workflow);
+  const snapshotRole = metadataText(snapshot.roleId), bindingRole = metadataText(binding.roleId);
+  const roleConflict = Boolean(snapshotRole && bindingRole && snapshotRole !== bindingRole);
+  const roleId = roleConflict ? undefined : snapshotRole ?? bindingRole;
+  const hasRole = Boolean(snapshotRole || bindingRole);
+  const targetKind = metadataText(snapshot.targetKind);
+  let kind: WorkbenchExecution['kind'] = 'unknown';
+  if (serviceInfo.kind === 'gateway_workflow' || targetKind === 'workflow') kind = 'workflow';
+  else if (roleConflict || targetKind === 'agent_host' && hasRole) kind = 'unknown';
+  else if (targetKind === 'resident_agent' || hasRole) kind = 'resident';
+  else if (targetKind === 'agent_host' || targetId.startsWith('legacy:')) kind = 'temporary';
+  const snapshotPreset = metadataText(snapshot.agentPreset), bindingPreset = metadataText(binding.agentPreset);
+  const presetConflict = Boolean(snapshotPreset && bindingPreset && snapshotPreset !== bindingPreset);
+  const presetUnusable = snapshot.agentPreset !== undefined && !snapshotPreset || binding.agentPreset !== undefined && !bindingPreset;
+  const hasFrozenTarget = Boolean(attempt && metadataText(snapshot.targetId) === targetId);
+  const agentPreset = kind === 'workflow' || presetConflict ? undefined : snapshotPreset ?? bindingPreset;
+  const presetStatus: WorkbenchExecution['presetStatus'] = kind === 'workflow' ? 'not_applicable'
+    : agentPreset ? 'recorded' : kind === 'temporary' && hasFrozenTarget && !presetConflict && !presetUnusable && snapshot.historicalConfigUnknown !== true ? 'host_default' : 'unknown';
+  const targetName = metadataText(snapshot.targetName), service = metadataText(snapshot.remote) ?? metadataText(attempt?.backendRunRef?.remote);
+  const provider = metadataText(snapshot.provider) ?? metadataText(attempt?.provider) ?? metadataText(attempt?.backendRunRef?.provider);
+  const connectionId = metadataText(snapshot.connectionId) ?? metadataText(attempt?.connectionId);
+  return { kind, targetId: metadataText(targetId) ?? '', presetStatus, serviceInfo,
+    ...(targetName ? { targetName } : {}), ...(roleId ? { roleId } : {}), ...(agentPreset ? { agentPreset } : {}),
+    ...(service ? { service } : {}), ...(provider ? { provider } : {}), ...(connectionId ? { connectionId } : {}) };
+}
 function safeArtifact(input: unknown): unknown | undefined {
   if (typeof input === 'string') { try { const url = new URL(input); return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? input : undefined; } catch { return undefined; } }
   if (!input || typeof input !== 'object') return undefined;
@@ -52,17 +121,17 @@ function safeArtifact(input: unknown): unknown | undefined {
   for (const key of ['name', 'path', 'mediaType', 'size', 'sha256']) if (['string', 'number'].includes(typeof value[key])) result[key] = value[key];
   return result;
 }
-function attemptView(attempt: LedgerAttempt): WorkbenchAttempt {
+function attemptView(attempt: LedgerAttempt, workflow = false): WorkbenchAttempt {
   const { input: _input, targetSnapshot: _snapshot, backendRunRef, ...view } = structuredClone(attempt);
   const refs: Record<string, string> = {};
   for (const key of ['provider', 'remote', 'taskId', 'contextId', 'sessionId', 'flowRunId', 'runId']) if (typeof backendRunRef?.[key] === 'string') refs[key] = backendRunRef[key];
   if (view.result) { view.result.artifactLinks = view.result.artifactLinks.map(safeArtifact).filter(item => item !== undefined); delete view.result.structuredResultRef; }
-  return { ...view, ...(Object.keys(refs).length ? { backendRunRef: refs } : {}) };
+  return { ...view, ...(Object.keys(refs).length ? { backendRunRef: refs } : {}), execution: executionView(attempt, attempt.targetId, workflow) };
 }
 function eventView(event: LedgerEvent): LedgerEvent {
   const clean = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(clean);
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([key]) => !/token|password|secret|authorization|apiKey|input|prompt/i.test(key)).map(([key, item]) => [key, clean(item)]));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).filter(([key]) => !/token|password|secret|authorization|apiKey|input|prompt|endpoint/i.test(key)).map(([key, item]) => [key, clean(item)]));
     return value;
   };
   return { ...structuredClone(event), ...(event.data === undefined ? {} : { data: clean(event.data) }) };
@@ -103,7 +172,7 @@ function summary(job: LedgerJob, run: PptDeliveryRun | undefined, reviews: reado
     originSessionId: job.originSessionId, ...(job.parentJobRef ? { parentJobRef: job.parentJobRef } : {}), ...(job.parentAttemptId ? { parentAttemptId: job.parentAttemptId } : {}),
     ...(job.purpose ? { purpose: job.purpose } : {}), targetId: job.targetId, currentAttemptId: job.currentAttemptId, executionStatus: job.executionStatus, displayStatus, phase,
     createdAt: job.createdAt, updatedAt: review && review.updatedAt > job.updatedAt ? review.updatedAt : job.updatedAt, stale: attempt?.stale ?? true,
-    inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds],
+    inFlightAttemptIds: [...job.inFlightAttemptIds], unresolvedAttemptIds: [...job.unresolvedAttemptIds], execution: executionView(attempt, job.targetId, Boolean(run)),
     ...(review ? { reviewStatus: review.status } : {}), ...(pending && review.reviewerId === actorId ? { pendingReviewId: review.reviewId } : {}), progressSummary };
 }
 
@@ -135,7 +204,8 @@ export function workbenchSnapshot(source: WorkbenchSource): WorkbenchSnapshot {
     for (const item of [...(run?.artifactHistory ?? []), ...(run?.validation ? [{ revision: run.revision, validation: run.validation }] : [])]) {
       if (!artifacts.some(a => a.revision === `revision-${item.revision}` && a.digest === item.validation.artifactDigest)) artifacts.push({ revision: `revision-${item.revision}`, digest: item.validation.artifactDigest, artifacts: item.validation.artifacts.map(safeArtifact).filter(a => a !== undefined) });
     }
-    const attempts = Object.values(ledger.attempts).filter(attempt => attempt.jobId === job.jobId).map(attemptView);
+    const attempts = Object.values(ledger.attempts).filter(attempt => attempt.jobId === job.jobId)
+      .map(attempt => attemptView(attempt, source.runs.some(item => item.jobId === job.jobId && item.attemptId === attempt.attemptId)));
     if (!run) for (const attempt of attempts) if (attempt.result?.artifactLinks.length) artifacts.push({ revision: attempt.result.resultRevision ?? attempt.attemptId, digest: attempt.result.resultDigest, artifacts: attempt.result.artifactLinks });
     const humanEvents: LedgerEvent[] = ownReviews.flatMap(review => review.history.map((decision, index) => ({ eventId: decision.decisionId, sourceId: ledger.sourceId, sequence: -(index + 1), jobId: review.jobId,
       attemptId: review.attemptId, jobVersion: 0, type: `human_review.${decision.action}`, observedAt: decision.at,
