@@ -1,5 +1,7 @@
 # 1ACP — native Agent sessions in DeepSeek Harness
 
+[1ACP 发布页](https://scottzx.github.io/1acp/) · [npm package](https://www.npmjs.com/package/@1agents/acp-service)
+
 Use Codex, Claude Code, Grok Build and other locally discovered ACP Agents inside DeepSeek Harness (DSH). Continue persistent native sessions, choose the models and settings exposed by each Agent, and handle tool permissions in DSH's approval UI. The same **`@1agents/acp-service`** package also provides a standalone CLI and ACP HTTP/WebSocket service.
 
 - Keep the native Agent's workspace, tools and session identity when reconnecting.

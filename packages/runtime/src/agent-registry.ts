@@ -122,6 +122,7 @@ const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     argv: ["npx", "-y", `mux@${ACP_ADAPTER_PACKAGE_RANGES.mux}`, "acp"],
     installedArgv: ["mux", "acp"],
   },
+  octomind: { name: "Octomind", argv: ["octomind", "acp", "developer:general"] },
   opencode: {
     name: "OpenCode",
     argv: ["npx", "-y", "opencode-ai", "acp"],

@@ -1,5 +1,5 @@
 /** Browser controls for native ACP configuration and ordinary DSH models. */
-import { createElement as h, useEffect, useState, useSyncExternalStore } from 'react';
+import { createElement as h, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { toolConversationDefinition } from './tool-conversation.js';
 import { installTranscriptView } from './transcript-view.js';
 
@@ -103,8 +103,11 @@ export function apply(ctx) {
   const configure = async (id, configId, value) => {
     const revision = revisionOf(id);
     const preset = presetOf(id);
-    const updated = await acpRequest(id, { configId, value });
-    if (!disposed && revision === revisionOf(id) && preset === presetOf(id) && isAcp(id)) publish(id, updated);
+    const current = () => !disposed && revision === revisionOf(id) && preset === presetOf(id) && isAcp(id);
+    try {
+      const updated = await acpRequest(id, { configId, value });
+      if (current()) publish(id, updated);
+    } catch (error) { if (current()) throw error; }
   };
   const invalidate = (id, selectedPreset) => {
     const tracked = native.has(id) || pending.has(id) || blockedSessions.has(id) || listeners.has(id);
@@ -141,6 +144,7 @@ export function apply(ctx) {
     const [loadError, setLoadError] = useState('');
     const [busy, setBusy] = useState(false);
     const [expanded, setExpanded] = useState(false);
+    const changeSequence = useRef(0);
     const refresh = async () => {
       const revision = revisionOf(sessionId);
       const current = () => !disposed && revision === revisionOf(sessionId) && presetOf(sessionId) === presetId;
@@ -160,6 +164,8 @@ export function apply(ctx) {
       if (!external) block(sessionId, undefined);
       setError('');
       setLoadError('');
+      changeSequence.current += 1;
+      setBusy(false);
       void refresh();
     }, [sessionId, presetId]);
     // Configuration updates can arrive while the remote Agent is working.
@@ -168,7 +174,16 @@ export function apply(ctx) {
       const timer = setInterval(() => { if (document.visibilityState === 'visible') void refresh(); }, 5000);
       return () => clearInterval(timer);
     }, [external, sessionId, presetId]);
-    const change = async action => { setBusy(true); setError(''); try { await action(); } catch (error) { setError(String(error.message ?? error)); } finally { setBusy(false); } };
+    const change = async action => {
+      const operation = ++changeSequence.current;
+      const revision = revisionOf(sessionId);
+      const current = () => !disposed && operation === changeSequence.current && revision === revisionOf(sessionId) && presetOf(sessionId) === presetId;
+      setBusy(true);
+      setError('');
+      try { await action(); }
+      catch (error) { if (current()) setError(String(error.message ?? error)); }
+      finally { if (operation === changeSequence.current) setBusy(false); }
+    };
     const disabled = locked || busy || (external && capabilities?.writable === false);
     const controls = [];
     if (external && capabilities) {
@@ -206,7 +221,8 @@ export function apply(ctx) {
       options: async ({ sessionId }) => {
         if (isAcp(sessionId)) {
           const capabilities = await load(sessionId);
-          const model = capabilities?.configOptions.find(option => option.category === 'model' || option.id === 'model');
+          if (!capabilities) return [];
+          const model = capabilities.configOptions.find(option => option.category === 'model' || option.id === 'model');
           if (!model) throw new Error(t('unsupported'));
           return choices(model).map(option => ({ id: JSON.stringify([model.id, option.value]), label: option.name, detail: option.description, active: option.value === model.currentValue }));
         }

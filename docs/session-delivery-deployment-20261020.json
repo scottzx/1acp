@@ -1,0 +1,458 @@
+{
+  "verifiedAt": "2026-10-20T05:29:52.093823+00:00",
+  "release": "/Users/scott/.local/share/1agents/a2a-gateway/releases/20261020-session-delivery-0.8.1",
+  "entrySha256": "3e18dcb83fb68d006cc0f039824e3502cc70187cb4f8794ebbfd1511d924c3ad",
+  "configPath": "/Users/scott/.config/1agents/a2a-gateway.json",
+  "remote": "http://100.75.225.56:3088",
+  "gatewayMethods": 11,
+  "serviceTests": {
+    "pass": 125,
+    "fail": 0
+  },
+  "dsh": {
+    "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+    "dispatchedAt": 1792473939.4287128,
+    "spawn": {
+      "remote": "wsl-dsh",
+      "taskId": "20877e6c-fb46-42e2-9733-9dd7515be014",
+      "contextId": "ee95eb77-8fa6-453c-abd9-e48dd4cb8576",
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-afc3c447-63a1-4581-958f-095403252ea0",
+      "state": "TASK_STATE_SUBMITTED",
+      "result": "",
+      "checkedAt": "2026-10-20T05:25:39.418Z",
+      "stale": false
+    },
+    "statusQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "20877e6c-fb46-42e2-9733-9dd7515be014",
+      "contextId": "ee95eb77-8fa6-453c-abd9-e48dd4cb8576",
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-afc3c447-63a1-4581-958f-095403252ea0",
+      "state": "TASK_STATE_WORKING",
+      "result": "",
+      "checkedAt": "2026-10-20T05:25:39.452Z",
+      "stale": false
+    },
+    "statusQueriedAt": 1792473939.4630988,
+    "completionQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "20877e6c-fb46-42e2-9733-9dd7515be014",
+      "contextId": "ee95eb77-8fa6-453c-abd9-e48dd4cb8576",
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-afc3c447-63a1-4581-958f-095403252ea0",
+      "state": "TASK_STATE_COMPLETED",
+      "result": "DSH_A2A_EXECUTOR_OK_20261020\n\n命令执行成功（退出码 0），输出如上。验收通过，未做任何其他操作。",
+      "checkedAt": "2026-10-20T05:26:37.464Z",
+      "stale": false
+    },
+    "inboxBeforeAck": {
+      "notices": [
+        {
+          "noticeId": "58ca14a509637d090ca3cd35c0fb175efb43e250df5f92215b7d30eefe7988ec",
+          "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+          "remote": "wsl-dsh",
+          "taskId": "20877e6c-fb46-42e2-9733-9dd7515be014",
+          "contextId": "ee95eb77-8fa6-453c-abd9-e48dd4cb8576",
+          "cwd": "/home/scott",
+          "agentPreset": "standard",
+          "title": "DSH parent completion wakeup probe",
+          "state": "TASK_STATE_COMPLETED",
+          "result": "DSH_A2A_EXECUTOR_OK_20261020\n\n命令执行成功（退出码 0），输出如上。验收通过，未做任何其他操作。",
+          "createdAt": "2026-10-20T05:26:32.366Z"
+        }
+      ]
+    },
+    "businessVerifiedAt": 1792473997.4763148,
+    "ack": {
+      "acknowledged": true,
+      "noticeId": "58ca14a509637d090ca3cd35c0fb175efb43e250df5f92215b7d30eefe7988ec"
+    },
+    "acknowledgedAt": 1792473997.495049,
+    "inboxAfterAck": {
+      "notices": []
+    }
+  },
+  "dshTimeline": [
+    {
+      "type": "turn/start",
+      "seq": 5,
+      "at": "2026-10-20T05:23:45.962000+00:00",
+      "data": {
+        "turn": 1
+      }
+    },
+    {
+      "type": "turn/end",
+      "seq": 161,
+      "at": "2026-10-20T05:24:45.173000+00:00",
+      "data": {
+        "turn": 1,
+        "reason": {
+          "kind": "aborted",
+          "reason": {
+            "kind": "user"
+          }
+        }
+      }
+    },
+    {
+      "type": "turn/start",
+      "seq": 163,
+      "at": "2026-10-20T05:25:35.913000+00:00",
+      "data": {
+        "turn": 2
+      }
+    },
+    {
+      "type": "turn/end",
+      "seq": 178,
+      "at": "2026-10-20T05:25:41.365000+00:00",
+      "data": {
+        "turn": 2,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    },
+    {
+      "type": "turn/start",
+      "seq": 179,
+      "at": "2026-10-20T05:25:41.367000+00:00",
+      "data": {
+        "turn": 3
+      }
+    },
+    {
+      "type": "turn/end",
+      "seq": 194,
+      "at": "2026-10-20T05:25:51.269000+00:00",
+      "data": {
+        "turn": 3,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    },
+    {
+      "type": "turn/start",
+      "seq": 196,
+      "at": "2026-10-20T05:26:35.150000+00:00",
+      "data": {
+        "turn": 4
+      }
+    },
+    {
+      "type": "turn/end",
+      "seq": 219,
+      "at": "2026-10-20T05:26:41.913000+00:00",
+      "data": {
+        "turn": 4,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    },
+    {
+      "type": "turn/start",
+      "seq": 222,
+      "at": "2026-10-20T05:27:15.936000+00:00",
+      "data": {
+        "turn": 5
+      }
+    },
+    {
+      "type": "turn/end",
+      "seq": 230,
+      "at": "2026-10-20T05:27:17.620000+00:00",
+      "data": {
+        "turn": 5,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    }
+  ],
+  "dshMarkers": [
+    {
+      "seq": 176,
+      "at": "2026-10-20T05:25:41.362000+00:00",
+      "marker": "DSH_PARENT_WAITING_20261020"
+    },
+    {
+      "seq": 192,
+      "at": "2026-10-20T05:25:51.267000+00:00",
+      "marker": "DSH_PARENT_WAITING_20261020"
+    },
+    {
+      "seq": 217,
+      "at": "2026-10-20T05:26:41.910000+00:00",
+      "marker": "DSH_PARENT_WOKE_READ_RESULT_AND_ACKED_20261020"
+    },
+    {
+      "seq": 228,
+      "at": "2026-10-20T05:27:17.616000+00:00",
+      "marker": "DSH_HOST_RESTART_QUEUE_OK_20261020"
+    }
+  ],
+  "dshRestart": {
+    "restartAt": 1792474035.8616,
+    "previousCredentialStillValid": true,
+    "priorTurns": 4
+  },
+  "codex": {
+    "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+    "beforeWake": {
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "turnId": "01a157b9-5334-7691-af6f-f0bf5f8c20e7",
+      "turnStatus": "inProgress"
+    },
+    "dispatchedAt": 1792474054.888813,
+    "spawn": {
+      "remote": "wsl-dsh",
+      "taskId": "048df8ef-421f-4f19-83f6-fa4e9c1b21ca",
+      "contextId": "f24b47ed-5f1c-44fb-8bc5-9ba472cf3333",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-56b1720c-0e3b-4156-b240-6747f7ac72b9",
+      "state": "TASK_STATE_SUBMITTED",
+      "result": "",
+      "checkedAt": "2026-10-20T05:27:35.022Z",
+      "stale": false
+    },
+    "statusQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "048df8ef-421f-4f19-83f6-fa4e9c1b21ca",
+      "contextId": "f24b47ed-5f1c-44fb-8bc5-9ba472cf3333",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-56b1720c-0e3b-4156-b240-6747f7ac72b9",
+      "state": "TASK_STATE_WORKING",
+      "result": "",
+      "checkedAt": "2026-10-20T05:27:35.068Z",
+      "stale": false
+    },
+    "statusQueriedAt": 1792474055.0765681,
+    "completionQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "048df8ef-421f-4f19-83f6-fa4e9c1b21ca",
+      "contextId": "f24b47ed-5f1c-44fb-8bc5-9ba472cf3333",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-56b1720c-0e3b-4156-b240-6747f7ac72b9",
+      "state": "TASK_STATE_COMPLETED",
+      "result": "验收通过。\n\n- 执行命令：`python3 -c \"import time; time.sleep(90); print('CODEX_A2A_EXECUTOR_OK_20261020')\"`\n- 结果输出（退出码 0）：**CODEX_A2A_EXECUTOR_OK_20261020**\n- 未修改任何文件，未访问任何外部服务。\n\nCodex 原主会话自动唤醒部署验收完成，任务结束。",
+      "checkedAt": "2026-10-20T05:29:33.485Z",
+      "stale": false
+    },
+    "inboxBeforeAck": {
+      "notices": [
+        {
+          "noticeId": "95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f",
+          "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+          "remote": "wsl-dsh",
+          "taskId": "048df8ef-421f-4f19-83f6-fa4e9c1b21ca",
+          "contextId": "f24b47ed-5f1c-44fb-8bc5-9ba472cf3333",
+          "cwd": "/home/scott",
+          "agentPreset": "standard",
+          "title": "Codex original parent automatic wakeup probe",
+          "state": "TASK_STATE_COMPLETED",
+          "result": "验收通过。\n\n- 执行命令：`python3 -c \"import time; time.sleep(90); print('CODEX_A2A_EXECUTOR_OK_20261020')\"`\n- 结果输出（退出码 0）：**CODEX_A2A_EXECUTOR_OK_20261020**\n- 未修改任何文件，未访问任何外部服务。\n\nCodex 原主会话自动唤醒部署验收完成，任务结束。",
+          "createdAt": "2026-10-20T05:29:18.789Z"
+        }
+      ]
+    },
+    "wakeEvidence": {
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "status": {
+        "type": "active",
+        "activeFlags": []
+      },
+      "turns": [
+        {
+          "id": "01a157c9-2633-7593-a5cb-0a9302000f9f",
+          "status": "inProgress",
+          "startedAt": 1792474162,
+          "completedAt": null,
+          "userMessages": [
+            {
+              "id": "01a157c9-2673-7151-8f6d-6148bd81ccac",
+              "text": "[A2A任务通知]\n{\"noticeId\":\"95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f\",\"originSessionId\":\"01a1573e-be28-70b3-8cde-13d3470f4f74\",\"remote\":\"wsl-dsh\",\"taskId\":\"048df8ef-421f-4f19-83f6-fa4e9c1b21ca\",\"contextId\":\"f24b47ed-5f1c-44fb-8bc5-9ba472cf3333\",\"state\":\"TASK_STATE_COMPLETED\"}\n请通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 读取完整结果，在原任务授权范围内处理。保存处理结论后调用 remote_agent_ack。"
+            }
+          ]
+        },
+        {
+          "id": "01a157b9-5334-7691-af6f-f0bf5f8c20e7",
+          "status": "completed",
+          "startedAt": 1792473125,
+          "completedAt": 1792474119,
+          "userMessages": [
+            {
+              "id": "01a157b9-535f-7f31-8236-f79420b27f3a",
+              "text": "把这版部署到当前 A2A 网关，配置好 Codex 和 DSH 宿主，分别实测派单、状态查询，以及任务完成后自动通知并唤醒原主会话的完整流程。\n"
+            }
+          ]
+        }
+      ]
+    },
+    "idleWakeVerified": {
+      "previousTurnCompletedAt": 1792474119,
+      "noticeCreatedAt": "2026-10-20T05:29:18.789Z",
+      "resumedTurnStartedAt": 1792474162,
+      "newTurnId": "01a157c9-2633-7593-a5cb-0a9302000f9f",
+      "idleBeforeTaskCompletionNotification": true
+    },
+    "businessVerifiedAt": 1792474191.9755452,
+    "businessConclusion": "真实远端任务完成，包含预期标记；完成通知在上轮结束后创建，由原 Codex thread 自动开始新一轮并读取结果，归属一致。",
+    "ack": {
+      "acknowledged": true,
+      "noticeId": "95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f"
+    },
+    "acknowledgedAt": 1792474192.027057,
+    "inboxAfterAck": {
+      "notices": []
+    },
+    "deliveryAfterAck": {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T05:29:20.175Z",
+      "messageId": "a2a-notice:95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f",
+      "updatedAt": "2026-10-20T05:29:52.018Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a157c9-1ed3-7093-9a48-6bd6f32e9d3b",
+      "processedAt": "2026-10-20T05:29:52.018Z"
+    }
+  },
+  "notices": [
+    {
+      "sessionDeliveryId": "a2a-notice:58ca14a509637d090ca3cd35c0fb175efb43e250df5f92215b7d30eefe7988ec",
+      "notice": {
+        "noticeId": "58ca14a509637d090ca3cd35c0fb175efb43e250df5f92215b7d30eefe7988ec",
+        "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+        "remote": "wsl-dsh",
+        "taskId": "20877e6c-fb46-42e2-9733-9dd7515be014",
+        "contextId": "ee95eb77-8fa6-453c-abd9-e48dd4cb8576",
+        "cwd": "/home/scott",
+        "agentPreset": "standard",
+        "title": "DSH parent completion wakeup probe",
+        "state": "TASK_STATE_COMPLETED",
+        "result": "DSH_A2A_EXECUTOR_OK_20261020\n\n命令执行成功（退出码 0），输出如上。验收通过，未做任何其他操作。",
+        "createdAt": "2026-10-20T05:26:32.366Z"
+      },
+      "acknowledged": true
+    },
+    {
+      "sessionDeliveryId": "a2a-notice:95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f",
+      "notice": {
+        "noticeId": "95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f",
+        "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+        "remote": "wsl-dsh",
+        "taskId": "048df8ef-421f-4f19-83f6-fa4e9c1b21ca",
+        "contextId": "f24b47ed-5f1c-44fb-8bc5-9ba472cf3333",
+        "cwd": "/home/scott",
+        "agentPreset": "standard",
+        "title": "Codex original parent automatic wakeup probe",
+        "state": "TASK_STATE_COMPLETED",
+        "result": "验收通过。\n\n- 执行命令：`python3 -c \"import time; time.sleep(90); print('CODEX_A2A_EXECUTOR_OK_20261020')\"`\n- 结果输出（退出码 0）：**CODEX_A2A_EXECUTOR_OK_20261020**\n- 未修改任何文件，未访问任何外部服务。\n\nCodex 原主会话自动唤醒部署验收完成，任务结束。",
+        "createdAt": "2026-10-20T05:29:18.789Z"
+      },
+      "acknowledged": true
+    }
+  ],
+  "deliveryReceipts": [
+    {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:23:45.924Z",
+      "hostFingerprint": "7cc7fc48a7772f0ccf06bbbcd8f98a1de41f4e40318e9b7e6f6f667458dc3b42",
+      "messageId": "deploy-dsh-parent-start-20261020",
+      "status": "accepted",
+      "attempts": 1,
+      "updatedAt": "2026-10-20T05:23:45.982Z",
+      "hostReceiptId": "1agents-session:049d1cbc5a73a03c9ee55aae13d5e7f89e7ed599ac0f14762578fdd24b91766d"
+    },
+    {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:24:35.129Z",
+      "hostFingerprint": "7cc7fc48a7772f0ccf06bbbcd8f98a1de41f4e40318e9b7e6f6f667458dc3b42",
+      "messageId": "deploy-dsh-parent-retry-20261020",
+      "updatedAt": "2026-10-20T05:24:35.213Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "1agents-session:75ab1de20a712d2a968aef2607ce94dbffe0db65e85d648667d915e2e894acb9"
+    },
+    {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:25:35.872Z",
+      "hostFingerprint": "7cc7fc48a7772f0ccf06bbbcd8f98a1de41f4e40318e9b7e6f6f667458dc3b42",
+      "messageId": "deploy-dsh-parent-resume-20261020",
+      "updatedAt": "2026-10-20T05:25:35.929Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "1agents-session:72cdbfa7db0e3df8822b1efb60bc629c9bb9649c8059c960b79532af03789953"
+    },
+    {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:26:35.125Z",
+      "hostFingerprint": "7cc7fc48a7772f0ccf06bbbcd8f98a1de41f4e40318e9b7e6f6f667458dc3b42",
+      "messageId": "a2a-notice:58ca14a509637d090ca3cd35c0fb175efb43e250df5f92215b7d30eefe7988ec",
+      "updatedAt": "2026-10-20T05:26:37.489Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "1agents-session:f0e33eb968f0932cce911558e153e2e79ed4f030389ed131b7e3056222980953",
+      "processedAt": "2026-10-20T05:26:37.489Z"
+    },
+    {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:27:15.866Z",
+      "hostFingerprint": "7cc7fc48a7772f0ccf06bbbcd8f98a1de41f4e40318e9b7e6f6f667458dc3b42",
+      "messageId": "deploy-dsh-restart-check-20261020",
+      "updatedAt": "2026-10-20T05:27:15.944Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "1agents-session:b87a5d2ac66b013d064ab172196607ded9749e465bba335192af7ba7b9d6b486"
+    },
+    {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T05:29:20.175Z",
+      "hostFingerprint": "a590fe6009ede3cd61dd7a5bc7f8fec8b79e99809db8e3165b716dee52062cba",
+      "messageId": "a2a-notice:95dae8f5f748bcebfcd72b3773864f11560ace4592501f06402dcbcd775de76f",
+      "updatedAt": "2026-10-20T05:29:52.018Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a157c9-1ed3-7093-9a48-6bd6f32e9d3b",
+      "processedAt": "2026-10-20T05:29:52.018Z"
+    }
+  ],
+  "credentialLifetime": {
+    "issuedAt": "2026-10-20T05:22:12.493000+00:00",
+    "expiresAt": "2026-11-19T05:22:12.493000+00:00"
+  },
+  "rollback": {
+    "gatewayPreviousRelease": "/Users/scott/.local/share/1agents/a2a-gateway/releases/20261019-coordinated-0.8.1",
+    "dshPreviousPid": 75180,
+    "dshProfile": "/Users/scott/.dsh/profiles/web"
+  }
+}

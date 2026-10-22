@@ -1,0 +1,391 @@
+{
+  "verifiedAt": "2026-10-20T05:57:21.597654+00:00",
+  "deployment": {
+    "release": "/Users/scott/.local/share/1agents/a2a-gateway/releases/20261020-notice-body-0.8.1",
+    "previousRelease": "/Users/scott/.local/share/1agents/a2a-gateway/releases/20261020-session-delivery-0.8.1",
+    "noticeFormatterSha256": "3208a3bdf92910061a9ddc02edf6bd06dce80d54eaf97a91b91923a86653c37a",
+    "health": {
+      "status": "ok",
+      "service": "a2a-gateway",
+      "remotes": [
+        "wsl-dsh"
+      ],
+      "sessionDelivery": "ok"
+    },
+    "serviceTests": {
+      "pass": 130,
+      "fail": 0
+    },
+    "deployedAt": 1792475549.5323808
+  },
+  "dsh": {
+    "case": "dsh",
+    "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+    "marker": "DSH_NOTICE_BODY_ARTIFACT_OK_20261020",
+    "expectedArtifactPath": "/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md",
+    "dispatchedAt": 1792475631.062877,
+    "spawn": {
+      "remote": "wsl-dsh",
+      "taskId": "0355ccbf-33b4-42c6-99eb-bfd6f4e1886b",
+      "contextId": "2812db3a-1c87-446e-a846-43e253e85b78",
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-50abab44-3d56-4db4-9743-1b7b5f7c75f0",
+      "state": "TASK_STATE_SUBMITTED",
+      "result": "",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T05:53:51.050Z",
+      "stale": false
+    },
+    "statusQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "0355ccbf-33b4-42c6-99eb-bfd6f4e1886b",
+      "contextId": "2812db3a-1c87-446e-a846-43e253e85b78",
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-50abab44-3d56-4db4-9743-1b7b5f7c75f0",
+      "state": "TASK_STATE_WORKING",
+      "result": "",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T05:53:51.100Z",
+      "stale": false
+    },
+    "statusQueriedAt": 1792475631.1104388,
+    "completionQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "0355ccbf-33b4-42c6-99eb-bfd6f4e1886b",
+      "contextId": "2812db3a-1c87-446e-a846-43e253e85b78",
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-50abab44-3d56-4db4-9743-1b7b5f7c75f0",
+      "state": "TASK_STATE_COMPLETED",
+      "result": "DSH_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md)",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T05:54:29.189Z",
+      "stale": false
+    },
+    "inboxBeforeAck": {
+      "notices": [
+        {
+          "noticeId": "88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e",
+          "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+          "remote": "wsl-dsh",
+          "taskId": "0355ccbf-33b4-42c6-99eb-bfd6f4e1886b",
+          "contextId": "2812db3a-1c87-446e-a846-43e253e85b78",
+          "cwd": "/home/scott",
+          "agentPreset": "standard",
+          "title": "DSH 通知正文与产物链接验收",
+          "state": "TASK_STATE_COMPLETED",
+          "result": "DSH_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md)",
+          "createdAt": "2026-10-20T05:54:24.144Z"
+        }
+      ]
+    },
+    "notificationText": "[A2A任务通知] 任务已完成\nDSH 通知正文与产物链接验收\n\nDSH_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md)\n\n以上正文和链接为远端任务结果。可通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 核验状态与完整结果。请在原任务授权范围内处理，保存处理结论后调用 remote_agent_ack。\n\n---\n任务定位信息：\n{\"noticeId\":\"88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e\",\"originSessionId\":\"session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec\",\"remote\":\"wsl-dsh\",\"taskId\":\"0355ccbf-33b4-42c6-99eb-bfd6f4e1886b\",\"contextId\":\"2812db3a-1c87-446e-a846-43e253e85b78\",\"state\":\"TASK_STATE_COMPLETED\"}",
+    "artifact": {
+      "case": "dsh",
+      "localPath": "/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md",
+      "sha256": "6f4ef8562c88e51b56ffef77d7c3b05aab07f6964dea7e760952571cf5bde475",
+      "receivedAt": 1792475657.562946,
+      "sourceAddress": "100.75.225.56"
+    },
+    "artifactReadable": true,
+    "businessVerifiedAt": 1792475669.205334,
+    "businessConclusion": "通知直接包含真实最终答复和可读取产物链接；任务定位信息在末尾。查询与归属核验通过，已读取产物并核对 SHA256。",
+    "ack": {
+      "acknowledged": true,
+      "noticeId": "88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e"
+    },
+    "acknowledgedAt": 1792475669.222974,
+    "inboxAfterAck": {
+      "notices": []
+    },
+    "deliveryAfterAck": {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:54:26.518Z",
+      "messageId": "a2a-notice:88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e",
+      "updatedAt": "2026-10-20T05:54:29.215Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "1agents-session:cdfa199e17e671e2f4f6fec5d6f104ef0e18164fd91167a31666ec04e0ec943b",
+      "processedAt": "2026-10-20T05:54:29.215Z"
+    }
+  },
+  "codex": {
+    "case": "codex",
+    "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+    "marker": "CODEX_NOTICE_BODY_ARTIFACT_OK_20261020",
+    "expectedArtifactPath": "/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md",
+    "dispatchedAt": 1792475690.587845,
+    "spawn": {
+      "remote": "wsl-dsh",
+      "taskId": "4d601509-d98a-47c6-af5d-bd59eb18df19",
+      "contextId": "330a1648-c60a-4ace-9bb8-58f70698ca47",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-fc55bfee-cdae-4a14-b6eb-26e5902b521d",
+      "state": "TASK_STATE_SUBMITTED",
+      "result": "",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T05:54:50.574Z",
+      "stale": false
+    },
+    "statusQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "4d601509-d98a-47c6-af5d-bd59eb18df19",
+      "contextId": "330a1648-c60a-4ace-9bb8-58f70698ca47",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-fc55bfee-cdae-4a14-b6eb-26e5902b521d",
+      "state": "TASK_STATE_WORKING",
+      "result": "",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T05:54:50.607Z",
+      "stale": false
+    },
+    "statusQueriedAt": 1792475690.6180081,
+    "beforeWake": {
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "turnId": "01a157d9-8320-7073-8cec-97f4f17ebda4",
+      "turnStatus": "inProgress",
+      "startedAt": 1792475235
+    },
+    "completionQuery": {
+      "remote": "wsl-dsh",
+      "taskId": "4d601509-d98a-47c6-af5d-bd59eb18df19",
+      "contextId": "330a1648-c60a-4ace-9bb8-58f70698ca47",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/home/scott",
+      "agentPreset": "standard",
+      "sessionId": "session-fc55bfee-cdae-4a14-b6eb-26e5902b521d",
+      "state": "TASK_STATE_COMPLETED",
+      "result": "命令执行成功。\n\nCODEX_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md)",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T05:56:57.603Z",
+      "stale": false
+    },
+    "inboxBeforeAck": {
+      "notices": [
+        {
+          "noticeId": "86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4",
+          "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+          "remote": "wsl-dsh",
+          "taskId": "4d601509-d98a-47c6-af5d-bd59eb18df19",
+          "contextId": "330a1648-c60a-4ace-9bb8-58f70698ca47",
+          "cwd": "/home/scott",
+          "agentPreset": "standard",
+          "title": "CODEX 通知正文与产物链接验收",
+          "state": "TASK_STATE_COMPLETED",
+          "result": "命令执行成功。\n\nCODEX_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md)",
+          "createdAt": "2026-10-20T05:56:32.729Z"
+        }
+      ]
+    },
+    "notificationText": "[A2A任务通知] 任务已完成\nCODEX 通知正文与产物链接验收\n\n命令执行成功。\n\nCODEX_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md)\n\n以上正文和链接为远端任务结果。可通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 核验状态与完整结果。请在原任务授权范围内处理，保存处理结论后调用 remote_agent_ack。\n\n---\n任务定位信息：\n{\"noticeId\":\"86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4\",\"originSessionId\":\"01a1573e-be28-70b3-8cde-13d3470f4f74\",\"remote\":\"wsl-dsh\",\"taskId\":\"4d601509-d98a-47c6-af5d-bd59eb18df19\",\"contextId\":\"330a1648-c60a-4ace-9bb8-58f70698ca47\",\"state\":\"TASK_STATE_COMPLETED\"}",
+    "artifact": {
+      "case": "codex",
+      "localPath": "/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md",
+      "sha256": "b88ba632fedc37124615a71ea81730342008b09c9ddd9601e1aafdc4d0b90019",
+      "receivedAt": 1792475789.5398898,
+      "sourceAddress": "100.75.225.56"
+    },
+    "artifactReadable": true,
+    "businessVerifiedAt": 1792475817.61566,
+    "businessConclusion": "通知直接包含真实最终答复和可读取产物链接；任务定位信息在末尾。查询与归属核验通过，已读取产物并核对 SHA256。",
+    "wakeEvidence": {
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "status": {
+        "type": "active",
+        "activeFlags": []
+      },
+      "turns": [
+        {
+          "id": "01a157e2-2c82-7d10-8826-304269017d2d",
+          "status": "inProgress",
+          "startedAt": 1792475802,
+          "completedAt": null,
+          "userMessages": [
+            {
+              "id": "01a157e2-2cce-7e82-8465-03e9b79416f6",
+              "text": "[A2A任务通知] 任务已完成\nCODEX 通知正文与产物链接验收\n\n命令执行成功。\n\nCODEX_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md)\n\n以上正文和链接为远端任务结果。可通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 核验状态与完整结果。请在原任务授权范围内处理，保存处理结论后调用 remote_agent_ack。\n\n---\n任务定位信息：\n{\"noticeId\":\"86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4\",\"originSessionId\":\"01a1573e-be28-70b3-8cde-13d3470f4f74\",\"remote\":\"wsl-dsh\",\"taskId\":\"4d601509-d98a-47c6-af5d-bd59eb18df19\",\"contextId\":\"330a1648-c60a-4ace-9bb8-58f70698ca47\",\"state\":\"TASK_STATE_COMPLETED\"}"
+            }
+          ]
+        },
+        {
+          "id": "01a157d9-8320-7073-8cec-97f4f17ebda4",
+          "status": "completed",
+          "startedAt": 1792475235,
+          "completedAt": 1792475776,
+          "userMessages": [
+            {
+              "id": "01a157d9-835a-7ee3-b7fb-37f86b24ea37",
+              "text": "就按这个方式改，通知直接带最终答复正文和产物链接，任务 ID 放末尾，保留查询和 ack 机制。改完部署到当前网关，再实测一下 Codex 和 DSH。\n"
+            }
+          ]
+        }
+      ]
+    },
+    "idleWakeVerified": {
+      "previousTurnCompletedAt": 1792475776,
+      "noticeCreatedAt": "2026-10-20T05:56:32.729Z",
+      "resumedTurnStartedAt": 1792475802,
+      "newTurnId": "01a157e2-2c82-7d10-8826-304269017d2d",
+      "nativePromptExactlyMatchesQueuedBody": true
+    },
+    "ack": {
+      "acknowledged": true,
+      "noticeId": "86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4"
+    },
+    "acknowledgedAt": 1792475817.629744,
+    "inboxAfterAck": {
+      "notices": []
+    },
+    "deliveryAfterAck": {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T05:56:35.574Z",
+      "messageId": "a2a-notice:86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4",
+      "updatedAt": "2026-10-20T05:56:57.622Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a157e2-12f4-7022-8cb6-302e6a38d6ad",
+      "processedAt": "2026-10-20T05:56:57.622Z"
+    }
+  },
+  "dshNativeQueuePrompts": [
+    {
+      "seq": 267,
+      "time": 1792475666599,
+      "text": "[A2A任务通知] 任务已完成\nDSH 通知正文与产物链接验收\n\nDSH_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md)\n\n以上正文和链接为远端任务结果。可通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 核验状态与完整结果。请在原任务授权范围内处理，保存处理结论后调用 remote_agent_ack。\n\n---\n任务定位信息：\n{\"noticeId\":\"88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e\",\"originSessionId\":\"session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec\",\"remote\":\"wsl-dsh\",\"taskId\":\"0355ccbf-33b4-42c6-99eb-bfd6f4e1886b\",\"contextId\":\"2812db3a-1c87-446e-a846-43e253e85b78\",\"state\":\"TASK_STATE_COMPLETED\"}",
+      "source": {
+        "kind": "user",
+        "rpcId": "1agents-session:cdfa199e17e671e2f4f6fec5d6f104ef0e18164fd91167a31666ec04e0ec943b"
+      }
+    }
+  ],
+  "dshTurnTimeline": [
+    {
+      "seq": 232,
+      "time": 1792475626296,
+      "type": "turn/start",
+      "data": {
+        "turn": 6
+      }
+    },
+    {
+      "seq": 262,
+      "time": 1792475632538,
+      "type": "turn/end",
+      "data": {
+        "turn": 6,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    },
+    {
+      "seq": 264,
+      "time": 1792475666571,
+      "type": "turn/start",
+      "data": {
+        "turn": 7
+      }
+    },
+    {
+      "seq": 279,
+      "time": 1792475670521,
+      "type": "turn/end",
+      "data": {
+        "turn": 7,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    }
+  ],
+  "dshReplies": [
+    {
+      "seq": 260,
+      "time": 1792475632536,
+      "text": "DSH_BODY_PARENT_WAITING_20261020"
+    },
+    {
+      "seq": 277,
+      "time": 1792475670519,
+      "text": "DSH_BODY_LINK_READ_AND_ACK_OK_20261020"
+    }
+  ],
+  "notices": [
+    {
+      "sessionDeliveryId": "a2a-notice:88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e",
+      "notice": {
+        "noticeId": "88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e",
+        "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+        "remote": "wsl-dsh",
+        "taskId": "0355ccbf-33b4-42c6-99eb-bfd6f4e1886b",
+        "contextId": "2812db3a-1c87-446e-a846-43e253e85b78",
+        "cwd": "/home/scott",
+        "agentPreset": "standard",
+        "title": "DSH 通知正文与产物链接验收",
+        "state": "TASK_STATE_COMPLETED",
+        "result": "DSH_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/dsh-report.md)",
+        "createdAt": "2026-10-20T05:54:24.144Z"
+      },
+      "acknowledged": true
+    },
+    {
+      "sessionDeliveryId": "a2a-notice:86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4",
+      "notice": {
+        "noticeId": "86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4",
+        "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+        "remote": "wsl-dsh",
+        "taskId": "4d601509-d98a-47c6-af5d-bd59eb18df19",
+        "contextId": "330a1648-c60a-4ace-9bb8-58f70698ca47",
+        "cwd": "/home/scott",
+        "agentPreset": "standard",
+        "title": "CODEX 通知正文与产物链接验收",
+        "state": "TASK_STATE_COMPLETED",
+        "result": "命令执行成功。\n\nCODEX_NOTICE_BODY_ARTIFACT_OK_20261020\n已完成计算与文档归档，sum(1..100)=5050。\n[验收产物](/Users/scott/.local/state/1agents/a2a-gateway/deployment-20261020/workspace/notice-body-20261020/artifacts/codex-report.md)",
+        "createdAt": "2026-10-20T05:56:32.729Z"
+      },
+      "acknowledged": true
+    }
+  ],
+  "deliveryReceipts": [
+    {
+      "originSessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "host": "dsh-local",
+      "sessionId": "session-a9a78ade-d1e5-43a9-a84e-e5bbca0e9bec",
+      "createdAt": "2026-10-20T05:54:26.518Z",
+      "messageId": "a2a-notice:88a214b28dff3df9b92c37b1e5cc94f935abb77b02be22c64984652422dfaa6e",
+      "updatedAt": "2026-10-20T05:54:29.215Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "1agents-session:cdfa199e17e671e2f4f6fec5d6f104ef0e18164fd91167a31666ec04e0ec943b",
+      "processedAt": "2026-10-20T05:54:29.215Z"
+    },
+    {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T05:56:35.574Z",
+      "messageId": "a2a-notice:86c7452d60b1f0b751c9bae0db3239507d6b55103816015c2bc9a9e9c88921b4",
+      "updatedAt": "2026-10-20T05:56:57.622Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a157e2-12f4-7022-8cb6-302e6a38d6ad",
+      "processedAt": "2026-10-20T05:56:57.622Z"
+    }
+  ],
+  "dshFullCyclePassed": true,
+  "codexFullCyclePassed": true,
+  "testFixtureStopped": true
+}

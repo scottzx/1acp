@@ -216,3 +216,43 @@ for (const site of canonicalSites) {
     }
   });
 }
+
+test("docs site excludes internal proof records while checking public links", (t) => {
+  const repositoryRoot = process.cwd();
+  const directory = mkdtempSync(path.join(os.tmpdir(), "acpx-docs-proof-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const docsDirectory = path.join(directory, "docs");
+  const proofDirectory = path.join(docsDirectory, "proof-2026-07-18-fixture");
+  mkdirSync(proofDirectory, { recursive: true });
+  writeFileSync(path.join(docsDirectory, "index.md"), "# Public documentation\n");
+  writeFileSync(path.join(docsDirectory, "install.md"), "# Install\n");
+  writeFileSync(path.join(docsDirectory, "quickstart.md"), "# Quickstart\n");
+  writeFileSync(
+    path.join(proofDirectory, "README.md"),
+    "# Internal proof\n\n[Summary](./SUMMARY.json)\n[Transcript](./live-transcript.jsonl)\n[Console](./console.log)\n",
+  );
+  const build = () =>
+    spawnSync(process.execPath, [path.join(repositoryRoot, "scripts", "build-docs-site.mjs")], {
+      cwd: directory,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+  const result = build();
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const outputDirectory = path.join(directory, "dist", "docs-site");
+  assert.equal(existsSync(path.join(outputDirectory, "proof-2026-07-18-fixture")), false);
+  assert.doesNotMatch(
+    readFileSync(path.join(outputDirectory, "llms.txt"), "utf8"),
+    /Internal proof/,
+  );
+
+  writeFileSync(
+    path.join(docsDirectory, "index.md"),
+    "# Public documentation\n\n[Missing](./missing.md)\n",
+  );
+  const broken = build();
+  assert.equal(broken.error, undefined);
+  assert.notEqual(broken.status, 0, "public documentation must still reject broken links");
+  assert.match(broken.stderr, /broken docs links/);
+});

@@ -1,0 +1,16 @@
+# EXAMPLE ONLY. Do not install this file as the role bundle patch.
+# Preserve every existing oneagents-acp configuration field before applying.
+# Provision DSH_PPT_A2A_TOKEN securely in the managed DSH Web host environment.
+- id: oneagents-acp
+  name: '@1agents/acp-service'
+  config:
+    serviceUrl: http://127.0.0.1:36813
+    a2a:
+      enabled: true
+      tokenEnv: DSH_PPT_A2A_TOKEN
+      publicUrl: http://127.0.0.1:3080
+      stateDirectory: /Users/scott/.local/share/1agents/ppt-beautifier/a2a-state
+      defaultCwd: /Users/scott/.local/share/1agents/ppt-beautifier/workspace
+      defaultAgentPreset: ppt-beautifier
+      pushNotificationOrigins:
+        - '<GATEWAY_CALLBACK_ORIGIN>'

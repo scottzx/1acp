@@ -1,0 +1,639 @@
+{
+  "updatedAt": "2026-10-20T11:43:00.682539+00:00",
+  "status": "complete",
+  "role": {
+    "id": "ppt-beautifier",
+    "name": "PPT 美化大师",
+    "version": "0.1.2",
+    "scope": "PPT tasks; per-task independent DSH session",
+    "modelRoute": {
+      "provider": "minimax-cn",
+      "model": "MiniMax-M3"
+    }
+  },
+  "skillBinding": {
+    "skillManager": {
+      "node": "scott-mac",
+      "service": "@1agents/skill-manager",
+      "skillId": "skills-auto-system-536cf74d7fa9298966e0:1512e97a4b84b0da4f2f",
+      "name": "pptx",
+      "revision": "c3731de3c335a330deea222dc9c55e2140a4581a8960f61d26f37db1dccdcddf",
+      "source": "/Users/scott/.grok/bundled/skills/pptx",
+      "snapshot": "/Users/scott/.local/share/1agents/ppt-beautifier/skills/pptx"
+    },
+    "authoringSkill": {
+      "name": "presentations",
+      "bundleVersion": "26.1017.11052",
+      "snapshot": "/Users/scott/.local/share/1agents/ppt-beautifier/skills/presentations"
+    },
+    "runtime": {
+      "node": "/Users/scott/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node",
+      "nodeModules": "/Users/scott/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules",
+      "python": "/Users/scott/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+    },
+    "workspace": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+    "artifactRoot": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts",
+    "artifactBaseUrl": "http://100.88.227.56:36818/artifacts"
+  },
+  "deployment": {
+    "a2aCard": {
+      "name": "1agents DSH",
+      "description": "Delegate text tasks to persistent DSH sessions and selected agent presets.",
+      "supportedInterfaces": [
+        {
+          "url": "http://127.0.0.1:3080/a2a",
+          "protocolBinding": "JSONRPC",
+          "protocolVersion": "1.0"
+        }
+      ],
+      "version": "1.0.0",
+      "capabilities": {
+        "streaming": true,
+        "pushNotifications": true
+      },
+      "securitySchemes": {
+        "bearerAuth": {
+          "httpAuthSecurityScheme": {
+            "scheme": "bearer"
+          }
+        }
+      },
+      "securityRequirements": [
+        {
+          "schemes": {
+            "bearerAuth": {}
+          }
+        }
+      ],
+      "defaultInputModes": [
+        "text/plain"
+      ],
+      "defaultOutputModes": [
+        "text/plain"
+      ],
+      "skills": [
+        {
+          "id": "dsh-session",
+          "name": "DSH session task",
+          "description": "Create or resume a session using metadata.1agents.cwd, workspace and agentPreset; retain contextId to continue collaboration.",
+          "tags": [
+            "dsh",
+            "project",
+            "role",
+            "async"
+          ]
+        }
+      ]
+    },
+    "gatewayHealth": {
+      "status": "ok",
+      "service": "a2a-gateway",
+      "remotes": [
+        "wsl-dsh",
+        "ppt-beautifier"
+      ],
+      "sessionDelivery": "ok"
+    },
+    "role": "ppt-beautifier",
+    "remote": "ppt-beautifier",
+    "artifactUrl": "http://100.88.227.56:36818/artifacts",
+    "deployedAt": 1792480923.515784,
+    "profileLayering": "ACP serviceUrl preserved in private Host bundle; superseded profile row removed"
+  },
+  "globalDefaultBefore": {
+    "provider": "deepseek-account",
+    "model": "deepseek-flash",
+    "reasoningEffort": "high"
+  },
+  "globalDefaultAfter": {
+    "provider": "deepseek-account",
+    "model": "deepseek-flash",
+    "reasoningEffort": "high"
+  },
+  "dispatch": {
+    "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+    "jobId": "demo-20261020-01",
+    "attempt": 3,
+    "roleVersion": "0.1.2",
+    "modelRoute": {
+      "provider": "minimax-cn",
+      "model": "MiniMax-M3"
+    },
+    "contractPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/demo-20261020-01/contract.v2.json",
+    "dispatchedAt": 1792496007.455559,
+    "spawn": {
+      "remote": "ppt-beautifier",
+      "taskId": "dfd2516b-9872-4dd6-8919-26df9839a9c3",
+      "contextId": "7c1e3011-246a-40fe-961e-dd2bd756e0b4",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+      "agentPreset": "ppt-beautifier",
+      "sessionId": "session-15a26bd8-d8cc-45b2-b9c0-a909dba611dd",
+      "state": "TASK_STATE_SUBMITTED",
+      "result": "",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T11:33:27.557Z",
+      "stale": false
+    },
+    "statusQuery": {
+      "remote": "ppt-beautifier",
+      "taskId": "dfd2516b-9872-4dd6-8919-26df9839a9c3",
+      "contextId": "7c1e3011-246a-40fe-961e-dd2bd756e0b4",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+      "agentPreset": "ppt-beautifier",
+      "sessionId": "session-15a26bd8-d8cc-45b2-b9c0-a909dba611dd",
+      "state": "TASK_STATE_WORKING",
+      "result": "",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T11:33:27.584Z",
+      "stale": false
+    },
+    "statusQueriedAt": 1792496007.5958889,
+    "beforeWake": {
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "turnId": "01a15911-e2aa-7810-98d4-f00aa7e088b4",
+      "status": "inProgress",
+      "startedAt": 1792495707
+    }
+  },
+  "actualModelRoute": {
+    "sessionId": "session-15a26bd8-d8cc-45b2-b9c0-a909dba611dd",
+    "routes": [
+      {
+        "provider": "minimax-cn",
+        "model": "MiniMax-M3",
+        "reasoningEffort": null
+      }
+    ]
+  },
+  "failedAttempts": [
+    {
+      "task": {
+        "remote": "ppt-beautifier",
+        "taskId": "aa583014-b9eb-45ee-a126-4886c5d93094",
+        "contextId": "1dd8409c-50bc-41d9-a24d-ee546fdb9e8d",
+        "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+        "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+        "agentPreset": "ppt-beautifier",
+        "sessionId": "session-584e0ba0-840a-4439-ba4d-4a1f5b03285e",
+        "state": "TASK_STATE_FAILED",
+        "result": "ACP execution failed.",
+        "artifactLinks": [],
+        "checkedAt": "2026-10-20T07:26:42.951Z",
+        "stale": false
+      },
+      "notice": {
+        "noticeId": "e5e68fdf9f73c5c80b62b0b9c3db302763de84de4ab842bcc3129115daf14722",
+        "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+        "remote": "ppt-beautifier",
+        "taskId": "aa583014-b9eb-45ee-a126-4886c5d93094",
+        "contextId": "1dd8409c-50bc-41d9-a24d-ee546fdb9e8d",
+        "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+        "agentPreset": "ppt-beautifier",
+        "title": "PPT 美化大师：4页源稿美化与原主会话交付",
+        "state": "TASK_STATE_FAILED",
+        "result": "ACP execution failed.",
+        "createdAt": "2026-10-20T07:24:21.660Z"
+      },
+      "reason": "DSH unknown prompt variable {{cwd}} in persona suffix; only provider/model are registered",
+      "repair": "Removed template variable; role version 0.1.1; fresh context required",
+      "recordedAt": 1792481202.968523,
+      "ack": {
+        "acknowledged": true,
+        "noticeId": "e5e68fdf9f73c5c80b62b0b9c3db302763de84de4ab842bcc3129115daf14722"
+      }
+    },
+    {
+      "task": {
+        "remote": "ppt-beautifier",
+        "taskId": "2cb43791-d4be-4384-8938-451ed2f0fa22",
+        "contextId": "5ab692cf-f4d4-402e-8b51-ca95c1b452da",
+        "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+        "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+        "agentPreset": "ppt-beautifier",
+        "sessionId": "session-52c1834b-8801-4922-b8f9-ce94bae6af92",
+        "state": "TASK_STATE_FAILED",
+        "result": "我会先读取合同和运行时文档，并加载所需的技能。",
+        "artifactLinks": [],
+        "checkedAt": "2026-10-20T11:31:05.481Z",
+        "stale": false
+      },
+      "notice": {
+        "noticeId": "abc885ab6fe6bb9f87ff14efda8df2b9ec9e9b937af60b560364b2e1e33c3824",
+        "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+        "remote": "ppt-beautifier",
+        "taskId": "2cb43791-d4be-4384-8938-451ed2f0fa22",
+        "contextId": "5ab692cf-f4d4-402e-8b51-ca95c1b452da",
+        "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+        "agentPreset": "ppt-beautifier",
+        "title": "PPT 美化大师：4页源稿美化（重跑）",
+        "state": "TASK_STATE_FAILED",
+        "result": "我会先读取合同和运行时文档，并加载所需的技能。",
+        "createdAt": "2026-10-20T07:40:05.960Z"
+      },
+      "reason": "DeepSeek Messages stream idle timeout followed by TRANSPORT failures after native 5 retries; no PPT exported",
+      "repair": "Configure only the PPT preset request route to existing minimax-cn/MiniMax-M3; preserve global default; fresh context with recorded checkpoints",
+      "recordedAt": 1792495865.498535,
+      "ack": {
+        "acknowledged": true,
+        "noticeId": "abc885ab6fe6bb9f87ff14efda8df2b9ec9e9b937af60b560364b2e1e33c3824"
+      }
+    }
+  ],
+  "workerResult": {
+    "schemaVersion": 1,
+    "jobId": "demo-20261020-01",
+    "attempt": 3,
+    "status": "delivered",
+    "modelRoute": "minimax-cn/MiniMax-M3",
+    "producedAt": "2026-10-20T19:36:30Z",
+    "input": {
+      "path": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/demo-20261020-01/input/source.pptx",
+      "sha256": "1600b885c6b5a310d2983ffeeb473b693ebef3dfa3b573d103d4501df48942cc",
+      "bytes": 27434,
+      "modifiedAt": "2026-10-20T15:14:33Z"
+    },
+    "design": {
+      "palette": [
+        "#0B1832",
+        "#F6F4EF",
+        "#14B8A6"
+      ],
+      "font": "PingFang SC",
+      "canvas": {
+        "width": 1280,
+        "height": 720
+      },
+      "coverTitlePx": 64,
+      "slideTitlePx": 44,
+      "bodyPx": 30
+    },
+    "final": {
+      "pptx": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/demo-20261020-01/published/beautified.pptx",
+      "previewPng": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/preview.png",
+      "slidePngs": [
+        "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-1.png",
+        "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-2.png",
+        "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-3.png",
+        "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-4.png"
+      ],
+      "byteCount": 30276,
+      "finalizerSha256": "33821054240aa8c8d095006536b9b0f54ac6f5fc19edf64df85a515c984aa6e7"
+    },
+    "validation": {
+      "privateReceipt": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/demo-20261020-01/build/validation.json",
+      "packageIntegrity": "passed",
+      "layoutGeometry": "passed",
+      "fontPolicy": "passed (PingFang SC)",
+      "nativeTableArithmetic": "passed (no tables)",
+      "nativeChartTitles": "passed (no charts)",
+      "firstPartyImport": "passed (4 slides)",
+      "expectedSlideSizeEmu": "12192000,6858000",
+      "explicitTotalSlideCount": 4,
+      "passed": true
+    },
+    "httpLinks": {
+      "pptx": "http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx",
+      "preview": "http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png",
+      "slide1": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-1.png",
+      "slide2": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-2.png",
+      "slide3": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-3.png",
+      "slide4": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-4.png"
+    },
+    "httpVerified": true,
+    "contentPreservation": {
+      "strategy": "imported source via PresentationFile.importPptx, restyled existing source-title / source-body text shapes in place; no text replaced or paraphrased",
+      "preservedTitles": [
+        "智能体能力常驻服务",
+        "PPT 美化大师的工作范围",
+        "任务合同与产物",
+        "原主会话的验收"
+      ],
+      "preservedBodyLines": [
+        "示例：PPT 美化大师",
+        "独立接单，完成后回传可编辑文稿与预览",
+        "制作：根据已确认的内容生成演示文稿",
+        "美化：调整版式、字体、配色与留白",
+        "交付：保留内容，输出可编辑 PPT 和预览",
+        "输入：源文件、受众、设计要求与输出格式",
+        "执行：独立任务目录，保留原稿",
+        "输出：美化文稿、逐页预览和最终答复",
+        "通知：直接附最终答复与产物链接",
+        "检查：读取 PPT 和预览，核对内容与可编辑性",
+        "确认：保存处理结论后 ack 通知"
+      ],
+      "pageCount": 4,
+      "addedShapes": [
+        {
+          "name": "accent-strip",
+          "kind": "rect",
+          "fill": "#14B8A6",
+          "role": "left-edge accent"
+        },
+        {
+          "name": "title-rule",
+          "kind": "rect",
+          "fill": "#14B8A6",
+          "role": "horizontal divider"
+        },
+        {
+          "name": "page-index",
+          "kind": "textbox",
+          "role": "page indicator (e.g. 1 / 4)"
+        }
+      ]
+    },
+    "visualReview": {
+      "method": "render_final.mjs imports the final PPTX and exports PNGs; read_image was used to inspect each slide and the 2x2 montage",
+      "scope": [
+        "slide-1.png",
+        "slide-2.png",
+        "slide-3.png",
+        "slide-4.png",
+        "preview.png"
+      ],
+      "findings": [
+        "All four slides use cream background (#F6F4EF), navy text (#0B1832), and teal accents (#14B8A6).",
+        "Cover slide title is 64px bold; content slides use 44px bold titles. Body lines are 30px navy.",
+        "Teal accent strip sits to the left of each title without overlapping any character.",
+        "Teal horizontal rule below the title spans the slide and visually separates title from body.",
+        "Page index 'N / 4' is right-aligned bottom corner on every slide.",
+        "Body bullets are separated by single blank lines; no overflow, no clipping, no truncation.",
+        "Original text and page order are preserved exactly across all four slides."
+      ]
+    },
+    "needsUpstreamVisualReview": false,
+    "notes": [
+      "Final PPTX stores PingFang SC as the latin/ea/cs typeface for every text run; if the rendering host lacks the font, the local font fallback is used (the file itself stays editable and the typefaces are preserved).",
+      "First-party Artifact Tool import was re-run as part of finalization and reported 4 slides with the expected SHA-256.",
+      "Source file input/source.pptx was not modified (sha256 verified at receipt time)."
+    ]
+  },
+  "parentVerification": {
+    "jobId": "demo-20261020-01",
+    "verifiedAt": 1792496266.98854,
+    "sourceSha256": "1600b885c6b5a310d2983ffeeb473b693ebef3dfa3b573d103d4501df48942cc",
+    "sourceUnchanged": true,
+    "slides": [
+      {
+        "slide": 1,
+        "editableTextShapes": 3,
+        "allInputTextPresent": true,
+        "imageObjects": 0
+      },
+      {
+        "slide": 2,
+        "editableTextShapes": 3,
+        "allInputTextPresent": true,
+        "imageObjects": 0
+      },
+      {
+        "slide": 3,
+        "editableTextShapes": 3,
+        "allInputTextPresent": true,
+        "imageObjects": 0
+      },
+      {
+        "slide": 4,
+        "editableTextShapes": 3,
+        "allInputTextPresent": true,
+        "imageObjects": 0
+      }
+    ],
+    "downloads": [
+      {
+        "name": "beautified.pptx",
+        "localPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/beautified.pptx",
+        "url": "http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx",
+        "bytes": 30276,
+        "sha256": "33821054240aa8c8d095006536b9b0f54ac6f5fc19edf64df85a515c984aa6e7"
+      },
+      {
+        "name": "preview.png",
+        "localPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/preview.png",
+        "url": "http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png",
+        "bytes": 131566,
+        "sha256": "5d7bde01801406913b519f9ab2e3ddeb63de931dcfec29c3fb9d4e312a366f87"
+      },
+      {
+        "name": "slide-1.png",
+        "localPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-1.png",
+        "url": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-1.png",
+        "bytes": 43055,
+        "sha256": "9b9810de0d212f99eacd71b6a3b7c5b186d3ccde2246c149d24ae174b4c90414"
+      },
+      {
+        "name": "slide-2.png",
+        "localPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-2.png",
+        "url": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-2.png",
+        "bytes": 56252,
+        "sha256": "68bb97f6e18c6d42dcc2bcdc8d5aaa4c197ceb5822f887c7da095dfff89a09df"
+      },
+      {
+        "name": "slide-3.png",
+        "localPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-3.png",
+        "url": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-3.png",
+        "bytes": 56383,
+        "sha256": "4ef71813f0706cc15bfde1d4be03853e2305a8ae41d3ec1055045c12cd3da5cb"
+      },
+      {
+        "name": "slide-4.png",
+        "localPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts/demo-20261020-01/slide-4.png",
+        "url": "http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-4.png",
+        "bytes": 58864,
+        "sha256": "bd93d815e64920084d470ab8dbec1a44fb0bace05cad34ad26101186b841cffc"
+      }
+    ],
+    "visualReview": "passed",
+    "visualReviewAt": "2026-10-20T11:40:36.456273+00:00",
+    "visualReviewEvidence": {
+      "method": "Original parent independently viewed all four final slide PNGs",
+      "slides": [
+        {
+          "slide": 1,
+          "result": "passed",
+          "checks": [
+            "all text legible",
+            "no overlap or clipping",
+            "consistent typography, colors and spacing",
+            "no unresolved placeholders"
+          ]
+        },
+        {
+          "slide": 2,
+          "result": "passed",
+          "checks": [
+            "all text legible",
+            "no overlap or clipping",
+            "consistent typography, colors and spacing",
+            "no unresolved placeholders"
+          ]
+        },
+        {
+          "slide": 3,
+          "result": "passed",
+          "checks": [
+            "all text legible",
+            "no overlap or clipping",
+            "consistent typography, colors and spacing",
+            "no unresolved placeholders"
+          ]
+        },
+        {
+          "slide": 4,
+          "result": "passed",
+          "checks": [
+            "all text legible",
+            "no overlap or clipping",
+            "consistent typography, colors and spacing",
+            "no unresolved placeholders"
+          ]
+        }
+      ],
+      "conclusion": "The four-slide demonstration retains the original content and page order, with a consistent cream, navy and teal presentation style."
+    }
+  },
+  "handoffVerification": {
+    "recordedAt": "2026-10-20T11:40:36.522280+00:00",
+    "businessConclusion": "Accepted after source integrity, editable contents, per-slide visual inspection and byte-identical HTTP downloads passed.",
+    "task": {
+      "remote": "ppt-beautifier",
+      "taskId": "dfd2516b-9872-4dd6-8919-26df9839a9c3",
+      "contextId": "7c1e3011-246a-40fe-961e-dd2bd756e0b4",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+      "agentPreset": "ppt-beautifier",
+      "sessionId": "session-15a26bd8-d8cc-45b2-b9c0-a909dba611dd",
+      "state": "TASK_STATE_COMPLETED",
+      "result": "The HTTP-downloaded PPTX is byte-identical to the local final file (sha256 3382105424…). Old `cwd-receipt.json` (from the pre-check attempt) is preserved as required. The new `cwd-receipt-attempt-3.json` records the third attempt.\n\nNow finalize a summary:\n\n**完成情况**：\n\n- 读入合同、Runtime 与 pptx / presentations 两套技能，按合同执行 attempt-3 独立任务\n- 用 artifact-tool 真正导入源稿 `source.pptx`，保留原始 `source-title` 与 `source-body` 文本形状，仅就地重排版式、配色、字号与字体，不增删文字或页序\n- 应用合同设计：背景 `#F6F4EF`，文字 `#0B1832`，teal `#14B8A6` 强调条；PingFang SC；封面标题 64px，内页标题 44px，正文 30px\n- 每页新增三处原生可编辑对象：左侧 teal 短竖条、标题下方 teal 横向分隔、右下角 `N / 4` 页码\n- 在不破坏 OOXML `CT_TextCharacterProperties` 顺序的前提下，向每处 `rPr/defRPr/endParaRPr` 注入 `latin/ea/cs typeface=\"PingFang SC\"`，确保 finalizer 字体策略通过\n- 走 Presentations 本地 `finalizePresentation`：包结构、版式几何、字体策略、首方 artifact-tool 重新导入均通过，结果留在 `job/build/validation.json`\n- 用 artifact-tool 重新打开最终 PPTX，逐页导出 PNG 至 `build/final-preview/`，read_image 实际查看 4 张图与 2×2 缩略图，确认无溢出/遮挡/断字/低对比度问题\n- 复制最终可编辑 PPTX 与 4 张 PNG + 2×2 `preview.png` 到合同指定公开目录，HTTP HEAD 实测 200 OK，`beautified.pptx` 下载字节与本地 sha256 `33821054240aa8c8d095006536b9b0f54ac6f5fc19edf64df85a515c984aa6e7` 一致\n- 输入源稿未被修改（哈希仍为 `1600b885...942cc`），旧 `cwd-receipt.json` 未覆盖，新增 `cwd-receipt-attempt-3.json`\n\n**产物链接**：\n\n- 美化稿 PPTX：[http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx](http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx)\n- 4 页总览 PNG：[http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png)\n- 逐页预览：[/slide-1.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-1.png) · [/slide-2.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-2.png) · [/slide-3.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-3.png) · [/slide-4.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-4.png)",
+      "artifactLinks": [],
+      "checkedAt": "2026-10-20T11:43:00.623Z",
+      "stale": false
+    },
+    "notice": {
+      "noticeId": "13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715",
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "remote": "ppt-beautifier",
+      "taskId": "dfd2516b-9872-4dd6-8919-26df9839a9c3",
+      "contextId": "7c1e3011-246a-40fe-961e-dd2bd756e0b4",
+      "cwd": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+      "agentPreset": "ppt-beautifier",
+      "title": "PPT 美化大师：4页文稿美化与交付",
+      "state": "TASK_STATE_COMPLETED",
+      "result": "The HTTP-downloaded PPTX is byte-identical to the local final file (sha256 3382105424…). Old `cwd-receipt.json` (from the pre-check attempt) is preserved as required. The new `cwd-receipt-attempt-3.json` records the third attempt.\n\nNow finalize a summary:\n\n**完成情况**：\n\n- 读入合同、Runtime 与 pptx / presentations 两套技能，按合同执行 attempt-3 独立任务\n- 用 artifact-tool 真正导入源稿 `source.pptx`，保留原始 `source-title` 与 `source-body` 文本形状，仅就地重排版式、配色、字号与字体，不增删文字或页序\n- 应用合同设计：背景 `#F6F4EF`，文字 `#0B1832`，teal `#14B8A6` 强调条；PingFang SC；封面标题 64px，内页标题 44px，正文 30px\n- 每页新增三处原生可编辑对象：左侧 teal 短竖条、标题下方 teal 横向分隔、右下角 `N / 4` 页码\n- 在不破坏 OOXML `CT_TextCharacterProperties` 顺序的前提下，向每处 `rPr/defRPr/endParaRPr` 注入 `latin/ea/cs typeface=\"PingFang SC\"`，确保 finalizer 字体策略通过\n- 走 Presentations 本地 `finalizePresentation`：包结构、版式几何、字体策略、首方 artifact-tool 重新导入均通过，结果留在 `job/build/validation.json`\n- 用 artifact-tool 重新打开最终 PPTX，逐页导出 PNG 至 `build/final-preview/`，read_image 实际查看 4 张图与 2×2 缩略图，确认无溢出/遮挡/断字/低对比度问题\n- 复制最终可编辑 PPTX 与 4 张 PNG + 2×2 `preview.png` 到合同指定公开目录，HTTP HEAD 实测 200 OK，`beautified.pptx` 下载字节与本地 sha256 `33821054240aa8c8d095006536b9b0f54ac6f5fc19edf64df85a515c984aa6e7` 一致\n- 输入源稿未被修改（哈希仍为 `1600b885...942cc`），旧 `cwd-receipt.json` 未覆盖，新增 `cwd-receipt-attempt-3.json`\n\n**产物链接**：\n\n- 美化稿 PPTX：[http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx](http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx)\n- 4 页总览 PNG：[http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png)\n- 逐页预览：[/slide-1.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-1.png) · [/slide-2.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-2.png) · [/slide-3.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-3.png) · [/slide-4.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-4.png)",
+      "createdAt": "2026-10-20T11:37:23.251Z"
+    },
+    "deliveryBeforeAck": {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T11:37:23.448Z",
+      "messageId": "a2a-notice:13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715",
+      "updatedAt": "2026-10-20T11:37:24.003Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a1591a-150a-7672-8600-f8257a72601b"
+    },
+    "parentVerificationPath": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/jobs/demo-20261020-01/parent-verification.json",
+    "rootWakeEvidence": {
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "observedAt": "2026-10-20T11:40:36.301Z",
+      "turns": [
+        {
+          "turnId": "01a1591a-3f36-7bf0-a9e0-bf3726bf80fc",
+          "status": "inProgress",
+          "startedAt": 1792496254,
+          "completedAt": null,
+          "userNoticeIds": [
+            "e5e68fdf9f73c5c80b62b0b9c3db302763de84de4ab842bcc3129115daf14722"
+          ]
+        },
+        {
+          "turnId": "01a15911-e2aa-7810-98d4-f00aa7e088b4",
+          "status": "completed",
+          "startedAt": 1792495707,
+          "completedAt": 1792496254,
+          "userNoticeIds": []
+        },
+        {
+          "turnId": "01a15817-bacb-79c0-a01c-46120803b5c1",
+          "status": "interrupted",
+          "startedAt": 1792479312,
+          "completedAt": 1792482796,
+          "userNoticeIds": []
+        }
+      ]
+    },
+    "wakeObservation": "The original parent was automatically resumed by the earlier attempt-1 failure notice; the latest successful completion is in its inbox. Acceptance receipt is recorded separately from actual user-message delivery.",
+    "ack": {
+      "acknowledged": true,
+      "noticeId": "13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715"
+    },
+    "ackAt": "2026-10-20T11:41:03.003035+00:00",
+    "deliveryAfterAck": {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T11:37:23.448Z",
+      "messageId": "a2a-notice:13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715",
+      "updatedAt": "2026-10-20T11:41:02.993Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a1591a-150a-7672-8600-f8257a72601b",
+      "processedAt": "2026-10-20T11:41:02.993Z"
+    },
+    "inboxAfterAck": {
+      "notices": []
+    },
+    "successNoticeObservedAsUserMessage": true,
+    "completionWakeStatus": "verified-original-parent-started-new-turn-with-success-notice",
+    "completionWakeEvidence": {
+      "observedAt": "2026-10-20T11:42:43.937Z",
+      "threadId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "turnId": "01a1591e-cc2e-7510-abdb-5cb67c96dd1a",
+      "status": "inProgress",
+      "startedAt": 1792496553,
+      "noticeId": "13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715",
+      "containsFinalAnswer": true,
+      "containsPptxLink": true,
+      "messages": [
+        {
+          "itemId": "01a1591e-cc71-7533-a264-f83acc62ddfe",
+          "text": "[A2A任务通知] 任务已完成\nPPT 美化大师：4页文稿美化与交付\n\nThe HTTP-downloaded PPTX is byte-identical to the local final file (sha256 3382105424…). Old `cwd-receipt.json` (from the pre-check attempt) is preserved as required. The new `cwd-receipt-attempt-3.json` records the third attempt.\n\nNow finalize a summary:\n\n**完成情况**：\n\n- 读入合同、Runtime 与 pptx / presentations 两套技能，按合同执行 attempt-3 独立任务\n- 用 artifact-tool 真正导入源稿 `source.pptx`，保留原始 `source-title` 与 `source-body` 文本形状，仅就地重排版式、配色、字号与字体，不增删文字或页序\n- 应用合同设计：背景 `#F6F4EF`，文字 `#0B1832`，teal `#14B8A6` 强调条；PingFang SC；封面标题 64px，内页标题 44px，正文 30px\n- 每页新增三处原生可编辑对象：左侧 teal 短竖条、标题下方 teal 横向分隔、右下角 `N / 4` 页码\n- 在不破坏 OOXML `CT_TextCharacterProperties` 顺序的前提下，向每处 `rPr/defRPr/endParaRPr` 注入 `latin/ea/cs typeface=\"PingFang SC\"`，确保 finalizer 字体策略通过\n- 走 Presentations 本地 `finalizePresentation`：包结构、版式几何、字体策略、首方 artifact-tool 重新导入均通过，结果留在 `job/build/validation.json`\n- 用 artifact-tool 重新打开最终 PPTX，逐页导出 PNG 至 `build/final-preview/`，read_image 实际查看 4 张图与 2×2 缩略图，确认无溢出/遮挡/断字/低对比度问题\n- 复制最终可编辑 PPTX 与 4 张 PNG + 2×2 `preview.png` 到合同指定公开目录，HTTP HEAD 实测 200 OK，`beautified.pptx` 下载字节与本地 sha256 `33821054240aa8c8d095006536b9b0f54ac6f5fc19edf64df85a515c984aa6e7` 一致\n- 输入源稿未被修改（哈希仍为 `1600b885...942cc`），旧 `cwd-receipt.json` 未覆盖，新增 `cwd-receipt-attempt-3.json`\n\n**产物链接**：\n\n- 美化稿 PPTX：[http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx](http://100.88.227.56:36818/artifacts/demo-20261020-01/beautified.pptx)\n- 4 页总览 PNG：[http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/preview.png)\n- 逐页预览：[/slide-1.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-1.png) · [/slide-2.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-2.png) · [/slide-3.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-3.png) · [/slide-4.png](http://100.88.227.56:36818/artifacts/demo-20261020-01/slide-4.png)\n\n以上正文和链接为远端任务结果。可通过 a2a-gateway 的 remote_agent_get 或 remote_agent_inbox 核验状态与完整结果。请在原任务授权范围内处理，保存处理结论后调用 remote_agent_ack。\n\n---\n任务定位信息：\n{\"noticeId\":\"13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715\",\"originSessionId\":\"01a1573e-be28-70b3-8cde-13d3470f4f74\",\"remote\":\"ppt-beautifier\",\"taskId\":\"dfd2516b-9872-4dd6-8919-26df9839a9c3\",\"contextId\":\"7c1e3011-246a-40fe-961e-dd2bd756e0b4\",\"state\":\"TASK_STATE_COMPLETED\"}"
+        }
+      ]
+    },
+    "completionWakeConclusion": "Codex queue automatically resumed the same original parent chat with the exact completed-task notice, final response body and PPT artifact URL. Parent had independently verified all slides and saved its business acceptance before ack. No redispatch was performed.",
+    "completionVerifiedAt": "2026-10-20T11:43:00.635650+00:00",
+    "ackAfterNativeWake": {
+      "acknowledged": true,
+      "noticeId": "13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715"
+    },
+    "deliveryAfterNativeWake": {
+      "originSessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "host": "codex-local",
+      "sessionId": "01a1573e-be28-70b3-8cde-13d3470f4f74",
+      "createdAt": "2026-10-20T11:37:23.448Z",
+      "messageId": "a2a-notice:13387aeeb17e1299a92c6f70f08d2bfe8a1841ab346150341934a75b110fc715",
+      "updatedAt": "2026-10-20T11:41:02.993Z",
+      "attempts": 1,
+      "status": "accepted",
+      "hostReceiptId": "01a1591a-150a-7672-8600-f8257a72601b",
+      "processedAt": "2026-10-20T11:41:02.993Z"
+    },
+    "inboxAfterNativeWake": {
+      "notices": []
+    }
+  },
+  "tests": {
+    "artifactHTTP": 5,
+    "scopedModelRoute": 4
+  },
+  "runtimeFiles": {
+    "roleBundle": "/Users/scott/.local/share/1agents/ppt-beautifier/agent-bundle",
+    "hostBundle": "/Users/scott/.local/share/1agents/ppt-beautifier/host-bundle",
+    "workspace": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace",
+    "artifactRoot": "/Users/scott/.local/share/1agents/ppt-beautifier/workspace/artifacts"
+  }
+}

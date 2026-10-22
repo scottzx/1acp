@@ -1,0 +1,215 @@
+/** Durable admission to host-owned conversation queues; acceptance is not business completion. */
+import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { z } from 'zod';
+import { deliverSessionMessage, SessionDeliveryError, type SessionHost } from './session-hosts.js';
+
+const id = z.string().trim().min(1).max(512);
+export const sessionOriginSchema = z.object({ originSessionId: id }).strict();
+export const sessionBindSchema = sessionOriginSchema.extend({ host: id, sessionId: id }).strict();
+export const sessionMessageSchema = sessionOriginSchema.extend({ messageId: id }).strict();
+export const sessionSendSchema = sessionMessageSchema.extend({ text: z.string().min(1).max(256 * 1024).refine(value => Boolean(value.trim())) }).strict();
+export const sessionResolveSchema = sessionMessageSchema.extend({ accepted: z.boolean(), note: id, hostReceiptId: id.optional() }).strict();
+
+export interface SessionBinding {
+  originSessionId: string;
+  host: string;
+  sessionId: string;
+  createdAt: string;
+}
+interface StoredBinding extends SessionBinding { hostFingerprint: string }
+export type SessionDeliveryStatus = 'pending' | 'dispatching' | 'retrying' | 'accepted' | 'unknown' | 'rejected';
+export interface SessionDeliveryReceipt extends SessionBinding {
+  messageId: string;
+  status: SessionDeliveryStatus;
+  attempts: number;
+  updatedAt: string;
+  nextAttemptAt?: string;
+  hostReceiptId?: string;
+  error?: string;
+  processedAt?: string;
+  resolutionNote?: string;
+}
+interface Delivery extends SessionDeliveryReceipt { text: string; hostFingerprint: string }
+const bindingSchema = sessionBindSchema.extend({ createdAt: id, hostFingerprint: id }).strict();
+const deliverySchema = bindingSchema.extend({
+  messageId: id, text: sessionSendSchema.shape.text,
+  status: z.enum(['pending', 'dispatching', 'retrying', 'accepted', 'unknown', 'rejected']),
+  attempts: z.number().int().nonnegative(), updatedAt: id,
+  nextAttemptAt: id.optional(), hostReceiptId: id.optional(), error: id.optional(),
+  processedAt: id.optional(), resolutionNote: id.optional(),
+}).strict();
+const stateSchema = z.object({ version: z.literal(1), bindings: z.array(bindingSchema), deliveries: z.array(deliverySchema) }).strict();
+type State = { version: 1; bindings: StoredBinding[]; deliveries: Delivery[] };
+
+/** Credentials may rotate; a host alias must never silently redirect saved messages. */
+function fingerprint(host: SessionHost): string {
+  const { headers, timeoutMs, ...locator } = host as SessionHost & { headers?: unknown; timeoutMs?: number };
+  return createHash('sha256').update(JSON.stringify(Object.fromEntries(Object.entries(locator).sort(([a], [b]) => a.localeCompare(b))))).digest('hex');
+}
+function receipt(delivery: Delivery): SessionDeliveryReceipt {
+  const { text, hostFingerprint, ...view } = delivery;
+  return { ...view };
+}
+
+/** Owned by the gateway's single-writer storage lease. */
+export class SessionDelivery {
+  private readonly file: string;
+  private readonly state: State;
+  private readonly controller = new AbortController();
+  private pumping?: Promise<void>;
+  private closed = false;
+  private storageFailed = false;
+
+  constructor(directory: string, private readonly hosts: Record<string, SessionHost>) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    this.file = path.join(directory, 'session-delivery.json');
+    try {
+      this.state = stateSchema.parse(JSON.parse(readFileSync(this.file, 'utf8')));
+      const origins = new Set<string>(), messages = new Set<string>();
+      for (const binding of this.state.bindings) {
+        if (origins.has(binding.originSessionId)) throw new Error('Duplicate session binding');
+        origins.add(binding.originSessionId);
+      }
+      for (const delivery of this.state.deliveries) {
+        const key = JSON.stringify([delivery.originSessionId, delivery.messageId]);
+        if (messages.has(key)) throw new Error('Duplicate session delivery');
+        messages.add(key);
+        const binding = this.state.bindings.find(value => value.originSessionId === delivery.originSessionId);
+        if (!binding || binding.host !== delivery.host || binding.sessionId !== delivery.sessionId || binding.hostFingerprint !== delivery.hostFingerprint) throw new Error('Session delivery binding mismatch');
+        if (delivery.status === 'dispatching') {
+          delivery.status = 'unknown';
+          delivery.error = 'Gateway restarted during host admission; verify the host before resolving';
+          delivery.updatedAt = new Date().toISOString();
+        }
+      }
+      this.save();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      this.state = { version: 1, bindings: [], deliveries: [] };
+    }
+  }
+
+  private save(): void {
+    if (this.storageFailed) throw new Error('Session delivery storage is unavailable; repair storage and restart the gateway');
+    const temporary = `${this.file}.${randomUUID()}.tmp`;
+    try {
+      const fd = openSync(temporary, 'wx', 0o600);
+      try { writeFileSync(fd, JSON.stringify(this.state)); fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(temporary, this.file);
+      const dir = openSync(path.dirname(this.file), 'r');
+      try { fsyncSync(dir); } finally { closeSync(dir); }
+    } catch {
+      this.storageFailed = true;
+      throw new Error('Session delivery storage is unavailable; repair storage and restart the gateway');
+    }
+  }
+  get healthy(): boolean { return !this.storageFailed; }
+  private requireWritable(): void {
+    if (this.closed) throw new Error('Session delivery is closed');
+    if (this.storageFailed) throw new Error('Session delivery storage is unavailable; repair storage and restart the gateway');
+  }
+  hasBinding(originSessionId: string): boolean { return this.state.bindings.some(value => value.originSessionId === originSessionId); }
+  hasDelivery(originSessionId: string, messageId: string): boolean {
+    return this.state.deliveries.some(value => value.originSessionId === originSessionId && value.messageId === messageId);
+  }
+  bind(input: z.output<typeof sessionBindSchema>): SessionBinding {
+    this.requireWritable();
+    const host = this.hosts[input.host];
+    if (!host) throw new Error('Unknown session host');
+    if (host.kind === 'codex' && !z.uuid().safeParse(input.sessionId).success) throw new Error('Codex session ID must be a thread UUID');
+    const previous = this.state.bindings.find(value => value.originSessionId === input.originSessionId);
+    if (previous) {
+      if (previous.host !== input.host || previous.sessionId !== input.sessionId || previous.hostFingerprint !== fingerprint(host)) throw new Error('Origin session is already bound to a different host or session');
+      const { hostFingerprint, ...view } = previous; return { ...view };
+    }
+    const binding = { ...input, hostFingerprint: fingerprint(host), createdAt: new Date().toISOString() };
+    this.state.bindings.push(binding);
+    try { this.save(); } catch (error) { this.state.bindings.pop(); throw error; }
+    const { hostFingerprint, ...view } = binding; return view;
+  }
+  enqueue(input: z.output<typeof sessionSendSchema>): SessionDeliveryReceipt {
+    this.requireWritable();
+    const previous = this.state.deliveries.find(value => value.originSessionId === input.originSessionId && value.messageId === input.messageId);
+    if (previous) {
+      if (previous.text !== input.text) throw new Error('Message ID was already used for different content');
+      return receipt(previous);
+    }
+    const binding = this.state.bindings.find(value => value.originSessionId === input.originSessionId);
+    if (!binding) throw new Error('Origin session is not bound');
+    const now = new Date().toISOString();
+    const delivery: Delivery = { ...binding, messageId: input.messageId, text: input.text, createdAt: now, updatedAt: now, attempts: 0, status: 'pending' };
+    this.state.deliveries.push(delivery);
+    try { this.save(); } catch (error) { this.state.deliveries.pop(); throw error; }
+    return receipt(delivery);
+  }
+  get(input: z.output<typeof sessionMessageSchema>): SessionDeliveryReceipt { this.requireWritable(); return receipt(this.find(input)); }
+  private find(input: z.output<typeof sessionMessageSchema>): Delivery {
+    const delivery = this.state.deliveries.find(value => value.originSessionId === input.originSessionId && value.messageId === input.messageId);
+    if (!delivery) throw new Error('Delivery not found for this origin session');
+    return delivery;
+  }
+  resolve(input: z.output<typeof sessionResolveSchema>): SessionDeliveryReceipt {
+    this.requireWritable();
+    const delivery = this.find(input);
+    if (!['unknown', 'rejected'].includes(delivery.status)) throw new Error('Only unknown or rejected host admission can be resolved');
+    delivery.status = input.accepted ? 'accepted' : 'pending';
+    delivery.resolutionNote = input.note;
+    if (input.hostReceiptId) delivery.hostReceiptId = input.hostReceiptId;
+    delivery.updatedAt = new Date().toISOString();
+    delete delivery.error; delete delivery.nextAttemptAt;
+    this.save(); return receipt(delivery);
+  }
+  acknowledgeNotice(originSessionId: string, noticeId: string): void {
+    this.acknowledgeMessage(originSessionId, `a2a-notice:${noticeId}`);
+  }
+  acknowledgeMessage(originSessionId: string, messageId: string): void {
+    this.requireWritable();
+    const delivery = this.state.deliveries.find(value => value.originSessionId === originSessionId && value.messageId === messageId);
+    if (delivery && !delivery.processedAt) {
+      delivery.processedAt = new Date().toISOString(); delivery.updatedAt = delivery.processedAt; this.save();
+    }
+  }
+  async reconcile(): Promise<void> {
+    if (this.closed || this.storageFailed) return;
+    if (this.pumping) return this.pumping;
+    const run = async (): Promise<void> => {
+      const origins = new Set(this.state.deliveries.map(value => value.originSessionId));
+      await Promise.allSettled([...origins].map(async origin => {
+        if (this.closed || this.storageFailed) return;
+        // The first unresolved admission holds later messages in FIFO order.
+        const delivery = this.state.deliveries.find(value => value.originSessionId === origin && value.status !== 'accepted' && !value.processedAt);
+        if (!delivery || ['unknown', 'rejected', 'dispatching'].includes(delivery.status)) return;
+        if (delivery.nextAttemptAt && Date.parse(delivery.nextAttemptAt) > Date.now()) return;
+        const host = this.hosts[delivery.host];
+        if (!host || fingerprint(host) !== delivery.hostFingerprint) {
+          delivery.status = 'unknown'; delivery.error = 'Saved host configuration is missing or its destination changed';
+          delivery.updatedAt = new Date().toISOString(); this.save(); return;
+        }
+        delivery.status = 'dispatching'; delivery.attempts++; delivery.updatedAt = new Date().toISOString();
+        delete delivery.nextAttemptAt; this.save();
+        try {
+          // Host deduplication must preserve the ledger's origin/message scope.
+          const hostMessageId = `1agents-session:${createHash('sha256').update(JSON.stringify([delivery.originSessionId, delivery.messageId])).digest('hex')}`;
+          const result = await deliverSessionMessage(host, { sessionId: delivery.sessionId, messageId: hostMessageId, text: delivery.text }, this.controller.signal);
+          delivery.status = 'accepted'; delivery.hostReceiptId = result.hostReceiptId;
+          delete delivery.error;
+        } catch (error) {
+          if (error instanceof SessionDeliveryError && error.retryable && !error.outcomeUnknown) {
+            delivery.status = 'retrying';
+            delivery.nextAttemptAt = new Date(Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(delivery.attempts - 1, 6))).toISOString();
+          } else delivery.status = error instanceof SessionDeliveryError && !error.outcomeUnknown ? 'rejected' : 'unknown';
+          delivery.error = error instanceof SessionDeliveryError ? error.message : 'Host admission failed; verify delivery before retrying';
+        }
+        delivery.updatedAt = new Date().toISOString(); this.save();
+      }));
+    };
+    this.pumping = run();
+    try { await this.pumping; } finally { this.pumping = undefined; }
+  }
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true; this.controller.abort(); await this.pumping;
+  }
+}

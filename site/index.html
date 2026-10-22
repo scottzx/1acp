@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#12201d" />
+    <meta
+      name="description"
+      content="1ACP：连接原生 Agent 与你的应用。一个 npm 包，提供持久会话、CLI、运行时 SDK、HTTP/WebSocket 服务与 DeepSeek Harness 插件。"
+    />
+    <meta property="og:title" content="1ACP · 连接原生 Agent，让会话持续运行" />
+    <meta
+      property="og:description"
+      content="保留 Agent 的原生模型、工具与会话。通过 CLI、SDK、服务或 DSH 插件接入你的工作流。"
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://scottzx.github.io/1acp/" />
+    <link rel="canonical" href="https://scottzx.github.io/1acp/" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>1ACP · 原生 Agent 的会话连接层</title>
+    <script src="main.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到正文</a>
+    <header class="site-header">
+      <div class="container header-inner">
+        <a class="brand" href="#main" aria-label="1ACP 首页"
+          ><img src="favicon.svg" width="36" height="36" alt="" /><span
+            >1ACP<span class="brand-by">BY 1AGENTS</span></span
+          ></a
+        >
+        <nav aria-label="主导航">
+          <a href="#features">能力</a><a href="#integrations">接入方式</a
+          ><a href="#install">开始使用</a>
+        </nav>
+        <a class="header-source" href="https://github.com/scottzx/1acp"
+          >GitHub <span aria-hidden="true">↗</span></a
+        >
+      </div>
+    </header>
+    <main id="main">
+      <section class="hero">
+        <div class="container hero-grid">
+          <div class="hero-copy">
+            <a class="release-pill" href="https://www.npmjs.com/package/@1agents/acp-service"
+              ><span class="status-dot"></span> v__VERSION__ 已发布
+              <span aria-hidden="true">↗</span></a
+            >
+            <p class="eyebrow">AGENT CLIENT PROTOCOL / 1ACP</p>
+            <h1>连接原生 Agent，<br />让会话<span class="accent">持续运行。</span></h1>
+            <p class="hero-description">
+              把 Codex、Claude Code、Grok Build
+              的原生能力带进你的应用。保留模型、工具与会话身份，通过统一的 ACP 接口接入工作流。
+            </p>
+            <div class="hero-actions">
+              <a class="button button-lime" href="#install"
+                >开始使用 <span aria-hidden="true">↗</span></a
+              ><a class="button button-outline" href="https://github.com/scottzx/1acp"
+                >浏览源码 <span aria-hidden="true">↗</span></a
+              >
+            </div>
+            <p class="hero-footnote">开源 · Node.js 22.13+ · 可独立于 DSH 使用</p>
+          </div>
+          <div class="connection-card">
+            <div class="card-topline">
+              <span class="mono">ONE CONNECTION. NATIVE CAPABILITIES.</span
+              ><span class="diagram-label">架构示意</span>
+            </div>
+            <div
+              class="connection-map"
+              role="img"
+              aria-label="CLI、应用 SDK 和 DeepSeek Harness 通过 1ACP 连接 Codex、Claude Code 和 Grok Build"
+            >
+              <div class="node-row applications">
+                <span><b aria-hidden="true">&gt;_</b> CLI</span
+                ><span><b aria-hidden="true">{ }</b> SDK</span
+                ><span><b aria-hidden="true">▤</b> DSH</span>
+              </div>
+              <div class="connector connector-top"><i></i><i></i><i></i></div>
+              <div class="protocol-node">
+                <img src="favicon.svg" alt="" width="40" height="40" />
+                <div><strong>1ACP</strong><small>SESSION · PROTOCOL · RUNTIME</small></div>
+                <span class="protocol-badge">ACP v1</span>
+              </div>
+              <div class="connector connector-bottom"><i></i><i></i><i></i></div>
+              <div class="node-row agents">
+                <span><i class="agent-dot codex"></i>Codex</span
+                ><span><i class="agent-dot claude"></i>Claude Code</span
+                ><span><i class="agent-dot grok"></i>Grok Build</span>
+              </div>
+            </div>
+            <div class="session-preview">
+              <div>
+                <span class="status-dot"></span><span class="mono">PERSISTENT SESSION</span
+                ><span class="example-label">调用示例</span>
+              </div>
+              <pre><code><span class="code-comment"># 创建原生会话</span>
+<span class="prompt">$</span> acp-service codex sessions new
+
+<span class="code-comment"># 在同一个会话中继续工作</span>
+<span class="prompt">$</span> acp-service codex <span class="code-string">"梳理项目结构"</span></code></pre>
+            </div>
+          </div>
+        </div>
+        <div class="container hero-strip">
+          <span>一个包，四种接入方式</span>
+          <div>
+            <span>CLI</span><span>Runtime SDK</span><span>HTTP / WebSocket</span
+            ><span>DSH Plugin</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section container" id="features">
+        <div class="section-heading">
+          <p class="eyebrow">01 / BUILT AROUND THE AGENT</p>
+          <h2>接入你的系统，<br />保留 Agent 的原生能力。</h2>
+          <p>
+            从一次命令调用，到应用中的持续会话，<br class="desktop-break" />让协议负责连接，让 Agent
+            继续负责工作。
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="feature-symbol" aria-hidden="true">↻</span
+            ><span class="feature-number mono">01 — SESSION</span>
+            <h3>会话可以接着做</h3>
+            <p>
+              保留原生 Agent、工作区与会话身份。重连时恢复同一会话，持续处理多轮任务；在 DSH
+              中回放托管回合的更新。
+            </p>
+          </article>
+          <article class="feature">
+            <span class="feature-symbol" aria-hidden="true">⌘</span
+            ><span class="feature-number mono">02 — CAPABILITIES</span>
+            <h3>原生模型与工具</h3>
+            <p>
+              使用 Agent 实际提供的模型、推理设置、模式和命令。在 DSH 中处理权限请求，工具仍由原生
+              Agent 执行。
+            </p>
+          </article>
+          <article class="feature">
+            <span class="feature-symbol" aria-hidden="true">⇄</span
+            ><span class="feature-number mono">03 — INTEGRATION</span>
+            <h3>从本机接入工作流</h3>
+            <p>
+              用 CLI 运行任务，用 SDK 嵌入应用，或通过 HTTP 与 WebSocket 建立连接。需要跨 Agent
+              委派时，再按需开启 A2A。
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="integration-section" id="integrations">
+        <div class="container">
+          <div class="integration-intro">
+            <div>
+              <p class="eyebrow">02 / NATIVE IN YOUR WORKSPACE</p>
+              <h2>在熟悉的工作台，<br />继续原生会话。</h2>
+            </div>
+            <div>
+              <p>
+                通过 DeepSeek Harness 插件，选择已发现的 ACP Agent
+                与本地工作区，直接使用它的模型选项、原生命令和权限交互。
+              </p>
+              <a
+                class="text-link"
+                href="https://github.com/scottzx/1acp/blob/main/packages/dsh-plugin/README.md"
+                >阅读 DSH 接入指南 <span aria-hidden="true">↗</span></a
+              >
+            </div>
+          </div>
+          <figure class="product-figure">
+            <div class="window-bar">
+              <span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span
+              ><span>1ACP × DeepSeek Harness</span><span class="mono">NATIVE SESSION</span>
+            </div>
+            <img
+              src="assets/dsh-codex-controls.png"
+              alt="DeepSeek Harness 中的 ACP · Codex 会话，显示原生模型选择和 ACP 设置入口"
+              width="2924"
+              height="1478"
+              loading="lazy"
+            />
+            <figcaption>
+              <span>原生模型选择 · ACP 会话设置 · 本地工作区</span
+              ><span>实际界面 · 本地 DSH 验证构建</span>
+            </figcaption>
+          </figure>
+          <div class="integration-notes">
+            <p>
+              <span class="note-mark" aria-hidden="true">↳</span> 也可以独立运行 CLI、SDK
+              与服务，接入自己的应用。
+            </p>
+            <p>具体模型与控制项取决于 Agent、适配器和账号。当前 DSH 插件支持文本提示。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section container install-section" id="install">
+        <div class="install-copy">
+          <p class="eyebrow">03 / GET STARTED</p>
+          <h2>一个安装入口。<br />从你需要的方式开始。</h2>
+          <p class="install-description">
+            正式分发包
+            <a href="https://www.npmjs.com/package/@1agents/acp-service">@1agents/acp-service</a>
+            包含运行时、CLI、服务与 DSH 插件。
+          </p>
+          <div class="requirements">
+            <h3>开始前</h3>
+            <p>
+              安装 Node.js 22.13 或更新版本，并在运行主机上准备好原生 Agent CLI、登录凭据及对应的
+              ACP 适配器。
+            </p>
+            <p>安装 DSH 插件后，重启 DSH 并确认插件已启用。插件可自动启动或复用本地 ACP 服务。</p>
+          </div>
+          <a
+            class="text-link"
+            href="https://github.com/scottzx/1acp/blob/main/packages/service/README.md"
+            >完整安装与配置文档 <span aria-hidden="true">↗</span></a
+          >
+        </div>
+        <div class="quickstart">
+          <div class="install-tabs" role="tablist" aria-label="选择接入方式">
+            <button
+              id="tab-dsh"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="panel-dsh"
+              tabindex="0"
+              data-tab="dsh"
+            >
+              DSH 插件</button
+            ><button
+              id="tab-cli"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-cli"
+              tabindex="-1"
+              data-tab="cli"
+            >
+              CLI</button
+            ><button
+              id="tab-sdk"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-sdk"
+              tabindex="-1"
+              data-tab="sdk"
+            >
+              SDK / 服务
+            </button>
+          </div>
+          <div
+            id="panel-dsh"
+            class="install-panel"
+            role="tabpanel"
+            aria-labelledby="tab-dsh"
+            tabindex="0"
+          >
+            <div class="code-header">
+              <span class="mono">TERMINAL</span
+              ><button
+                class="copy-button"
+                type="button"
+                data-copy="code-dsh"
+                aria-label="复制 DSH 安装命令"
+              >
+                复制命令 <span aria-hidden="true">⧉</span>
+              </button>
+            </div>
+            <pre><code id="code-dsh"><span class="code-comment"># 安装到 DSH 的 web profile</span>
+dsh plugin --profile web add @1agents/acp-service</code></pre>
+            <div class="panel-note">
+              <span class="step-tag">接下来</span>
+              <p>重启 DSH → 启用插件 → 新建 <strong>ACP · Agent</strong> 会话 → 选择现有工作区。</p>
+            </div>
+          </div>
+          <div
+            id="panel-cli"
+            class="install-panel"
+            role="tabpanel"
+            aria-labelledby="tab-cli"
+            tabindex="0"
+            hidden
+          >
+            <div class="code-header">
+              <span class="mono">TERMINAL</span
+              ><button
+                class="copy-button"
+                type="button"
+                data-copy="code-cli"
+                aria-label="复制 CLI 安装与使用命令"
+              >
+                复制命令 <span aria-hidden="true">⧉</span>
+              </button>
+            </div>
+            <pre><code id="code-cli"><span class="code-comment"># 安装统一 CLI</span>
+npm install -g @1agents/acp-service
+
+<span class="code-comment"># 创建并使用 Codex 会话</span>
+acp-service codex sessions new
+acp-service codex "梳理当前项目结构"</code></pre>
+            <div class="panel-note">
+              <span class="step-tag">独立使用</span>
+              <p>不依赖 DSH。进入你的项目目录后运行，Agent 使用本机的工具与登录凭据。</p>
+            </div>
+          </div>
+          <div
+            id="panel-sdk"
+            class="install-panel"
+            role="tabpanel"
+            aria-labelledby="tab-sdk"
+            tabindex="0"
+            hidden
+          >
+            <div class="code-header">
+              <span class="mono">JAVASCRIPT · NODE.JS</span
+              ><button
+                class="copy-button"
+                type="button"
+                data-copy="code-sdk"
+                aria-label="复制 SDK 服务示例"
+              >
+                复制代码 <span aria-hidden="true">⧉</span>
+              </button>
+            </div>
+            <pre><code id="code-sdk"><span class="code-comment">// 先安装：npm install @1agents/acp-service</span>
+import { serveAcpService } from "@1agents/acp-service";
+
+const service = await serveAcpService({
+  host: "127.0.0.1",
+  port: 36812,
+  report: false,
+});
+
+<span class="code-comment">// 结束时：await service.close();</span></code></pre>
+            <div class="panel-note">
+              <span class="step-tag">嵌入应用</span>
+              <p>
+                通过 HTTP / WebSocket 提供 ACP 服务。另有 <code>/runtime</code> 与
+                <code>/flows</code> 导出供应用集成。
+              </p>
+            </div>
+          </div>
+          <div class="package-line">
+            <span class="status-dot"></span><span class="mono">@1agents/acp-service</span
+            ><a href="https://www.npmjs.com/package/@1agents/acp-service/v/__VERSION__"
+              >v__VERSION__ ↗</a
+            >
+          </div>
+          <p id="copy-status" class="sr-only" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+
+      <section class="resources container">
+        <div>
+          <p class="eyebrow">KEEP BUILDING</p>
+          <h2>从接入，走向协作。</h2>
+        </div>
+        <div class="resource-links">
+          <a href="https://github.com/scottzx/1acp/blob/main/packages/service/README.md"
+            ><span><small>DOCUMENTATION</small>服务与 SDK 文档</span
+            ><span aria-hidden="true">↗</span></a
+          ><a href="https://github.com/scottzx/1acp/blob/main/docs/activepieces-automation.md"
+            ><span><small>WORKFLOWS</small>Activepieces 自动化</span
+            ><span aria-hidden="true">↗</span></a
+          ><a href="https://github.com/scottzx/1acp/releases"
+            ><span><small>RELEASES</small>版本与发布记录</span><span aria-hidden="true">↗</span></a
+          >
+        </div>
+      </section>
+    </main>
+    <footer class="container site-footer">
+      <a class="brand footer-brand" href="#main"
+        ><img src="favicon.svg" alt="" width="28" height="28" /><span>1ACP</span></a
+      >
+      <p>连接原生 Agent 与你的应用。</p>
+      <div>
+        <a href="https://github.com/scottzx/1acp">GitHub ↗</a
+        ><a href="https://www.npmjs.com/package/@1agents/acp-service">npm ↗</a
+        ><a href="llms.txt">面向 Agent 的说明 ↗</a>
+      </div>
+      <span class="footer-credit">A PROJECT BY 1AGENTS</span>
+    </footer>
+  </body>
+</html>

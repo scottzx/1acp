@@ -6,7 +6,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { ContentBlock, MessageId, UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
-import type { A2ABackend, A2APrepareInput, A2ARunResult, A2ATarget } from '@1agents/acp-service/a2a';
+import { A2APreflightError, runA2APreflight, type A2ABackend, type A2APreflightInput, type A2APrepareInput, type A2ARunResult, type A2ATarget } from '@1agents/acp-service/a2a';
 import { toSafeError } from '@1agents/acp-service/runtime';
 
 import type { Diagnostics } from './diagnostics.js';
@@ -60,6 +60,10 @@ export class DshA2ABackend implements A2ABackend {
     return this.diagnostics?.find(target.sessionId, options.requestId);
   }
 
+  async preflight(input: A2APreflightInput) {
+    return runA2APreflight(input);
+  }
+
   /** Create a new session or restore an explicitly addressed session without changing its workspace or preset.
    * @param input Remote host directory, preset, and optional existing DSH session identity.
    * @returns The resolved DSH session and its durable workspace and preset.
@@ -68,14 +72,28 @@ export class DshA2ABackend implements A2ABackend {
     const previous = input.sessionId === undefined
       ? undefined
       : await this.ctx.sessionController.inspect(input.sessionId as SessionId);
+    if (input.sessionId !== undefined && previous == null) throw new Error(`Session ${input.sessionId} not found`);
+    if (previous !== undefined && previous.meta.id !== input.sessionId) throw new Error('Existing session identity conflicts');
     const requestedCwd = input.cwd ?? previous?.meta.cwd ?? process.cwd();
     if (!isAbsolute(requestedCwd)) throw new Error('A2A cwd must be an absolute directory on the DSH host');
     const cwd = await realpath(requestedCwd);
     if (!(await stat(cwd)).isDirectory()) throw new Error('A2A cwd must point to a directory on the DSH host');
+    const preflight = await this.preflight({ ...input.preflight, cwd });
+    if (!preflight.ok) throw new A2APreflightError(preflight);
     const agentPreset = input.agentPreset ?? previous?.meta.agentPreset;
+    if (input.sessionId !== undefined && previous !== undefined) {
+      if (previous.meta.cwd === undefined || await realpath(previous.meta.cwd) !== cwd) throw new Error('Existing session cwd conflicts');
+      if (input.agentPreset !== undefined && input.agentPreset !== previous.meta.agentPreset) throw new Error('Existing session preset conflicts');
+      // create() only reuses blank Sessions on current DSH; resolve the saved
+      // identity directly so an active or completed context keeps its queue.
+      const agent = await this.agent(input.sessionId as SessionId);
+      if (agent.id !== input.sessionId || agent.session.id !== input.sessionId) throw new Error('Existing session identity conflicts');
+      if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw new Error('Existing session cwd conflicts');
+      if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw new Error('Existing session preset conflicts');
+      return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight };
+    }
     const created = await this.ctx.sessionController.create({
       cwd,
-      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId as SessionId }),
       ...(agentPreset === undefined ? {} : { agentPreset }),
     });
     const agent = await this.agent(created.sessionId);
@@ -83,6 +101,7 @@ export class DshA2ABackend implements A2ABackend {
       sessionId: created.sessionId,
       cwd: agent.session.header.cwd ?? cwd,
       ...(created.agentPreset === undefined ? {} : { agentPreset: created.agentPreset }),
+      preflight,
     };
   }
 

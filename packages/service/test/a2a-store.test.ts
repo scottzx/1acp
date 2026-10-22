@@ -111,6 +111,22 @@ test('A2A list preserves SDK filtering, cursor pagination, artifact and history 
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('A2A context retains a validated host preflight receipt across restart', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'a2a-target-preflight-'));
+  let store = new FileA2AStore(directory);
+  try {
+    const target = { sessionId: 'actual-session', cwd: directory,
+      preflight: { ok: true, checkedAt: new Date().toISOString(), cwd: directory, jobDirectory: directory, checks: [{ id: 'cwd', ok: true }] } };
+    store.saveTarget('context', target, context());
+    store.close(); store = new FileA2AStore(directory);
+    assert.deepEqual(store.loadTarget('context', context()), target);
+    const copy = store.loadTarget('context', context())!;
+    copy.preflight!.ok = false;
+    assert.equal(store.loadTarget('context', context())!.preflight!.ok, true);
+    assert.throws(() => store.saveTarget('invalid', { ...target, preflight: { ...target.preflight, ok: 'spoof' as unknown as boolean } }, context()));
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('A2A restart marks every unfinished scoped execution failed and keeps terminal results', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'a2a-recovery-'));
   let store = new FileA2AStore(directory);
