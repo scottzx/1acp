@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -55,7 +55,8 @@ async function fixture(t: TestContext, extra: Record<string, unknown> = {}) {
   const step = async () => { await advancePptDelivery(run, adapter); run = JSON.parse(saved); };
   async function completeCurrent(verdict = 'passed') {
     assert.ok(run.currentChild); const child = childStates.get(run.currentChild.attemptId)!; child.executionStatus = 'completed';
-    if (run.stage === 'review') await writeFile(join(run.jobDirectory, `revision-${run.revision}`, 'independent-review.json'), JSON.stringify({
+    if (run.stage === 'review') await writeFile(join(run.jobDirectory, `revision-${run.revision}`,
+      run.recovery?.mode === 'review_only' ? `independent-review.${run.attemptId}.json` : 'independent-review.json'), JSON.stringify({
       verdict, artifactDigest: run.validation!.artifactDigest, factsChecked: true, allSlidesViewed: true,
       issues: verdict === 'passed' ? [] : ['Page 2: correct the boundary'], limitations: ['No native PowerPoint application verification'],
       evidence: ['preview.png', ...Array.from({ length: 6 }, (_, i) => `slide-${i + 1}.png`)]
@@ -149,6 +150,76 @@ test('recovery rejects unresolved/live children and stops on checkpoint byte cha
   Object.assign(f.run, resumed); const before = f.requests.length;
   f.adapter.validateCandidate = async () => ({ ...f.run.validation!, artifactDigest: 'a'.repeat(64) });
   await f.step(); assert.equal(f.run.executionStatus, 'input_required'); assert.equal(f.requests.length, before);
+});
+
+test('review-only recovery uses a fresh independent child and parent round, preserving failed history and original version', async t => {
+  const f = await fixture(t); await f.untilReview();
+  f.childStates.get(f.run.currentChild!.attemptId)!.executionStatus = 'failed'; await f.step();
+  assert.equal(f.run.executionStatus, 'failed');
+  const old = structuredClone(f.run), originalContract = await readFile(old.contractPath, 'utf8');
+  // A terminal round may be resumed days later; only the new round gets a fresh bounded deadline.
+  old.createdAt = new Date(Date.now() - 86400000).toISOString();
+  const resumed = await recoverPptDeliveryRun(old, 'review-only-parent', { recoveryMode: 'review_only', reviewTargetId: 'codex-review' });
+  assert.deepEqual(f.run.children, old.children); assert.equal(await readFile(old.contractPath, 'utf8'), originalContract);
+  assert.equal(resumed.revision, old.revision); assert.equal(resumed.policy.makerTargetId, old.policy.makerTargetId);
+  assert.equal(resumed.executionRetries.review, 0); assert.equal(resumed.createdAt, old.createdAt);
+  f.run = resumed; const before = f.requests.length; await f.step();
+  assert.equal(f.requests.length, before + 1); const request = f.requests.at(-1)!;
+  assert.equal(request.purpose, 'independent_review'); assert.equal(request.targetId, 'codex-review');
+  assert.equal(request.parentAttemptId, 'review-only-parent'); assert.equal(request.resultRevision, `revision-${old.revision}`);
+  assert.notEqual(f.run.currentChild!.jobId, old.currentChild!.jobId);
+  assert.match(String(request.input.prompt), /禁止制作、修改、重导出/);
+  await f.completeCurrent(); assert.equal(f.run.executionStatus, 'completed');
+  assert.equal(f.run.deliveryReceipt!.selectedProduction && (f.run.deliveryReceipt!.selectedProduction as any).attemptId,
+    old.children.find(c => c.purpose === 'ppt_production')!.child.attemptId);
+  assert.equal(f.run.deliveryReceipt!.productionAttemptCount, 1);
+  assert.match(String(f.run.deliveryReceipt!.independentReviewRef), /independent-review.review-only-parent.json$/);
+  assert.equal(f.run.validation!.artifactDigest, old.validation!.artifactDigest);
+  assert.equal(old.executionStatus, 'failed'); assert.ok(f.run.metrics.elapsedMs >= old.metrics.elapsedMs);
+});
+
+test('review-only changes requested never re-enters production or consumes a quality revision', async t => {
+  const f = await fixture(t); await f.untilReview();
+  f.childStates.get(f.run.currentChild!.attemptId)!.executionStatus = 'failed'; await f.step();
+  f.run = await recoverPptDeliveryRun(f.run, 'review-only-parent', { recoveryMode: 'review_only', reviewTargetId: 'codex-review' });
+  await f.step(); const before = f.requests.length;
+  await f.completeCurrent('changes_requested'); await f.step();
+  assert.equal(f.run.executionStatus, 'input_required'); assert.equal(f.run.stage, 'review');
+  assert.equal(f.requests.length, before); assert.equal(f.run.metrics.qualityRevisions, 0);
+  assert.match(f.run.diagnostics.join(), /只重试验收/);
+});
+
+test('review-only verifies frozen source snapshot and exact candidate before dispatch, then rechecks source at delivery', async t => {
+  const f = await fixture(t); await f.untilReview();
+  f.childStates.get(f.run.currentChild!.attemptId)!.executionStatus = 'failed'; await f.step();
+  const snapshot = join(f.root, 'original-source'); await cp(f.run.input.projectDirectory, snapshot, { recursive: true });
+  await writeFile(join(f.run.input.projectDirectory, 'source-0.md'), 'new project facts');
+  const old = structuredClone(f.run), options = { recoveryMode: 'review_only' as const, reviewTargetId: 'codex-review', sourceSnapshotDirectory: snapshot };
+  f.run = await recoverPptDeliveryRun(old, 'changed-bytes', options);
+  f.adapter.validateCandidate = async () => ({ ...old.validation!, artifactDigest: 'f'.repeat(64) });
+  const before = f.requests.length; await f.step();
+  assert.equal(f.run.executionStatus, 'input_required'); assert.equal(f.requests.length, before);
+  f.adapter.validateCandidate = async () => old.validation!;
+  f.run = await recoverPptDeliveryRun(old, 'source-snapshot-review', options); await f.step();
+  assert.equal(f.requests.length, before + 1); assert.match(String(f.requests.at(-1)!.input.prompt), /原始字节快照/);
+  await writeFile(join(snapshot, 'source-0.md'), 'tampered snapshot'); await f.completeCurrent();
+  assert.notEqual(f.run.executionStatus, 'completed'); assert.ok(f.run.diagnostics.some(item => item.includes('Source hash mismatch')));
+});
+
+test('review-only rejects canceled parents, live/unknown children and changed script/source manifests', async t => {
+  const f = await fixture(t); await f.untilReview(); await f.completeCurrent();
+  const options = { recoveryMode: 'review_only' as const, reviewTargetId: 'codex-review' };
+  f.run.executionStatus = 'canceled'; f.run.stage = 'review';
+  await assert.rejects(recoverPptDeliveryRun(f.run, 'new-round', options), /terminal failed/);
+  f.run.executionStatus = 'failed'; f.run.cancellationRequestedAt = new Date().toISOString();
+  await assert.rejects(recoverPptDeliveryRun(f.run, 'new-round', options), /terminal failed/); delete f.run.cancellationRequestedAt;
+  f.run.children[0]!.child.submissionStatus = 'submission_unknown';
+  await assert.rejects(recoverPptDeliveryRun(f.run, 'new-round', options), /unresolved or running/);
+  f.run.children[0]!.child.submissionStatus = 'accepted';
+  f.run = await recoverPptDeliveryRun(f.run, 'new-round', options);
+  await writeFile(join(f.run.jobDirectory, 'coordinator/slide-script.json'), '{}');
+  const before = f.requests.length; await f.step();
+  assert.equal(f.run.executionStatus, 'input_required'); assert.equal(f.requests.length, before);
 });
 
 test('unknown acceptance and query outage never blindly resubmit', async t => {

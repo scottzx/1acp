@@ -95,6 +95,43 @@ test('explicit PPT checkpoint continuation persists a new parent attempt and ide
   await assert.rejects(gateway.invoke('execution_continue', { ...request, input: { projectName: 'changed' }, clientRequestId: 'changed-recovery' }), /frozen input/);
 });
 
+test('review-only admission freezes the recovery request, survives restart and cannot reopen a closed parent', async t => {
+  const f = await fixture(t);
+  f.config.pptDelivery = { workspaceRoot: join(f.root, 'roles'), publicDirectory: join(f.root, 'public'),
+    publicBaseUrl: 'http://127.0.0.1:1/artifacts', allowedProjectRoots: [f.root], summaryTargetId: 'summary', makerTargetId: 'maker', reviewTargetId: 'review',
+    runtimeDocument: join(f.root, 'RUNTIME.md'), designSkill: join(f.root, 'SKILL.md'), pythonExecutable: '/usr/bin/python3' };
+  let gateway = f.gateway(); await new Promise(resolve => setTimeout(resolve, 30));
+  await gateway.invoke('execution_target_create', { targetId: 'delivery', kind: 'resident_agent', name: 'Delivery', connectionId: 'remote:local', enabled: true,
+    capabilities: { query: true, cancel: true, continue: true, reconcile: true }, binding: { cwd: f.root, agentPreset: 'standard', roleId: 'delivery', driver: 'ppt_delivery' } });
+  await gateway.invoke('execution_target_create', { targetId: 'codex-review', kind: 'resident_agent', name: 'Codex review', connectionId: 'remote:local', enabled: true,
+    binding: { cwd: f.root, agentPreset: 'codex', roleId: 'review' } });
+  const first = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'delivery', input: { projectDirectory: f.root, projectName: 'Project' } }) as any;
+  const internals = gateway as any, prior = internals.state.pptDeliveries.runs[first.attemptId];
+  prior.executionStatus = 'failed'; prior.stage = 'review'; prior.phase = 'failed'; prior.scriptDigest = 'b'.repeat(64); prior.sourceManifestDigest = 'c'.repeat(64);
+  prior.validation = { status: 'passed', artifactDigest: 'a'.repeat(64) };
+  prior.currentChild = { jobId: 'old-review', attemptId: 'old-review-attempt', executionStatus: 'failed', submissionStatus: 'accepted' };
+  internals.ledger.observe(first.attemptId, { executionStatus: 'failed', phase: 'failed' });
+  const frozen = structuredClone(prior), request = { originSessionId: 'root', jobId: first.jobId,
+    input: { recoveryMode: 'review_only', reviewTargetId: 'codex-review', sourceSnapshotDirectory: join(f.root, 'snapshot') }, clientRequestId: 'review-retry' };
+  await assert.rejects(gateway.invoke('execution_continue', { ...request, input: { ...request.input, projectName: 'changed' } }), /frozen input/);
+  await assert.rejects(gateway.invoke('execution_continue', { ...request, input: { ...request.input, reviewTargetId: 'missing' } }), /not found/);
+  const next = await gateway.invoke('execution_continue', request) as any;
+  assert.equal(next.jobId, first.jobId); assert.equal(next.attempts.length, 2); assert.equal(next.attempts[0].executionStatus, 'failed');
+  assert.notEqual(next.attemptId, first.attemptId); assert.deepEqual(internals.state.pptDeliveries.runs[first.attemptId], frozen);
+  const recovered = internals.state.pptDeliveries.runs[next.attemptId];
+  assert.equal(recovered.recovery.mode, 'review_only'); assert.equal(recovered.policy.reviewTargetId, 'codex-review');
+  assert.equal(recovered.recovery.artifactDigest, frozen.validation.artifactDigest);
+  assert.equal(recovered.currentChild, undefined); assert.equal(f.backend.runs.length, 0);
+  await assert.rejects(gateway.invoke('execution_continue', { ...request, input: { ...request.input, reviewTargetId: 'review' } }), /conflicts/);
+  await gateway.close(); gateway = f.gateway();
+  const replay = await gateway.invoke('execution_continue', request) as any;
+  assert.equal(replay.attemptId, next.attemptId); assert.equal(replay.attempts.length, 2);
+  await gateway.invoke('execution_cancel', { originSessionId: 'root', jobId: first.jobId });
+  await assert.rejects(gateway.invoke('execution_continue', { ...request, clientRequestId: 'after-close' }), /closing or closed/);
+  const closed = await gateway.invoke('execution_get', { originSessionId: 'root', jobId: first.jobId }) as any;
+  assert.equal(closed.attempts.length, 2); assert.equal(closed.cancellation.status, 'completed');
+});
+
 test('unified submit/get/list/events persist scope and IDs; replay does not create another backend run', async t => {
   const f = await fixture(t), gateway = f.gateway();
   const first = await gateway.invoke('execution_submit', { ...submit, clientRequestId: 'stable-submit' }) as any;

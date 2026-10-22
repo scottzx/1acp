@@ -18,8 +18,8 @@ import { a2aResultContractSchema } from './result-metadata.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
 import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput } from '../execution/ledger.js';
-import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema,
-  type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest } from '../execution/ppt-delivery.js';
+import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
+  type PptDeliveryRun, type PptDeliveryChild, type PptDeliveryChildRequest, type PptDeliveryRecoveryInput } from '../execution/ppt-delivery.js';
 export type { RemoteAgentNotice } from './notices.js';
 
 const string = z.string().trim().min(1).max(512);
@@ -76,7 +76,7 @@ const executionReviewSchema = executionJobSchema.extend({ attemptId: string, res
 const EXECUTION_METHODS = {
   ...TARGET_METHODS,
   execution_submit: { description: '向已登记目标提交任务；派发前持久保存jobId/attemptId和幂等请求。固定角色不接受cwd/preset覆盖。', parameters: z.toJSONSchema(executionSubmitSchema) },
-  execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知时禁止新派发。', parameters: z.toJSONSchema(executionContinueSchema) },
+  execution_continue: { description: '同任务显式继续或返工，新建执行轮次；旧终态不重新打开，受理未知/关闭时禁止新派发。PPT仅重试验收用input:{recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}，复用冻结成稿，不派制作。', parameters: z.toJSONSchema(executionContinueSchema) },
   execution_cancel: { description: '持久关闭任务并取消执行；PPT交付默认级联全部子任务，通用任务可显式cascade=true。未知受理或失联保留未决状态，确认全部停止后才完成关闭。', parameters: z.toJSONSchema(executionCancelSchema) },
   execution_get: { description: '读取任务、执行轮次、父子关系、交付阶段进度、已有产物及关闭回执；查询进度不唤醒主会话。在途/未决历史单列。', parameters: z.toJSONSchema(executionJobSchema) },
   execution_list: { description: '按来源范围、目标与状态分页列出统一任务。', parameters: z.toJSONSchema(executionListSchema) },
@@ -253,7 +253,7 @@ export class RemoteAgentGateway {
         sessionId: Task.fromJSON(raw.task).metadata?.['1agents']?.sessionId,
         resultMetadata: Task.fromJSON(raw.task).metadata?.['1agents']?.result } : {}) };
   }
-  private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
+  private async submitExecution(input: z.output<typeof executionSubmitSchema>, options: { jobId?: string; previous?: Job; deliveryRecovery?: PptDeliveryRun; deliveryRecoveryInput?: PptDeliveryRecoveryInput; notificationOrigin?: string; requestDigestInput?: unknown } = {}) {
     const replay = this.ledger.replay({ ...input, requestDigestInput: options.requestDigestInput, jobId: options.jobId, operation: options.jobId ? 'continue' : 'submit', targetSnapshot: { targetId: input.targetId } });
     if (replay) return { ...this.ledgerView(input.originSessionId, replay.job.jobId), attemptId: replay.attempt.attemptId, requestedAttempt: replay.attempt };
     this.assertDispatchOpen(input.originSessionId, options.jobId ?? input.parentJobRef?.jobId);
@@ -268,10 +268,10 @@ export class RemoteAgentGateway {
     let sent = false;
     try {
       if (resolved.target.binding.driver === 'ppt_delivery') {
-        if (options.jobId && !options.deliveryRecovery) throw new Error('PPT continuation requires an independently passed recovery checkpoint');
+        if (options.jobId && !options.deliveryRecovery) throw new Error('PPT continuation requires a verified recovery checkpoint');
         const roleInput = pptDeliveryInputSchema.parse(input.input);
         if (!this.config.pptDelivery) throw new Error('PPT delivery role policy is not configured');
-        const run = options.deliveryRecovery ? await recoverPptDeliveryRun(options.deliveryRecovery, attempt.attemptId)
+        const run = options.deliveryRecovery ? await recoverPptDeliveryRun(options.deliveryRecovery, attempt.attemptId, options.deliveryRecoveryInput)
           : await createPptDeliveryRun({ sourceId: this.ledger.sourceId, jobId: job.jobId, attemptId: attempt.attemptId,
             originSessionId: input.originSessionId, input: roleInput, policy: this.config.pptDelivery });
         this.state.pptDeliveries.runs[attempt.attemptId] = run;
@@ -704,9 +704,20 @@ export class RemoteAgentGateway {
       if (job.unresolvedAttemptIds.length) throw new Error('Job has submission_unknown or unresolved attempts; reconcile before continuing');
       const delivery = this.state.pptDeliveries.runs[attempt.attemptId];
       if (delivery) {
-        if (Object.keys(input.input).length) throw new Error('PPT checkpoint recovery preserves the frozen input; use an empty input object');
+        this.assertDispatchOpen(input.originSessionId, job.jobId);
+        const recovery = Object.keys(input.input).length ? pptDeliveryRecoveryInputSchema.safeParse(input.input) : undefined;
+        if (recovery && !recovery.success) throw new Error('PPT recovery preserves the frozen input; use {} or {recoveryMode:"review_only",reviewTargetId,sourceSnapshotDirectory?}');
+        const recoveryInput = recovery?.data;
         if (job.inFlightAttemptIds.length) throw new Error('PPT parent still has in-flight execution rounds');
-        assertPptDeliveryRecoverable(delivery);
+        assertPptDeliveryRecoverable(delivery, recoveryInput);
+        if (recoveryInput) {
+          for (const childId of this.cancellationJobs(input.originSessionId, job.jobId, true)) {
+            const child = this.ledger.get(input.originSessionId, childId);
+            if (child.inFlightAttemptIds.length || child.unresolvedAttemptIds.length) throw new Error('PPT recovery has unresolved or running descendants');
+          }
+          const reviewer = this.targets.resolve(recoveryInput.reviewTargetId, { prompt: 'Independent review recovery preflight' });
+          if (reviewer.target.binding.driver === 'ppt_delivery') throw new Error('Independent reviewer must be an A2A execution target');
+        }
         const current = this.targets.resolve(job.targetId, attempt.input as Record<string, unknown>);
         if (!current.target.capabilities?.continue) throw new Error('PPT target does not enable checkpoint continuation');
         const snapshot = attempt.targetSnapshot;
@@ -715,7 +726,7 @@ export class RemoteAgentGateway {
             || current.target.binding.driver !== 'ppt_delivery') throw new Error('PPT checkpoint recovery cannot change its host or role');
         return this.submitExecution({ originSessionId: input.originSessionId, targetId: job.targetId, title: job.title,
           input: attempt.input as Record<string, unknown>, clientRequestId: input.clientRequestId },
-          { jobId: job.jobId, deliveryRecovery: delivery, requestDigestInput: input.input });
+          { jobId: job.jobId, deliveryRecovery: delivery, deliveryRecoveryInput: recoveryInput, requestDigestInput: input.input });
       }
       const previous = this.state.jobs.find(item => item.attemptId === attempt.attemptId);
       if (!previous) throw new Error('Continue is unsupported for this provider');
