@@ -45,6 +45,10 @@ acp-service --skill install acp-service --agent codex --scope repo
 
 `--skill` 同时保留内嵌 runtime 的 `acpx` 技能。`acp-service` **不带参数会启动 ACP 常驻服务**；查看帮助要显式传 `--help`。
 
+## 异步调用纪律
+
+开发、部署与回归先独立完成。日常派单使用 [通知驱动调用入口](references/async-caller.md)：提交并保存回执后必须立即结束本轮；只有实际通知唤醒后才单次读取回执、记录结论、ack 并答复。禁止主会话主动轮询 get/list/inbox、sleep/wait 等完成、读取子会话日志/进程，或重复文件/hash/图像/事实验收。用户明确要求单次查询/取消时只执行该动作；受理未知不自动重派。此纪律限定主会话调用，不关闭后台网关的状态核对能力。
+
 ## 远端任务的最短工作流
 
 如果宿主已有 DreamMate 工具，检索服务 `a2a-gateway`，按需查看方法契约，再通过 `dreammate_invoke` 调用。没有 DreamMate 时，使用同名 CLI `a2a invoke`；两者调用同一个 gateway。
@@ -52,8 +56,8 @@ acp-service --skill install acp-service --agent codex --scope repo
 1. 取得当前主会话的稳定 ID，作为 `originSessionId`；保留真实会话归属，不使用每次随机生成的 ID。
    如需自动回投，先将该 ID 用 `session_bind` 绑定到已配置宿主和真实原会话 ID；未绑定时保留原收件箱/webhook 路径。
 2. 明确远端节点名、远端绝对目录、预设和完整任务说明。远端会话不会自动继承主会话上下文。
-3. 调用 `remote_agent_spawn`，记录返回的 `taskId`、`contextId`、`sessionId` 和实际 `agentPreset`。取到 ID 只表示已受理；仍要检查状态和结果。
-4. 查询 `remote_agent_get` 或读取 `remote_agent_inbox`。处理报告或所需输入后，按 `noticeId` 调用 `remote_agent_ack`。读取通知本身不会删除或确认它。
+3. 调用已登记目标的 `execution_submit`（或兼容 `remote_agent_spawn`），保存 job/attempt/task/context/session 与实际预设；受理不等于完成。随后立即结束本轮。
+4. 真实通知唤醒后，只读取一次交付回执及新报告，核对身份与版本绑定，保存处理结论，再 ack。独立角色的验收不由主会话重复执行。
 5. 要继续同一远端会话，使用 `remote_agent_message`；需要全新上下文则再次 spawn。取消时传入准确的任务 ID。
 
 ```json

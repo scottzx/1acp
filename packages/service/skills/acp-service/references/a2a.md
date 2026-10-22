@@ -1,5 +1,9 @@
 # A2A 调度、查询与完成通知
 
+## 默认调用边界
+
+日常主会话按 [通知驱动调用](async-caller.md) 执行：开发部署先完成，派单保存回执后立即结束本轮；实际通知唤醒后只读一次回执/新报告、保存结论并 ack。以下 get/list/inbox 示例是接口说明，只用于真实通知后的单次读取或用户明确要求的单次状态查询，不能组成主会话轮询。后台网关核对照常运行，主会话不读子日志、不等待、不重复产物验收。
+
 ## 链路与入口
 
 ```text
@@ -119,7 +123,7 @@ JSON
 
 ## 原会话排队投递（本次新增）
 
-这是本次源码新增的可选 gateway 能力，尚未实际部署，也未用真实会话发送消息。旧部署必须先更新并核对工具契约；没有 `sessionHosts` 和绑定时，既有七个任务工具、webhook 和收件箱行为保持兼容。
+这是可选 gateway 能力。以当前安装的方法契约和真实绑定为准；没有 `sessionHosts` 和绑定时保留原收件箱/webhook 路径。普通 MCP 连接本身不证明可自动唤醒。
 
 gateway 配置中的 `sessionHosts` 按名称定义宿主。`kind: "codex"` 使用原生 `codex queue --thread=<UUID> --message=<原文>`，可配置 `executable`、`remote`、`cwd`、`timeoutMs` 和 `remoteAuthTokenEnv`；进程参数不经 shell。`kind: "dsh"` 使用宿主 origin 的 `/api/session/prompt`，按其 Web Remote envelope 发送 `mode: "queue"` 和稳定 requestId，可配置 `url`、`headers`、`timeoutMs`。这条路径直接使用已有宿主队列，无需另设通知 receiver。
 
