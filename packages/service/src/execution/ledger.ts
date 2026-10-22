@@ -25,6 +25,8 @@ export interface LedgerResult {
   resultDigest?: string;
   resultRevision?: string;
   artifactLinks: unknown[];
+  /** Artifact byte receipts supplied by the execution host, when available. */
+  resultArtifacts?: unknown[];
   resultAvailable: boolean;
   observedAt: string;
 }
@@ -38,7 +40,7 @@ export interface LedgerAttempt {
   provider: string; targetSnapshot: LedgerTargetSnapshot; input: unknown; previousAttemptId?: string;
   backendRunRef?: BackendRunRef; submissionStatus: SubmissionStatus; executionStatus: ExecutionStatus;
   providerState?: string; phase?: string; cancellationRequestedAt?: string; checkedAt?: string; stale: boolean;
-  createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult;
+  createdAt: string | null; updatedAt: string; diagnostic?: string; result?: LedgerResult; resultHistory?: LedgerResult[];
 }
 export interface LedgerJob {
   sourceId: string; jobId: string; title?: string; originSessionId: string; accessScopeRef: string;
@@ -67,7 +69,7 @@ export interface LedgerPrepareInput {
 export interface LedgerObservation {
   executionStatus?: ExecutionStatus; providerState?: string; phase?: string; checkedAt?: string; stale?: boolean;
   resultSummary?: string; structuredResultRef?: unknown; resultDigest?: string; resultRevision?: string;
-  artifactLinks?: unknown[]; resultAvailable?: boolean; diagnostic?: string;
+  artifactLinks?: unknown[]; resultArtifacts?: unknown[]; resultAvailable?: boolean; diagnostic?: string;
 }
 export interface LegacyLedgerRecord {
   originSessionId: string; remote: string; taskId: string; contextId?: string; sessionId?: string;
@@ -76,7 +78,7 @@ export interface LegacyLedgerRecord {
   targetSnapshot?: LedgerTargetSnapshot;
 }
 export interface LedgerJobView extends LedgerJob {
-  attempts: LedgerAttempt[]; children: LedgerJob[]; result?: LedgerResult;
+  attempts: LedgerAttempt[]; children: LedgerJob[]; result?: LedgerResult; resultHistory: LedgerResult[];
   businessAcceptance?: BusinessAcceptance; acceptanceHistory: BusinessAcceptance[];
 }
 
@@ -84,6 +86,8 @@ const terminal = new Set<ExecutionStatus>(['completed', 'failed', 'canceled', 'r
 const statuses = new Set<ExecutionStatus>(['not_started', 'submitted', 'working', 'input_required', 'auth_required', 'completed', 'failed', 'canceled', 'rejected', 'unknown']);
 const clone = <T>(value: T): T => structuredClone(value);
 const now = () => new Date().toISOString();
+const resultContent = (result: LedgerResult) => canonical({ resultSummary: result.resultSummary,
+  structuredResultRef: result.structuredResultRef, artifactLinks: result.artifactLinks, resultArtifacts: result.resultArtifacts ?? [] });
 function nonempty(value: unknown, name: string): asserts value is string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} must be a nonempty string`);
 }
@@ -287,7 +291,7 @@ export class JobLedger {
     });
   }
   private applyObservation(attempt: LedgerAttempt, input: LedgerObservation): boolean {
-    const timestamp = input.checkedAt ?? now(); let conflict = false;
+    const timestamp = input.checkedAt ?? now(), completedBefore = attempt.executionStatus === 'completed'; let conflict = false;
     if (input.executionStatus !== undefined) {
       if (!statuses.has(input.executionStatus)) throw new Error('Unknown execution status');
       const previous = attempt.executionStatus, next = input.executionStatus;
@@ -301,14 +305,36 @@ export class JobLedger {
     if (input.diagnostic !== undefined && !conflict) attempt.diagnostic = input.diagnostic;
     attempt.stale = input.stale ?? false; attempt.checkedAt = timestamp; attempt.updatedAt = timestamp;
     if (!conflict && (input.resultSummary !== undefined || input.structuredResultRef !== undefined || input.resultDigest !== undefined
-      || input.artifactLinks !== undefined || input.resultAvailable !== undefined || input.resultRevision !== undefined)) {
+      || input.artifactLinks !== undefined || input.resultArtifacts !== undefined || input.resultAvailable !== undefined || input.resultRevision !== undefined)) {
       const previous = attempt.result;
-      attempt.result = { ...previous, attemptId: attempt.attemptId, artifactLinks: clone(input.artifactLinks ?? previous?.artifactLinks ?? []),
+      const result: LedgerResult = { ...previous, attemptId: attempt.attemptId, artifactLinks: clone(input.artifactLinks ?? previous?.artifactLinks ?? []),
         resultAvailable: input.resultAvailable ?? previous?.resultAvailable ?? true, observedAt: timestamp,
         ...(input.resultSummary !== undefined ? { resultSummary: input.resultSummary } : {}),
         ...(input.structuredResultRef !== undefined ? { structuredResultRef: clone(input.structuredResultRef) } : {}),
+        ...(input.resultArtifacts !== undefined ? { resultArtifacts: clone(input.resultArtifacts) } : {}),
         ...(input.resultDigest !== undefined ? { resultDigest: input.resultDigest } : {}),
         ...(input.resultRevision !== undefined ? { resultRevision: input.resultRevision } : {}) };
+      if (attempt.executionStatus === 'completed' && result.resultAvailable) {
+        if (input.resultRevision !== undefined) nonempty(input.resultRevision, 'resultRevision');
+        const content = resultContent(result), unchanged = previous && resultContent(previous) === content;
+        result.resultDigest = input.resultDigest ?? (unchanged ? previous.resultDigest : undefined)
+          ?? createHash('sha256').update(content).digest('hex');
+        nonempty(result.resultDigest, 'resultDigest');
+        const history = attempt.resultHistory ??= [];
+        if (!history.length && completedBefore && previous?.resultRevision && previous.resultDigest) history.push(clone(previous));
+        result.resultRevision = input.resultRevision ?? (unchanged && previous.resultDigest === result.resultDigest ? previous.resultRevision : undefined);
+        if (!result.resultRevision) {
+          let sequence = history.length + 1;
+          while (history.some(item => item.resultRevision === `result-${sequence}`)) sequence++;
+          result.resultRevision = `result-${sequence}`;
+        }
+        nonempty(result.resultRevision, 'resultRevision');
+        const existing = history.find(item => item.resultRevision === result.resultRevision);
+        if (existing && (existing.resultDigest !== result.resultDigest || resultContent(existing) !== content
+          || previous?.resultRevision !== result.resultRevision)) throw new Error('A result revision cannot be overwritten or reused after supersession');
+        if (!existing) history.push(clone(result));
+      }
+      attempt.result = result;
     }
     return conflict;
   }
@@ -321,7 +347,9 @@ export class JobLedger {
       const relevant = (item: LedgerAttempt) => ({ status: item.executionStatus, providerState: item.providerState, phase: item.phase, stale: item.stale,
         diagnostic: item.diagnostic, result: item.result ? { ...item.result, observedAt: undefined } : undefined });
       if (canonical(relevant(previous)) !== canonical(relevant(attempt))) this.event(state, state.jobs[attempt.jobId]!, attemptId,
-        conflict ? 'attempt.observation_conflict' : previous.executionStatus !== attempt.executionStatus ? 'attempt.state_changed' : 'attempt.result_updated');
+        conflict ? 'attempt.observation_conflict' : previous.executionStatus !== attempt.executionStatus ? 'attempt.state_changed' : 'attempt.result_updated',
+        attempt.result?.resultRevision && previous.result?.resultRevision !== attempt.result.resultRevision
+          ? { resultRevision: attempt.result.resultRevision, resultDigest: attempt.result.resultDigest, previousResultRevision: previous.result?.resultRevision } : undefined);
       return attempt;
     });
   }
@@ -337,11 +365,12 @@ export class JobLedger {
   get(originSessionId: string, jobId: string): LedgerJobView {
     const job = this.job(this.state, originSessionId, jobId), current = this.state.attempts[job.currentAttemptId]!;
     const history = this.state.acceptances[jobId] ?? [];
-    const acceptance = [...history].reverse().find(item => item.attemptId === current.attemptId
+    const acceptance = current.executionStatus === 'completed' && current.result?.resultAvailable && [...history].reverse().find(item => item.attemptId === current.attemptId
       && item.resultRevision === current.result?.resultRevision && item.resultDigest === current.result?.resultDigest);
     return clone({ ...job, attempts: Object.values(this.state.attempts).filter(item => item.jobId === jobId),
       children: Object.values(this.state.jobs).filter(item => item.parentJobRef?.sourceId === this.sourceId && item.parentJobRef.jobId === jobId),
-      ...(current.result ? { result: current.result } : {}), ...(acceptance ? { businessAcceptance: acceptance } : {}), acceptanceHistory: history });
+      ...(current.result ? { result: current.result } : {}), resultHistory: current.resultHistory ?? [],
+      ...(acceptance ? { businessAcceptance: acceptance } : {}), acceptanceHistory: history });
   }
   list(originSessionId: string): LedgerJobView[] {
     return Object.values(this.state.jobs).filter(job => job.originSessionId === originSessionId).map(job => this.get(originSessionId, job.jobId));
@@ -360,7 +389,8 @@ export class JobLedger {
   acceptance(originSessionId: string, jobId: string, input: Omit<BusinessAcceptance, 'recordedAt'>): BusinessAcceptance {
     return this.mutate(state => {
       const job = this.job(state, originSessionId, jobId), attempt = this.attempt(state, input.attemptId);
-      if (attempt.jobId !== jobId || attempt.executionStatus !== 'completed') throw new Error('Acceptance must reference a completed attempt of this job');
+      if (attempt.jobId !== jobId || attempt.attemptId !== job.currentAttemptId || attempt.executionStatus !== 'completed' || !attempt.result?.resultAvailable)
+        throw new Error('Acceptance must reference the current completed attempt with an available result');
       nonempty(input.resultRevision, 'resultRevision'); nonempty(input.resultDigest, 'resultDigest');
       if (attempt.result?.resultRevision !== input.resultRevision || attempt.result?.resultDigest !== input.resultDigest) throw new Error('Acceptance does not match the recorded result revision and digest');
       if (!['pending', 'accepted', 'changes_requested'].includes(input.reviewStatus)) throw new Error('Unknown business acceptance status');

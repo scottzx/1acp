@@ -163,6 +163,70 @@ test('unified submit/get/list/events persist scope and IDs; replay does not crea
   assert.equal(persisted.jobs[0].ledgerJobId, first.jobId); assert.equal(persisted.jobs[0].attemptId, first.attemptId);
 });
 
+test('generic resident results support version-bound review, stable reads and restart, and reject review of a superseded attempt', async t => {
+  const f = await fixture(t); let gateway = f.gateway();
+  await gateway.invoke('execution_target_create', { targetId: 'editor', kind: 'resident_agent', name: 'Editor', connectionId: 'remote:local',
+    binding: { cwd: '/project', agentPreset: 'standard', roleId: 'editor' } });
+  const first = await gateway.invoke('execution_submit', { originSessionId: 'root', targetId: 'editor', input: { prompt: 'create package' } }) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'package v1' });
+  const query = { originSessionId: 'root', jobId: first.jobId };
+  const completed = await until(() => gateway.invoke('execution_get', query) as Promise<any>, item => item.executionStatus === 'completed');
+  assert.equal(completed.resultRevision, 'result-1'); assert.match(completed.resultDigest, /^[a-f0-9]{64}$/);
+  assert.equal(completed.resultHistory.length, 1);
+  const review = { ...query, attemptId: first.attemptId, resultRevision: completed.resultRevision, resultDigest: completed.resultDigest, reviewStatus: 'accepted' };
+  await gateway.invoke('execution_review', review);
+  const repeated = await gateway.invoke('execution_get', query) as any;
+  assert.equal(repeated.resultDigest, completed.resultDigest); assert.equal(repeated.resultRevision, completed.resultRevision);
+  assert.equal(repeated.resultHistory.length, 1); assert.equal(repeated.businessAcceptance.reviewStatus, 'accepted');
+  const raw = await gateway.invoke('remote_agent_get', { originSessionId: 'root', remote: 'local', taskId: first.taskId }) as any;
+  assert.equal(raw.resultDigest, completed.resultDigest); assert.equal(raw.resultRevision, completed.resultRevision);
+  const inbox = await gateway.invoke('remote_agent_inbox', { originSessionId: 'root' }) as any;
+  assert.equal(inbox.notices.length, 1);
+  await gateway.invoke('remote_agent_ack', { originSessionId: 'root', noticeId: inbox.notices[0].noticeId });
+  assert.equal((await gateway.invoke('execution_get', query) as any).businessAcceptance.reviewStatus, 'accepted');
+  await gateway.close(); gateway = f.gateway();
+  const restored = await gateway.invoke('execution_get', query) as any;
+  assert.deepEqual(restored.resultHistory, completed.resultHistory); assert.equal(restored.businessAcceptance.reviewStatus, 'accepted');
+  assert.deepEqual(await gateway.invoke('remote_agent_inbox', { originSessionId: 'root' }), { notices: [] });
+  const next = await gateway.invoke('execution_continue', { ...query, input: { prompt: 'create v2' } }) as any;
+  assert.notEqual(next.attemptId, first.attemptId); assert.equal(next.businessAcceptance, undefined); assert.deepEqual(next.resultHistory, []);
+  await assert.rejects(gateway.invoke('execution_review', review), /current completed attempt/);
+  await until(async () => f.backend.runs.length, count => count === 2);
+  f.backend.runs[1]!.finish({ outcome: 'completed', text: 'package v2' });
+  const revised = await until(() => gateway.invoke('execution_get', query) as Promise<any>, item => item.executionStatus === 'completed');
+  assert.notEqual(revised.resultDigest, completed.resultDigest); assert.equal(revised.businessAcceptance, undefined);
+  assert.deepEqual(revised.attempts[0].resultHistory, completed.resultHistory); assert.equal(revised.acceptanceHistory.length, 1);
+});
+
+test('cached completed results missing versions are upgraded offline without new tasks, notices or automatic acceptance', async t => {
+  const f = await fixture(t), gateway = f.gateway();
+  const first = await gateway.invoke('execution_submit', submit) as any;
+  await until(async () => f.backend.runs.length, count => count === 1);
+  f.backend.runs[0]!.finish({ outcome: 'completed', text: 'saved result' });
+  const query = { originSessionId: 'root', jobId: first.jobId };
+  const completed = await until(() => gateway.invoke('execution_get', query) as Promise<any>, item => item.executionStatus === 'completed');
+  const inbox = await gateway.invoke('remote_agent_inbox', { originSessionId: 'root' }) as any;
+  await gateway.invoke('remote_agent_ack', { originSessionId: 'root', noticeId: inbox.notices[0].noticeId });
+  await gateway.close();
+  const filename = join(f.stateDirectory, 'gateway.json'), state = JSON.parse(await readFile(filename, 'utf8'));
+  const attempt = state.ledger.attempts[first.attemptId];
+  delete attempt.result.resultRevision; delete attempt.result.resultDigest; delete attempt.result.resultArtifacts; delete attempt.resultHistory;
+  await writeFile(filename, JSON.stringify(state));
+  f.config.remotes.local!.url = 'http://127.0.0.1:1';
+  const restored = f.gateway();
+  const list = await restored.invoke('execution_list', { originSessionId: 'root' }) as any;
+  const upgraded = list.jobs[0];
+  assert.equal(upgraded.sourceId, completed.sourceId); assert.equal(upgraded.jobId, first.jobId);
+  assert.equal(upgraded.currentAttemptId, first.attemptId); assert.equal(upgraded.result.resultRevision, completed.resultRevision);
+  assert.equal(upgraded.result.resultDigest, completed.resultDigest); assert.equal(upgraded.resultHistory.length, 1);
+  assert.equal(upgraded.businessAcceptance, undefined); assert.equal(f.backend.runs.length, 1);
+  assert.deepEqual(await restored.invoke('remote_agent_inbox', { originSessionId: 'root' }), { notices: [] });
+  await restored.close();
+  const again = f.gateway();
+  assert.deepEqual(await again.invoke('execution_list', { originSessionId: 'root' }), list);
+});
+
 test('legacy spawn fields remain compatible and message creates a new attempt in the same job and session', async t => {
   const f = await fixture(t), gateway = f.gateway();
   const first = await gateway.invoke('remote_agent_spawn', { ...rawSpawn, clientRequestId: 'raw-submit' }) as any;

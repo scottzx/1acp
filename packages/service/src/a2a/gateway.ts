@@ -14,10 +14,10 @@ import { sessionHostSchema } from './session-hosts.js';
 import { SessionDelivery, sessionBindSchema, sessionSendSchema, sessionMessageSchema, sessionResolveSchema } from './session-delivery.js';
 import { artifactLinks, formatNotice, type RemoteAgentNotice } from './notices.js';
 import { a2aPreflightInputSchema, a2aPreflightRequirementsSchema, a2aPreflightReportSchema } from './preflight.js';
-import { a2aResultContractSchema } from './result-metadata.js';
+import { a2aResultContractSchema, type A2AResultMetadata } from './result-metadata.js';
 import { TargetDirectory, TARGET_METHODS, type ExecutionTargetSnapshot } from '../execution/targets.js';
 import { deliveryProgress, deliveryException } from '../execution/delivery-progress.js';
-import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput } from '../execution/ledger.js';
+import { JobLedger, type LedgerState, type ExecutionStatus, type LedgerPrepareInput, type LedgerObservation } from '../execution/ledger.js';
 import { decideHumanReview, HumanReviewError, humanReviewDecisionSchema } from '../execution/human-review.js';
 import { workbenchSnapshot, listWorkbenchTasks, getWorkbenchTask, type WorkbenchListQuery } from '../execution/workbench.js';
 import { createPptDeliveryRun, recoverPptDeliveryRun, assertPptDeliveryRecoverable, advancePptDelivery, pptDeliveryInputSchema, pptDeliveryPolicySchema, pptDeliveryRecoveryInputSchema,
@@ -211,6 +211,12 @@ export class RemoteAgentGateway {
       for (const job of this.state.jobs) {
         const migrated = this.ledger.findByBackend(job.originSessionId, { remote: job.remote, taskId: job.taskId });
         if (!job.ledgerJobId && migrated) { job.ledgerJobId = migrated.job.jobId; job.attemptId = migrated.attempt.attemptId; }
+        // Upgrade cached completed results without contacting the host, dispatching work or creating notices.
+        if (job.attemptId && taskState(job) === 'TASK_STATE_COMPLETED') {
+          const attempt = this.ledger.getAttempt(job.attemptId);
+          if (!attempt.result?.resultRevision || !attempt.result.resultDigest) this.ledger.observe(job.attemptId,
+            { ...this.resultObservation(Task.fromJSON(job.task)), checkedAt: job.checkedAt, stale: job.stale ?? false });
+        }
       }
       this.state.ledger = this.ledger.snapshot(); this.state.version = 2;
       this.state.executionNotices ??= [];
@@ -605,11 +611,19 @@ export class RemoteAgentGateway {
   }
   private view(job: Job) {
     const task = Task.fromJSON(job.task);
+    const result = job.attemptId ? this.ledger.getAttempt(job.attemptId).result : undefined;
     return { remote: job.remote, taskId: job.taskId, contextId: job.contextId, originSessionId: job.originSessionId,
       ...(job.ledgerJobId ? { jobId: job.ledgerJobId, attemptId: job.attemptId, sourceId: this.ledger.sourceId } : {}),
       cwd: job.cwd, agentPreset: job.agentPreset, sessionId: task.metadata?.['1agents']?.sessionId,
       preflight: task.metadata?.['1agents']?.preflight, resultMetadata: task.metadata?.['1agents']?.result,
+      resultRevision: result?.resultRevision, resultDigest: result?.resultDigest,
       state: taskState(job), result: resultText(task), artifactLinks: artifactLinks(task), checkedAt: job.checkedAt, stale: Boolean(job.stale) };
+  }
+  private resultObservation(task: Task): LedgerObservation {
+    const metadata = task.metadata?.['1agents']?.result as A2AResultMetadata | undefined;
+    return { executionStatus: this.standardState(wire(task).status?.state), providerState: wire(task).status?.state,
+      resultSummary: resultText(task), artifactLinks: artifactLinks(task),
+      resultArtifacts: metadata?.artifacts ?? [], ...(metadata?.recordPath ? { structuredResultRef: metadata.recordPath } : {}) };
   }
   private accept(task: Task, fields: Omit<Job, 'task' | 'taskId' | 'contextId' | 'checkedAt'>): Job {
     const target = task.metadata?.['1agents'] as Record<string, unknown> | undefined;
@@ -636,10 +650,7 @@ export class RemoteAgentGateway {
           ...(artifactLinks(task).length ? { artifactLinks: artifactLinks(task) } : {}), createdAt: new Date().toISOString() } });
     }
     if (job.attemptId) {
-      const metadata = task.metadata?.['1agents']?.result as any;
-      const observed = { executionStatus: this.standardState(state), providerState: state, stale: false,
-        resultSummary: resultText(task), artifactLinks: artifactLinks(task),
-        ...(metadata ? { structuredResultRef: metadata.recordPath } : {}) };
+      const observed = { ...this.resultObservation(task), stale: false };
       if (this.ledger.getAttempt(job.attemptId).submissionStatus !== 'accepted') this.ledger.accept(job.attemptId,
         { provider: 'a2a', remote: job.remote, endpoint: job.remoteEndpoint, taskId: task.id, contextId: task.contextId, sessionId: task.metadata?.['1agents']?.sessionId }, observed);
       else this.ledger.observe(job.attemptId, observed);

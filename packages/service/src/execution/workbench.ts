@@ -125,7 +125,11 @@ function attemptView(attempt: LedgerAttempt, workflow = false): WorkbenchAttempt
   const { input: _input, targetSnapshot: _snapshot, backendRunRef, ...view } = structuredClone(attempt);
   const refs: Record<string, string> = {};
   for (const key of ['provider', 'remote', 'taskId', 'contextId', 'sessionId', 'flowRunId', 'runId']) if (typeof backendRunRef?.[key] === 'string') refs[key] = backendRunRef[key];
-  if (view.result) { view.result.artifactLinks = view.result.artifactLinks.map(safeArtifact).filter(item => item !== undefined); delete view.result.structuredResultRef; }
+  for (const result of [view.result, ...view.resultHistory ?? []]) if (result) {
+    result.artifactLinks = result.artifactLinks.map(safeArtifact).filter(item => item !== undefined);
+    if (result.resultArtifacts) result.resultArtifacts = result.resultArtifacts.map(safeArtifact).filter(item => item !== undefined);
+    delete result.structuredResultRef;
+  }
   return { ...view, ...(Object.keys(refs).length ? { backendRunRef: refs } : {}), execution: executionView(attempt, attempt.targetId, workflow) };
 }
 function eventView(event: LedgerEvent): LedgerEvent {
