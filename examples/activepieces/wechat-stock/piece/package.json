@@ -1,0 +1,13 @@
+{
+  "name": "@1agents/piece-wechat-stock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Restricted AP actions for the 30-minute WeChat reserve stock workflow.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": { "build": "tsc -p tsconfig.json" },
+  "dependencies": { "@activepieces/pieces-framework": "0.32.0" },
+  "devDependencies": { "@types/node": "22.10.2", "typescript": "5.7.2" }
+}

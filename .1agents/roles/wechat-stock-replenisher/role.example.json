@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "recordType": "reactive-role-profile",
+  "roleId": "wechat-stock-replenisher",
+  "displayName": "公众号补库专员",
+  "version": "0.1.0",
+  "instructionsPath": "ROLE.md",
+  "executionMode": "activepieces-reactive-workflow",
+  "status": "configuration-example-disabled",
+  "productionEnabled": false,
+  "policy": {
+    "lowWatermark": 10,
+    "targetStock": 15,
+    "maxConcurrent": 1,
+    "checkIntervalMs": 1800000
+  },
+  "binding": {
+    "activepiecesNode": "scott-pc-wsl",
+    "activepiecesFlowId": null,
+    "accountId": null,
+    "scopeId": "reserve-pool:wechat-report",
+    "snapshotAdapter": "examples/activepieces/wechat-stock/adapter.mjs",
+    "claimAdapter": "examples/activepieces/wechat-stock/bridge.mjs",
+    "ingestAdapter": "examples/activepieces/wechat-stock/adapter.mjs",
+    "productionTargetId": "wechat-series-editor"
+  },
+  "implementation": {
+    "policyModule": "examples/activepieces/wechat-stock/policy.mjs",
+    "flowBuilder": "examples/activepieces/wechat-stock/production-flow.mjs",
+    "configExample": ".1agents/config/wechat-stock.example.json",
+    "runtimeRoot": ".1agents/runtime/wechat-stock-replenisher"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "host": "100.0.0.1",
+  "port": 36816,
+  "token": "REPLACE_WITH_PRIVATE_RANDOM_64_HEX_TOKEN",
+  "gatewayUrl": "http://127.0.0.1:36814",
+  "workbenchRoot": "/absolute/project/工作台",
+  "workbenchHome": "/absolute/private/boss-ip",
+  "jobRoot": "/absolute/project/.1agents/runtime/wechat-series-editor/jobs",
+  "artifactRoot": "/absolute/1acp/.1agents/runtime/wechat-stock-replenisher/artifacts",
+  "stateDirectory": "/absolute/1acp/.1agents/runtime/wechat-stock-replenisher/state",
+  "seriesPath": "/absolute/project/工作台/roles/wechat-series-editor/series.json",
+  "publicBaseUrl": "http://100.0.0.1:36816",
+  "accountId": null,
+  "approvalRef": "REPLACE_WITH_EXPLICIT_ORIGINAL_PACKAGING_AUTHORIZATION",
+  "policy": {
+    "policyId": "wechat-report-stock-v1",
+    "scopeId": "reserve-pool:wechat-report",
+    "enabled": false,
+    "paused": false,
+    "lowWatermark": 10,
+    "targetStock": 15,
+    "maxConcurrent": 1,
+    "checkIntervalMs": 1800000
+  },
+  "catalog": [],
+  "seeds": []
+}

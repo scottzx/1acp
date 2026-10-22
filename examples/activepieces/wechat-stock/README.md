@@ -1,0 +1,68 @@
+# AP 公众号候补内容补库
+
+AP 每 30 分钟读取真实飞书工作台，执行固定条件流程：可发布库存少于 10 篇启动，逐篇补到 15 篇；待审和在途占位，最多一个在途制作。公众号暂留空，使用独立的候补内容池。已定稿报告按原文直接封装，成品必须人工审核。
+
+[角色声明](../../../.1agents/roles/wechat-stock-replenisher/ROLE.md) · [配置示例](../../../.1agents/config/wechat-stock.example.json) · [部署与验收](../../../docs/wechat-stock-replenishment-implementation-20261023.md)
+
+## 分工与入口
+
+```mermaid
+flowchart LR
+  AP[AP 每30分钟] --> Observe[Piece observe_stock]
+  Observe --> Facts[受限桥接：同步飞书并恢复原结果]
+  Observe --> Rule[CODE：纯规则]
+  Rule --> Apply[Piece apply_stock_advice]
+  Apply --> Claim[原子保存动作与冻结输入]
+  Claim --> ACP[1ACP execution_submit]
+  ACP --> Editor[已有公众号系列编辑]
+  Editor --> Result[下次观察核对交付与版本]
+  Result --> Asset[幂等登记成品待审]
+  Asset --> Human[人工审核]
+```
+
+| 文件 | 职责 |
+| --- | --- |
+| `policy.mjs` | 无 I/O 的库存规则，同一函数用于 Node 与 AP CODE |
+| `bridge.mjs` | 持久间隔、批次、串行领取、受理未知与原写回恢复；没有自主定时器 |
+| `adapter.mjs` | 真实工作台刷新、固定目标调用、系统文件回执与技能锁核对、待审成品登记、技术接受和通知确认 |
+| `server.mjs` | 独立密钥保护的 `/observe`、`/apply`、`/status`，及经核验文件的只读预览 |
+| `catalog.mjs` | 从三册正式目录冻结篇目、顺序、原文 SHA256 与前后篇链接，排除备份、目录页和重复入口 |
+| `production-flow.mjs` | 正式 AP 三步草稿构建器；使用加密连接，CODE 不联网 |
+| `piece/` | 私有组件 `@1agents/piece-wechat-stock`，凭据不进入流程 JSON 或动作输出 |
+| `flow.mjs`、`scenarios.mjs` | 保留的明确模拟规则演练，不能作为生产接入证据 |
+
+桥接只向本机现有网关 `/invoke` 发送内部构造的固定业务请求，不对网络开放通用 `/invoke` 或目标管理。1ACP 核心 API、原有宿主、模型策略、任务锁及既有 AP 验证流程均无需修改。
+
+## 状态和防重复
+
+`R` 为当前版本人工通过且未发布的本池成品，`P` 为已登记待审，`A` 为已领取、制作中、受理待核对或原写回待确认。`E=R+P+A` 达到 15 时停产等待审核，`R` 达到 15 才结束批次。已发布或已下架篇目不自动回库。没有活动批次时，恰好 10 篇等待；已启动批次跨回 10 篇仍补到 15。
+
+稳定动作键由规则、内容池、篇目、源文件 SHA256、显式修订号产生，不使用 AP 运行 ID 或当前时间。完整请求和占位先原子落盘，再提交网关；崩溃或受理响应丢失只重放原幂等请求。完成后先冻结核验文件和登记同一成品，最后技术接受并确认原通知。写回不确定时保留原占位，不新建另一篇或另一个成品。
+
+宿主回执必须绑定真实 Job/Attempt/Task、角色和任务技能锁。既有 `resultContract.jobId` 按现有契约保存稳定业务合同 ID；真实账本 Job/Attempt 另存，二者不混用。历史首期的 `article_sha256` 绑定 `article.wechat.html`，校验兼容该明确摘要；新合同要求 `article_file` 显式标注。
+
+受理或状态异常、交付不合格、人工退回、版本冲突均阻止新制作。普通来源读取失败记为未知，不按零库存继续。后台只在 AP 请求时推进有限事务，不常驻模型，不等待单次制作完成。
+
+## 本地验证
+
+```sh
+node --test examples/activepieces/wechat-stock/*.test.mjs
+cd examples/activepieces/wechat-stock/piece
+npm ci --ignore-scripts
+npm run build
+npm pack --ignore-scripts
+```
+
+测试覆盖 10/15 边界、批次持续、占位与耗尽、重启恢复、重复和并发请求、网关受理响应丢失、原写回恢复、事实变化、交付版本与文件摘要、HTTP 权限及 AP 的间隔等待分支。隔离 AP 测试适配器明确不调用模型或写飞书，其通过仅证明接线与固定规则。
+
+## 部署
+
+1. 复制配置示例为 `.1agents/config/wechat-stock.local.json`，填真实路径和独立随机密钥。用 `freezeCatalog()` 生成并审定本机清单；运行中不得自动用新的原文替换已冻结输入。
+2. 老板 IP 工作台需包含 `src/frozen-report.js` 及对应 SOP 扩展：仅带完整原文封装授权记录的长文章可以跳过选题/大纲前置步骤，成品审核不变。此来源标记保存在已有备注字段，不增加飞书列。网页使用相同 SOP 判定；原生飞书旧校验公式不在本次迁移范围。
+3. 启动 `node server.mjs <私密配置路径>`。桥接和审核网页可作为用户登录服务；启动日志位于 `~/Library/Logs/1agents/`，任务数据仍在项目 `.1agents/`。桥接监听指定 Tailnet 地址，网关保留本机回环地址。
+4. 构建并在 AP 安装私有 Piece，通过加密连接保存 `bridgeUrl`、`token`。网络调用使用 Piece；通过 `productionFlow(connectionExternalId)` 创建草稿前先查重，已有流程用更新接口维护。
+5. 隔离测试通过后切换连接到真实桥接，核验健康、真实刷新及目标，再发布启用。正式派单后主会话立即交接，后续每 30 分钟由 AP 恢复结果。
+
+本机配置、运行回执、状态、冻结输入、私有包与产物均忽略提交。HTTP 预览仅提供已校验的冻结文件；访问需要设备可达 Tailnet。登录后服务可用，机器休眠、退出登录或网络中断会延迟处理；恢复后沿用原状态。
+
+停用时在 AP 禁用本流程；若需要阻止新派单但继续接收已有结果，将私密配置 `policy.paused` 设为 `true` 后重载本桥接。异常暂停保存在状态中，修复并核对原任务后才能清除，不能删除状态重新开始。更改账号时保留内容池与原动作身份，防止重建已有文章。

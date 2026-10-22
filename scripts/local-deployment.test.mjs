@@ -41,7 +41,7 @@ test('source capture includes tracked .1agents definitions and excludes private 
   const root = mkdtempSync(join(tmpdir(), '1acp-project-role-source-test-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   execFileSync('git', ['init', '--quiet'], { cwd: root });
-  const definitions = ['.1agents/README.md', '.1agents/roles/ppt-beautifier/profile.json', '.1agents/roles/ppt-beautifier/ROLE.md', '.1agents/config/role-skills.example.json', '.1agents/config/project-discovery.example.json'];
+  const definitions = ['.1agents/README.md', '.1agents/roles/ppt-beautifier/profile.json', '.1agents/roles/ppt-beautifier/ROLE.md', '.1agents/config/role-skills.example.json', '.1agents/config/project-discovery.example.json', '.1agents/config/wechat-stock.example.json', '.1agents/roles/wechat-stock-replenisher/role.example.json', 'examples/activepieces/wechat-stock/bridge.mjs'];
   const privateFiles = ['.1agents/config/role-skills.local.json', '.1agents/config/project-discovery.local.json', '.1agents/config/credentials.json', '.1agents/cache/roles/locks/task.json', '.1agents/state/a2a-gateway/targets.json', '.1agents/state/a2a-gateway/project-discovery/discovery.json', '.1agents/workspaces/ppt-beautifier/artifacts/final.pptx', '.1agents/roles/ppt-beautifier/.env'];
   for (const path of [...definitions, ...privateFiles]) save(join(root, path), 'fixture');
   const legacyRole = 'roles/ppt-beautifier/profile.json';
