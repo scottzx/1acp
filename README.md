@@ -132,9 +132,11 @@ Restart DSH after migration. Plugin IDs, preset IDs, binding paths and service s
 
 ## Repository migration
 
-This repository preserves the original runtime history and merges the complete service and plugin histories without squashing. `git log --all` includes their original commits. The canonical checkout is `services/1acp`; the former service/plugin checkouts are local backups only.
+This repository preserves the original runtime history and merges the complete service and plugin histories without squashing. `git log --all` includes their original commits.
 
 `1agents_app/modules/1acp` remains a pinned consumer submodule of this repository. Its runtime is now under `packages/runtime`; package build tooling and adapter discovery use that path. Push this repository's referenced commit before sharing the updated consumer submodule pointer.
+
+In the shared local workspace, keep `1agents_app/modules/1acp` as the real checkout and make `services/1acp` a relative symlink to `../1agents_app/modules/1acp`. This lets App builds and service discovery use the same source while preserving the consumer submodule. Archive any pending work and repository metadata before replacing an existing standalone checkout.
 
 See each package README for its protocol, configuration and usage details.
 
