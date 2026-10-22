@@ -1,0 +1,40 @@
+{
+  "countingRule": "Every unique native root tool call from dispatch through this ack inclusive; development before dispatch and worker calls excluded; no reset.",
+  "rootToolCalls": 4,
+  "calls": [
+    {
+      "callId": "call_b77e232776b24efea780f13c214ba74d",
+      "name": "exec",
+      "timestamp": "2026-10-22T08:27:37.974Z"
+    },
+    {
+      "callId": "call_61b5236631484c14a0a3e4c9b36dc866",
+      "name": "exec",
+      "timestamp": "2026-10-22T08:40:02.331Z"
+    },
+    {
+      "callId": "call_671c6fcd3e054a41a98a8d6367f48b26",
+      "name": "exec",
+      "timestamp": "2026-10-22T08:42:07.207Z"
+    },
+    {
+      "callId": "call_175720b4ba7f4cd7bff09b5da1528a86",
+      "name": "exec",
+      "timestamp": "2026-10-22T08:42:14.209Z"
+    }
+  ],
+  "actionCalls": {
+    "dispatch": "call_b77e232776b24efea780f13c214ba74d",
+    "inspect": "call_61b5236631484c14a0a3e4c9b36dc866",
+    "record": "call_671c6fcd3e054a41a98a8d6367f48b26",
+    "ack": "call_175720b4ba7f4cd7bff09b5da1528a86"
+  },
+  "callsBeforeNotification": [],
+  "unexpectedCalls": [],
+  "nativeNotificationReceived": true,
+  "rootTurnEndedBeforeNotification": true,
+  "stepBudgetMet": true,
+  "strictAsyncFlowPassed": true,
+  "qualityVerdict": "changes_requested",
+  "pptChanged": false
+}

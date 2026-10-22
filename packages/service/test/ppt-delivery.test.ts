@@ -19,17 +19,17 @@ async function fixture(t: TestContext, extra: Record<string, unknown> = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'ppt-delivery-test-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = join(root, 'project'); await mkdir(project);
-  const files = [];
+  const files: { path: string; sha256: string }[] = [];
   for (let i = 0; i < 6; i++) { const path = `source-${i}.md`, content = `project fact ${i}`; await writeFile(join(project, path), content); files.push({ path, sha256: hash(content) }); }
   let run = await createPptDeliveryRun({ sourceId: 'source', jobId: 'parent-job', attemptId: 'parent-attempt', originSessionId: 'root-session',
-    input: { projectDirectory: project, projectName: 'Project', ...extra },
+    input: { projectDirectory: project, projectName: 'Project', slideCount: 6, ...extra },
     policy: { workspaceRoot: join(root, 'jobs'), publicDirectory: join(root, 'public'), publicBaseUrl: 'http://127.0.0.1:1/artifacts',
       allowedProjectRoots: [project], summaryTargetId: 'summary', makerTargetId: 'maker', reviewTargetId: 'review',
       runtimeDocument: join(root, 'RUNTIME.md'), designSkill: join(root, 'SKILL.md'), pythonExecutable: python,
       maxRevisionRounds: 1, maxExecutionRetries: 0 } });
   for (const path of [run.policy.runtimeDocument, run.policy.designSkill]) await writeFile(path, 'fixture');
   const coordinator = join(run.jobDirectory, 'coordinator');
-  await writeFile(join(coordinator, 'slide-script.json'), JSON.stringify({ title: 'Project', slides: files.map((file, i) => ({ title: `Page ${i}`, message: 'message', body: ['fact'], visual: 'diagram', sources: [`${file.path}:1`], facts: [`project fact ${i}`], notes: '' })) }));
+  await writeFile(join(coordinator, 'slide-script.json'), JSON.stringify({ title: 'Project', slides: Array.from({ length: run.input.slideCount ?? 6 }, (_, i) => ({ ...files[i % files.length] })).map((file, i) => ({ title: `Page ${i}`, message: 'message', body: ['fact'], visual: 'diagram', sources: [`${file.path}:1`], facts: [`project fact ${i}`], notes: '' })) }));
   await writeFile(join(coordinator, 'source-manifest.json'), JSON.stringify({ projectDirectory: project, gitHead: 'unknown', gitStatus: '', files }));
   await writeFile(join(coordinator, 'project-summary.md'), 'summary'); await writeFile(join(coordinator, 'slide-script.md'), 'script');
   let saved = JSON.stringify(run), sequence = 0;
@@ -38,7 +38,7 @@ async function fixture(t: TestContext, extra: Record<string, unknown> = {}) {
   const validation = (): PptDeliveryValidation => ({ status: 'passed', artifactDigest: String(run.revision).repeat(64), checkedAt: new Date().toISOString(),
     artifacts: [{ path: join(run.jobDirectory, `revision-${run.revision}`, 'project-overview.pptx'), url: 'http://example.invalid/final.pptx', mediaType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', size: 100, sha256: 'a'.repeat(64) },
       { path: join(run.jobDirectory, `revision-${run.revision}`, 'preview.png'), url: 'http://example.invalid/preview.png', mediaType: 'image/png', size: 30, sha256: 'b'.repeat(64) }],
-    structure: { slideCount: 6, editableTextRuns: 100, shapes: 80, pictures: 0, aspectRatio: 16/9 }, checks: ['fixture injection'] });
+    structure: { slideCount: run.input.slideCount ?? 6, editableTextRuns: 100, shapes: 80, pictures: 0, aspectRatio: 16/9 }, checks: ['fixture injection'] });
   async function submitted(request: PptDeliveryChildRequest, prior?: PptDeliveryChild) {
     requests.push(structuredClone(request)); const id = ++sequence;
     const child: PptDeliveryChild = { jobId: prior?.jobId ?? `child-${id}`, attemptId: `attempt-${id}`, executionStatus: 'working',
@@ -59,7 +59,7 @@ async function fixture(t: TestContext, extra: Record<string, unknown> = {}) {
       run.recovery?.mode === 'review_only' ? `independent-review.${run.attemptId}.json` : 'independent-review.json'), JSON.stringify({
       verdict, artifactDigest: run.validation!.artifactDigest, factsChecked: true, allSlidesViewed: true,
       issues: verdict === 'passed' ? [] : ['Page 2: correct the boundary'], limitations: ['No native PowerPoint application verification'],
-      evidence: ['preview.png', ...Array.from({ length: 6 }, (_, i) => `slide-${i + 1}.png`)]
+      evidence: ['preview.png', ...Array.from({ length: run.validation?.structure.slideCount ?? run.input.slideCount ?? 6 }, (_, i) => `slide-${i + 1}.png`)]
         .map(filename => `read_image ${join(run.jobDirectory, `revision-${run.revision}`, filename)}`).concat('source-0.md:1') }));
     await step();
   }
@@ -331,8 +331,8 @@ test('terminal parent update survives a crash without repeating production', asy
   assert.equal(f.run.parentUpdatePending, undefined);
 });
 
-test('deterministic validator performs real ZIP, HTTP and byte checks, rejects poisoned manifest and drift', async t => {
-  const f = await fixture(t), run = f.run, directory = join(run.jobDirectory, 'revision-1'); await mkdir(directory);
+for (const slideCount of [6, 9]) test(`deterministic validator checks real ${slideCount}-page ZIP, HTTP, poisoned manifest and drift`, async t => {
+  const f = await fixture(t, { slideCount }), run = f.run, directory = join(run.jobDirectory, 'revision-1'); await mkdir(directory);
   const publicDir = join(run.policy.publicDirectory, run.jobId, 'revision-1'); await mkdir(publicDir, { recursive: true });
   const server = createServer(async (req, res) => { try { res.end(await readFile(join(publicDir, basename(req.url!)))); } catch { res.writeHead(404).end(); } });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -340,9 +340,9 @@ test('deterministic validator performs real ZIP, HTTP and byte checks, rejects p
   const address = server.address(); assert.ok(address && typeof address !== 'string'); run.policy.publicBaseUrl = `http://127.0.0.1:${address.port}/artifacts`;
   // Synthetic structural fixture, not an artifact-tool authoring or native application claim.
   const pptx = join(directory, 'project-overview.pptx');
-  await execute(python, ['-I', '-c', `import zipfile,sys\np='http://schemas.openxmlformats.org/presentationml/2006/main';a='http://schemas.openxmlformats.org/drawingml/2006/main'\nwith zipfile.ZipFile(sys.argv[1],'w') as z:\n z.writestr('ppt/presentation.xml',f'<p:presentation xmlns:p="{p}"><p:sldIdLst>'+''.join('<p:sldId/>' for _ in range(6))+'</p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>')\n for i in range(1,7):z.writestr(f'ppt/slides/slide{i}.xml',f'<p:sld xmlns:p="{p}" xmlns:a="{a}"><p:sp><a:t>Editable page {i}</a:t></p:sp></p:sld>')`, pptx]);
+  await execute(python, ['-I', '-c', `import zipfile,sys\np='http://schemas.openxmlformats.org/presentationml/2006/main';a='http://schemas.openxmlformats.org/drawingml/2006/main'\nwith zipfile.ZipFile(sys.argv[1],'w') as z:\n z.writestr('ppt/presentation.xml',f'<p:presentation xmlns:p="{p}"><p:sldIdLst>'+''.join('<p:sldId/>' for _ in range(int(sys.argv[2])))+'</p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>')\n for i in range(1,int(sys.argv[2])+1):z.writestr(f'ppt/slides/slide{i}.xml',f'<p:sld xmlns:p="{p}" xmlns:a="{a}"><p:sp><a:t>Editable page {i}</a:t></p:sp></p:sld>')`, pptx, String(slideCount)]);
   const artifacts = [];
-  for (const name of ['project-overview.pptx', 'preview.png', ...Array.from({ length: 6 }, (_, i) => `slide-${i+1}.png`)]) {
+  for (const name of ['project-overview.pptx', 'preview.png', ...Array.from({ length: run.validation?.structure.slideCount ?? run.input.slideCount ?? 6 }, (_, i) => `slide-${i+1}.png`)]) {
     if (name.endsWith('.png')) await writeFile(join(directory, name), Buffer.from([137,80,78,71,13,10,26,10,1,2,3]));
     await writeFile(join(publicDir, name), await readFile(join(directory, name)));
     artifacts.push({ path: join(directory, name), url: `${run.policy.publicBaseUrl}/${run.jobId}/revision-1/${name}`, mediaType: name.endsWith('.png') ? 'image/png' : 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
@@ -352,7 +352,8 @@ test('deterministic validator performs real ZIP, HTTP and byte checks, rejects p
   await writeFile(join(directory, 'finalizer-validation.json'), JSON.stringify({ schemaVersion: 'presentation-finalization.v1', finalSha256: sha, byteCount: bytes.length,
     packageIntegrity: { status: 'pass' }, presentationLayout: { exitCode: 0 }, fontSelection: { performed: true, passed: true }, firstPartyImport: { performed: true, passed: true, sha256: sha } }));
   const manifestPath = join(directory, 'artifact-manifest.json'); await writeFile(manifestPath, JSON.stringify({ artifacts }));
-  const report = await validatePptDeliveryCandidate(run); assert.equal(report.structure.slideCount, 6); assert.equal(report.artifacts.length, 8);
+  const report = await validatePptDeliveryCandidate(run); assert.equal(report.structure.slideCount, slideCount); assert.equal(report.artifacts.length, slideCount + 2);
+  await writeFile(manifestPath, JSON.stringify({ artifacts: artifacts.slice(0, -1) })); await assert.rejects(validatePptDeliveryCandidate(run));
   await writeFile(manifestPath, JSON.stringify({ artifacts, jobId: 'illegal' })); await assert.rejects(validatePptDeliveryCandidate(run));
   await writeFile(manifestPath, JSON.stringify({ artifacts })); await writeFile(join(publicDir, 'preview.png'), 'drift');
   await assert.rejects(validatePptDeliveryCandidate(run), /Published bytes differ/);
@@ -394,4 +395,35 @@ test('cancellation arriving during publication preflight prevents any child disp
   await entered; run.cancellationRequestedAt = new Date().toISOString(); await f.adapter.persist(run); release(); await advancing;
   assert.equal(f.requests.length, 0);
   assert.ok(f.parents.every(update => update.executionStatus !== 'completed'));
+});
+
+for (const requested of [undefined, 4, 9]) test(`page count ${requested ?? 'automatic'} propagates through script, production and independent review`, async t => {
+  const count = requested ?? 9;
+  const f = await fixture(t, { slideCount: requested });
+  const path = join(f.run.jobDirectory, 'coordinator', 'slide-script.json');
+  const script = JSON.parse(await readFile(path, 'utf8'));
+  script.slides = Array.from({ length: count }, (_, i) => ({ ...script.slides[i % script.slides.length], title: `Page ${i + 1}` }));
+  await writeFile(path, JSON.stringify(script));
+  const validate = f.adapter.validateCandidate!;
+  f.adapter.validateCandidate = async run => ({ ...await validate(run), structure: { slideCount: count, editableTextRuns: 100, shapes: 80, pictures: 0, aspectRatio: 16/9 } });
+  await f.untilReview();
+  const contract = JSON.parse(await readFile(join(f.run.jobDirectory, 'revision-1', 'production-contract.json'), 'utf8'));
+  assert.equal(contract.slideCount, count);
+  assert.equal(contract.artifacts.length, count + 2);
+  assert.ok(contract.artifacts.some((a: {path: string}) => a.path.endsWith(`slide-${count}.png`)));
+  await f.completeCurrent();
+  assert.equal(f.run.executionStatus, 'completed');
+  assert.match(f.run.resultSummary!, new RegExp(`${count}页PPT`));
+  assert.equal(f.requests.length, 3);
+});
+
+test('explicit page count mismatch stops before production; invalid counts are rejected', async t => {
+  const f = await fixture(t, { slideCount: 4 });
+  const path = join(f.run.jobDirectory, 'coordinator', 'slide-script.json');
+  const script = JSON.parse(await readFile(path, 'utf8')); script.slides.pop();
+  await writeFile(path, JSON.stringify(script));
+  await f.step(); await f.completeCurrent();
+  assert.equal(f.run.executionStatus, 'failed'); assert.equal(f.requests.length, 1);
+  const { pptDeliveryInputSchema } = await import('../src/execution/ppt-delivery.js');
+  for (const slideCount of [0, -1, 1.5]) assert.equal(pptDeliveryInputSchema.safeParse({ projectDirectory: f.run.input.projectDirectory, projectName: 'Invalid', slideCount }).success, false);
 });

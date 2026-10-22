@@ -42,7 +42,7 @@ skills/
 
 Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`。Node与依赖位置以工作根目录 `RUNTIME.md` 为准，不使用系统 `python3` 猜测依赖。原模板微软雅黑在当前runtime不可用，采用已验证的 `PingFang SC` 并记录字体替换，不能声称精确雅黑保真。
 
-每job额外交付 `design-plan.json`、`design-usage.json`，逐页记录模板页、原库页/精选页、native shape origins、输出对象映射及实际改造。最终PPT逐页与对应主源比较，复核可编辑性、示例内容清理与内容覆盖；6页合同须检查全部6页。新任务使用fresh session，同一任务的message续派复用原session，node、profile、模型路由和A2A协议保持现有行为。
+每job额外交付 `design-plan.json`、`design-usage.json`，逐页记录模板页、原库页/精选页、native shape origins、输出对象映射及实际改造。最终PPT逐页与对应主源比较，复核可编辑性、示例内容清理与内容覆盖；页数遵从当前合同；未指定时按内容规划，脚本冻结后全页制作与全页验收，不固定6页。新任务使用fresh session，同一任务的message续派复用原session，node、profile、模型路由和A2A协议保持现有行为。
 
 ## 本地设计版本备份与恢复
 
@@ -114,3 +114,7 @@ Python辅助脚本使用3.12：`/Library/Frameworks/Python.framework/Versions/3.
 如未明确指定模板，使用上述默认设计绑定；另有模板时在合同中给出路径与使用要求。设计来源与业务资料分别记录，模板中的报告内容和素材库中的示例数据不能补成业务事实。
 
 真实验收应覆盖：A2A 派单返回 taskId，状态进入 WORKING，模型实际读取合同与技能并导入原稿，最终可编辑 PPTX 真实存在，各页已渲染并实际检查，自动通知包含最终答复与产物链接，原主会话读取并确认产物后 ack。各阶段分别保留可核验记录。
+
+## 固定角色与页数
+
+角色规则以 [ROLE.md](ROLE.md) 为准，同步到角色 workspace/ROLE.md。页数可通过交付输入 `slideCount` 指定；省略时由事实脚本按内容规划，后续制作、预览、机器校验及独立验收按冻结脚本的实际 N 页执行。既有六页合同与产物不变。

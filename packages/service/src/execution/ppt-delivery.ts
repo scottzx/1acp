@@ -12,7 +12,7 @@ const absolute = z.string().min(1).refine(isAbsolute, 'Expected an absolute path
 const identifier = z.string().min(1).max(512);
 export const pptDeliveryInputSchema = z.object({
   projectDirectory: absolute, projectName: z.string().min(1).max(200),
-  instructions: z.string().max(16000).optional(), slideCount: z.literal(6).default(6),
+  instructions: z.string().max(16000).optional(), slideCount: z.number().int().positive().optional(),
   /** Explicit acceptance exercise, reported separately from real quality failures. */
   revisionRequest: z.string().min(1).max(4000).optional(),
 }).strict();
@@ -214,37 +214,38 @@ async function buildRequest(run: PptDeliveryRun, retry: number): Promise<PptDeli
   let cwd: string | undefined;
   let manifestPath: string | undefined;
   const revisionContract = join(revision, 'production-contract.json');
+  const slideCount = run.stage === 'summary' ? 0 : (await readSlideScript(run)).script.slides.length;
   if (run.stage === 'summary') {
     targetId = run.policy.summaryTargetId; cwd = run.input.projectDirectory;
-    prompt = `${common}\n你负责亲自只读理解项目、写总结与6页中文胶片脚本，不制作PPT。先留真实cwd/session回执于${summary}/cwd-receipt.json。阅读README/package清单和至少6份实际相关源码/文档（可更多但不要无界扫描），对事实标注源码位置，区分设计意图、源码支持与本次实测。写${summary}/project-summary.md、slide-script.md、slide-script.json。脚本JSON严格为 {"title":"...","slides":[{"title":"...","message":"...","body":["..."],"visual":"...","sources":["相对路径:行号"],"facts":["必须保留的事实"],"notes":"..."}]}，恰好6页（含封面），每页有事实依据，不捏造指标。另写source-manifest.json严格为 {"projectDirectory":"真实项目路径","gitHead":"当前HEAD或unknown","gitStatus":"原始git status --porcelain输出","files":[{"path":"项目内相对路径","sha256":"真实SHA256"}]}。最后正文简述项目特点与脚本路径。本子任务完成只表示脚本阶段完成，不声称父交付完成。`;
+    prompt = `${common}\n你负责亲自只读理解项目、写总结与中文胶片脚本，不制作PPT。先留真实cwd/session回执于${summary}/cwd-receipt.json。阅读README/package清单和至少6份实际相关源码/文档（可更多但不要无界扫描），对事实标注源码位置，区分设计意图、源码支持与本次实测。写${summary}/project-summary.md、slide-script.md、slide-script.json。脚本JSON严格为 {"title":"...","slides":[{"title":"...","message":"...","body":["..."],"visual":"...","sources":["相对路径:行号"],"facts":["必须保留的事实"],"notes":"..."}]}，${run.input.slideCount !== undefined ? `恰好${run.input.slideCount}页（含封面）` : '按受众、内容和可读性自行确定页数（含封面），不默认限定6页；在slide-script.md说明页数选择'}，每页有事实依据，不捏造指标。另写source-manifest.json严格为 {"projectDirectory":"真实项目路径","gitHead":"当前HEAD或unknown","gitStatus":"原始git status --porcelain输出","files":[{"path":"项目内相对路径","sha256":"真实SHA256"}]}。最后正文简述项目特点与脚本路径。本子任务完成只表示脚本阶段完成，不声称父交付完成。`;
   } else if (run.stage === 'make') {
     targetId = run.policy.makerTargetId;
     manifestPath = join(revision, 'artifact-manifest.json');
-    const artifacts = ['project-overview.pptx', 'preview.png', ...Array.from({ length: 6 }, (_, i) => `slide-${i + 1}.png`)].map(filename => ({
+    const artifacts = ['project-overview.pptx', 'preview.png', ...Array.from({ length: slideCount }, (_, i) => `slide-${i + 1}.png`)].map(filename => ({
       path: join(revision, filename), publicPath: join(publicRevisionDirectory(run), filename), url: publicUrl(run, filename),
       mediaType: filename.endsWith('.pptx') ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation' : 'image/png',
     }));
     const scriptPath = join(summary, 'slide-script.json');
     const scriptBytes = await readFile(scriptPath);
     await jsonFile(revisionContract, { schema: 'ppt-production-contract-v1', parentContract: run.contractPath, resultRevision: revisionName(run),
-      scriptPath, scriptSha256: digest(scriptBytes), artifacts, manifestPath, sourcePptx: null,
+      scriptPath, scriptSha256: digest(scriptBytes), slideCount, artifacts, manifestPath, sourcePptx: null,
       finalizerReceiptPath: join(revision, 'finalizer-validation.json'),
       ...(run.revision > 1 ? { previousVersionDirectory: join(run.jobDirectory, `revision-${run.revision - 1}`), fixes: run.revisionReasons } : {}),
-      requirements: ['6 pages including cover, editable PPTX 16:9', 'Use registered AI value report main template and semantic native components from full 202-page library',
+      requirements: [`${slideCount} pages including cover, editable PPTX 16:9`, 'Use registered AI value report main template and semantic native components from full 202-page library',
         'All facts from frozen script; no fictional performance figures', 'Finalizer and native import must validate exact delivered bytes; copy unmodified actual presentation-finalization.v1 receipt to finalizerReceiptPath', 'Inspect all final page images and montage',
-        'Manifest strictly has only artifacts; each of 8 entries only path/url/mediaType', 'Use independent version directory; never overwrite preceding revisions'] });
-    prompt = `${common}\n你是独立PPT制作角色。先读取${run.policy.runtimeDocument}与技能${run.policy.designSkill}及其实际引用的模板、完整图表库索引/排版规划。制作合同：${revisionContract}。源稿不存在，必须从6页事实脚本新建可编辑稿。采用主模板骨架与品牌替换，正文按语义查完整库选型、原生对象迁移，不做6页同款卡片墙，不整页截图。运行时若无雅黑用PingFang SC并披露。实际@oai/artifact-tool导入、正式finalizer并重开最终字节导出6张PNG和总览。逐页实际读图后修复。写design-plan.json/design-usage.json/qa.json与finalizer回执（在本轮目录），QA如实记录performed、限制。复制合同8份产物至各自publicPath，实际GET核对字节。严格manifest顶层只有artifacts，8条每条只有path/url/mediaType，path用本轮私有产物路径，url用合同精确URL。禁止加jobId/hash/身份字段（身份由宿主记录）。${run.revision > 1 ? `同一制作任务的新执行轮次，只按修订清单改进：${JSON.stringify(run.revisionReasons)}，保留上一轮全部文件，必要时复制上一版到本轮再编辑。` : ''} 最终中文简短给出PPTX/预览真实链接和限制，不声称通过独立验收。`;
+        `Manifest strictly has only artifacts; each of ${slideCount + 2} entries only path/url/mediaType`, 'Use independent version directory; never overwrite preceding revisions'] });
+    prompt = `${common}\n你是独立PPT制作角色。先读取${run.policy.runtimeDocument}与技能${run.policy.designSkill}及其实际引用的模板、完整图表库索引/排版规划。制作合同：${revisionContract}。源稿不存在，必须从${slideCount}页事实脚本新建可编辑稿。采用主模板骨架与品牌替换，正文按语义查完整库选型、原生对象迁移，不做全稿同款卡片墙，不整页截图。运行时若无雅黑用PingFang SC并披露。实际@oai/artifact-tool导入、正式finalizer并重开最终字节导出${slideCount}张PNG和总览。逐页实际读图后修复。写design-plan.json/design-usage.json/qa.json与finalizer回执（在本轮目录），QA如实记录performed、限制。复制合同${slideCount + 2}份产物至各自publicPath，实际GET核对字节。严格manifest顶层只有artifacts，${slideCount + 2}条每条只有path/url/mediaType，path用本轮私有产物路径，url用合同精确URL。禁止加jobId/hash/身份字段（身份由宿主记录）。${run.revision > 1 ? `同一制作任务的新执行轮次，只按修订清单改进：${JSON.stringify(run.revisionReasons)}，保留上一轮全部文件，必要时复制上一版到本轮再编辑。` : ''} 最终中文简短给出PPTX/预览真实链接和限制，不声称通过独立验收。`;
   } else {
     targetId = run.policy.reviewTargetId;
     const report = reviewReportPath(run);
-    prompt = `${common}\n你是独立验收角色，与PPT制作分开。读取${run.policy.designSkill}的实际排版/事实边界要求、${summary}/project-summary.md、slide-script.json、source-manifest.json和本轮${revisionContract}、${revision}/machine-validation.json、design-plan.json、design-usage.json、qa.json。亲自对照项目关键源码验证事实，不能只信制作自评；必须用read_image实际查看${revision}/preview.png与slide-1.png…slide-6.png全部全尺寸图，核对层级/阅读路径/溢出/低对比/图示因果与边界/示例内容残留。核对最终6页事实覆盖。不要自行改稿或重导出，不可把看图委派回制作角色。本轮最终清单摘要 ${run.validation!.artifactDigest}。写${report}严格JSON：{"verdict":"passed或changes_requested","artifactDigest":"${run.validation!.artifactDigest}","factsChecked":true或false,"allSlidesViewed":true或false,"issues":["必须修复的具体页/问题/要求"],"limitations":["已知限制"],"evidence":["实际查看的7张图绝对路径与源码行号等"]}。若不能读图/未核对事实必须changes_requested并披露；不要假称通过。passed时issues必须为空，轻微非阻断项写limitations。只写该报告及同目录必要验收证据。`;
+    prompt = `${common}\n你是独立验收角色，与PPT制作分开。读取${run.policy.designSkill}的实际排版/事实边界要求、${summary}/project-summary.md、slide-script.json、source-manifest.json和本轮${revisionContract}、${revision}/machine-validation.json、design-plan.json、design-usage.json、qa.json。亲自对照项目关键源码验证事实，不能只信制作自评；必须用read_image实际查看${revision}/preview.png与slide-1.png…slide-${slideCount}.png全部全尺寸图，核对层级/阅读路径/溢出/低对比/图示因果与边界/示例内容残留。核对最终${slideCount}页事实覆盖。不要自行改稿或重导出，不可把看图委派回制作角色。本轮最终清单摘要 ${run.validation!.artifactDigest}。写${report}严格JSON：{"verdict":"passed或changes_requested","artifactDigest":"${run.validation!.artifactDigest}","factsChecked":true或false,"allSlidesViewed":true或false,"issues":["必须修复的具体页/问题/要求"],"limitations":["已知限制"],"evidence":["实际查看的${slideCount + 1}张图绝对路径与源码行号等"]}。若不能读图/未核对事实必须changes_requested并披露；不要假称通过。passed时issues必须为空，轻微非阻断项写limitations。只写该报告及同目录必要验收证据。`;
   }
   const purpose = purposeFor(run.stage);
   targetId = run.activeTargets[purpose] ?? targetId;
   const recovering = [...run.targetSwitches].reverse().find(item => item.purpose === purpose && item.toTargetId === targetId);
   const replacement = recovering && !run.children.some(item => item.purpose === purpose && item.targetId === targetId)
     ? recovering.replacesJobRef : undefined;
-  if (run.stage === 'review') prompt += '\n证据evidence数组必须逐项列出preview.png和slide-1.png到slide-6.png共7张图的完整绝对路径，禁止用范围缩写代替；另列实际核对的源码位置。';
+  if (run.stage === 'review') prompt += `\n证据evidence数组必须逐项列出preview.png和slide-1.png到slide-${slideCount}.png共${slideCount + 1}张图的完整绝对路径，禁止用范围缩写代替；另列实际核对的源码位置。`;
   if (run.recovery?.mode === 'review_only') prompt += `\n这是只重试验收的新父执行轮次 ${run.attemptId}，复用原版本，禁止制作、修改、重导出或覆盖任何已有PPT/PNG/合同/报告。只写本轮报告 ${reviewReportPath(run)} 和以本轮attemptId命名的必要证据。${run.recovery.sourceSnapshotDirectory ? `当前项目已变化；事实只对照此原始字节快照：${run.recovery.sourceSnapshotDirectory}，文件已由系统按原source-manifest逐一核验。原manifest的projectDirectory记录的是历史来源，不要改它，也不要用当前项目代替快照。` : ''}发现阻断问题如实changes_requested，系统停止并回传，不会派制作任务。`;
   const requiredFiles = run.stage === 'summary' ? [run.contractPath] : run.stage === 'make'
     ? [run.contractPath, revisionContract, join(summary, 'slide-script.json'), run.policy.runtimeDocument, run.policy.designSkill]
@@ -263,14 +264,22 @@ async function buildRequest(run: PptDeliveryRun, retry: number): Promise<PptDeli
     ...(replacement ? { replacesJobRef: replacement } : {}) };
 }
 
+async function readSlideScript(run: PptDeliveryRun) {
+  const bytes = await readFile(join(join(run.jobDirectory, 'coordinator'), 'slide-script.json'));
+  if (run.scriptDigest && digest(bytes) !== run.scriptDigest) throw new Error('Frozen source/script manifest changed');
+  const script = z.object({ title: z.string().min(1), slides: z.array(z.object({ title: z.string().min(1),
+    message: z.string(), body: z.array(z.string()), visual: z.string(), sources: z.array(z.string()).min(1),
+    facts: z.array(z.string()).min(1), notes: z.string() }).strict()).min(1) }).strict().parse(JSON.parse(bytes.toString('utf8')));
+  if (run.input.slideCount !== undefined && script.slides.length !== run.input.slideCount) throw new Error('Script slide count differs from requested count');
+  return { script, bytes };
+}
+
 async function validateSummary(run: PptDeliveryRun): Promise<void> {
   const root = join(run.jobDirectory, 'coordinator');
   const scriptDigest = digest(await readFile(join(root, 'slide-script.json')));
   const sourceManifestDigest = digest(await readFile(join(root, 'source-manifest.json')));
   if ((run.scriptDigest && run.scriptDigest !== scriptDigest) || (run.sourceManifestDigest && run.sourceManifestDigest !== sourceManifestDigest)) throw new Error('Frozen source/script manifest changed');
-  const script = z.object({ title: z.string().min(1), slides: z.array(z.object({ title: z.string().min(1),
-    message: z.string(), body: z.array(z.string()), visual: z.string(), sources: z.array(z.string()).min(1),
-    facts: z.array(z.string()).min(1), notes: z.string() }).strict()).length(6) }).strict().parse(JSON.parse(await readFile(join(root, 'slide-script.json'), 'utf8')));
+  const { script } = await readSlideScript(run);
   const source = z.object({ projectDirectory: z.string(), gitHead: z.string(), gitStatus: z.string(),
     files: z.array(z.object({ path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).min(6).max(128) }).strict().parse(JSON.parse(await readFile(join(root, 'source-manifest.json'), 'utf8')));
   if (await realpath(source.projectDirectory) !== run.input.projectDirectory) throw new Error('Summary project path mismatch');
@@ -289,7 +298,7 @@ async function validateSummary(run: PptDeliveryRun): Promise<void> {
     filesChecked: source.files.length, scriptSha256: digest(await readFile(join(root, 'slide-script.json'))) });
 }
 
-const manifestSchema = z.object({ artifacts: z.array(z.object({ path: absolute, url: z.string().url(), mediaType: z.string() }).strict()).length(8) }).strict();
+const manifestSchema = (slideCount: number) => z.object({ artifacts: z.array(z.object({ path: absolute, url: z.string().url(), mediaType: z.string() }).strict()).length(slideCount + 2) }).strict();
 /** Publication transport errors cannot be repaired by asking the model to redesign slides. */
 export class PptPublicationError extends Error {}
 export async function preflightPptPublication(run: PptDeliveryRun): Promise<void> {
@@ -330,8 +339,9 @@ with zipfile.ZipFile(sys.argv[1]) as z:
  print(json.dumps({'slideCount':len(parts),'editableTextRuns':texts,'shapes':shapes,'pictures':pics,'aspectRatio':ratio}))`;
 export async function validatePptDeliveryCandidate(run: PptDeliveryRun): Promise<PptDeliveryValidation> {
   const root = await realpath(revisionDirectory(run));
-  const manifest = manifestSchema.parse(JSON.parse(await readFile(join(root, 'artifact-manifest.json'), 'utf8')));
-  const expected = new Set(['project-overview.pptx', 'preview.png', ...Array.from({ length: 6 }, (_, i) => `slide-${i + 1}.png`)]);
+  const slideCount = (await readSlideScript(run)).script.slides.length;
+  const manifest = manifestSchema(slideCount).parse(JSON.parse(await readFile(join(root, 'artifact-manifest.json'), 'utf8')));
+  const expected = new Set(['project-overview.pptx', 'preview.png', ...Array.from({ length: slideCount }, (_, i) => `slide-${i + 1}.png`)]);
   const artifacts: PptDeliveryArtifact[] = [];
   for (const item of manifest.artifacts) {
     const filename = basename(item.path), path = await realpath(item.path);
@@ -353,7 +363,7 @@ export async function validatePptDeliveryCandidate(run: PptDeliveryRun): Promise
     artifacts.push({ ...item, path, size: bytes.length, sha256 });
   }
   if (expected.size) throw new Error('Missing artifact');
-  const { stdout } = await execute(run.policy.pythonExecutable, ['-I', '-c', inspectPptx, join(root, 'project-overview.pptx'), String(run.input.slideCount)], { timeout: 30000, maxBuffer: 65536 });
+  const { stdout } = await execute(run.policy.pythonExecutable, ['-I', '-c', inspectPptx, join(root, 'project-overview.pptx'), String(slideCount)], { timeout: 30000, maxBuffer: 65536 });
   const structure = JSON.parse(stdout) as PptDeliveryValidation['structure'];
   // Reading actual finalizer output is required; model-authored qa.json alone is not authoritative.
   await readFile(join(root, 'design-plan.json')); await readFile(join(root, 'design-usage.json')); await readFile(join(root, 'qa.json'));
@@ -366,7 +376,7 @@ export async function validatePptDeliveryCandidate(run: PptDeliveryRun): Promise
       || finalizer.firstPartyImport?.sha256 !== pptx.sha256) throw new Error('Actual finalizer receipt missing, failed, or bound to different bytes');
   const artifactDigest = digest(JSON.stringify(artifacts.map(({ path, url, mediaType, size, sha256 }) => ({ name: basename(path), url, mediaType, size, sha256 })).sort((a,b) => a.name.localeCompare(b.name))));
   return { status: 'passed', artifactDigest, checkedAt: new Date().toISOString(), artifacts, structure,
-    checks: ['strict eight-entry manifest', 'version-scoped real files', 'PPTX ZIP integrity, six editable-text slides, 16:9', 'PNG signatures', 'private/public/HTTP byte equality', 'finalizer receipt matches actual bytes', 'design evidence present'] };
+    checks: [`strict ${slideCount + 2}-entry manifest`, 'version-scoped real files', `PPTX ZIP integrity, ${slideCount} editable-text slides, 16:9`, 'PNG signatures', 'private/public/HTTP byte equality', 'finalizer receipt matches actual bytes', 'design evidence present'] };
 }
 
 const reviewSchema = z.object({ verdict: z.enum(['passed', 'changes_requested']), artifactDigest: z.string().regex(/^[a-f0-9]{64}$/),
@@ -526,9 +536,10 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
       let review: PptDeliveryReview;
       try { review = reviewSchema.parse(JSON.parse(await readFile(reviewReportPath(run), 'utf8'))); }
       catch (error) { return stop(run, adapter, 'failed', `独立验收回执无效：${String(error)}`); }
-      const evidenceImages = ['preview.png', ...Array.from({ length: 6 }, (_, i) => `slide-${i + 1}.png`)]
+      const slideCount = run.validation!.structure.slideCount;
+      const evidenceImages = ['preview.png', ...Array.from({ length: slideCount }, (_, i) => `slide-${i + 1}.png`)]
         .map(filename => join(revisionDirectory(run), filename));
-      if (review.verdict === 'passed' && evidenceImages.some(path => !review.evidence.some(evidence => evidence.includes(path)))) return stop(run, adapter, 'failed', '独立验收缺少逐一对应的七张实际图像证据路径');
+      if (review.verdict === 'passed' && evidenceImages.some(path => !review.evidence.some(evidence => evidence.includes(path)))) return stop(run, adapter, 'failed', `独立验收缺少逐一对应的${slideCount + 1}张实际图像证据路径`);
       if (review.artifactDigest !== run.validation!.artifactDigest) return stop(run, adapter, 'failed', '验收回执与已校验产物字节摘要不一致');
       run.review = review; run.metrics.reviewRounds++;
       if (review.verdict !== 'passed' || review.issues.length || !review.factsChecked || !review.allSlidesViewed) return revise(run, adapter, review.issues.length ? review.issues : ['独立事实或逐页视觉验收尚未完成']);
@@ -558,7 +569,7 @@ export async function advancePptDelivery(run: PptDeliveryRun, adapter: PptDelive
         ...(run.recovery ? { recovery: run.recovery } : {}),
         productionAttemptCount: makerAttempts.length };
       const ppt = rechecked.artifacts.find(item => item.path.endsWith('.pptx'))!, preview = rechecked.artifacts.find(item => item.path.endsWith('/preview.png'))!;
-      run.resultSummary = `${run.input.projectName}：6页PPT已完成交付闭环。\n\n[最终可编辑PPT](${ppt.url})\n[预览总览](${preview.url})\n\n机器验收通过；独立会话已核对事实并逐页看图。版本 ${revisionName(run)}；制作执行轮次 ${makerAttempts.length}；产物摘要 ${review.artifactDigest}。${review.limitations.length ? `\n限制：${review.limitations.join('；')}` : ''}\n\n人类业务接受与通知ack分别记录，不作为父任务完成前提。`;
+      run.resultSummary = `${run.input.projectName}：${slideCount}页PPT已完成交付闭环。\n\n[最终可编辑PPT](${ppt.url})\n[预览总览](${preview.url})\n\n机器验收通过；独立会话已核对事实并逐页看图。版本 ${revisionName(run)}；制作执行轮次 ${makerAttempts.length}；产物摘要 ${review.artifactDigest}。${review.limitations.length ? `\n限制：${review.limitations.join('；')}` : ''}\n\n人类业务接受与通知ack分别记录，不作为父任务完成前提。`;
       await jsonFile(join(run.jobDirectory, run.recovery?.mode === 'review_only' ? `delivery-receipt.${run.attemptId}.json` : 'delivery-receipt.json'), run.deliveryReceipt);
       if (run.cancellationRequestedAt) return;
       run.executionStatus = 'completed'; mark(run, 'finished', 'delivery_ready');
