@@ -44,6 +44,27 @@ test('delivery rejects mismatched host identity and incomplete package manifests
   await assert.rejects(verifyDelivery(f.operation, missingEvidence, join(f.root, 'assets')), /absent/);
 });
 
+test('legacy actual view_image review is accepted only with all required screenshot hashes', async t => {
+  const f = await delivery(t), path = join(f.output, 'visual-qa.json');
+  const visual = JSON.parse(await readFile(path, 'utf8'));
+  delete visual.inspection_tool;
+  async function report() {
+    const bytes = JSON.stringify(visual); await writeFile(path, bytes);
+    Object.assign(f.view.resultMetadata.artifacts.find(item => item.path === path), { size: Buffer.byteLength(bytes), sha256: sha(bytes) });
+  }
+  await report();
+  await assert.rejects(verifyDelivery(f.operation, f.view, join(f.root, 'assets')), /visual report failed/);
+  visual.reviewer = 'Codex（使用 view_image 实际读图）';
+  visual.evidence_sha256 = Object.fromEntries(visual.evidence.map(name => [name, f.view.resultMetadata.artifacts.find(item => item.path.endsWith('/' + name)).sha256]));
+  visual.evidence_sha256['cover.png'] = 'f'.repeat(64); await report();
+  await assert.rejects(verifyDelivery(f.operation, f.view, join(f.root, 'assets')), /visual report failed/);
+  visual.evidence_sha256['cover.png'] = f.view.resultMetadata.artifacts.find(item => item.path.endsWith('/cover.png')).sha256;
+  await report();
+  const result = await verifyDelivery(f.operation, f.view, join(f.root, 'assets'));
+  assert.equal(result.visualReview.inspectionTool, 'view_image');
+  assert.equal(result.visualReview.toolSource, 'legacy-reviewer-and-evidence-hashes');
+});
+
 test('AP code preserves the observation identity and normalizes an early duplicate without dispatch', async () => {
   const flow = productionFlow('test-encrypted-connection');
   const code = (await import(`data:text/javascript;base64,${Buffer.from(flow.steps[1].sourceCode).toString('base64')}`)).code;

@@ -153,6 +153,37 @@ export class StockBridge {
       observation.applied = true; observation.receipt = receipt; await this.save(); return receipt;
     });
   }
+  /** Explicit local repair of the same completed delivery; never submits a job. */
+  async recoverDelivery(key) {
+    return this.serialize(async () => {
+      const operation = this.state.operations[key];
+      const reason = `制作交付未通过文件与版本核验：${key}`;
+      if (!operation || !['delivery_invalid', 'write_pending', 'pending_review', 'ready'].includes(operation.phase)
+          || this.state.pausedReason !== reason) throw new Error('Recovery does not match the original delivery pause');
+      const facts = await this.adapter.readFacts();
+      if (!facts.complete || facts.stale) throw new Error('Fresh business facts required for recovery');
+      if (operation.phase === 'delivery_invalid') {
+        const view = await this.adapter.get(operation);
+        if (view.stale || view.executionStatus !== 'completed') throw new Error('Original delivery is not current and completed');
+        operation.delivery = await this.adapter.verify(operation, view);
+        operation.phase = 'write_pending'; await this.save();
+      }
+      if (operation.phase === 'write_pending') {
+        operation.asset = await this.adapter.ingest(operation, facts);
+        operation.phase = 'pending_review'; await this.save();
+      }
+      const status = this.adapter.assetStatus(operation, facts);
+      if (!['pending_review', 'ready'].includes(status)) throw new Error('Recovered asset has a business conflict');
+      operation.phase = status;
+      if (!operation.noticeHandled) {
+        await this.adapter.acceptAndAcknowledge(operation); operation.noticeHandled = true;
+      }
+      operation.recovery = { recoveredAt: new Date(this.clock()).toISOString(), jobId: operation.job.jobId,
+        attemptId: operation.job.attemptId, resultRevision: operation.delivery.resultRevision };
+      delete this.state.pausedReason;
+      await this.save(); return this.status();
+    });
+  }
   status() {
     return { roleId: 'wechat-stock-replenisher', mode: 'production', enabled: this.config.policy.enabled,
       scopeId: this.config.policy.scopeId, accountId: this.config.accountId ?? null, checkIntervalMs: this.config.policy.checkIntervalMs,

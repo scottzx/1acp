@@ -41,6 +41,10 @@ flowchart LR
 
 宿主回执必须绑定真实 Job/Attempt/Task、角色和任务技能锁。既有 `resultContract.jobId` 按现有契约保存稳定业务合同 ID；真实账本 Job/Attempt 另存，二者不混用。历史首期的 `article_sha256` 绑定 `article.wechat.html`，校验兼容该明确摘要；新合同要求 `article_file` 显式标注。
 
+旧视觉报告缺少 `inspection_tool` 时，仅兼容 reviewer 明确声明使用 `view_image` 实际读图、必需截图全部具有匹配 SHA256 的报告；在独立回执记录规范化来源，保留原报告与原宿主清单字节。新任务提示明确要求工具字段与截图摘要。
+
+交付格式修复后，可停止专用桥接，执行 `node examples/activepieces/wechat-stock/recover-delivery.mjs <私密配置路径> <原动作键>`。命令持有同一服务租约，只重新核对原完成任务、恢复原成品写回与通知确认，成功后解除该动作对应暂停；不会提交制作、改变 Job/Attempt、清除占位或重置30分钟间隔。随后启动更新后的桥接，由AP按原批次继续到15个位置；成品人工审核仍保留。
+
 受理或状态异常、交付不合格、人工退回、版本冲突均阻止新制作。普通来源读取失败记为未知，不按零库存继续。后台只在 AP 请求时推进有限事务，不常驻模型，不等待单次制作完成。
 
 ## 本地验证

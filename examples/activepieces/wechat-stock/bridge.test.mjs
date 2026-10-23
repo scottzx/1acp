@@ -97,3 +97,19 @@ test('network bridge requires its dedicated credential and never exposes arbitra
   assert.equal((await fetch(base + '/invoke', { method: 'POST', headers: { Authorization: `Bearer ${token}` } })).status, 404);
   assert.equal((await fetch(base + '/observe', { method: 'POST', headers: { Authorization: `Bearer ${token}`, Origin: base } })).status, 403);
 });
+
+test('explicit delivery repair reuses the same job and resumes review without submitting again', async t => {
+  const f = await fixture(t); await apply(f.bridge); f.complete(); f.tick();
+  const original = f.adapter.verify;
+  f.adapter.verify = async () => { throw new Error('legacy report shape'); };
+  await f.bridge.observe();
+  const operation = Object.values(f.bridge.state.operations)[0], jobId = operation.job.jobId;
+  await assert.rejects(f.bridge.recoverDelivery('unknown'), /original delivery pause/);
+  f.adapter.verify = original;
+  const status = await f.bridge.recoverDelivery(operation.key);
+  assert.equal(status.pausedReason, null);
+  assert.equal(status.operations[0].phase, 'pending_review');
+  assert.equal(status.operations[0].jobId, jobId);
+  assert.equal(f.count.uniqueExecutions, 1); assert.equal(f.count.submitted, 1);
+  assert.equal((await f.bridge.observe()).due, false, 'recovery preserves the 30-minute observation limit');
+});

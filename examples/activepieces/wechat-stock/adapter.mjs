@@ -41,14 +41,22 @@ export async function verifyDelivery(operation, view, artifactRoot) {
   const verification = parse('verification.json'), visual = parse('visual-qa.json'), article = parse('metadata.json');
   // Older editor deliveries named the WeChat HTML hash "article_sha256" without an article_file field.
   const reviewedFile = visual.article_file ?? ['article.html', 'article.wechat.html'].find(name => visual.article_sha256 === files.get(name).sha256);
+  const evidenceNames = ['cover.png', 'qa-mobile.png', 'qa-footer.png'];
+  // Accept the existing host-frozen report shape only when it explicitly records
+  // actual view_image review and binds every required screenshot to its bytes.
+  const legacyTool = typeof visual.reviewer === 'string' && /\bview_image\b/.test(visual.reviewer)
+    && /实际读图/.test(visual.reviewer)
+    && evidenceNames.every(name => visual.evidence_sha256?.[name] === files.get(name).sha256);
+  const inspectionTool = typeof visual.inspection_tool === 'string' && visual.inspection_tool.trim()
+    ? visual.inspection_tool : legacyTool ? 'view_image' : null;
   if (sha(files.get('source.md').bytes) !== operation.article.sourceSha256
       || verification.source_sha256 !== operation.article.sourceSha256 || verification.snapshot_sha256 !== operation.article.sourceSha256
       || verification.source_file_unchanged !== true || verification.snapshot_byte_identical !== true || verification.visible_text_equal !== true
       || verification.cover_exact_16_9 !== true || JSON.stringify(verification.cover_size) !== '[1920,1080]'
       || verification.mobile_no_horizontal_overflow !== true || Object.keys(verification.remaining_placeholders ?? { missing: true }).length
-      || visual.status !== 'passed' || !visual.inspection_tool || !['article.html', 'article.wechat.html'].includes(reviewedFile)
+      || visual.status !== 'passed' || !inspectionTool || !['article.html', 'article.wechat.html'].includes(reviewedFile)
       || visual.article_sha256 !== files.get(reviewedFile).sha256
-      || !['cover.png', 'qa-mobile.png', 'qa-footer.png'].every(name => visual.evidence?.includes(name))) throw new Error('Package verification or visual report failed');
+      || !evidenceNames.every(name => visual.evidence?.includes(name))) throw new Error('Package verification or visual report failed');
   const title = article.title ?? article.publish_title, summary = article.summary;
   if (typeof title !== 'string' || !title.trim() || typeof summary !== 'string' || !summary.trim() || [...summary].length > 100) throw new Error('Invalid publishing title or summary');
   const receipts = Object.fromEntries([...files].map(([name, value]) => [name, { sha256: value.sha256, size: value.size, mediaType: value.mediaType }]));
@@ -58,6 +66,7 @@ export async function verifyDelivery(operation, view, artifactRoot) {
     catch (error) { if (error.code !== 'EEXIST' || sha(await readFile(join(destination, name))) !== value.sha256) throw error; }
   }
   return { title, summary, receipts, packageDigest: digest(receipts), artifactDirectory: destination, reviewedFile,
+    visualReview: { inspectionTool, toolSource: visual.inspection_tool ? 'inspection_tool' : 'legacy-reviewer-and-evidence-hashes' },
     resultRevision, resultDigest, sourceId: view.sourceId, jobId: view.jobId, attemptId, taskId: view.taskId, remote: view.remote };
 }
 
@@ -102,6 +111,7 @@ export async function createWorkbenchAdapter(config) {
         `原文源标题、元信息、导航、正文和参考资料全部保留，新增标题、百字内摘要和系列策展说明放独立区域。渲染--source用报告根目录内原文件，不误用冻结副本作为相对链接根。` +
         `使用合同series与前后篇真实报告链接，未发布篇目标明原报告，不虚构公众号URL、联系方式或发布日期。封面1920×1080，墨绿/米白/老金三册书脊，保留SVG/HTML。` +
         `仅写${outputDirectory}，不得修改报告原文、冻结输入、技能缓存或宿主。按技能生成${requiredFiles.join('、')}与手机截图，读取verification通过后，使用真正可用的读图工具查看cover.png、qa-mobile.png、qa-footer.png，保存visual-qa.json，article_file明确为article.wechat.html，article_sha256绑定该最终文件SHA256。` +
+        `visual-qa.json必须包含status、inspection_tool（实际使用的读图工具名称）、reviewer、evidence（截图文件名数组）、evidence_sha256（对应截图SHA256）、article_file与article_sha256；不得省略inspection_tool或用文字备注替代实际读图。` +
         `输出artifact-manifest.json，严格{\"artifacts\":[{\"path\":\"最终文件绝对路径\",\"mediaType\":\"真实MIME\"}]}；覆盖所有必交文件与截图，只列本任务实际最终文件，不填size/hash或虚构HTTP URL。` +
         `最后复核源文件/冻结副本未变，README给出标题摘要、锁版本与校验结论。网关负责通知，不替上游ack，不写飞书，不登录上传或群发公众号。`;
       return { outputDirectory, frozenSourcePath: join(inputDirectory, 'source.md'), request: { originSessionId: `wechat-stock:${key}`, targetId: 'wechat-series-editor', clientRequestId: `wechat-stock:${key}`,
