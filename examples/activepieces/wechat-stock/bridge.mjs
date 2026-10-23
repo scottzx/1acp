@@ -50,8 +50,9 @@ export class StockBridge {
       if (operation.phase === 'working') {
         const job = await this.adapter.get(operation);
         if (['submission_unknown', 'prepared'].includes(job.submissionStatus) || job.stale || job.executionStatus === 'unknown') {
-          await this.pause(`任务受理或状态待核对：${operation.key}`); continue;
+          operation.syncPending = true; await this.save(); continue;
         }
+        delete operation.syncPending;
         if (['failed', 'rejected', 'canceled', 'input_required', 'auth_required'].includes(job.executionStatus)) {
           operation.phase = 'failed'; await this.pause(`制作任务需要处理：${job.executionStatus}`); continue;
         }
@@ -85,6 +86,13 @@ export class StockBridge {
         await this.save();
       }
     }
+    // A transient transport outage must not become a permanent business pause.
+    // Keep every original slot while unknown; clear only this legacy sync pause
+    // after the complete reconciliation has observed all original tasks fresh.
+    if (this.state.pausedReason?.startsWith('任务受理或状态待核对：')
+        && !Object.values(this.state.operations).some(o => o.syncPending)) {
+      delete this.state.pausedReason; this.state.syncRecoveredAt = new Date(this.clock()).toISOString(); await this.save();
+    }
   }
   input(facts) {
     const operations = Object.values(this.state.operations);
@@ -94,7 +102,7 @@ export class StockBridge {
     const next = this.config.catalog.find(article => !operations.some(operation => operation.article.articleKey === article.articleKey));
     const policy = { ...this.config.policy, paused: Boolean(this.state.pausedReason || this.config.policy.paused) };
     return { policy, snapshot: { scopeId: policy.scopeId, mode: 'production', sample: false,
-      complete: facts.complete === true, stale: facts.stale === true, ready, pendingReview: pending, inFlight },
+      complete: facts.complete === true && !operations.some(o => o.syncPending), stale: facts.stale === true, ready, pendingReview: pending, inFlight },
       batch: structuredClone(this.state.batch), nextArticle: next ? { ...next, ready: facts.complete === true && next.ready === true } : null,
       ...(policy.mode === 'catalog_batch' ? { nextArticles: this.config.catalog.filter(article => !operations.some(o => o.article.articleKey === article.articleKey)).slice(0, 3) } : {}),
       catalogExhausted: !next };
@@ -221,6 +229,7 @@ export class StockBridge {
       scopeId: this.config.policy.scopeId, accountId: this.config.accountId ?? null, checkIntervalMs: this.config.policy.checkIntervalMs,
       nextCheckAt: this.state.nextCheckAt ? new Date(this.state.nextCheckAt).toISOString() : null,
       pausedReason: this.state.pausedReason ?? null, lastError: this.state.lastError ?? null,
+      syncPending: Object.values(this.state.operations).filter(o => o.syncPending).map(o => o.key),
       batch: this.state.batch, lastAction: this.state.observation?.receipt ?? null,
       operations: Object.values(this.state.operations).map(operation => ({ key: operation.key, articleKey: operation.article.articleKey,
         phase: operation.phase, jobId: operation.job?.jobId, assetId: operation.asset?.id })) };

@@ -2,10 +2,11 @@ import { evaluateStock } from './policy.mjs';
 
 /** One bounded cycle; the background service owns repetition, never the caller. */
 export async function continuousCycle(bridge) {
-  if (!bridge.config.policy.enabled || bridge.config.policy.paused || bridge.state.pausedReason) return { action: 'paused' };
+  const syncPause = bridge.state.pausedReason?.startsWith('任务受理或状态待核对：');
+  if (!bridge.config.policy.enabled || bridge.config.policy.paused || (bridge.state.pausedReason && !syncPause)) return { action: 'paused' };
   const active = Object.values(bridge.state.operations).filter(o => ['claimed', 'dispatch_unknown', 'working', 'write_pending'].includes(o.phase));
   if (active.length >= 3 && active.every(o => o.phase === 'working')) {
-    let changed = false;
+    let changed = Boolean(syncPause || active.some(o => o.syncPending));
     for (const operation of active) {
       const job = await bridge.adapter.get(operation);
       if (job.stale || job.executionStatus !== 'working') changed = true;

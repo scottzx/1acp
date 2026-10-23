@@ -37,6 +37,24 @@ async function fixture(t) {
 const apply = async bridge => { const observed = await bridge.observe(); assert.equal(observed.due, true);
   return bridge.apply({ observationId: observed.observationId, advice: evaluateStock(observed.input) }); };
 
+test('transient stale status retains three original jobs and automatically recovers legacy sync pause', async t => {
+  const f = await fixture(t); Object.assign(f.config.policy, { mode: 'catalog_batch', maxConcurrent: 3, continuous: true, checkIntervalMs: 5000 });
+  await continuousCycle(f.bridge);
+  const originals = Object.values(f.bridge.state.operations), key = originals[2].key;
+  const get = f.adapter.get; let offline = true;
+  f.adapter.get = async o => ({ ...await get(o), stale: offline && o.key === key });
+  assert.equal((await continuousCycle(f.bridge)).action, 'wait_facts');
+  assert.equal(f.bridge.state.pausedReason, undefined); assert.equal(f.count.uniqueExecutions, 3);
+  assert.equal(f.bridge.status().syncPending.length, 1);
+  f.bridge.state.pausedReason = `任务受理或状态待核对：${key}`;
+  offline = false;
+  assert.equal((await continuousCycle(f.bridge)).action, 'wait_task');
+  assert.equal(f.bridge.state.pausedReason, undefined); assert.equal(f.bridge.status().syncPending.length, 0);
+  assert.equal(f.count.submitted, 3); assert.equal(f.count.uniqueExecutions, 3);
+  f.bridge.state.pausedReason = '成品审核退回';
+  assert.equal((await continuousCycle(f.bridge)).action, 'paused');
+});
+
 test('continuous mode starts now and refills completed positions without the old 30-minute wait', async t => {
   const f = await fixture(t); Object.assign(f.config.policy, { mode: 'catalog_batch', maxConcurrent: 3, continuous: true, checkIntervalMs: 5000 });
   f.config.catalog = f.config.catalog.slice(0, 4);

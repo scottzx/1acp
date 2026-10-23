@@ -59,11 +59,16 @@ export async function startBridge(config) {
   try {
     const adapter = await createWorkbenchAdapter(config), bridge = await new StockBridge(config, adapter).initialize();
     const runner = config.policy.mode === 'catalog_batch' && config.policy.continuous === true ? continuousRunner(bridge) : null;
-    if (runner) bridge.startContinuous = () => runner.start();
+    if (runner) bridge.startContinuous = async () => ({ ...await runner.start(), status: bridge.status() });
     const server = bridgeServer(bridge, config.token);
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, config.host, resolve); });
+    const localServer = config.host !== '127.0.0.1' && config.host !== '0.0.0.0' ? bridgeServer(bridge, config.token) : null;
+    if (localServer) {
+      try { await new Promise((resolve, reject) => { localServer.once('error', reject); localServer.listen(config.port, '127.0.0.1', resolve); }); }
+      catch (error) { await new Promise(resolve => server.close(resolve)); throw error; }
+    }
     runner?.restore();
-    const close = async () => { await runner?.stop(); await new Promise(resolve => server.close(resolve)); await lease.close(); await unlink(leasePath); };
+    const close = async () => { await runner?.stop(); if (localServer) await new Promise(resolve => localServer.close(resolve)); await new Promise(resolve => server.close(resolve)); await lease.close(); await unlink(leasePath); };
     return { bridge, server, close };
   } catch (error) { await lease.close(); await unlink(leasePath); throw error; }
 }
