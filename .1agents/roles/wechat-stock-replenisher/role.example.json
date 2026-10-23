@@ -9,9 +9,8 @@
   "status": "configuration-example-disabled",
   "productionEnabled": false,
   "policy": {
-    "lowWatermark": 10,
-    "targetStock": 15,
-    "maxConcurrent": 1,
+    "mode": "catalog_batch",
+    "maxConcurrent": 3,
     "checkIntervalMs": 1800000
   },
   "binding": {

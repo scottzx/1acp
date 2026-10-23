@@ -12,9 +12,9 @@ export function evaluateStock(input) {
   if (!identity(policy.policyId) || !identity(scopeId)
       || typeof policy.enabled !== 'boolean' || typeof policy.paused !== 'boolean'
       || typeof batch.active !== 'boolean' || typeof batch.exhausted !== 'boolean'
-      || !integer(policy.lowWatermark) || policy.lowWatermark < 1
+      || (policy.mode === 'catalog_batch' ? policy.maxConcurrent !== 3 : (!integer(policy.lowWatermark) || policy.lowWatermark < 1
       || !integer(policy.targetStock) || policy.targetStock <= policy.lowWatermark
-      || policy.maxConcurrent !== 1 || !integer(policy.checkIntervalMs) || policy.checkIntervalMs < 30 * 60 * 1000) {
+      || policy.maxConcurrent !== 1)) || !integer(policy.checkIntervalMs) || policy.checkIntervalMs < 30 * 60 * 1000) {
     return answer('invalid_input', 'invalid_policy_or_batch');
   }
   if (!policy.enabled) return answer('disabled', 'policy_disabled');
@@ -32,6 +32,20 @@ export function evaluateStock(input) {
     return answer('wait_facts', 'invalid_inventory_counts');
   }
   if (snapshot.blockedReason) return answer('paused', 'business_exception');
+  if (policy.mode === 'catalog_batch') {
+    const counts = { ready, pendingReview, inFlight, occupied };
+    const slots = Math.max(0, policy.maxConcurrent - inFlight);
+    const remaining = input.nextArticles;
+    if (!Array.isArray(remaining)) return answer('wait_preparation', 'missing_catalog_candidates');
+    const nextBatch = { active: true, exhausted: false, mode: 'catalog_batch', scopeId };
+    if (!remaining.length && input.catalogExhausted === true && !inFlight) return answer('complete_catalog', 'all_articles_produced', { counts, nextBatch: { ...nextBatch, active: false, exhausted: true } });
+    if (!slots || !remaining.length) return answer('wait_task', 'batch_slots_occupied', { counts, nextBatch });
+    const articles = remaining.slice(0, slots);
+    if (articles.some(a => a.ready !== true || !identity(a.articleKey) || !/^[a-f0-9]{64}$/.test(a.sourceSha256) || !Number.isSafeInteger(a.revision) || a.revision < 1)
+        || new Set(articles.map(a => a.articleKey)).size !== articles.length) return answer('wait_preparation', 'article_or_approval_not_ready');
+    return answer('dispatch_batch', 'catalog_remaining', { counts, nextBatch, shouldDispatch: true,
+      articles: articles.map(a => ({ articleKey: a.articleKey, actionIdentity: [policy.policyId, scopeId, a.articleKey, a.sourceSha256, a.revision] })) });
+  }
   if (batch.active && (batch.targetStock !== policy.targetStock || (batch.scopeId ?? batch.accountId) !== scopeId)) {
     return answer('paused', 'batch_configuration_changed');
   }

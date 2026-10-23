@@ -91,6 +91,7 @@ export class StockBridge {
     return { policy, snapshot: { scopeId: policy.scopeId, mode: 'production', sample: false,
       complete: facts.complete === true, stale: facts.stale === true, ready, pendingReview: pending, inFlight },
       batch: structuredClone(this.state.batch), nextArticle: next ? { ...next, ready: facts.complete === true && next.ready === true } : null,
+      ...(policy.mode === 'catalog_batch' ? { nextArticles: this.config.catalog.filter(article => !operations.some(o => o.article.articleKey === article.articleKey)).slice(0, 3) } : {}),
       catalogExhausted: !next };
   }
   async observe({ flowRunId } = {}) {
@@ -128,6 +129,30 @@ export class StockBridge {
       const expected = evaluateStock(observation.input);
       if (digest(expected) !== digest(advice)) throw new Error('Advice differs from the frozen business observation');
       let receipt = { applied: true, action: expected.action, reason: expected.reason, executionPerformed: false };
+      if (expected.action === 'dispatch_batch') {
+        if (this.config.policy.mode !== 'catalog_batch' || this.config.policy.maxConcurrent !== 3
+            || this.state.pausedReason || !this.config.policy.enabled || this.config.policy.paused) throw new Error('Batch policy is disabled or paused');
+        const facts = await this.adapter.readFacts();
+        if (!facts.complete || facts.stale || facts.digest !== observation.factsDigest) throw new Error('Business facts changed; wait for the next observation');
+        const occupied = Object.values(this.state.operations).filter(o => ['claimed', 'dispatch_unknown', 'working', 'write_pending'].includes(o.phase)).length;
+        if (expected.articles.length > 3 - occupied) throw new Error('Batch capacity changed');
+        const claims = [];
+        for (const item of expected.articles) {
+          const article = this.config.catalog.find(a => a.articleKey === item.articleKey), key = digest(item.actionIdentity);
+          if (!article || Object.values(this.state.operations).some(o => o.article.articleKey === article.articleKey)) throw new Error('Article already claimed');
+          claims.push({ key, article, phase: 'claimed', ...await this.adapter.prepare(article, key) });
+        }
+        for (const operation of claims) this.state.operations[operation.key] = operation;
+        this.state.batch = structuredClone(expected.nextBatch); this.state.lastDispatchAt = this.clock(); await this.save();
+        // All slots are durable before any submit; unknown acceptance retains its slot.
+        for (const operation of claims) {
+          try { operation.job = await this.adapter.submit(operation); operation.phase = 'working'; }
+          catch { operation.phase = 'dispatch_unknown'; }
+          await this.save();
+        }
+        receipt = { ...receipt, executionPerformed: true, operations: claims.map(o => ({ key: o.key, articleKey: o.article.articleKey, phase: o.phase, jobId: o.job?.jobId, attemptId: o.job?.attemptId })) };
+        observation.applied = true; observation.receipt = receipt; await this.save(); return receipt;
+      }
       if (expected.shouldDispatch) {
         if (this.state.pausedReason || !this.config.policy.enabled || this.config.policy.paused) throw new Error('Policy is disabled or paused');
         if (this.state.lastDispatchAt && this.clock() - this.state.lastDispatchAt < this.config.policy.checkIntervalMs) throw new Error('Dispatch interval has not elapsed');
@@ -186,6 +211,7 @@ export class StockBridge {
   }
   status() {
     return { roleId: 'wechat-stock-replenisher', mode: 'production', enabled: this.config.policy.enabled,
+      executionMode: this.config.policy.mode ?? 'stock', maxConcurrent: this.config.policy.maxConcurrent,
       scopeId: this.config.policy.scopeId, accountId: this.config.accountId ?? null, checkIntervalMs: this.config.policy.checkIntervalMs,
       nextCheckAt: this.state.nextCheckAt ? new Date(this.state.nextCheckAt).toISOString() : null,
       pausedReason: this.state.pausedReason ?? null, lastError: this.state.lastError ?? null,

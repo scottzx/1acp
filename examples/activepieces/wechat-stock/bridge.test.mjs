@@ -36,6 +36,32 @@ async function fixture(t) {
 const apply = async bridge => { const observed = await bridge.observe(); assert.equal(observed.due, true);
   return bridge.apply({ observationId: observed.observationId, advice: evaluateStock(observed.input) }); };
 
+test('catalog batch reserves three, ignores review stock limits, and refills only free slots', async t => {
+  const f = await fixture(t); f.config.policy.mode = 'catalog_batch'; f.config.policy.maxConcurrent = 3;
+  const first = await apply(f.bridge);
+  assert.equal(first.operations.length, 3); assert.equal(f.count.uniqueExecutions, 3);
+  const original = Object.values(f.bridge.state.operations)[0];
+  original.phase = 'pending_review'; original.asset = { id: 'accepted-existing' }; original.noticeHandled = true;
+  f.tick(); const second = await apply(f.bridge);
+  assert.equal(second.operations.length, 1); assert.equal(f.count.uniqueExecutions, 4);
+  assert.equal(Object.values(f.bridge.state.operations).filter(o => o.phase === 'working').length, 3);
+  const restored = await new StockBridge(f.config, f.adapter, f.now).initialize(); f.tick();
+  assert.equal((await apply(restored)).action, 'wait_task'); assert.equal(f.count.uniqueExecutions, 4);
+  const input = restored.input(f.facts); input.snapshot.pendingReview = 99; input.snapshot.ready = 99; input.snapshot.inFlight = 0;
+  assert.equal(evaluateStock(input).action, 'dispatch_batch');
+  input.nextArticles = []; input.catalogExhausted = true;
+  assert.equal(evaluateStock(input).action, 'complete_catalog');
+});
+
+test('catalog batch duplicate apply and lost acceptance keep at most three original jobs', async t => {
+  const f = await fixture(t); f.config.policy.mode = 'catalog_batch'; f.config.policy.maxConcurrent = 3; f.loseSubmit();
+  const observed = await f.bridge.observe(), input = { observationId: observed.observationId, advice: evaluateStock(observed.input) };
+  const [a,b] = await Promise.all([f.bridge.apply(input), f.bridge.apply(input)]);
+  assert.deepEqual(a,b); assert.equal(f.count.uniqueExecutions,3);
+  const restored = await new StockBridge(f.config,f.adapter,f.now).initialize(); f.tick();
+  assert.equal((await apply(restored)).action,'wait_task'); assert.equal(f.count.uniqueExecutions,3);
+});
+
 test('AP duplicates share one occupied slot and a persisted 30-minute admission limit', async t => {
   const f = await fixture(t), observed = await f.bridge.observe(), advice = evaluateStock(observed.input);
   const [a, b] = await Promise.all([f.bridge.apply({ observationId: observed.observationId, advice }), f.bridge.apply({ observationId: observed.observationId, advice })]);

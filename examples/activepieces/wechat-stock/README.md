@@ -1,5 +1,7 @@
 # AP 公众号候补内容补库
 
+2026-10-23 最新运行方式为 `policy.mode=catalog_batch`、`maxConcurrent=3`：取消10/15库存阈值，按冻结清单顺序把剩余篇目全部制作。已完成和已有在途保留原动作身份，待审核数量不阻止新制作；每次AP检查补齐最多3个在途，清单全部制作交付后结束。沿用每30分钟的AP检查与持久观察间隔，成品人工审核保持。下文库存规则仍作为兼容模式保留。
+
 AP 每 30 分钟读取真实飞书工作台，执行固定条件流程：可发布库存少于 10 篇启动，逐篇补到 15 篇；待审和在途占位，最多一个在途制作。公众号暂留空，使用独立的候补内容池。已定稿报告按原文直接封装，成品必须人工审核。
 
 [角色声明](../../../.1agents/roles/wechat-stock-replenisher/ROLE.md) · [配置示例](../../../.1agents/config/wechat-stock.example.json) · [部署与验收](../../../docs/wechat-stock-replenishment-implementation-20261023.md)

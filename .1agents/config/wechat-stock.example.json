@@ -18,9 +18,8 @@
     "scopeId": "reserve-pool:wechat-report",
     "enabled": false,
     "paused": false,
-    "lowWatermark": 10,
-    "targetStock": 15,
-    "maxConcurrent": 1,
+    "mode": "catalog_batch",
+    "maxConcurrent": 3,
     "checkIntervalMs": 1800000
   },
   "catalog": [],
