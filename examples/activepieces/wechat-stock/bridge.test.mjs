@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { StockBridge, minimumIntervalMs } from './bridge.mjs';
 import { evaluateStock } from './policy.mjs';
 import { bridgeServer } from './server.mjs';
+import { continuousCycle, continuousRunner } from './continuous.mjs';
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'wechat-stock-')); t.after(() => rm(root, { recursive: true, force: true }));
@@ -35,6 +36,30 @@ async function fixture(t) {
 }
 const apply = async bridge => { const observed = await bridge.observe(); assert.equal(observed.due, true);
   return bridge.apply({ observationId: observed.observationId, advice: evaluateStock(observed.input) }); };
+
+test('continuous mode starts now and refills completed positions without the old 30-minute wait', async t => {
+  const f = await fixture(t); Object.assign(f.config.policy, { mode: 'catalog_batch', maxConcurrent: 3, continuous: true, checkIntervalMs: 5000 });
+  f.config.catalog = f.config.catalog.slice(0, 4);
+  f.bridge.state.nextCheckAt = f.now() + minimumIntervalMs;
+  assert.equal((await continuousCycle(f.bridge)).operations.length, 3);
+  f.complete();
+  assert.equal((await continuousCycle(f.bridge)).operations.length, 1);
+  assert.equal(f.count.ingested, 1, 'refill the first released slot before processing other completed deliveries');
+  assert.equal(f.count.uniqueExecutions, 4);
+  await continuousCycle(f.bridge); await continuousCycle(f.bridge);
+  assert.equal((await continuousCycle(f.bridge)).action, 'complete_catalog');
+  assert.equal(f.count.uniqueExecutions, 4);
+});
+
+test('continuous runner persists its start and deduplicates simultaneous startup requests', async t => {
+  const f = await fixture(t); Object.assign(f.config.policy, { mode: 'catalog_batch', maxConcurrent: 3, continuous: true, checkIntervalMs: 5000 });
+  const runner = continuousRunner(f.bridge); t.after(() => runner.stop());
+  const results = await Promise.all([runner.start(), runner.start()]);
+  assert.equal(f.count.uniqueExecutions, 3); assert.deepEqual(results[0], results[1]);
+  assert.equal(f.bridge.state.continuousStarted, true);
+  const restored = await new StockBridge(f.config, f.adapter, f.now).initialize();
+  assert.equal(restored.state.continuousStarted, true);
+});
 
 test('catalog batch reserves three, ignores review stock limits, and refills only free slots', async t => {
   const f = await fixture(t); f.config.policy.mode = 'catalog_batch'; f.config.policy.maxConcurrent = 3;

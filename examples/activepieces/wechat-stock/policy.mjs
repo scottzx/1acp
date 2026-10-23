@@ -14,7 +14,8 @@ export function evaluateStock(input) {
       || typeof batch.active !== 'boolean' || typeof batch.exhausted !== 'boolean'
       || (policy.mode === 'catalog_batch' ? policy.maxConcurrent !== 3 : (!integer(policy.lowWatermark) || policy.lowWatermark < 1
       || !integer(policy.targetStock) || policy.targetStock <= policy.lowWatermark
-      || policy.maxConcurrent !== 1)) || !integer(policy.checkIntervalMs) || policy.checkIntervalMs < 30 * 60 * 1000) {
+      || policy.maxConcurrent !== 1)) || !integer(policy.checkIntervalMs)
+      || policy.checkIntervalMs < (policy.mode === 'catalog_batch' && policy.continuous === true ? 5000 : 30 * 60 * 1000)) {
     return answer('invalid_input', 'invalid_policy_or_batch');
   }
   if (!policy.enabled) return answer('disabled', 'policy_disabled');

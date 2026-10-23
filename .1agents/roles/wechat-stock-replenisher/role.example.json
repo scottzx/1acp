@@ -10,8 +10,9 @@
   "productionEnabled": false,
   "policy": {
     "mode": "catalog_batch",
+    "continuous": true,
     "maxConcurrent": 3,
-    "checkIntervalMs": 1800000
+    "checkIntervalMs": 5000
   },
   "binding": {
     "activepiecesNode": "scott-pc-wsl",

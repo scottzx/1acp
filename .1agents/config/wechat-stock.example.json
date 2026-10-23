@@ -19,8 +19,9 @@
     "enabled": false,
     "paused": false,
     "mode": "catalog_batch",
+    "continuous": true,
     "maxConcurrent": 3,
-    "checkIntervalMs": 1800000
+    "checkIntervalMs": 5000
   },
   "catalog": [],
   "seeds": []

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { StockBridge } from './bridge.mjs';
 import { createWorkbenchAdapter } from './adapter.mjs';
+import { continuousRunner } from './continuous.mjs';
 
 const types = { '.html': 'text/html; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json', '.md': 'text/markdown; charset=utf-8' };
 export function bridgeServer(bridge, token) {
@@ -14,7 +15,7 @@ export function bridgeServer(bridge, token) {
     try {
       const url = new URL(req.url, 'http://stock.local');
       if (url.search || req.headers.origin) return json(403, { error: 'unsupported_request' });
-      if (req.method === 'GET' && url.pathname === '/health') return json(200, { status: 'ok', service: 'wechat-stock-bridge', minimumIntervalMs: 1800000 });
+      if (req.method === 'GET' && url.pathname === '/health') return json(200, { status: 'ok', service: 'wechat-stock-bridge' });
       const artifact = /^\/artifacts\/([a-f0-9]{64})\/([a-zA-Z0-9.-]+)$/.exec(url.pathname);
       if (req.method === 'GET' && artifact) {
         const operation = bridge.state.operations[artifact[1]], file = operation?.delivery?.receipts?.[artifact[2]];
@@ -32,12 +33,12 @@ export function bridgeServer(bridge, token) {
       const expected = Buffer.from(`Bearer ${token}`), provided = Buffer.from(req.headers.authorization ?? '');
       if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) return json(401, { error: 'unauthorized' });
       if (req.method === 'GET' && url.pathname === '/status') return json(200, bridge.status());
-      if (req.method !== 'POST' || !['/observe', '/apply'].includes(url.pathname)) return json(404, { error: 'no_route' });
+      if (req.method !== 'POST' || !['/observe', '/apply', ...(bridge.startContinuous ? ['/run'] : [])].includes(url.pathname)) return json(404, { error: 'no_route' });
       if (!req.headers['content-type']?.startsWith('application/json')) return json(415, { error: 'json_required' });
       const chunks = []; let length = 0;
       for await (const chunk of req) { length += chunk.length; if (length > 65536) return json(413, { error: 'body_too_large' }); chunks.push(chunk); }
       const input = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-      return json(200, await (url.pathname === '/observe' ? bridge.observe(input) : bridge.apply(input)));
+      return json(200, await (url.pathname === '/run' ? bridge.startContinuous() : url.pathname === '/observe' ? bridge.observe(input) : bridge.apply(input)));
     } catch { json(409, { error: 'business_operation_requires_reconciliation' }); }
   })(); });
 }
@@ -57,9 +58,12 @@ export async function startBridge(config) {
   if (!lease) throw new Error('Could not acquire stock service ownership');
   try {
     const adapter = await createWorkbenchAdapter(config), bridge = await new StockBridge(config, adapter).initialize();
+    const runner = config.policy.mode === 'catalog_batch' && config.policy.continuous === true ? continuousRunner(bridge) : null;
+    if (runner) bridge.startContinuous = () => runner.start();
     const server = bridgeServer(bridge, config.token);
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, config.host, resolve); });
-    const close = async () => { await new Promise(resolve => server.close(resolve)); await lease.close(); await unlink(leasePath); };
+    runner?.restore();
+    const close = async () => { await runner?.stop(); await new Promise(resolve => server.close(resolve)); await lease.close(); await unlink(leasePath); };
     return { bridge, server, close };
   } catch (error) { await lease.close(); await unlink(leasePath); throw error; }
 }

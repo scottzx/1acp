@@ -18,7 +18,8 @@ export async function atomicJson(path, value) {
 /** Finite AP-requested transactions. No timer and no autonomous scheduling in this service. */
 export class StockBridge {
   constructor(config, adapter, clock = () => Date.now()) {
-    if (!Number.isSafeInteger(config.policy.checkIntervalMs) || config.policy.checkIntervalMs < minimumIntervalMs) throw new Error('checkIntervalMs must be at least 1800000');
+    const minimum = config.policy.mode === 'catalog_batch' && config.policy.continuous === true ? 5000 : minimumIntervalMs;
+    if (!Number.isSafeInteger(config.policy.checkIntervalMs) || config.policy.checkIntervalMs < minimum) throw new Error(`checkIntervalMs must be at least ${minimum}`);
     this.config = config; this.adapter = adapter; this.clock = clock; this.queue = Promise.resolve();
     this.path = join(config.stateDirectory, 'stock.json');
   }
@@ -39,6 +40,7 @@ export class StockBridge {
   async save() { this.state.revision++; await atomicJson(this.path, this.state); }
   async pause(reason) { this.state.pausedReason = reason; await this.save(); }
   async reconcile(facts) {
+    let deliveries = 0;
     for (const operation of Object.values(this.state.operations)) {
       if (['claimed', 'dispatch_unknown'].includes(operation.phase)) {
         // The stable execution_submit request is replay-safe at the gateway ledger boundary.
@@ -54,6 +56,7 @@ export class StockBridge {
           operation.phase = 'failed'; await this.pause(`制作任务需要处理：${job.executionStatus}`); continue;
         }
         if (job.executionStatus !== 'completed') continue;
+        if (this.config.policy.continuous && deliveries >= 1) continue;
         try { operation.delivery = await this.adapter.verify(operation, job); }
         catch (error) {
           operation.phase = 'delivery_invalid'; operation.diagnostic = String(error.message || error).slice(0, 500);
@@ -62,7 +65,9 @@ export class StockBridge {
         operation.phase = 'write_pending'; await this.save();
       }
       if (operation.phase === 'write_pending') {
+        if (this.config.policy.continuous && deliveries >= 1) continue;
         operation.asset = await this.adapter.ingest(operation, facts);
+        deliveries++;
         operation.phase = 'pending_review'; await this.save();
       }
       if (['pending_review', 'ready', 'published'].includes(operation.phase)) {
@@ -97,7 +102,7 @@ export class StockBridge {
   async observe({ flowRunId } = {}) {
     return this.serialize(async () => {
       const now = this.clock();
-      if (now < this.state.nextCheckAt) return { due: false, reason: 'minimum_interval', nextCheckAt: new Date(this.state.nextCheckAt).toISOString() };
+      if (!this.config.policy.continuous && now < this.state.nextCheckAt) return { due: false, reason: 'minimum_interval', nextCheckAt: new Date(this.state.nextCheckAt).toISOString() };
       this.state.nextCheckAt = now + this.config.policy.checkIntervalMs;
       this.state.lastCheckAt = new Date(now).toISOString(); await this.save();
       let facts;
@@ -212,6 +217,7 @@ export class StockBridge {
   status() {
     return { roleId: 'wechat-stock-replenisher', mode: 'production', enabled: this.config.policy.enabled,
       executionMode: this.config.policy.mode ?? 'stock', maxConcurrent: this.config.policy.maxConcurrent,
+      continuous: this.config.policy.continuous === true, continuousStarted: this.state.continuousStarted === true,
       scopeId: this.config.policy.scopeId, accountId: this.config.accountId ?? null, checkIntervalMs: this.config.policy.checkIntervalMs,
       nextCheckAt: this.state.nextCheckAt ? new Date(this.state.nextCheckAt).toISOString() : null,
       pausedReason: this.state.pausedReason ?? null, lastError: this.state.lastError ?? null,
