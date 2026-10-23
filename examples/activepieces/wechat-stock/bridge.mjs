@@ -42,6 +42,10 @@ export class StockBridge {
   async reconcile(facts) {
     let deliveries = 0;
     for (const operation of Object.values(this.state.operations)) {
+      if (operation.phase === 'working' && operation.recovery?.pending) {
+        await this.resumeInterrupted(operation);
+        if (operation.recovery.pending || operation.phase === 'failed') continue;
+      }
       if (['claimed', 'dispatch_unknown'].includes(operation.phase)) {
         // The stable execution_submit request is replay-safe at the gateway ledger boundary.
         try { operation.job = await this.adapter.submit(operation); operation.phase = 'working'; await this.save(); }
@@ -93,6 +97,74 @@ export class StockBridge {
         && !Object.values(this.state.operations).some(o => o.syncPending)) {
       delete this.state.pausedReason; this.state.syncRecoveredAt = new Date(this.clock()).toISOString(); await this.save();
     }
+  }
+  /** Explicit maintenance only: freeze all original checkpoints before any continuation. */
+  async prepareInterruptedRecovery(keys) {
+    return this.serialize(async () => {
+      if (this.config.policy.mode !== 'catalog_batch' || this.config.policy.maxConcurrent !== 3
+          || this.state.pausedReason !== '制作任务需要处理：failed'
+          || !Array.isArray(keys) || !keys.length || new Set(keys).size !== keys.length) throw new Error('Original failed batch required');
+      const failed = Object.values(this.state.operations).filter(o => o.phase === 'failed');
+      if (failed.length !== keys.length || failed.some(o => !keys.includes(o.key))
+          || Object.values(this.state.operations).some(o => ['claimed', 'dispatch_unknown', 'working', 'write_pending'].includes(o.phase))
+          || keys.length > 3) throw new Error('Recover all failed originals without exceeding capacity');
+      const prepared = [];
+      for (const key of keys) {
+        const operation = this.state.operations[key], view = await this.adapter.get(operation);
+        if (view.stale || view.executionStatus !== 'failed' || view.submissionStatus !== 'accepted'
+            || view.jobId !== operation.job.jobId || view.attemptId !== operation.job.attemptId
+            || view.inFlightAttemptIds?.length || view.unresolvedAttemptIds?.length
+            || !/interrupted by an A2A service restart/i.test(view.resultSummary ?? '')) throw new Error('Original interruption is not confirmed');
+        prepared.push([operation, await this.adapter.prepareRecovery(operation, view)]);
+      }
+      for (const [operation, recovery] of prepared) {
+        if (operation.recovery && !operation.recovery.pending) (operation.recoveryHistory ??= []).push(operation.recovery);
+        operation.recovery = recovery;
+      }
+      await this.save();
+      return prepared.map(([operation]) => ({ key: operation.key, jobId: operation.job.jobId, checkpointPath: operation.recovery.checkpointPath }));
+    });
+  }
+  async resumeInterrupted(operation) {
+    try {
+      const view = await this.adapter.continue(operation.recovery.request);
+      const attemptId = view.attemptId ?? view.currentAttemptId;
+      if (view.jobId !== operation.recovery.previousJob.jobId || !attemptId
+          || attemptId === operation.recovery.previousJob.attemptId) throw new Error('Continuation identity is unresolved');
+      if (view.submissionStatus === 'accepted' && view.contextId !== operation.recovery.previousJob.contextId) throw new Error('Continuation context changed');
+      operation.job = view; operation.recovery.pending = false;
+      operation.recovery.resumedAt = new Date(this.clock()).toISOString();
+      operation.phase = 'working';
+      if (view.submissionStatus !== 'accepted' || view.stale) operation.syncPending = true;
+      else delete operation.syncPending;
+      if (['failed', 'rejected', 'canceled'].includes(view.executionStatus)) {
+        operation.phase = 'failed'; this.state.pausedReason = `制作任务需要处理：${view.executionStatus}`;
+      }
+    } catch {
+      // The identical persisted request is replayed at the ledger boundary; never submit a replacement job.
+      operation.syncPending = true;
+    }
+    await this.save();
+  }
+  async submitInterruptedRecovery(keys) {
+    return this.serialize(async () => {
+      const operations = keys.map(key => this.state.operations[key]);
+      if (new Set(keys).size !== keys.length || !keys.length || keys.length > 3
+          || operations.some(o => !o?.recovery || o.recovery.previousJob.jobId !== o.job.jobId)
+          || ![undefined, '制作任务需要处理：failed'].includes(this.state.pausedReason)) throw new Error('Prepared original recovery required');
+      if (operations.some(o => !o.recovery.pending && o.phase === 'failed')) throw new Error('Resumed attempt failed; explicit new recovery required');
+      if (Object.values(this.state.operations).filter(o => !keys.includes(o.key)
+          && ['claimed', 'dispatch_unknown', 'working', 'write_pending'].includes(o.phase)).length) throw new Error('Other production slots are occupied');
+      if (this.state.pausedReason && Object.values(this.state.operations).some(o => o.phase === 'failed' && !keys.includes(o.key))) throw new Error('Unprepared failure remains');
+      // Occupy every slot durably before the first send, including unknown admissions.
+      for (const operation of operations) if (operation.recovery.pending) operation.phase = 'working';
+      delete this.state.pausedReason; delete this.state.continuousFinished;
+      this.state.continuousStarted = true; await this.save();
+      for (const operation of operations) if (operation.recovery.pending) await this.resumeInterrupted(operation);
+      return { action: 'resume_originals', operations: operations.map(o => ({ key: o.key, jobId: o.job.jobId,
+        previousAttemptId: o.recovery.previousJob.attemptId, attemptId: o.job.attemptId, taskId: o.job.taskId,
+        phase: o.phase, admissionPending: o.recovery.pending || o.syncPending === true })) };
+    });
   }
   input(facts) {
     const operations = Object.values(this.state.operations);

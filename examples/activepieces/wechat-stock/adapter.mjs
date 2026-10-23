@@ -3,6 +3,7 @@ import { readFile, writeFile, mkdir, realpath, lstat } from 'node:fs/promises';
 import { basename, join, relative, isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { digest } from './bridge.mjs';
+import { prepareRecovery } from './recovery.mjs';
 
 const requiredFiles = ['source.md', 'metadata.json', 'series.json', 'article.html', 'article.wechat.html', 'cover.png', 'cover.svg',
   'cover.html', 'footer.html', 'series-nav.html', 'verification.json', 'visual-qa.json', 'qa-mobile.png', 'qa-footer.png', 'README.md'];
@@ -121,6 +122,8 @@ export async function createWorkbenchAdapter(config) {
           resultContract: { jobId: contract.jobId, artifactManifestPath: join(outputDirectory, 'artifact-manifest.json') } } } };
     },
     async submit(operation) { return gateway('execution_submit', operation.request); },
+    prepareRecovery,
+    async continue(request) { return gateway('execution_continue', request); },
     async get(operation) { return gateway('execution_get', { originSessionId: operation.request.originSessionId, jobId: operation.job.jobId }); },
     async verify(operation, view) { return verifyDelivery(operation, view, config.artifactRoot); },
     async ingest(operation, observed) {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { StockBridge, minimumIntervalMs } from './bridge.mjs';
@@ -36,6 +36,65 @@ async function fixture(t) {
 }
 const apply = async bridge => { const observed = await bridge.observe(); assert.equal(observed.due, true);
   return bridge.apply({ observationId: observed.observationId, advice: evaluateStock(observed.input) }); };
+
+async function interruptedBatch(t) {
+  const f = await fixture(t);
+  Object.assign(f.config.policy, { mode: 'catalog_batch', maxConcurrent: 3, continuous: true, checkIntervalMs: 5000 });
+  await continuousCycle(f.bridge);
+  const originals = Object.values(f.bridge.state.operations), accepted = new Map(); let lose = false;
+  f.adapter.get = async o => accepted.get(o.key) ?? { ...o.job, contextId: `context:${o.key}`, sessionId: `session:${o.key}`,
+    executionStatus: 'failed', submissionStatus: 'accepted', stale: false,
+    resultSummary: 'Execution was interrupted by an A2A service restart and was not restarted.' };
+  f.adapter.prepareRecovery = async (o, v) => ({ pending: true, checkpointPath: `checkpoint:${o.key}`, previousJob: v,
+    request: { jobId: v.jobId, clientRequestId: `resume:${o.key}`, input: { prompt: 'reuse original files' } } });
+  f.adapter.continue = async request => {
+    const disk = JSON.parse(await readFile(f.bridge.path, 'utf8'));
+    assert.equal(Object.values(disk.operations).filter(o => o.phase === 'working').length, 3, 'all slots persisted before send');
+    const o = originals.find(o => o.job.jobId === request.jobId);
+    if (!accepted.has(o.key)) accepted.set(o.key, { jobId: request.jobId, attemptId: `resumed:${o.key}`, taskId: `task:${o.key}`,
+      contextId: `context:${o.key}`, executionStatus: 'working', submissionStatus: 'accepted', stale: false });
+    if (lose) { lose = false; throw new Error('response lost after continuation accepted'); }
+    return accepted.get(o.key);
+  };
+  await f.bridge.observe();
+  return { ...f, originals, accepted, keys: originals.map(o => o.key), lose: () => { lose = true; } };
+}
+
+test('restart recovery continues original jobs, preserves contexts and never submits replacement production', async t => {
+  const f = await interruptedBatch(t), jobIds = f.originals.map(o => o.job.jobId);
+  await assert.rejects(f.bridge.prepareInterruptedRecovery(f.keys.slice(0, 2)), /all failed originals/);
+  await f.bridge.prepareInterruptedRecovery(f.keys);
+  await f.bridge.observe();
+  assert.equal(f.accepted.size, 0, 'checkpoint preparation does not call models');
+  const result = await f.bridge.submitInterruptedRecovery(f.keys);
+  assert.equal(f.accepted.size, 3); assert.equal(f.count.submitted, 3);
+  assert.deepEqual(result.operations.map(o => o.jobId), jobIds);
+  assert.equal(f.bridge.state.pausedReason, undefined);
+  assert.equal((await continuousCycle(f.bridge)).action, 'wait_task');
+  await f.bridge.submitInterruptedRecovery(f.keys);
+  assert.equal(f.accepted.size, 3);
+  f.originals[0].phase = 'failed'; f.bridge.state.pausedReason = '制作任务需要处理：failed';
+  await assert.rejects(f.bridge.submitInterruptedRecovery(f.keys), /explicit new recovery/);
+});
+
+test('lost continuation response retains its original slot and replays the same durable request after restart', async t => {
+  const f = await interruptedBatch(t); await f.bridge.prepareInterruptedRecovery(f.keys); f.lose();
+  await f.bridge.submitInterruptedRecovery(f.keys);
+  assert.equal(f.bridge.status().syncPending.length, 1); assert.equal(f.accepted.size, 3);
+  const restored = await new StockBridge(f.config, f.adapter, f.now).initialize();
+  assert.equal((await continuousCycle(restored)).action, 'wait_task');
+  assert.equal(restored.status().syncPending.length, 0);
+  assert.equal(f.accepted.size, 3); assert.equal(f.count.submitted, 3);
+});
+
+test('recovery refuses stale, unrelated failures and completed originals before any continuation', async t => {
+  const f = await interruptedBatch(t), get = f.adapter.get;
+  for (const override of [{ stale: true }, { executionStatus: 'completed' }, { resultSummary: 'different failure' }, { attemptId: 'another-attempt' }]) {
+    f.adapter.get = async o => ({ ...await get(o), ...override });
+    await assert.rejects(f.bridge.prepareInterruptedRecovery(f.keys), /interruption is not confirmed/);
+    assert.equal(f.accepted.size, 0);
+  }
+});
 
 test('transient stale status retains three original jobs and automatically recovers legacy sync pause', async t => {
   const f = await fixture(t); Object.assign(f.config.policy, { mode: 'catalog_batch', maxConcurrent: 3, continuous: true, checkIntervalMs: 5000 });
