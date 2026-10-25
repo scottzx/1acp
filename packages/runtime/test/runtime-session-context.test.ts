@@ -547,6 +547,8 @@ test("shutdown joins admitted startup and rejects queued ensure without leaking 
   const entered = deferred<void>();
   const release = deferred<void>();
   const pids: number[] = [];
+  const reserved = new Set<string>();
+  const failures: unknown[] = [];
   await withRuntime(
     async ({ runtime, ensure }) => {
       const first = assert.rejects(ensure("starting"), /shut down/);
@@ -556,18 +558,26 @@ test("shutdown joins admitted startup and rejects queued ensure without leaking 
       release.resolve();
       await Promise.all([first, queued, shutdown]);
       assert.equal(pids.length, 0);
+      assert.equal(reserved.size, 0);
+      assert.equal(failures.length, 1);
+      assert.match(String(failures[0]), /shut down/);
       for (const pid of pids) {
         assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
       }
     },
     {
       processLifecycle: {
-        onBeforeSpawn: async () => {
+        onBeforeSpawn: async (launch) => {
+          reserved.add(launch.launchId);
           entered.resolve();
           await release.promise;
         },
         onSpawned: async ({ pid }) => {
           pids.push(pid);
+        },
+        onSpawnFailed: (failure) => {
+          assert.equal(reserved.delete(failure.launchId), true);
+          failures.push(failure.error);
         },
       },
     },

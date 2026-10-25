@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { client, type RequestError } from '@agentclientprotocol/sdk';
 import { createAgentRegistry, createRuntimeStore, type SafeError } from '@1agents/acp-service/runtime';
 import { WebSocket } from 'ws';
+import { testCapacityLifecycle } from './capacity-fixture.js';
 
 const secret = 'SYNTHETIC_SECRET_CANARY_NOT_REAL';
 const authLink = 'https://example.invalid/authorize?token=SYNTHETIC_AUTH_CANARY_NOT_REAL';
@@ -67,6 +68,7 @@ test('A05 native structured errors cross runtime, live ACP and bridge summary wi
   const { webSocketStream } = await import('../src/acp-connection.js');
   const options = Reflect.get(bridge.runtime, 'options');
   options.sessionStore = createRuntimeStore({ stateDir: directory });
+  options.processLifecycle = testCapacityLifecycle(directory);
   options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, fixturePath] } });
   const logs: unknown[][] = [];
   for (const method of ['error', 'warn', 'log'] as const) t.mock.method(console, method, (...args: unknown[]) => { logs.push(args); });

@@ -13,6 +13,8 @@ import { resolveRoleSkills, type RoleSkillLock } from '../roles/index.js';
 import { A2APreflightError, a2aPreflightRequirementsSchema } from './preflight.js';
 import { a2aResultContractSchema, A2AResultValidationError, createA2AResultMetadata, saveA2AResultMetadata,
   type A2AResultContract, type A2AResultMetadata } from './result-metadata.js';
+import { CapacityGovernor, CapacityError, type CapacityOptions, type CapacityLease } from '../capacity.js';
+import { CapacityQueue } from '../capacity-queue.js';
 
 const FAILURE_MESSAGES: Record<NonNullable<A2ARunResult['failureReason']>, string> = {
   'missing-final-answer': 'DSH completed the task without a final answer; ACP final-answer metadata contained no final output',
@@ -26,6 +28,8 @@ const FAILURE_MESSAGES: Record<NonNullable<A2ARunResult['failureReason']>, strin
 };
 
 export interface A2AExecutionOptions {
+  /** Trusted host policy. All A2A executions are automatic; request metadata cannot override it. */
+  capacity?: CapacityOptions;
   defaultCwd?: string;
   defaultAgentPreset?: string;
   workspaces?: Record<string, string>;
@@ -37,6 +41,7 @@ export interface A2AExecutionOptions {
 
 /** Validate trusted host configuration before acquiring a state-directory lease. */
 export function validateA2AExecutionOptions(options: A2AExecutionOptions): void {
+  new CapacityGovernor(options.capacity);
   const roles = options.roleSkills;
   if (roles === undefined) return;
   if (!roles || typeof roles !== 'object' || typeof roles.cacheRoot !== 'string' || !isAbsolute(roles.cacheRoot) || roles.cacheRoot.includes('\0')
@@ -50,6 +55,17 @@ export function validateA2AExecutionOptions(options: A2AExecutionOptions): void 
 
 class RoleSkillLoadingError extends Error {
   constructor(cause: unknown) { super('Role skills could not be loaded or verified; the model was not started', { cause }); }
+}
+
+async function waitForPreparation(previous: Promise<void>, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  let abort!: () => void;
+  const canceled = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  try { await Promise.race([previous, canceled]); }
+  finally { signal.removeEventListener('abort', abort); }
 }
 
 /** Validate application metadata before the SDK starts an execution. */
@@ -93,12 +109,14 @@ export function parseA2AInput(request: SendMessageRequest, options: A2AExecution
 
 /** SDK owns the execution lifetime; an HTTP disconnect never aborts this signal. */
 export class A2ASessionExecutor implements AgentExecutor {
+  private readonly capacity: CapacityQueue;
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private readonly awaitingInput = new Map<string, { contextId: string; target: A2ATarget; result: A2AResultMetadata }>();
   private readonly preparing = new Map<string, Promise<void>>();
   private stopped = false;
   constructor(private readonly backend: A2ABackend, private readonly store: FileA2AStore, private readonly options: A2AExecutionOptions) {
     validateA2AExecutionOptions(options);
+    this.capacity = new CapacityQueue(options.capacity);
   }
 
   private roleIdFor(input: A2APrepareInput, saved: A2ATarget | undefined): string | undefined {
@@ -164,6 +182,8 @@ export class A2ASessionExecutor implements AgentExecutor {
     const startedAt = new Date().toISOString();
     let resultContract: A2AResultContract | undefined;
     let resultMetadata: A2AResultMetadata | undefined;
+    let capacityLease: CapacityLease | undefined;
+    let capacityFailure: CapacityError | undefined;
     // DSH deduplicates prompts by rpcId across the whole session. A Task can
     // have several input-required turns, each with its own message identity.
     const requestId = a2aRequestId(context.taskId, context.userMessage.messageId);
@@ -175,13 +195,39 @@ export class A2ASessionExecutor implements AgentExecutor {
           ...target, ...(resultMetadata ? { result: resultMetadata } : {}), ...(error ? { error } : {}),
         } } : undefined }));
     };
-    const submitted = (): void => {
+    const submitted = (text?: string): void => {
       if (published) return;
       const task = Task.fromJSON({ ...Task.toJSON(context.task ?? Task.fromJSON({ id: context.taskId, contextId: context.contextId })) as object,
-        status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() },
+        status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString(),
+          ...(text ? { message: { messageId: randomUUID(), role: 'ROLE_AGENT', contextId: context.contextId,
+            taskId: context.taskId, parts: [{ text }] } } : {}) },
         metadata: { ...context.task?.metadata, '1agents': target ?? {} } });
       bus.publish(AgentEvent.task(task));
       published = true;
+    };
+    const pendingCapacity = (): void => {
+      const message = 'Pending: waiting in FIFO order for device memory and ACP capacity.';
+      submitted(message);
+      status(TaskState.TASK_STATE_SUBMITTED, message);
+    };
+    const acquireCapacity = (signal = controller.signal) => this.capacity.acquire({ kind: 'task', source: 'automatic', id: requestId }, {
+      signal, onPending: pendingCapacity,
+    });
+    const beforeStart = async (hostSignal?: AbortSignal): Promise<void> => {
+      const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
+      for (;;) {
+        signal.throwIfAborted();
+        try { await capacityLease!.recheck(); break; }
+        catch (error) {
+          if (!(error instanceof CapacityError)) throw error;
+          await capacityLease!.release();
+          capacityLease = undefined;
+          pendingCapacity();
+          capacityLease = await acquireCapacity(signal);
+        }
+      }
+      signal.throwIfAborted();
+      status(TaskState.TASK_STATE_WORKING);
     };
     try {
       const parsed = parseA2AInput(context.request, this.options);
@@ -191,13 +237,21 @@ export class A2ASessionExecutor implements AgentExecutor {
       // Ordinary clients retain the first Task's prepared session metadata.
       if (this.roleIdFor(input, this.store.loadTarget(context.contextId, context.context))) submitted();
       const key = JSON.stringify([context.context.tenant ?? '', resolveUserScope(context.context), context.contextId]);
+      if (this.preparing.has(key)) {
+        const message = 'Pending: waiting for an earlier task to prepare this session.';
+        submitted(message);
+        status(TaskState.TASK_STATE_SUBMITTED, message);
+      }
       const previous = this.preparing.get(key) ?? Promise.resolve();
       let promptPrefix = '';
       let unlock!: () => void;
       const lock = new Promise<void>(resolve => { unlock = resolve; });
-      this.preparing.set(key, lock);
+      // A canceled waiter must not let later requests bypass its still-pending predecessor.
+      const tail = previous.then(() => lock);
+      this.preparing.set(key, tail);
+      void tail.then(() => { if (this.preparing.get(key) === tail) this.preparing.delete(key); });
       try {
-        await previous;
+        await waitForPreparation(previous, controller.signal);
         controller.signal.throwIfAborted();
         const saved = this.store.loadTarget(context.contextId, context.context);
         if (saved?.roleSkills) submitted();
@@ -205,20 +259,26 @@ export class A2ASessionExecutor implements AgentExecutor {
         try { role = await this.roleFor(input, saved, key, controller.signal); }
         catch (error) { throw new RoleSkillLoadingError(error); }
         controller.signal.throwIfAborted();
+        // ACP session preparation can itself wait in the process FIFO.
+        if ((input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset)?.startsWith('oneagents-acp-')) pendingCapacity();
+        // Acquire only after context/role waits, immediately before session creation.
+        capacityLease = await acquireCapacity();
+        controller.signal.throwIfAborted();
         target = await this.backend.prepare({ sessionId: saved?.sessionId,
           cwd: input.cwd ?? saved?.cwd ?? this.options.defaultCwd,
           agentPreset: input.agentPreset ?? saved?.agentPreset ?? this.options.defaultAgentPreset,
-          ...(input.preflight ? { preflight: input.preflight } : {}) });
+          ...(input.preflight ? { preflight: input.preflight } : {}) }, { signal: controller.signal });
         if (role) { target.roleId = role.roleId; target.roleSkills = role.summary; promptPrefix = role.promptPrefix; }
         this.store.saveTarget(context.contextId, target, context.context);
       } finally {
         unlock();
-        if (this.preparing.get(key) === lock) this.preparing.delete(key);
       }
       submitted();
       controller.signal.throwIfAborted();
-      status(TaskState.TASK_STATE_WORKING);
-      const result = await this.backend.run(target, promptPrefix + prompt, { requestId, signal: controller.signal });
+      // Preparation can include I/O or a cold ACP handshake. Never start the
+      // model using a memory observation taken before that work.
+      await beforeStart();
+      const result = await this.backend.run(target, promptPrefix + prompt, { requestId, signal: controller.signal, beforeStart });
       returnedError = result.outcome === 'failed' && result.error !== undefined
         ? toSafeError(result.error, { origin: 'a2a', operationId: requestId }) : undefined;
       returnedFailureMessage = result.outcome === 'failed' && typeof result.failureReason === 'string' && Object.hasOwn(FAILURE_MESSAGES, result.failureReason)
@@ -248,6 +308,7 @@ export class A2ASessionExecutor implements AgentExecutor {
         ? toSafeError(returnedError, { origin: 'a2a', operationId: requestId }) : undefined;
       status(result.outcome === 'completed' ? TaskState.TASK_STATE_COMPLETED : result.outcome === 'input-required' ? TaskState.TASK_STATE_INPUT_REQUIRED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? error?.message ?? result.detail, error);
     } catch (error) {
+      if (error instanceof CapacityError) capacityFailure = error;
       if (!published) bus.publish(AgentEvent.task(Task.fromJSON({ id: context.taskId, contextId: context.contextId,
         status: { state: 'TASK_STATE_SUBMITTED', timestamp: new Date().toISOString() } })));
       const projected = controller.signal.aborted && returnedError ? returnedError : toSafeError(error, { origin: 'a2a', operationId: requestId });
@@ -257,12 +318,15 @@ export class A2ASessionExecutor implements AgentExecutor {
       });
       resultMetadata = await createA2AResultMetadata({ taskId: context.taskId, contextId: context.contextId,
         requestId, startedAt, outcome: controller.signal.aborted ? 'canceled' : 'failed', target, contract: resultContract,
-        validationCode: error instanceof A2AResultValidationError ? error.code : error instanceof RoleSkillLoadingError ? 'role-skills-unavailable' : undefined,
+        validationCode: capacityFailure?.code ?? (error instanceof A2AResultValidationError ? error.code : error instanceof RoleSkillLoadingError ? 'role-skills-unavailable' : undefined),
         ...(error instanceof A2APreflightError ? { preflight: error.report } : {}) });
       try { await saveA2AResultMetadata(resultMetadata, target); }
       catch { resultMetadata.validation = { status: 'failed', code: 'result-record-write-failed' }; delete resultMetadata.recordPath; }
-      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, returnedFailureMessage ?? safe.message, safe);
+      status(controller.signal.aborted ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED, capacityFailure?.message ?? returnedFailureMessage ?? safe.message, safe);
     } finally {
+      // Release failures retain the durable reservation and cannot strand close().
+      try { await capacityLease?.release(); }
+      catch { console.warn('ACP task capacity reservation could not be released'); }
       this.active.delete(context.taskId);
       finish();
     }

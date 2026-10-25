@@ -289,15 +289,30 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       });
     }
   }
-  async function ensure(params: RecordValue, fresh: boolean, replay: boolean) {
+  async function ensure(params: RecordValue, fresh: boolean, replay: boolean, signal?: AbortSignal) {
     requireInitialized();
+    signal?.throwIfAborted();
+    // Read-only status/replay work may be abandoned after cancellation; the
+    // dispatch that owns process creation is always awaited and explicitly closed.
+    async function readWhileActive<T>(operation: Promise<T>): Promise<T> {
+      if (!signal) return operation;
+      signal.throwIfAborted();
+      let abort!: () => void;
+      const canceled = new Promise<never>((_, reject) => {
+        abort = () => reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+      });
+      try { return await Promise.race([operation, canceled]); }
+      finally { signal.removeEventListener('abort', abort); }
+    }
     if (typeof params.cwd !== 'string' || !isAbsolute(params.cwd)) throw RequestError.invalidParams('cwd must be absolute');
     try { params = { ...params, cwd: realpathSync(params.cwd) }; }
     catch { throw RequestError.invalidParams('cwd must name an existing directory'); }
     const id = fresh ? randomUUID() : params.sessionId;
     const custom = extensions ? metadata(params) : {};
     const stored = state.get(id);
-    const record = fresh ? undefined : await backend.record(stored?.runtimeRecordId || id);
+    const record = fresh ? undefined : await readWhileActive(backend.record(stored?.runtimeRecordId || id));
+    signal?.throwIfAborted();
     if (!fresh) {
       const live = backend.sessions.get(id);
       const binding = state.get(id);
@@ -310,9 +325,42 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       if (record?._meta?.[NS]?.agentType && record._meta[NS].agentType !== agentName) throw RequestError.invalidParams('Session Agent cannot change');
     }
     if (held.has(id)) throw new RequestError(-32000, 'Session attachment is already in progress');
+    const previousSession = backend.sessions.get(id);
+    const previousPeer = previousSession?.ws;
+    const previousResponsePolicy = previousSession?.acpResponsePolicy;
+    const previouslyAttached = attached.has(id);
     held.set(id, []);
+    let dispatchStarted = false;
+    let abortCleanup: Promise<unknown> | undefined;
+    let restoredExisting = false;
+    const closeOwnedStartup = async () => {
+      const current = backend.sessions.get(id);
+      if (previousSession && current === previousSession) {
+        // A canceled reattachment must preserve the user's original live turn.
+        if (current.ws === peer) {
+          current.ws = previousPeer;
+          current.acpResponsePolicy = previousResponsePolicy;
+          restoredExisting = true;
+        }
+        return;
+      }
+      // Ownership may have passed to another successful attachment while a
+      // canceled request was awaiting status. Never close that connection.
+      if (current && current.ws !== peer) return;
+      await peer.command(backend, { action: 'close_session', sessionId: id, initializationSignal: signal });
+    };
+    const abort = () => {
+      if (!dispatchStarted) return;
+      // The client does not know a fresh session's ID yet. Cancel its private
+      // initialization immediately, including while dispatch is awaiting capacity.
+      abortCleanup ??= closeOwnedStartup().catch(() => undefined);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
-      const events = await peer.command(backend, { ...custom, action: 'ensure_session', sessionId: id, workspacePath: params.cwd, agentType: agentName, mcpServers: params.mcpServers, runtimeSessionKey: stored?.runtimeRecordId, resumeSessionId: fresh ? custom.resumeSessionId : record?.acpSessionId, responsePolicy: 'stream' });
+      signal?.throwIfAborted();
+      dispatchStarted = true;
+      const events = await peer.command(backend, { ...custom, action: 'ensure_session', sessionId: id, workspacePath: params.cwd, agentType: agentName, mcpServers: params.mcpServers, runtimeSessionKey: stored?.runtimeRecordId, resumeSessionId: fresh ? custom.resumeSessionId : record?.acpSessionId, responsePolicy: 'stream', initializationSignal: signal });
+      signal?.throwIfAborted();
       state.create({ sessionId: id, agentType: agentName, cwd: params.cwd, completeHistory: fresh ? !custom.resumeSessionId : stored?.completeHistory === true, runtimeRecordId: backend.sessions.get(id)?.handle?.acpxRecordId });
       attached.add(id);
       const session = backend.sessions.get(id);
@@ -322,23 +370,46 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
         for (const update of state.history(id)) {
           notify('session/update', { sessionId: id, update });
         }
-        await output;
+        await readWhileActive(output);
+        signal?.throwIfAborted();
       }
-      const status = await backend.status(id);
+      const status = await readWhileActive(backend.status(id));
+      signal?.throwIfAborted();
       if (backend.sessions.get(id)?.ws !== peer) throw new RequestError(-32000, 'Session taken over during attachment');
       if (status.availableCommands) {
         notify('session/update', { sessionId: id, update: {
           sessionUpdate: 'available_commands_update',
           availableCommands: status.availableCommands.map((c: RecordValue) => ({ name: c.name, description: c.description || '', ...(c.hasInput ? { input: { hint: c.inputHint || 'Arguments' } } : {}) })),
         } });
-        await output;
+        await readWhileActive(output);
+        signal?.throwIfAborted();
       }
       const ready = events.find(e => e.event === 'session_ready') || {};
+      signal?.throwIfAborted();
+      if (previousSession && backend.sessions.get(id) === previousSession && previousSession.ws === peer &&
+          previousPeer && previousPeer !== peer && previousPeer.readyState === 1) {
+        previousPeer.send(JSON.stringify({ event: 'session_taken_over', sessionId: id }));
+      }
       return { ...(fresh ? { sessionId: id } : {}), ...(status.modes ? { modes: status.modes } : {}), configOptions: configOptions(status), _meta: { [NS]: { agentSessionId: ready.agentSessionId, turnProtocolVersion: 3, agentType: agentName } } };
+    } catch (error) {
+      if (signal?.aborted && dispatchStarted) {
+        if (!previouslyAttached) attached.delete(id);
+        abort();
+        await abortCleanup;
+        // A backend may finish attachment after the first close was sent.
+        // Awaiting dispatch and then closing again retires that late handle too.
+        await closeOwnedStartup();
+        signal.throwIfAborted();
+      }
+      throw error;
     } finally {
+      signal?.removeEventListener('abort', abort);
       const buffered = held.get(id) || [];
       held.delete(id);
-      for (const event of buffered) {
+      if (signal?.aborted && restoredExisting && previousPeer && previousPeer !== peer && backend.sessions.get(id)?.ws === previousPeer) {
+        for (const event of buffered) previousPeer.send(JSON.stringify(event));
+      }
+      for (const event of signal?.aborted && !previouslyAttached ? [] : buffered) {
         // The explicit load replay is the standard transcript; runtime history
         // snapshots are emitted only as negotiated application extensions.
         receive(event);
@@ -353,9 +424,9 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
       return { protocolVersion: PROTOCOL_VERSION, agentInfo: { name: '1agents-acp-service', version: '0.2.0' }, authMethods: [], agentCapabilities: { promptCapabilities: { image: true, audio: true }, loadSession: true, sessionCapabilities: { resume: {}, close: {}, list: {}, delete: {} }, _meta: { [NS]: { version: 1, agentType: agentName, interactions: true, turnSync: true } } } };
     })
     .onRequest('authenticate', () => { requireInitialized(); throw RequestError.invalidParams('No connection authentication methods are configured'); })
-    .onRequest('session/new', async ({ params }) => await ensure(params, true, false) as { sessionId: string })
-    .onRequest('session/load', ({ params }) => ensure(params, false, true))
-    .onRequest('session/resume', ({ params }) => ensure(params, false, false))
+    .onRequest('session/new', async ({ params, signal }) => await ensure(params, true, false, signal) as { sessionId: string })
+    .onRequest('session/load', ({ params, signal }) => ensure(params, false, true, signal))
+    .onRequest('session/resume', ({ params, signal }) => ensure(params, false, false, signal))
     .onRequest('session/prompt', async ({ params, signal }) => {
       requireSession(params.sessionId);
       const custom = extensions ? metadata(params) : {};
@@ -427,10 +498,10 @@ export function attachAcpConnection(ws: WebSocket, req?: IncomingMessage, backen
   app.onRequest(`${EXT}session/import`, (value: unknown): RecordValue => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw RequestError.invalidParams('Expected object');
     return value as RecordValue;
-  }, async ({ params }) => {
+  }, async ({ params, signal }) => {
     requireInitialized();
     if (!extensions || typeof params.sessionId !== 'string' || !params.sessionId) throw RequestError.invalidParams('Native session ID required');
-    return ensure({ ...params, _meta: { [NS]: { ...metadata(params), resumeSessionId: params.sessionId } } }, true, false);
+    return ensure({ ...params, _meta: { [NS]: { ...metadata(params), resumeSessionId: params.sessionId } } }, true, false, signal);
   });
   const controls: Record<string, string> = { 'session/history': 'get_history', 'session/permission_mode': 'set_permission_mode', 'session/cancel_queued': 'cancel_queued', 'session/fork': 'fork_session', 'session/authenticate': 'authenticate', 'session/logout': 'logout' };
   for (const [method, action] of Object.entries(controls)) {

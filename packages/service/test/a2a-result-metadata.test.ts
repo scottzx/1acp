@@ -1,3 +1,4 @@
+import { testCapacity } from './capacity-fixture.js';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
@@ -84,7 +85,7 @@ async function fixture(t: TestContext, outcome: A2ARunResult['outcome'] = 'compl
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   const origin = `http://127.0.0.1:${address.port}`;
-  host = await createA2AServer({ backend, stateDirectory: state, publicUrl: origin, token: 'test-token', defaultCwd: root });
+  host = await createA2AServer({ backend, capacity: testCapacity(root), stateDirectory: state, publicUrl: origin, token: 'test-token', defaultCwd: root });
   t.after(async () => { await host.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
   const client = await new ClientFactory().createFromUrl(origin);
   const auth = { serviceParameters: { Authorization: 'Bearer test-token' } };

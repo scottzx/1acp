@@ -1,3 +1,4 @@
+import { testCapacity } from './capacity-fixture.js';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile, symlink } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
@@ -50,7 +51,7 @@ async function fixture(t: TestContext) {
     else void host.handler(req, res);
   });
   const url = await listen(server);
-  host = await createA2AServer({ backend, publicUrl: url, stateDirectory: join(root, 'host'), token: 'test-token' });
+  host = await createA2AServer({ backend, capacity: testCapacity(root), publicUrl: url, stateDirectory: join(root, 'host'), token: 'test-token' });
   const stateDirectory = join(root, 'client');
   const config: A2AGatewayConfig = { stateDirectory, port: 0, remotes: { local: { url, token: 'test-token' } }, pollIntervalMs: 60_000 };
   const gateways = new Set<RemoteAgentGateway>();

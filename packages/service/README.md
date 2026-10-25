@@ -73,6 +73,8 @@ pnpm start:service serve --host 127.0.0.1 --port 36812 --no-report
 
 The default port is 36812. Without `--no-report`, the service reports to the local DreamMate node. Agent executables and their authentication must be available to the service process. `ACP_STATE_DIR` overrides the default `~/.1agents/acpx-state` directory for runtime records, turn journals and ACP replay data.
 
+Automatic launches now share a device capacity ledger and FIFO queue. Admission checks current available memory immediately before startup, keeps a configurable reserve, and also enforces estimated soft/hard concurrency limits. A2A work stays `SUBMITTED` (Pending) while resources are unavailable, then starts in queue order; queued work can be canceled. ACP launches, probes and pre-warming use the same memory protection. Native user sessions outside this service continue independently. See [device capacity and queue policy](../../docs/device-capacity-queue-20261023.md) for defaults, environment variables, scope and restart behavior.
+
 For npm-backed agents, the service first uses an adapter package installed in its package search roots, then the runtime's adapter executable on PATH or in user-local binary directories. JavaScript adapters run with the service's Node interpreter. Only when an adapter is absent does launch fall back to npx; discovery itself never downloads packages. Installing the native `codex` CLI does not replace installing the `codex-acp` adapter.
 
 If startup reports npm `ENOTEMPTY` inside `_npx`, upgrade npm and move the affected cache directory aside once no installation is using it, then retry. The diagnostic preserves npm's failing path. This error concerns npm's cache directory replacement rather than macOS device permissions.

@@ -209,16 +209,22 @@ for (const agent of ["gemini", "copilot"] as const) {
     const f = await fixture(t, modern, agent);
     const denial = new Error("synthetic admission denied");
     const before: AcpProcessLaunch[] = [];
+    const failures: { launchId: string; error: unknown }[] = [];
     const client = f.client({
       onBeforeSpawn: (launch) => {
         before.push(launch);
         throw denial;
       },
       onSpawned: () => assert.fail("denied probe must not spawn"),
-      onSpawnFailed: () => assert.fail("denial is not an OS spawn failure"),
+      onSpawnFailed: (failure) => {
+        failures.push(failure);
+      },
     });
     await assert.rejects(client.start(), (error) => error === denial);
     assert.equal(before.length, 1);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]?.launchId, before[0]?.launchId);
+    assert.equal(failures[0]?.error, denial);
     assert.deepEqual(before[0]?.args, [agent === "gemini" ? "--version" : "--help"]);
     assert.deepEqual(await f.trace(), []);
   });
@@ -252,6 +258,66 @@ test("held pre-spawn probe admission has no side effect before release", native,
     await starting.catch(() => {});
   }
 });
+
+for (const action of ["cancel", "close"] as const) {
+  test(
+    `${action} after successful probe admission reports failure without spawning`,
+    native,
+    async (t) => {
+      const f = await fixture(t);
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const controller = new AbortController();
+      const revoked = new Error("probe authority revoked after reservation");
+      const before: AcpProcessLaunch[] = [];
+      const failures: { launchId: string; error: unknown }[] = [];
+      let spawned = false;
+      const client = f.client({
+        onBeforeSpawn: async (launch) => {
+          before.push(launch);
+          entered.resolve(undefined);
+          await release.promise;
+        },
+        onSpawned: () => {
+          spawned = true;
+        },
+        onSpawnFailed: (failure) => {
+          failures.push(failure);
+        },
+      });
+      const starting = client.start({ signal: controller.signal });
+      let rejected: unknown;
+      const rejection = assert.rejects(starting, (error) => {
+        rejected = error;
+        if (action === "cancel") {
+          assert.equal(error, revoked);
+        } else {
+          assert.match(String(error), /closed while the agent was starting/);
+        }
+        return true;
+      });
+      try {
+        await expectEntered(starting, entered.promise);
+        if (action === "cancel") {
+          controller.abort(revoked);
+        } else {
+          await client.close();
+        }
+        release.resolve(undefined);
+        await rejection;
+        assert.equal(before.length, 1);
+        assert.equal(failures.length, 1);
+        assert.equal(failures[0]?.launchId, before[0]?.launchId);
+        assert.equal(failures[0]?.error, rejected);
+        assert.equal(spawned, false);
+        assert.deepEqual(await f.trace(), []);
+      } finally {
+        release.resolve(undefined);
+        await rejection;
+      }
+    },
+  );
+}
 
 test(
   "fast probe exit waits for spawned admission without becoming an ACP failure",

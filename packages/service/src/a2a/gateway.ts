@@ -1082,6 +1082,21 @@ async function stop(server: http.Server): Promise<void> {
   server.closeIdleConnections();
   await new Promise<void>(resolve => server.close(() => resolve()));
 }
+// The node rejects the whole registration when a method descriptor breaks its
+// contract, and its HTTP reason hides the offending method. Mirror the rule
+// here so the operator learns which method to fix.
+function methodContractViolations(methods: Record<string, { description?: unknown; parameters?: unknown }>): string[] {
+  return Object.entries(methods).flatMap(([name, method]) => {
+    const description = typeof method?.description === 'string' ? method.description.trim() : '';
+    const parameters = method?.parameters as { type?: unknown } | undefined;
+    if (!description) return [`method "${name}" requires a non-empty description`];
+    if (!parameters || typeof parameters !== 'object' || parameters.type !== 'object') {
+      return [`method "${name}" parameters must be an object schema with type: "object"`];
+    }
+    return [];
+  });
+}
+
 export async function serveA2AGateway(input: A2AGatewayConfig, options: { report?: boolean } = {}) {
   const gateway = new RemoteAgentGateway(input);
   const server = http.createServer((req, res) => { void (async () => {
@@ -1140,9 +1155,18 @@ export async function serveA2AGateway(input: A2AGatewayConfig, options: { report
     const entry = { id: 'a2a-gateway', name: 'DSH 远端智能体', kind: 'agent_runtime' as const,
       capabilities: Object.keys(REMOTE_AGENT_METHODS), execution: 'http' as const, port, reachability: 'localhost' as const, health: '/health', methods: REMOTE_AGENT_METHODS,
       metadata: { local_only_methods: [...Object.keys(TARGET_METHODS), ...Object.keys(DISCOVERY_METHODS)] } };
+    const contractViolations = methodContractViolations(REMOTE_AGENT_METHODS);
+    if (contractViolations.length) console.error(`[a2a-gateway] DreamMate registration contract violated: ${contractViolations.join('; ')}`);
     const registration = options.report === false ? undefined : await reportAndHoldRegistration(entry);
+    if (registration && !registration.ok) console.error(`[a2a-gateway] DreamMate registration failed: ${registration.reason ?? 'unknown reason'}`);
     // Node's directory is ephemeral. Re-report after a Node restart; this never registers new execution targets.
-    const reporting = options.report === false ? undefined : setInterval(() => { void reportToAgent(entry).catch(() => {}); }, 15_000);
+    const reporting = options.report === false ? undefined : setInterval(() => {
+      void reportToAgent(entry).then(result => {
+        if (!result.ok) console.error(`[a2a-gateway] DreamMate re-registration failed: ${result.reason ?? 'unknown reason'}`);
+      }).catch(error => {
+        console.error(`[a2a-gateway] DreamMate re-registration error: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, 15_000);
     reporting?.unref();
     let closing: Promise<void> | undefined;
     return { gateway, port, callbackPort, automationPort, registration, close: async () => {

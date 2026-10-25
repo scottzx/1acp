@@ -49,6 +49,17 @@ function answerOf(content: readonly ContentBlock[], turn: number): { text: strin
   };
 }
 
+async function waitForIdle(agent: Agent, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  let abort!: () => void;
+  const canceled = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  try { await Promise.race([agent.whenIdle(), canceled]); }
+  finally { signal.removeEventListener('abort', abort); }
+}
+
 /** Uses public session-controller and inbox events to account for one A2A prompt's exact DSH turn. */
 export class DshA2ABackend implements A2ABackend {
   private readonly executions = new Map<string, Promise<void>>();
@@ -68,17 +79,23 @@ export class DshA2ABackend implements A2ABackend {
    * @param input Remote host directory, preset, and optional existing DSH session identity.
    * @returns The resolved DSH session and its durable workspace and preset.
    */
-  async prepare(input: A2APrepareInput): Promise<A2ATarget> {
+  async prepare(input: A2APrepareInput, options?: { signal: AbortSignal }): Promise<A2ATarget> {
+    const signal = options?.signal;
+    signal?.throwIfAborted();
     const previous = input.sessionId === undefined
       ? undefined
       : await this.ctx.sessionController.inspect(input.sessionId as SessionId);
+    signal?.throwIfAborted();
     if (input.sessionId !== undefined && previous == null) throw new Error(`Session ${input.sessionId} not found`);
     if (previous !== undefined && previous.meta.id !== input.sessionId) throw new Error('Existing session identity conflicts');
     const requestedCwd = input.cwd ?? previous?.meta.cwd ?? process.cwd();
     if (!isAbsolute(requestedCwd)) throw new Error('A2A cwd must be an absolute directory on the DSH host');
     const cwd = await realpath(requestedCwd);
+    signal?.throwIfAborted();
     if (!(await stat(cwd)).isDirectory()) throw new Error('A2A cwd must point to a directory on the DSH host');
+    signal?.throwIfAborted();
     const preflight = await this.preflight({ ...input.preflight, cwd });
+    signal?.throwIfAborted();
     if (!preflight.ok) throw new A2APreflightError(preflight);
     const agentPreset = input.agentPreset ?? previous?.meta.agentPreset;
     if (input.sessionId !== undefined && previous !== undefined) {
@@ -87,8 +104,10 @@ export class DshA2ABackend implements A2ABackend {
       // create() only reuses blank Sessions on current DSH; resolve the saved
       // identity directly so an active or completed context keeps its queue.
       const agent = await this.agent(input.sessionId as SessionId);
+      signal?.throwIfAborted();
       if (agent.id !== input.sessionId || agent.session.id !== input.sessionId) throw new Error('Existing session identity conflicts');
       if (agent.session.header.cwd === undefined || await realpath(agent.session.header.cwd) !== cwd) throw new Error('Existing session cwd conflicts');
+      signal?.throwIfAborted();
       if (agent.session.header.agentPreset !== previous.meta.agentPreset) throw new Error('Existing session preset conflicts');
       return { sessionId: input.sessionId, cwd, ...(agentPreset === undefined ? {} : { agentPreset }), preflight };
     }
@@ -96,7 +115,11 @@ export class DshA2ABackend implements A2ABackend {
       cwd,
       ...(agentPreset === undefined ? {} : { agentPreset }),
     });
+    // Native create owns a durable blank session, not an ACP launch or prompt.
+    // If its non-abortable host operation finishes late, do not restore or run it.
+    signal?.throwIfAborted();
     const agent = await this.agent(created.sessionId);
+    signal?.throwIfAborted();
     return {
       sessionId: created.sessionId,
       cwd: agent.session.header.cwd ?? cwd,
@@ -111,7 +134,7 @@ export class DshA2ABackend implements A2ABackend {
    * @param options Task-owned request identity and cancellation signal.
    * @returns The exact turn's ending and its final assistant text.
    */
-  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal }): Promise<A2ARunResult> {
+  async run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void> }): Promise<A2ARunResult> {
     options.signal.throwIfAborted();
     const queuedAbort = Promise.withResolvers<A2ARunResult>();
     const abort = (): void => { queuedAbort.reject(options.signal.reason); };
@@ -128,10 +151,12 @@ export class DshA2ABackend implements A2ABackend {
     finally { options.signal.removeEventListener('abort', abort); }
   }
 
-  private async execute(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal }): Promise<A2ARunResult> {
+  private async execute(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal; beforeStart?: (signal?: AbortSignal) => Promise<void> }): Promise<A2ARunResult> {
     const agent = await this.agent(target.sessionId as SessionId);
     options.signal.throwIfAborted();
     const completion = Promise.withResolvers<A2ARunResult>();
+    const startupAbort = new AbortController();
+    const startupSignal = AbortSignal.any([options.signal, startupAbort.signal]);
     const listeners: (() => void)[] = [];
     let messageId: MessageId | undefined;
     let turn: number | undefined;
@@ -197,8 +222,11 @@ export class DshA2ABackend implements A2ABackend {
       }
     }));
     listeners.push(agent.ctx.on('agent/disposed', event => {
-      if (event.agent === agent) settle({ outcome: 'failed', text, failureReason: 'disposed', detail: 'DSH session was disposed before the task finished',
-        error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: turn !== undefined }) });
+      if (event.agent === agent) {
+        settle({ outcome: 'failed', text, failureReason: 'disposed', detail: 'DSH session was disposed before the task finished',
+          error: toSafeError(undefined, { origin: 'dsh', operationId: options.requestId, outcomeUnknown: turn !== undefined }) });
+        startupAbort.abort(new Error('DSH session was disposed before startup'));
+      }
     }));
     listeners.push(agent.ctx.on('session/event', (session, event) => {
       if (session !== agent.session || turn === undefined) return;
@@ -214,6 +242,16 @@ export class DshA2ABackend implements A2ABackend {
     options.signal.addEventListener('abort', cancel, { once: true });
     try {
       // Recheck after event registration; cancellation can arrive during Agent restoration.
+      options.signal.throwIfAborted();
+      // Native user turns do not share this backend's execution map.
+      try {
+        if (options.beforeStart) await waitForIdle(agent, startupSignal);
+        await options.beforeStart?.(startupSignal);
+      } catch (error) {
+        if (settled) return await completion.promise;
+        throw error;
+      }
+      if (settled) return await completion.promise;
       options.signal.throwIfAborted();
       await this.ctx.sessionController.prompt({
         requestId: options.requestId as SessionRequestId,

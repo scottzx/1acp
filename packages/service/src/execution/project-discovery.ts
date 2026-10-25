@@ -15,10 +15,14 @@ export const projectDiscoveryConfigSchema = z.object({
   maxProjects: z.number().int().min(1).max(1000).default(200),
 }).strict();
 const interval = z.number().int().min(60_000).max(86_400_000);
-const settingsSchema = z.discriminatedUnion('mode', [
-  z.object({ mode: z.literal('manual'), intervalMs: interval.optional() }).strict(),
-  z.object({ mode: z.literal('interval'), intervalMs: interval }).strict(),
-]);
+const settingsSchema = z.object({
+  mode: z.enum(['manual', 'interval']),
+  intervalMs: interval.optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.mode === 'interval' && value.intervalMs === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'intervalMs is required in interval mode', path: ['intervalMs'] });
+  }
+});
 const empty = z.object({}).strict();
 export const DISCOVERY_METHODS = {
   execution_project_scan: { description: '只读探查批准目录及可选 Session Reader 项目中的 .1agents 角色声明；不创建目标或任务。', parameters: z.toJSONSchema(empty) },

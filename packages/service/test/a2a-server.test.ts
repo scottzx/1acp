@@ -1,3 +1,4 @@
+import { testCapacity } from './capacity-fixture.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -93,7 +94,7 @@ async function fixture(t: TestContext, options: Partial<Omit<A2AServerOptions, '
   });
   const origin = await listen(server);
   try {
-    host = await createA2AServer({ backend, stateDirectory, publicUrl: origin, token,
+    host = await createA2AServer({ backend, stateDirectory, publicUrl: origin, token, capacity: testCapacity(stateDirectory),
       defaultCwd: '/tmp/a2a-default', defaultAgentPreset: 'coding', ...options });
   } catch (error) { await stopHttp(server); throw error; }
   const factory = new ClientFactory(ClientFactoryOptions.createFrom(ClientFactoryOptions.default, {
@@ -153,6 +154,111 @@ async function rpc(origin: string, method: string, params: unknown, headers: Rec
   }, body: JSON.stringify({ jsonrpc: '2.0', id: 'test-request', method, params }) });
   return { response, body: await response.json() as RpcEnvelope };
 }
+
+test('memory-bound tasks return pending Task IDs, start FIFO after release and can be canceled without preparation', { timeout: 10000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'a2a-capacity-fifo-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let availableBytes = 0;
+  const f = await fixture(t, { capacity: { ...testCapacity(root), softLimit: 1, hardLimit: 2,
+    memoryReserveBytes: 10, estimatedInstanceBytes: 20,
+    memoryProvider: () => ({ totalBytes: 100, availableBytes }) } });
+  const first = await submit(f.client, message('first'));
+  const canceled = await submit(f.client, message('canceled'));
+  const third = await submit(f.client, message('third'));
+  assert.equal(first.status?.state, TaskState.TASK_STATE_SUBMITTED);
+  assert.match(first.status?.message?.parts[0]?.content?.value as string ?? '', /Pending/);
+  assert.equal(f.backend.preparations.length, 0);
+  await f.client.cancelTask(CancelTaskRequest.fromJSON({ id: canceled.id }), authenticated);
+  await waitForTask(f.client, canceled.id, TaskState.TASK_STATE_CANCELED);
+  availableBytes = 100;
+  await waitForTask(f.client, first.id, TaskState.TASK_STATE_WORKING);
+  assert.deepEqual(f.backend.runs.map(run => run.prompt), ['first']);
+  f.backend.runs[0].result.resolve({ text: 'done', outcome: 'completed' });
+  await waitForTask(f.client, third.id, TaskState.TASK_STATE_WORKING);
+  assert.deepEqual(f.backend.runs.map(run => run.prompt), ['first', 'third']);
+  f.backend.runs[1].result.resolve({ text: 'done', outcome: 'completed' });
+  await waitForTask(f.client, third.id, TaskState.TASK_STATE_COMPLETED);
+});
+
+test('a memory drop during preparation queues the prepared task and never repeats session creation', { timeout: 10000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'a2a-capacity-recheck-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let availableBytes = 100;
+  const backend = new DeferredBackend();
+  const prepare = backend.prepare.bind(backend);
+  backend.prepare = async input => { const target = await prepare(input); availableBytes = 0; return target; };
+  const f = await fixture(t, { capacity: { ...testCapacity(root), memoryReserveBytes: 10, estimatedInstanceBytes: 20,
+    memoryProvider: () => ({ totalBytes: 100, availableBytes }) } }, backend);
+  const task = await submit(f.client);
+  assert.equal(task.status?.state, TaskState.TASK_STATE_SUBMITTED);
+  assert.equal(backend.preparations.length, 1);
+  assert.equal(backend.runs.length, 0);
+  availableBytes = 100;
+  await waitForTask(f.client, task.id, TaskState.TASK_STATE_WORKING);
+  assert.equal(backend.preparations.length, 1);
+  assert.equal(backend.runs.length, 1);
+  backend.runs[0].result.resolve({ text: 'done', outcome: 'completed' });
+  await waitForTask(f.client, task.id, TaskState.TASK_STATE_COMPLETED);
+});
+
+test('canceling a same-context waiter needs no memory recovery and preserves the preceding preparation lock', { timeout: 10000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'a2a-capacity-context-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let availableBytes = 0;
+  const f = await fixture(t, { capacity: { ...testCapacity(root), softLimit: 1, hardLimit: 2,
+    memoryReserveBytes: 10, estimatedInstanceBytes: 20,
+    memoryProvider: () => ({ totalBytes: 100, availableBytes }) } });
+  const first = await submit(f.client, message('first'));
+  const second = await submit(f.client, message('cancel', { contextId: first.contextId }));
+  await deadline(f.client.cancelTask(CancelTaskRequest.fromJSON({ id: second.id }), authenticated), 'cancel waited for memory');
+  await waitForTask(f.client, second.id, TaskState.TASK_STATE_CANCELED);
+  const third = await submit(f.client, message('third', { contextId: first.contextId }));
+  assert.equal(f.backend.preparations.length, 0);
+  availableBytes = 100;
+  await waitForTask(f.client, first.id, TaskState.TASK_STATE_WORKING);
+  assert.deepEqual(f.backend.runs.map(run => run.prompt), ['first']);
+  f.backend.runs[0].result.resolve({ text: 'done', outcome: 'completed' });
+  await waitForTask(f.client, third.id, TaskState.TASK_STATE_WORKING);
+  assert.deepEqual(f.backend.runs.map(run => run.prompt), ['first', 'third']);
+  assert.equal(f.backend.preparations[1].sessionId, f.backend.runs[0].target.sessionId);
+  f.backend.runs[1].result.resolve({ text: 'done', outcome: 'completed' });
+  await waitForTask(f.client, third.id, TaskState.TASK_STATE_COMPLETED);
+});
+
+test('canceling during backend preparation aborts admission and waits for its cleanup before releasing the task', { timeout: 10000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'a2a-capacity-prepare-cancel-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const entered = deferred<void>(), cleaned = deferred<void>();
+  let stopped = false;
+  class PreparingBackend extends DeferredBackend {
+    override async prepare(input: A2APrepareInput, options?: { signal: AbortSignal }): Promise<A2ATarget> {
+      assert.ok(options?.signal);
+      entered.resolve();
+      try {
+        await new Promise<void>((_, reject) => {
+          const abort = () => reject(options.signal.reason);
+          options.signal.addEventListener('abort', abort, { once: true });
+          if (options.signal.aborted) abort();
+        });
+      } finally { await cleaned.promise; stopped = true; }
+      return super.prepare(input);
+    }
+  }
+  const backend = new PreparingBackend();
+  const f = await fixture(t, { capacity: testCapacity(root), defaultAgentPreset: 'oneagents-acp-codex' }, backend);
+  const task = await submit(f.client);
+  await entered.promise;
+  let canceled = false;
+  const cancellation = f.client.cancelTask(CancelTaskRequest.fromJSON({ id: task.id }), authenticated).then(() => { canceled = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(canceled, false, 'cancellation must drain the owned initialization');
+  cleaned.resolve();
+  await deadline(cancellation, 'preparation cancellation did not drain');
+  await waitForTask(f.client, task.id, TaskState.TASK_STATE_CANCELED);
+  assert.equal(stopped, true);
+  assert.equal(backend.preparations.length, 0);
+  assert.equal(backend.runs.length, 0);
+});
 
 test('official A2A client discovers the card and returns a Task before execution; query and SSE deliver completion', { timeout: 10000 }, async t => {
   const f = await fixture(t, { workspaces: { app: '/tmp/a2a-app' } });

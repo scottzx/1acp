@@ -2335,6 +2335,39 @@ test("AcpClient aborts before spawn when lifecycle admission fails", async () =>
   assert.equal(spawned, false);
 });
 
+test("AcpClient reports revoked authority after successful pre-spawn admission", async () => {
+  const controller = new AbortController();
+  const revoked = new Error("startup authority revoked after reservation");
+  let launchId: string | undefined;
+  let reserved = false;
+  let spawned = false;
+  const failures: unknown[] = [];
+  const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [process.execPath, path.join(process.cwd(), "dist-test", "test", "mock-agent.js")],
+    processLifecycle: {
+      onBeforeSpawn: (launch) => {
+        launchId = launch.launchId;
+        reserved = true;
+        controller.abort(revoked);
+      },
+      onSpawned: () => {
+        spawned = true;
+      },
+      onSpawnFailed: (failure) => {
+        assert.equal(failure.launchId, launchId);
+        failures.push(failure.error);
+        reserved = false;
+      },
+    },
+  });
+
+  await assert.rejects(client.start({ signal: controller.signal }), (error) => error === revoked);
+  assert.equal(spawned, false);
+  assert.equal(reserved, false);
+  assert.deepEqual(failures, [revoked]);
+});
+
 test("AcpClient correlates spawn failures with the prepared launch", async () => {
   let launchId: string | undefined;
   let failureLaunchId: string | undefined;

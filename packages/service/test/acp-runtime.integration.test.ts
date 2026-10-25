@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { client, type PromptRequest, type SessionUpdate } from '@agentclientprotocol/sdk';
 import { createAgentRegistry, createRuntimeStore } from '@1agents/acp-service/runtime';
 import { WebSocket } from 'ws';
+import { testCapacityLifecycle } from './capacity-fixture.js';
 
 test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', { timeout: 20000 }, async t => {
   const directory = mkdtempSync(join(tmpdir(), 'acp-runtime-'));
@@ -18,6 +19,7 @@ test('ACP WebSocket traverses the real 1acp runtime and external stdio Agent', {
   // process is a fixture; session persistence, permissions and transport are real.
   const options = Reflect.get(runtime, 'options');
   options.sessionStore = createRuntimeStore({ stateDir: directory });
+  options.processLifecycle = testCapacityLifecycle(directory);
   options.agentRegistry = createAgentRegistry({ overrides: { codex: [process.execPath, fileURLToPath(new URL('./fixtures/acp-agent.mjs', import.meta.url))] } });
   const startTurn = runtime.startTurn.bind(runtime);
   const terminalAnswers = new Map([['terminal only', 'Authoritative terminal answer'], ['terminal empty', ''], ['terminal replacement', 'Corrected terminal answer']]);

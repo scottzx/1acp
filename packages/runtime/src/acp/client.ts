@@ -1093,8 +1093,13 @@ export class AcpClient {
     }
     const prepared = this.prepareProcessLaunch(plan.spawnCommand, plan.args, plan.spawnOptions);
     const { launch } = prepared;
-    await this.options.processLifecycle?.onBeforeSpawn?.(launch);
-    assertControlAuthority(authority);
+    try {
+      await this.options.processLifecycle?.onBeforeSpawn?.(launch);
+      assertControlAuthority(authority);
+    } catch (error) {
+      this.notifyProcessSpawnFailure(launch, error);
+      throw error;
+    }
 
     let spawnedChild: ChildProcessByStdio<Writable, Readable, Readable>;
     try {
@@ -1141,15 +1146,19 @@ export class AcpClient {
   ): Promise<string | undefined> {
     const prepared = this.prepareProcessLaunch(command, args, options);
     const { launch } = prepared;
-    await admitCommandProbe(async () => {
-      this.assertCommandProbeActive(epoch, authority);
-      await this.options.processLifecycle?.onBeforeSpawn?.(launch);
-    });
-    // No await may separate this check from the actual probe spawn.
     try {
+      await admitCommandProbe(async () => {
+        this.assertCommandProbeActive(epoch, authority);
+        await this.options.processLifecycle?.onBeforeSpawn?.(launch);
+      });
+      // No await may separate this check from the actual probe spawn.
       this.assertCommandProbeActive(epoch, authority);
     } catch (error) {
-      throw new CommandProbeAdmissionError(error);
+      const reason = error instanceof CommandProbeAdmissionError ? error.reason : error;
+      this.notifyProcessSpawnFailure(launch, reason);
+      throw error instanceof CommandProbeAdmissionError
+        ? error
+        : new CommandProbeAdmissionError(error);
     }
 
     let child: ChildProcess;

@@ -1,3 +1,4 @@
+import { testCapacity } from './capacity-fixture.js';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -28,7 +29,7 @@ async function fixture(t: TestContext) {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   const url = `http://127.0.0.1:${address.port}`;
-  host = await createA2AServer({ backend, publicUrl: url, token: 'test-only-token', stateDirectory: join(root, 'host') });
+  host = await createA2AServer({ backend, capacity: testCapacity(root), publicUrl: url, token: 'test-only-token', stateDirectory: join(root, 'host') });
   const gateway = new RemoteAgentGateway({ remotes: { local: { url, token: 'test-only-token' } }, stateDirectory: join(root, 'gateway'), pollIntervalMs: 50 });
   t.after(async () => { await gateway.close(); await host.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(root, { recursive: true, force: true }); });
   return { root, gateway, counts: () => ({ creates, runs }) };

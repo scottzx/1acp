@@ -1,3 +1,4 @@
+import { testCapacity } from './capacity-fixture.js';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
@@ -45,7 +46,7 @@ async function fixture(t: TestContext) {
   const profile = { id: 'ppt', version: '1', instructionsPath: 'ROLE.md', network: { agentUrl: `http://127.0.0.1:${address.port}` },
     entrySkill: 'design', skills: [{ key: 'design', name: 'design', sourceId: 'source' }] };
   await writeFile(profilePath, JSON.stringify(profile));
-  const options: A2AExecutionOptions = { defaultCwd: root, defaultAgentPreset: 'codex', roleSkills: { cacheRoot, profiles: { maker: profilePath, reviewer: profilePath } } };
+  const options: A2AExecutionOptions = { capacity: testCapacity(root), defaultCwd: root, defaultAgentPreset: 'codex', roleSkills: { cacheRoot, profiles: { maker: profilePath, reviewer: profilePath } } };
   let store = new FileA2AStore(join(root, 'state'));
   const prepares: A2APrepareInput[] = [], runs: { target: A2ATarget; prompt: string }[] = [];
   const backend: A2ABackend = {

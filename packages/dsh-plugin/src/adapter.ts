@@ -1,6 +1,7 @@
 /** Presents an external Agent's output through DSH's existing streaming surface. */
 import { createHash } from 'node:crypto';
 import { randomUUID } from 'node:crypto';
+import { isAbsolute, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -18,7 +19,30 @@ import { connect, object, type JsonObject } from './transport.js';
 import { State, hasActiveWriter, type Binding } from './state.js';
 import { mergeTool, type RemoteTool } from './tool-events.js';
 import { toSafeError } from '@1agents/acp-service/runtime';
-export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number }
+export interface SessionPolicy {
+  /** Exact workspace and ACP registry name; no global or wildcard policy. */
+  cwd: string;
+  agent: string;
+  permissionMode: 'approve-reads' | 'approve-all' | 'deny-all';
+  initialModeId?: string;
+}
+export interface Config { serviceUrl: string; agents: string[]; stateDirectory: string; reconnectAttempts: number; reconnectDelayMs: number; sessionPolicies?: SessionPolicy[] }
+export function validateSessionPolicies(policies: SessionPolicy[] = []): SessionPolicy[] {
+  const seen = new Set<string>();
+  if (!Array.isArray(policies)) throw new Error('sessionPolicies must be an array');
+  return policies.map(policy => {
+    if (!policy || typeof policy.cwd !== 'string' || !isAbsolute(policy.cwd)
+      || typeof policy.agent !== 'string' || !/^[a-z0-9_-]+$/i.test(policy.agent)
+      || !['approve-reads', 'approve-all', 'deny-all'].includes(policy.permissionMode)
+      || (policy.initialModeId !== undefined && (typeof policy.initialModeId !== 'string' || !policy.initialModeId))) {
+      throw new Error('Invalid workspace-scoped ACP session policy');
+    }
+    const normalized = { ...policy, cwd: resolve(policy.cwd) };
+    const key = JSON.stringify([normalized.cwd, normalized.agent]);
+    if (seen.has(key)) throw new Error('Duplicate workspace-scoped ACP session policy');
+    seen.add(key); return normalized;
+  });
+}
 export interface Capabilities {
   agent: string;
   writable?: boolean;
@@ -28,6 +52,9 @@ export interface Capabilities {
   modes?: SessionModeState;
 }
 type Link = Awaited<ReturnType<typeof connect>>;
+/** A failed remote close must keep its identity until the host explicitly recovers it. */
+type RecoveringBinding = Binding & { initializationCleanupPending?: true };
+const recoveryMessage = 'ACP session initialization failed and remote cleanup could not be confirmed; host recovery is required before retrying.';
 type AcpStream = { turn: number; step: number; requestId: string; messagePhase?: 'commentary' | 'final_answer'; messageId?: string };
 
 /** Only the negotiated service's direct canonical error data is a projection. */
@@ -78,6 +105,7 @@ class Queue<T> {
 
 export class AcpAdapter implements LlmAdapter {
   private state: State;
+  private initializationFailures = new Map<string, Error>();
   private controllers = new Map<string, AbortController>();
   private jobs = new Set<Promise<void>>();
   private links = new Map<string, Promise<Link>>();
@@ -207,7 +235,10 @@ export class AcpAdapter implements LlmAdapter {
     if (!cwd) throw new Error('Create the ACP session in a workspace first');
     const endpoint = new URL(`/agents/${encodeURIComponent(name)}`, this.config.serviceUrl);
     endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+    const initializationFailure = this.initializationFailures.get(agent.id);
+    if (initializationFailure) throw initializationFailure;
     let binding = this.state.get(agent.id);
+    if (binding && 'initializationCleanupPending' in binding) throw new Error(recoveryMessage);
     if (binding && (binding.agent !== name || binding.cwd !== cwd || binding.endpoint !== endpoint.href)) {
       const boundary = this.ctx.sessionProjections.stateOf(agent.session, 'turnBoundary');
       const previousEndpoint = new URL(`/agents/${encodeURIComponent(binding.agent)}`, this.config.serviceUrl);
@@ -271,18 +302,50 @@ export class AcpAdapter implements LlmAdapter {
         question: (p, s) => this.question(agent, p, interactionSignal(s)),
         plan: (p, s) => this.plan(agent, p, interactionSignal(s)),
       }, this.lifetime.signal);
+      let createdBinding: Binding | undefined;
       try {
-        const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': { permissionMode: 'approve-reads' } } };
+        const policy = this.config.sessionPolicies?.find(p => p.cwd === resolve(cwd) && p.agent === name);
+        const params: NewSessionRequest = { cwd, mcpServers: [], _meta: { '1agents': { permissionMode: policy?.permissionMode ?? 'approve-reads' } } };
         const cancellationSignal = AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(60_000)]);
         const result = binding
           ? await link.rpc.request(binding.restoreMethod ?? 'session/load', { ...params, sessionId: binding.sessionId! }, { cancellationSignal })
           : await link.rpc.request('session/new', params, { cancellationSignal });
-        if (!binding) this.state.save(agent.id, { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId });
+        if (!binding) createdBinding = { agent: name, endpoint: endpoint.href, cwd, sessionId: (result as { sessionId: string }).sessionId };
         capabilities.configOptions = result.configOptions ?? capabilities.configOptions;
         capabilities.modes = result.modes ?? undefined;
+        // Select an advertised native mode before the first prompt. Loading an
+        // existing session must retain its native mode and user selections.
+        if (!binding && policy?.initialModeId) {
+          if (!capabilities.modes?.availableModes.some(m => m.id === policy.initialModeId)) throw new Error('Configured initial ACP mode is not advertised by the Agent');
+          await link.rpc.request('session/set_mode', { sessionId: (result as { sessionId: string }).sessionId, modeId: policy.initialModeId }, { cancellationSignal });
+          capabilities.modes.currentModeId = policy.initialModeId;
+        }
+        if (createdBinding) this.state.save(agent.id, createdBinding);
         void link.closed.then(() => { if (this.links.get(agent.id) === operation) this.links.delete(agent.id); });
         return link;
-      } catch (error) { link.close(); throw error; }
+      } catch (error) {
+        let failure = error;
+        if (createdBinding) {
+          const cleanup = new AbortController();
+          try {
+            // SDK cancellation alone only notifies the peer, so bound the wait locally as well.
+            await Promise.race([
+              link.rpc.request('session/close', { sessionId: createdBinding.sessionId! }, { cancellationSignal: cleanup.signal }),
+              delay(5000, undefined, { signal: cleanup.signal }).then(() => { throw new Error(recoveryMessage); }),
+            ]);
+          } catch {
+            // Preserve a recovery identity rather than create another process on retry.
+            const recoveryError = new Error(recoveryMessage);
+            this.initializationFailures.set(agent.id, recoveryError);
+            const recovering: RecoveringBinding = { ...createdBinding, initializationCleanupPending: true };
+            try { this.state.save(agent.id, recovering); }
+            catch { /* The in-memory guard still blocks retry if local storage is also unavailable. */ }
+            failure = recoveryError;
+          } finally { cleanup.abort(); }
+        }
+        link.close();
+        throw failure;
+      }
     })();
     this.links.set(agent.id, operation);
     try { return await operation; }

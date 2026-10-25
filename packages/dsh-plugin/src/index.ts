@@ -6,7 +6,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 import { openDiagnostics } from './diagnostics.js';
-import { AcpAdapter, type Config } from './adapter.js';
+import { AcpAdapter, validateSessionPolicies, type Config } from './adapter.js';
 import { discoverPresets } from './discovery.js';
 import { NativeSessions } from './imports.js';
 import { acquireService, resolveServiceOptions, type ServiceOptions } from './service-process.js';
@@ -26,6 +26,7 @@ export async function apply(ctx: Context, input: Partial<Config & ServiceOptions
     serviceUrl, agents: presets.map(preset => preset.id),
     stateDirectory: input.stateDirectory ?? join(home, 'plugins', '1agents-acp', 'sessions'),
     reconnectAttempts: input.reconnectAttempts ?? 5, reconnectDelayMs: input.reconnectDelayMs ?? 1000,
+    sessionPolicies: validateSessionPolicies(input.sessionPolicies),
   };
   if (config.agents.some(a => !/^[a-z0-9_-]+$/i.test(a))) throw new Error('agents must contain ACP registry names');
   if (!Number.isSafeInteger(config.reconnectAttempts) || config.reconnectAttempts < 0 || !Number.isSafeInteger(config.reconnectDelayMs) || config.reconnectDelayMs < 1) throw new Error('Invalid ACP reconnect policy');

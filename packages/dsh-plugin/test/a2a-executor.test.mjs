@@ -13,6 +13,94 @@ import { toSafeError } from '@1agents/acp-service/runtime';
 
 const targetIdentity = ({ preflight, ...identity }) => identity;
 
+test('A2A checks startup admission after session serialization and before submitting a prompt', async t => {
+  const f = await fixture(t);
+  const target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const first = f.backend.run(target, 'first', { requestId: 'first', signal: new AbortController().signal });
+  await f.admitted.promise;
+  const gate = Promise.withResolvers();
+  const checked = Promise.withResolvers();
+  let checks = 0;
+  const second = f.backend.run(target, 'second', { requestId: 'second', signal: new AbortController().signal,
+    beforeStart: async () => { checks++; checked.resolve(); await gate.promise; } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(checks, 0, 'the occupied session must drain before admission is sampled');
+  f.claim(agent, 'first', 1); f.output(agent, 1, 'first done'); f.finish(agent, 1, { kind: 'completed' });
+  await first;
+  await checked.promise;
+  assert.equal(f.prompts.length, 1, 'the queued turn cannot submit a model prompt while memory is pending');
+  gate.resolve();
+  while (f.prompts.length < 2) await new Promise(resolve => setImmediate(resolve));
+  f.claim(agent, 'second', 2); f.output(agent, 2, 'second done'); f.finish(agent, 2, { kind: 'completed' });
+  assert.equal((await second).outcome, 'completed');
+  assert.equal(checks, 1);
+});
+
+test('A2A samples memory after an existing native turn drains and cancellation does not wait for that turn', async t => {
+  const f = await fixture(t);
+  const target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const idle = Promise.withResolvers();
+  agent.whenIdle = () => idle.promise;
+  let checks = 0;
+  const controller = new AbortController();
+  const canceled = f.backend.run(target, 'cancel', { requestId: 'cancel', signal: controller.signal,
+    beforeStart: async () => { checks++; } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(checks, 0); assert.equal(f.prompts.length, 0);
+  controller.abort(new Error('cancel before native idle'));
+  await assert.rejects(canceled, /cancel before native idle/);
+  const run = f.backend.run(target, 'after idle', { requestId: 'after-idle', signal: new AbortController().signal,
+    beforeStart: async () => { checks++; } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(checks, 0);
+  idle.resolve();
+  await f.admitted.promise;
+  assert.equal(checks, 1);
+  f.claim(agent, 'after-idle', 1); f.output(agent, 1, 'done'); f.finish(agent, 1, { kind: 'completed' });
+  assert.equal((await run).outcome, 'completed');
+});
+
+test('disposing a native session aborts pending memory admission and never submits a late prompt', async t => {
+  const f = await fixture(t);
+  const target = await f.backend.prepare({ cwd: f.cwd });
+  const agent = f.agents.get(target.sessionId);
+  const waiting = Promise.withResolvers();
+  let admissionAborted = false;
+  const run = f.backend.run(target, 'pending', { requestId: 'dispose-pending', signal: new AbortController().signal,
+    beforeStart: signal => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => { admissionAborted = true; reject(signal.reason); }, { once: true });
+      waiting.resolve();
+    }) });
+  await waiting.promise;
+  f.ctx.emit('agent/disposed', { agent });
+  const result = await run;
+  assert.equal(result.failureReason, 'disposed');
+  assert.equal(admissionAborted, true);
+  assert.equal(f.prompts.length, 0);
+  assert.equal(f.listenerCount, 0);
+});
+
+test('preparation cancellation never restores a late blank session or submits a prompt', async t => {
+  const f = await fixture(t);
+  const create = f.controller.create;
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  f.controller.create = async request => { entered.resolve(); await release.promise; return create(request); };
+  const controller = new AbortController();
+  const preparing = f.backend.prepare({ cwd: f.cwd }, { signal: controller.signal });
+  await entered.promise;
+  controller.abort(new Error('cancel session preparation'));
+  const rejection = assert.rejects(preparing, /cancel session preparation/);
+  release.resolve();
+  await rejection;
+  assert.equal(f.createCount, 1, 'the host retains its own durable blank session');
+  assert.equal(f.resolveCount, 0, 'cancellation must prevent subsequent Agent restoration');
+  assert.equal(f.prompts.length, 0);
+  await assert.rejects(f.backend.prepare({ cwd: f.cwd }, { signal: controller.signal }), /cancel session preparation/);
+  assert.equal(f.createCount, 1, 'a pre-canceled request cannot allocate another session');
+});
+
 async function fixture(t) {
   const cwd = await realpath(await mkdtemp(join(tmpdir(), 'dsh-a2a-executor-')));
   const { diagnostics } = await diagnosticsFixture(t, join(cwd, 'diagnostics'));

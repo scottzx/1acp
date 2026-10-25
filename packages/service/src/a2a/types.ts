@@ -71,6 +71,9 @@ export interface A2ABackend {
   preflight?(input: A2APreflightInput): Promise<A2APreflightReport>;
   /** Optional read-only reconciliation; never resumes or repeats execution. */
   recover?(target: A2ATarget, options: { requestId: string }): Promise<SafeError | undefined>;
-  prepare(input: A2APrepareInput): Promise<A2ATarget>;
-  run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal }): Promise<A2ARunResult>;
+  /** Cancel pending admission and drain owned initialization before rejecting an aborted preparation. */
+  prepare(input: A2APrepareInput, options?: { signal: AbortSignal }): Promise<A2ATarget>;
+  run(target: A2ATarget, prompt: string, options: { requestId: string; signal: AbortSignal;
+    /** Hosts with a session queue call this again immediately before submitting the prompt. */
+    beforeStart?: (signal?: AbortSignal) => Promise<void> }): Promise<A2ARunResult>;
 }

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { agent as acpAgent, RequestError } from '@agentclientprotocol/sdk';
 import { WebSocketServer } from 'ws';
 import { LlmError } from '@deepseek-ai/dsh-llm';
-import { AcpAdapter } from '../dist/adapter.js';
+import { AcpAdapter, validateSessionPolicies } from '../dist/adapter.js';
 import { stream, object } from '../dist/transport.js';
 import { State } from '../dist/state.js';
 import { diagnosticsFixture } from './helpers/diagnostics.mjs';
@@ -28,6 +28,8 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const cancelled = Promise.withResolvers();
   const prompts = [];
   const changes = [];
+  const creationsInput = [];
+  const closedSessions = [];
   const commands = new Map();
   let model = 'native-a';
   const configOptions = () => [{ id: 'native-model', name: 'Native model', category: 'model', type: 'select', currentValue: model, options: [{ value: 'native-a', name: 'Native A' }, { value: 'native-b', name: 'Native B' }] }];
@@ -35,7 +37,8 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
     let connection;
     const app = acpAgent()
       .onRequest('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true, _meta: { '1agents': { version: 1 } } } }))
-      .onRequest('session/new', async () => {
+      .onRequest('session/new', async ({ params }) => {
+        creationsInput.push(params);
         await beforeNew();
         const sessionId = 'remote-' + (++creations);
         await connection.client.notify('session/update', { sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'review', description: 'Native review', input: { hint: 'Scope' } }, { name: 'model', description: 'Native model' }] } });
@@ -52,7 +55,17 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
         await connection.client.notify('session/update', { sessionId: params.sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'status', description: 'Native status' }] } });
         return { configOptions: configOptions() };
       })
-      .onRequest('session/set_mode', ({ params }) => { changes.push(params); return {}; })
+      .onRequest('session/set_mode', ({ params }) => {
+        changes.push(params);
+        if (streamConfig.modeError) throw new RequestError(streamConfig.modeError.code, streamConfig.modeError.message, streamConfig.modeError.data);
+        return {};
+      })
+      .onRequest('session/close', async ({ params }) => {
+        closedSessions.push(params.sessionId);
+        await streamConfig.beforeClose?.();
+        if (streamConfig.closeError) throw new RequestError(streamConfig.closeError.code, streamConfig.closeError.message, streamConfig.closeError.data);
+        return {};
+      })
       .onRequest('session/load', async ({ params }) => { for (const update of replay.get(params.sessionId) ?? []) await connection.client.notify('session/update', { sessionId: params.sessionId, update }); return {}; })
       .onNotification('session/cancel', () => cancelled.resolve())
       .onRequest('session/prompt', async ({ params }) => {
@@ -119,9 +132,136 @@ async function fixture(t, disconnect = false, interaction = 'permission', before
   const adapter = new AcpAdapter(ctx, config, streamConfig.diagnostics);
   t.after(async () => { await adapter.dispose(); for (const ws of wss.clients) ws.terminate(); await new Promise(r => wss.close(r)); rmSync(directory, { recursive: true, force: true }); });
   const options = id => ({ provider: '1agents-acp', model: 'codex', sessionId: local.id, messages: [{ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }] });
-  return { adapter, options, config, ctx, local, sent, prompts, changes, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
+  return { adapter, options, config, ctx, local, sent, prompts, changes, creationsInput, closedSessions, commands, waiting: waiting.promise, cancelled: cancelled.promise, counts: () => ({ creations, executions, permissions }) };
 }
 async function collect(adapter, options) { const chunks = []; for await (const c of adapter.stream(options)) chunks.push(c); return chunks; }
+
+test('workspace policy sets permission and advertised native mode before any prompt', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  f.config.sessionPolicies = validateSessionPolicies([{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'write' }]);
+  const capabilities = await f.adapter.describe(f.local);
+  assert.equal(capabilities.modes.currentModeId, 'write');
+  assert.equal(f.creationsInput[0]._meta['1agents'].permissionMode, 'approve-all');
+  assert.deepEqual(f.changes, [{ sessionId: 'remote-1', modeId: 'write' }]);
+  assert.equal(f.prompts.length, 0);
+  await f.adapter.describe(f.local);
+  assert.equal(f.changes.length, 1);
+  assert.deepEqual(f.closedSessions, []);
+});
+
+for (const mismatch of ['workspace', 'agent']) {
+  test(`workspace policy does not affect a different ${mismatch}`, { timeout: 5000 }, async t => {
+    const f = await fixture(t);
+    f.config.sessionPolicies = validateSessionPolicies([{ cwd: mismatch === 'workspace' ? join(f.local.session.header.cwd, 'other') : f.local.session.header.cwd, agent: mismatch === 'agent' ? 'grok-build' : 'codex', permissionMode: 'approve-all', initialModeId: 'write' }]);
+    const capabilities = await f.adapter.describe(f.local);
+    assert.equal(capabilities.modes.currentModeId, 'read');
+    assert.equal(f.creationsInput[0]._meta['1agents'].permissionMode, 'approve-reads');
+    assert.deepEqual(f.changes, []);
+  });
+}
+
+test('unadvertised initial mode fails before prompting', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  f.config.sessionPolicies = validateSessionPolicies([{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'unknown' }]);
+  await assert.rejects(f.adapter.describe(f.local), /not advertised/);
+  assert.equal(f.prompts.length, 0);
+  assert.deepEqual(f.changes, []);
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+  assert.equal(new State(f.config.stateDirectory).get(f.local.id), undefined);
+});
+
+test('failed initial mode RPC closes only the newly created remote session', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    modeError: { code: -32603, message: 'Initial mode rejected' },
+  });
+  f.config.sessionPolicies = [{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'write' }];
+  await assert.rejects(f.adapter.describe(f.local), /Initial mode rejected/);
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+  assert.equal(new State(f.config.stateDirectory).get(f.local.id), undefined);
+  assert.equal(f.prompts.length, 0);
+});
+
+test('initialization failure waits for remote close acknowledgement', { timeout: 5000 }, async t => {
+  const entered = Promise.withResolvers(); const finish = Promise.withResolvers();
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    beforeClose: async () => { entered.resolve(); await finish.promise; },
+  });
+  f.config.sessionPolicies = [{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'unknown' }];
+  let settled = false;
+  const description = f.adapter.describe(f.local).finally(() => { settled = true; });
+  const rejected = assert.rejects(description, /not advertised/);
+  await entered.promise;
+  assert.equal(settled, false);
+  finish.resolve(); await rejected;
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+});
+
+test('failed local binding save closes the just-created remote session', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  t.mock.method(f.adapter.state, 'save', () => { throw new Error('Synthetic local save failure'); });
+  await assert.rejects(f.adapter.describe(f.local), /Synthetic local save failure/);
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+  assert.equal(new State(f.config.stateDirectory).get(f.local.id), undefined);
+});
+
+test('failed remote cleanup preserves a guarded identity across adapter restart and preset changes', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    modeError: { code: -32603, message: 'SYNTHETIC_PRIVATE_MODE_FAILURE' },
+    closeError: { code: -32603, message: 'SYNTHETIC_PRIVATE_CLOSE_FAILURE' },
+  });
+  f.config.sessionPolicies = [{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'write' }];
+  const recoveryError = error => {
+    assert.match(error.message, /remote cleanup could not be confirmed; host recovery is required/);
+    assert.doesNotMatch(String(error), /SYNTHETIC_PRIVATE/);
+    return true;
+  };
+  await assert.rejects(f.adapter.describe(f.local), recoveryError);
+  const binding = new State(f.config.stateDirectory).get(f.local.id);
+  assert.equal(binding.sessionId, 'remote-1');
+  assert.equal(binding.initializationCleanupPending, true);
+  await assert.rejects(f.adapter.describe(f.local), recoveryError);
+  await f.adapter.dispose();
+  const restored = new AcpAdapter(f.ctx, f.config);
+  try {
+    await assert.rejects(restored.describe(f.local), recoveryError);
+    f.local.session.header.agentPreset = 'oneagents-acp-grok-build';
+    await assert.rejects(restored.describe(f.local), recoveryError);
+    assert.equal(f.counts().creations, 1);
+    assert.deepEqual(f.closedSessions, ['remote-1']);
+  } finally { await restored.dispose(); }
+});
+
+test('failed cleanup and unavailable state storage still block repeated creation in the same adapter', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    closeError: { code: -32603, message: 'Synthetic close failure' },
+  });
+  f.config.sessionPolicies = [{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'unknown' }];
+  t.mock.method(f.adapter.state, 'save', () => { throw new Error('Synthetic local save failure'); });
+  await assert.rejects(f.adapter.describe(f.local), /host recovery is required/);
+  await assert.rejects(f.adapter.describe(f.local), /host recovery is required/);
+  assert.equal(f.counts().creations, 1);
+  assert.deepEqual(f.closedSessions, ['remote-1']);
+});
+
+test('failed configuration of an existing binding retains its session', { timeout: 5000 }, async t => {
+  const f = await fixture(t, false, 'permission', async () => {}, [], {
+    modeError: { code: -32603, message: 'Mode change rejected' },
+  });
+  await f.adapter.describe(f.local);
+  await assert.rejects(f.adapter.configure(f.local, '$mode', 'write'), /Mode change rejected/);
+  assert.deepEqual(f.closedSessions, []);
+  assert.equal(new State(f.config.stateDirectory).get(f.local.id).sessionId, 'remote-1');
+  assert.equal(f.counts().creations, 1);
+});
+
+test('workspace policies reject wildcard, relative, invalid and duplicate declarations', () => {
+  const valid = { cwd: '/tmp/video', agent: 'codex', permissionMode: 'approve-all', initialModeId: 'write' };
+  assert.deepEqual(validateSessionPolicies(), []);
+  for (const invalid of [{ ...valid, cwd: '*' }, { ...valid, agent: '*' }, { ...valid, permissionMode: 'bypass' }, { ...valid, initialModeId: '' }]) {
+    assert.throws(() => validateSessionPolicies([invalid]), /Invalid workspace-scoped/);
+  }
+  assert.throws(() => validateSessionPolicies([valid, { ...valid, cwd: '/tmp/video/' }]), /Duplicate workspace-scoped/);
+});
 
 test('main session streams ACP output, surfaces approval, and retains remote identity', { timeout: 5000 }, async t => {
   const f = await fixture(t);
@@ -558,6 +698,21 @@ test('binding survives a new adapter instance', { timeout: 5000 }, async t => {
   const restored = new AcpAdapter(f.ctx, f.config);
   try { await collect(restored, f.options('message-2')); assert.equal(f.counts().creations, 1); }
   finally { await restored.dispose(); }
+});
+
+test('workspace policy never changes the native mode of an existing session', { timeout: 5000 }, async t => {
+  const f = await fixture(t);
+  await f.adapter.describe(f.local);
+  assert.equal(f.counts().creations, 1);
+  await f.adapter.dispose();
+  f.config.sessionPolicies = validateSessionPolicies([{ cwd: f.local.session.header.cwd, agent: 'codex', permissionMode: 'approve-all', initialModeId: 'write' }]);
+  const restored = new AcpAdapter(f.ctx, f.config);
+  try {
+    await restored.describe(f.local);
+    assert.equal(f.counts().creations, 1);
+    assert.deepEqual(f.changes, []);
+    assert.equal(f.prompts.length, 0);
+  } finally { await restored.dispose(); }
 });
 
 test('Grok questions and plan review use DSH interactions', { timeout: 5000 }, async t => {

@@ -14,6 +14,9 @@ export { ProjectRoleDiscovery, DISCOVERY_METHODS, projectDiscoveryConfigSchema }
 export { A2AAutomation } from './automation.js';
 export type { A2AAutomationConfig, AutomationRun, AutomationRunStatus } from './automation.js';
 export { DirectoryLease } from './lease.js';
+export { CapacityGovernor, CapacityError } from '../capacity.js';
+export { CapacityQueue } from '../capacity-queue.js';
+export type { CapacityOptions, CapacityLease, CapacitySnapshot } from '../capacity.js';
 export { SessionDelivery } from './session-delivery.js';
 export type { SessionBinding, SessionDeliveryReceipt, SessionDeliveryStatus } from './session-delivery.js';
 export { sessionHostSchema, deliverSessionMessage, SessionDeliveryError } from './session-hosts.js';

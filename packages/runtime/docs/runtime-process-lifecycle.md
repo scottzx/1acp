@@ -26,6 +26,12 @@ returns that error. An exit during admission is delivered after the admission
 callback settles, so a late successful write cannot overwrite an earlier exit
 observation.
 
+`onSpawnFailed` also reports admission rejection and cancellation before spawn,
+including authority revoked after `onBeforeSpawn` successfully reserved capacity.
+The observation retains the original error so hosts can release a reservation
+even when no child PID was created. A client closed during held compatibility
+probe admission reports the same failure without launching that probe.
+
 For embedded runtime session creation, a positive `timeoutMs` bounds ACP
 initialization. If the agent never completes the handshake, `ensureSession()`
 rejects with `ACP_SESSION_INIT_FAILED` after closing the client and cleaning up

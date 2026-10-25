@@ -33,7 +33,9 @@ execution targets or starting tasks. Optional interval mode runs in the gateway.
     if (process.platform !== 'win32' && (stat.mode & 0o077)) throw new Error('Gateway config contains credentials; set chmod 600');
     const config = JSON.parse(fs.readFileSync(file, 'utf8')) as A2AGatewayConfig;
     const host = await serveA2AGateway(config, { report: !args.includes('--no-report') });
-    console.log(`a2a-gateway listening on http://127.0.0.1:${host.port}; registration=${host.registration?.ok ?? false}`);
+    const registration = host.registration?.ok ?? false;
+    const reason = host.registration && !host.registration.ok ? ` reason=${host.registration?.reason ?? 'unknown reason'}` : '';
+    console.log(`a2a-gateway listening on http://127.0.0.1:${host.port}; registration=${registration}${reason}`);
     if (host.automationPort !== undefined) console.log(`a2a automation listening on http://${host.gateway.config.automation!.host}:${host.automationPort}`);
     const stop = () => { void host.close().then(() => { process.exitCode = 0; }); };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);

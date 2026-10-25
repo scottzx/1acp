@@ -10,3 +10,7 @@ export type { ServerOptions } from './server.js';
 export { attachBridgeServer, activeSessions, sessionBackgroundTasks, killAllManagedAgents } from './bridge.js';
 export { discoverAgents } from './catalog.js';
 export type { AgentStatus, DiscoveryOptions } from './catalog.js';
+export { CapacityGovernor, CapacityError } from './capacity.js';
+export type { CapacityOptions, CapacityLease, CapacitySnapshot } from './capacity.js';
+export { createCapacityLifecycle } from './capacity-lifecycle.js';
+export { CapacityQueue } from './capacity-queue.js';

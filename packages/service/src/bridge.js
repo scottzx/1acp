@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { WebSocketServer } from "ws";
 import { attachAcpConnection } from "./acp-connection.js";
 import { createServiceAgentRegistry } from "./catalog.js";
+import { CapacityQueue } from "./capacity-queue.js";
+import { createCapacityLifecycle } from "./capacity-lifecycle.js";
 import {
   createAcpRuntime,
   createRuntimeStore,
@@ -98,7 +100,47 @@ function parseBackgroundTaskReminder(update) {
 const sessionBackgroundTasks = new Map();
 
 // Setup session runtime manager options
+const processCapacity = new CapacityQueue();
+let capacityLaunchAbort = new AbortController();
+const sessionLaunchControllers = new Map();
+const initializingSessionControllers = new Map();
+const capacityLaunchSignals = new Map();
+const capacityLifecycle = createCapacityLifecycle({
+  acquire: request => processCapacity.acquire(request, {
+    signal: capacityLaunchSignals.get(request.id) || capacityLaunchAbort.signal,
+  }),
+});
 const runtime = createAcpRuntime({
+  // Includes compatibility checks, probes and pre-warm launches. Native user
+  // processes outside this service are not admitted through this governor.
+  processLifecycle: {
+    async onBeforeSpawn(launch) {
+      const session = launch.scope.kind === "runtime-session"
+        ? sessionLaunchControllers.get(launch.scope.sessionKey)
+        : undefined;
+      // Capture the generation before the lifecycle's deferred acquire runs.
+      const signal = AbortSignal.any([
+        capacityLaunchAbort.signal,
+        ...(session ? [session.controller.signal] : []),
+      ]);
+      capacityLaunchSignals.set(launch.launchId, signal);
+      signal.throwIfAborted();
+      await capacityLifecycle.onBeforeSpawn(launch);
+      signal.throwIfAborted();
+    },
+    async onSpawned(started) {
+      await capacityLifecycle.onSpawned(started);
+      capacityLaunchSignals.delete(started.launchId);
+    },
+    onSpawnFailed(failure) {
+      capacityLaunchSignals.delete(failure.launchId);
+      return capacityLifecycle.onSpawnFailed(failure);
+    },
+    onExit(exit) {
+      capacityLaunchSignals.delete(exit.launchId);
+      return capacityLifecycle.onExit(exit);
+    },
+  },
   cwd: process.cwd(),
   sessionStore: createRuntimeStore({ stateDir: DEFAULT_STATE_DIR }),
   agentRegistry: createServiceAgentRegistry(),
@@ -233,6 +275,16 @@ const historyPushStates = new Map();
 
 // Map of currently initializing sessions: sessionId -> Promise<handle>
 const initializingSessions = new Map();
+
+async function cancelInitializingSession(sessionId, expectedSignal) {
+  const initialization = initializingSessionControllers.get(sessionId);
+  if (!initialization) return false;
+  if (expectedSignal && initialization.signal !== expectedSignal) return false;
+  initialization.controller.abort(new DOMException("ACP session initialization canceled", "AbortError"));
+  // Wait for late handles and bridge state to be retired, not just ensureSession().
+  await initialization.done;
+  return true;
+}
 
 // Map of Agent UUID -> Client Session ID (for permission callbacks)
 const agentSessionToClientSession = new Map();
@@ -1221,6 +1273,11 @@ export async function dispatchCommand(ws, payload) {
     try {
       switch (action) {
         case "ensure_session": {
+          // This object is supplied only by the process-local ACP adapter. JSON
+          // extension metadata cannot manufacture an AbortSignal instance.
+          const initializationSignal = payload.initializationSignal instanceof AbortSignal
+            ? payload.initializationSignal : undefined;
+          initializationSignal?.throwIfAborted();
           const {
             workspacePath,
             agentType,
@@ -1399,7 +1456,9 @@ export async function dispatchCommand(ws, payload) {
           }
           if (existingSession) {
             console.log(`[acpx-server] Reconnecting to existing session: ${sessionId}`);
-            notifySessionTakenOver(existingSession.ws, ws, sessionId);
+            // ACP attachment commits after its status read. A canceled attach
+            // must not invalidate the original user's live request first.
+            if (!initializationSignal) notifySessionTakenOver(existingSession.ws, ws, sessionId);
             existingSession.ws = ws;
             if (launchArgv.length > 0) {
               await runtime.ensureSession({
@@ -1470,11 +1529,13 @@ export async function dispatchCommand(ws, payload) {
             console.log(
               `[acpx-server] Session ${sessionId} is currently initializing, awaiting...`,
             );
+            const initialization = initializingSessionControllers.get(sessionId);
             try {
               const handle = await initializingSessions.get(sessionId);
+              initialization?.controller.signal.throwIfAborted();
               const sess = activeSessions.get(sessionId);
               if (sess) {
-                notifySessionTakenOver(sess.ws, ws, sessionId);
+                if (!initializationSignal) notifySessionTakenOver(sess.ws, ws, sessionId);
                 sess.ws = ws;
                 sess.agentType = agentType;
                 sess.sessionMode = await resolveGrokPermissionMode(handle, agentType);
@@ -1482,8 +1543,10 @@ export async function dispatchCommand(ws, payload) {
                   sess.permissionMode = seededMode;
                 }
               }
+              initialization?.controller.signal.throwIfAborted();
               registerAgentSessionMapping(sessionId, handle);
               await sendAuthoritativeTurnSync(ws, sessionId, sess || { handle, agentType });
+              initialization?.controller.signal.throwIfAborted();
               ws.send(
                 JSON.stringify({
                   event: "session_ready",
@@ -1578,10 +1641,23 @@ export async function dispatchCommand(ws, payload) {
             agentArgv: launchArgv.length > 0 ? launchArgv : undefined,
             authCredentials: transientCredentials,
           };
+          let finishInitialization;
+          const initialization = {
+            controller: new AbortController(),
+            signal: initializationSignal,
+            done: new Promise(resolve => { finishInitialization = resolve; }),
+          };
+          const forwardCancellation = () => initialization.controller.abort(initializationSignal.reason);
+          initializationSignal?.addEventListener("abort", forwardCancellation, { once: true });
+          if (initializationSignal?.aborted) forwardCancellation();
+          initializingSessionControllers.set(sessionId, initialization);
+          sessionLaunchControllers.set(runtimeSessionKey, initialization);
           const sessionPromise = (async () => {
             try {
+              initialization.controller.signal.throwIfAborted();
               return await runtime.ensureSession(ensureInput);
             } catch (err) {
+              initialization.controller.signal.throwIfAborted();
               if (!profileChanged || !resumeId) {
                 throw err;
               }
@@ -1591,8 +1667,13 @@ export async function dispatchCommand(ws, payload) {
           })();
           initializingSessions.set(sessionId, sessionPromise);
 
+          let initializedHandle;
           try {
             const handle = await sessionPromise;
+            initializedHandle = handle;
+            initialization.controller.signal.throwIfAborted();
+            const sessionMode = await resolveGrokPermissionMode(handle, agentType);
+            initialization.controller.signal.throwIfAborted();
             console.timeEnd(`ensure_session_${sessionId}`);
             console.log(`[DEBUG] ensure_session finished for session=${sessionId}`);
 
@@ -1607,7 +1688,7 @@ export async function dispatchCommand(ws, payload) {
               promptQueue: [],
               ws,
               agentType,
-              sessionMode: await resolveGrokPermissionMode(handle, agentType),
+              sessionMode,
               // permissionMode is per-session and overrides the runtime
               // default in handlePermissionRequestCallback. The Composer's
               // mode toggle later updates this via set_permission_mode.
@@ -1625,6 +1706,7 @@ export async function dispatchCommand(ws, payload) {
             if (normalizedResponsePolicy !== "summary") {
               await sendAuthoritativeTurnSync(ws, sessionId, activeSessions.get(sessionId), true);
             }
+            initialization.controller.signal.throwIfAborted();
             ws.send(
               JSON.stringify({
                 event: "session_ready",
@@ -1646,8 +1728,23 @@ export async function dispatchCommand(ws, payload) {
                 }),
               );
             }
+          } catch (error) {
+            if (initialization.controller.signal.aborted && initializedHandle) {
+              const current = activeSessions.get(sessionId);
+              if (current?.handle === initializedHandle) {
+                activeSessions.delete(sessionId);
+                sessionBackgroundTasks.delete(sessionId);
+              }
+              unregisterAgentSessionMapping(initializedHandle);
+              await runtime.close({ handle: initializedHandle, reason: "Session initialization canceled" });
+            }
+            throw error;
           } finally {
-            initializingSessions.delete(sessionId);
+            initializationSignal?.removeEventListener("abort", forwardCancellation);
+            if (initializingSessions.get(sessionId) === sessionPromise) initializingSessions.delete(sessionId);
+            if (initializingSessionControllers.get(sessionId) === initialization) initializingSessionControllers.delete(sessionId);
+            if (sessionLaunchControllers.get(runtimeSessionKey) === initialization) sessionLaunchControllers.delete(runtimeSessionKey);
+            finishInitialization();
           }
           break;
         }
@@ -2162,6 +2259,10 @@ export async function dispatchCommand(ws, payload) {
 
           const session = activeSessions.get(sessionId);
           if (!session) {
+            if (await cancelInitializingSession(sessionId)) {
+              clearSessionHistoryPush(sessionId);
+              break;
+            }
             sendError(ws, sessionId, "SESSION_NOT_FOUND", "Session not initialized");
             return;
           }
@@ -2220,7 +2321,11 @@ export async function dispatchCommand(ws, payload) {
             return;
           }
 
+          const expectedSignal = payload.initializationSignal instanceof AbortSignal ? payload.initializationSignal : undefined;
+          if (expectedSignal && activeSessions.get(sessionId)?.ws && activeSessions.get(sessionId).ws !== ws) break;
+          await cancelInitializingSession(sessionId, expectedSignal);
           const session = activeSessions.get(sessionId);
+          if (expectedSignal && session && session.ws !== ws) break;
           if (session) {
             console.log(`[acpx-server] Closing session: ${sessionId}`);
             unregisterAgentSessionMapping(session.handle);
@@ -3552,7 +3657,15 @@ async function handlePermissionRequestCallback(req, ctx) {
 // ----------------------------------------------------
 async function killAllManagedAgents() {
   console.log("[acpx-server] Cleaning up all active sessions and child processes...");
+  const pendingLaunches = capacityLaunchAbort;
+  capacityLaunchAbort = new AbortController();
+  pendingLaunches.abort(new Error("ACP service is closing pending launches"));
+  const pendingInitializations = [...initializingSessionControllers.values()];
+  for (const initialization of pendingInitializations) {
+    initialization.controller.abort(new Error("ACP service is closing pending launches"));
+  }
   const promises = [];
+  promises.push(...pendingInitializations.map(initialization => initialization.done));
   for (const [sessionId, session] of activeSessions.entries()) {
     try {
       unregisterAgentSessionMapping(session.handle);
