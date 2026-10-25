@@ -1,7 +1,7 @@
 /** Verify the tarball installed outside the workspace can load and launch its runtime. */
 import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, mkdirSync, cpSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, mkdirSync, cpSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -79,11 +79,19 @@ try {
   const testDirectory = join(directory, 'test');
   mkdirSync(join(testDirectory, 'fixtures'), { recursive: true });
   cpSync(new URL('../packages/service/test/fixtures/acp-agent.mjs', import.meta.url), join(testDirectory, 'fixtures/acp-agent.mjs'));
+  const testSource = new URL('../packages/service/test/', import.meta.url);
   const installedTests = ['acp-runtime.integration.test.ts', 'catalog.test.ts', 'a2a-server.test.ts', 'a2a-store.test.ts', 'a2a-gateway.test.ts'];
-  for (const file of installedTests) {
-    const source = readFileSync(new URL(`../packages/service/test/${file}`, import.meta.url), 'utf8')
-      .replaceAll("'../src/", "'./node_modules/@1agents/acp-service/dist/src/");
-    writeFileSync(join(directory, file), source.replace("'./fixtures/acp-agent.mjs'", "'./test/fixtures/acp-agent.mjs'"));
+  // Sibling helper modules are shared by the installed tests. Node strips types
+  // natively but never remaps "./helper.js" to "./helper.ts", so copy the real
+  // TypeScript files and point the specifiers at them.
+  const helperModules = readdirSync(testSource).filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'));
+  const helperSpecifiers = helperModules.map((name) => [`'./${name.replace(/\.ts$/, '.js')}'`, `'./${name}'`]);
+  for (const file of [...installedTests, ...helperModules]) {
+    let source = readFileSync(new URL(file, testSource), 'utf8')
+      .replaceAll("'../src/", "'./node_modules/@1agents/acp-service/dist/src/")
+      .replace("'./fixtures/acp-agent.mjs'", "'./test/fixtures/acp-agent.mjs'");
+    for (const [from, to] of helperSpecifiers) source = source.replaceAll(from, to);
+    writeFileSync(join(directory, file), source);
   }
   execFileSync(process.execPath, ['--test', ...installedTests], { cwd: directory, stdio: 'inherit', timeout: 60_000 });
   if (process.argv[3]) {
