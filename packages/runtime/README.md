@@ -1,3 +1,7 @@
+> **This repository has moved to [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow).** It is archived and read-only; please open issues and PRs there. npm package names are unchanged.
+>
+> 本仓库已迁移至 [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow)，此处归档只读；npm 包名不变。
+
 # acpx 🤝 — Agents talking to agents, minus the terminal séance
 
 <p align="center">
