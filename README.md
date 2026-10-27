@@ -1,6 +1,12 @@
-# 1ACP — native Agent sessions in DeepSeek Harness
+# 1ACP — the agent task-flow engine
 
 [1ACP 发布页](https://scottzx.github.io/1acp/) · [npm package](https://www.npmjs.com/package/@1agents/acp-service) · [变更日志](CHANGELOG.md)
+
+1ACP is the agent task-flow engine in 一芥天地 (DreamMate World), from 一芥智能. It creates and runs A2A tasks: register a resident role or a one-off host, submit the work, and keep the job, its attempts and its results on the execution ledger. DeepSeek Harness (DSH) hosts the sessions. Codex, Claude Code, Pi and Cursor are built-in ACP agents, together with the other agents this runtime already registers.
+
+1ACP dispatches that work and accepts it. In the delivery flows in this repository, a stage's output moves on when that stage's acceptance passes, and a person stays on the loop. 给 Agent 猛猛套上缰绳，库库干活。
+
+A PPT script is structure-checked and, under the default policy, waits for a human decision before production starts. The deck then goes through a deterministic machine check. An independent agent reviewer is dispatched after that check passes, and the deck is delivered after that review passes. A report workflow file-checks the Markdown, then finishes when a person approves that exact file. Code checks, a separate agent reviewer and a human decision are the acceptance steps these deliveries use, each tied to its own stage.
 
 Use Codex, Claude Code, Grok Build and other locally discovered ACP Agents inside DeepSeek Harness (DSH). Continue persistent native sessions, choose the models and settings exposed by each Agent, and handle tool permissions in DSH's approval UI. The same **`@1agents/acp-service`** package also provides a standalone CLI and ACP HTTP/WebSocket service.
 
