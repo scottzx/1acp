@@ -1,3 +1,7 @@
+> **This repository has moved to [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow).** It is archived and read-only; please open issues and PRs there. npm package names are unchanged.
+>
+> 本仓库已迁移至 [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow)，此处归档只读；npm 包名不变。
+
 # @1agents/acp-service
 
 Run persistent Codex, Claude Code, Grok Build and other supported native Agent sessions in DeepSeek Harness (DSH), or use the same package as a standalone CLI and ACP service. DSH exposes the Agent's native models, settings, commands and permission requests; each session keeps its Agent and workspace when reconnected.

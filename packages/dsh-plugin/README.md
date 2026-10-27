@@ -1,3 +1,7 @@
+> **This repository has moved to [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow).** It is archived and read-only; please open issues and PRs there. npm package names are unchanged.
+>
+> 本仓库已迁移至 [scottzx/agent-workflow](https://github.com/scottzx/agent-workflow)，此处归档只读；npm 包名不变。
+
 # DSH plugin in @1agents/acp-service
 
 Use persistent native Codex, Claude Code, Grok Build and other locally discovered ACP Agent sessions inside DeepSeek Harness. Choose native models and settings, use advertised commands, and answer tool permissions in DSH. The plugin is embedded with the runtime and service in the single public **`@1agents/acp-service`** package. This directory is its private source module.
